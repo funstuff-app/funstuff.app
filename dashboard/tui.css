@@ -1,0 +1,368 @@
+:root {
+    /* 
+       Replicating the specific look of the target screenshot.
+       The user is running Textual with 'gruvbox' theme, BUT the terminal profile 'Clear Dark' 
+       seems to be influencing the colors (specifically Blue -> Purple).
+    */
+    
+    /* Background: Dark Grey/Brownish (Gruvbox-ish but darker) */
+    --bg-color: #1d2021; 
+    --fg-color: #ebdbb2; /* Gruvbox fg */
+    
+    /* Colors extracted from "Clear Dark" profile to match screenshot behavior */
+    --ansi-blue-purple: #7d5af0; /* The "Blue" that looks Purple */
+    --ansi-green: #98971a; /* Gruvbox Green */
+    --ansi-bright-green: #b8bb26;
+    
+    /* The screenshot shows the "Sensor Details" border is Purple. Code says "blue". 
+       So we map our "border-blue" var to this Purple color. */
+    --border-blue: #d3869b; /* Gruvbox Purple / or the terminal profile purple */
+    --border-green: #b8bb26; /* Gruvbox Bright Green */
+    
+    /* Selection: The screenshot shows a Teal/Aqua background for the selected item */
+    --selection-bg: #458588; /* Gruvbox Blue/Teal */
+    --selection-fg: #ebdbb2;
+    
+    --dim-text: #928374; /* Gruvbox Gray */
+    
+    /* Specific Pollutant Colors from Screenshot */
+    --pollutant-pm25: #83a598; /* Blue-ish */
+    --pollutant-pm10: #83a598;
+    --pollutant-ozone: #b8bb26; /* Green-ish */
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--bg-color);
+    color: var(--fg-color);
+    /* SF Mono is the macOS terminal font. 13px/14px looks closer to the screenshot's weight than 12px */
+    font-family: "SF Mono", "Menlo", "Monaco", "Courier New", monospace;
+    font-size: 13px; 
+    line-height: 1.3;
+    height: 100vh;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+}
+
+#app {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+#header {
+    text-align: center;
+    background-color: #32302f; /* Slightly lighter header */
+    padding: 4px 0;
+    font-weight: bold;
+    color: #d5c4a1;
+}
+
+#last-updated {
+    padding: 4px 12px;
+    color: var(--dim-text);
+    border-bottom: 1px solid #32302f;
+    font-size: 12px;
+}
+
+#main-content {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+}
+
+#left-pane {
+    width: 40%;
+    min-width: 38ch;
+    border-right: 1px solid var(--selection-bg); /* Blue/Teal separator in screenshot */
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    padding-top: 0;
+}
+
+#right-pane {
+    width: 60%;
+    display: flex;
+    flex-direction: column;
+    padding: 12px; /* More breathing room */
+}
+
+#details-pane {
+    flex: 0 0 auto;
+    margin-bottom: 12px;
+}
+
+#raw-data-pane {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Footer */
+#footer {
+    background-color: #32302f;
+    padding: 4px 12px;
+    display: flex;
+    gap: 16px;
+    font-size: 12px;
+    color: #d5c4a1;
+    border-top: 1px solid #32302f;
+}
+
+.key-binding {
+    cursor: pointer;
+}
+
+.key-binding:hover {
+    text-decoration: underline;
+}
+
+.key {
+    color: #fabd2f; /* Gruvbox Yellow */
+    font-weight: bold;
+}
+
+/* Sensor List Items */
+.sensor-item {
+    padding: 4px 12px; /* More padding */
+    border-bottom: 1px solid #32302f;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow: hidden;
+}
+
+.sensor-item.selected {
+    background-color: var(--selection-bg);
+    color: #fbf1c7; /* Bright text on selection */
+}
+
+.sensor-header {
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Unselected colors */
+.sensor-item:not(.selected) .sensor-header {
+    color: #b8bb26; /* Gruvbox Green for ID */
+}
+.sensor-item:not(.selected).fixed .sensor-header {
+    color: #fabd2f; /* Gruvbox Yellow for Fixed? Or White? Screenshot shows WBB (Fixed) as White/Bold */
+    color: #ebdbb2; 
+}
+/* Wait, in screenshot:
+   TRX03 (Mobile) -> Selected, White text.
+   WBB (Fixed) -> Not selected, White text, Red Pin.
+   QBV (Fixed) -> Not selected, Green ID? No, "QBV (Viewmont)" is White/Bold.
+   Wait, "QBV" is Green in the screenshot? No, it looks White.
+   Actually, looking at "QBV (Viewmont)", "QBV" is bold white, "(Viewmont)" is bold white.
+   "PM25: 3.40 -" is Cyan. "OZNE: 42.00 -" is Green.
+   
+   Let's look at "BUS04" at the top. "BUS04" is Green (dimmed?).
+   
+   Code says:
+   col = row_data[2] (Value Color)
+   
+   The ID color isn't explicitly set in `SensorItem` compose, just `Label(title, classes="sensor-title")`.
+   In Textual, Label uses default fg color unless styled.
+   
+   However, `mobile_air.py` has:
+   .sensor-title { text-style: bold; width: 100%; }
+   
+   So it should be bold default fg.
+*/
+
+.sensor-item .sensor-header {
+    color: #ebdbb2; /* Default text color */
+}
+.sensor-item.mobile .sensor-header {
+    color: #b8bb26; /* Mobile IDs often Green in TUI apps? Screenshot shows BUS04 as Green-ish grey? */
+    /* Actually BUS04 looks dark grey in the screenshot (Ghosted?). */
+    /* TRX03 is selected. */
+    /* QIP (South Park Academy) -> QIP is White. */
+}
+
+.sensor-readings {
+    display: flex;
+    gap: 12px;
+    color: var(--dim-text);
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sensor-item.selected .sensor-readings {
+    color: #fbf1c7;
+}
+
+.reading {
+    display: flex;
+    gap: 4px;
+}
+
+.reading-label {
+    color: var(--dim-text);
+}
+.sensor-item.selected .reading-label {
+    color: #d5c4a1;
+}
+
+.reading-value {
+    font-weight: bold;
+}
+
+/* TUI Box Styling */
+.tui-box {
+    border: 1px solid;
+    border-radius: 0; /* Textual panels usually have square corners or rounded? Screenshot shows rounded. */
+    border-radius: 4px;
+    padding: 12px;
+    position: relative;
+    margin-top: 10px;
+}
+
+.tui-box-title {
+    position: absolute;
+    top: -9px;
+    left: 50%;
+    transform: translateX(-50%);
+    background-color: var(--bg-color);
+    padding: 0 8px;
+    font-weight: bold;
+    font-size: 13px;
+    white-space: nowrap;
+    z-index: 1;
+}
+
+/* Details Box Specifics */
+.details-box {
+    border-color: var(--border-blue); /* Purple */
+    min-height: 220px;
+}
+
+.details-box .tui-box-title {
+    color: var(--border-blue);
+}
+
+.sensor-name-large {
+    text-align: center;
+    font-size: 14px;
+    font-weight: bold;
+    margin-bottom: 4px;
+    color: var(--fg-color);
+    text-decoration: underline; /* Screenshot shows underline */
+}
+
+.sensor-location {
+    text-align: center;
+    color: var(--fg-color);
+    margin-bottom: 16px;
+    font-size: 12px;
+}
+
+/* Table Compactness */
+.pollutant-table {
+    display: grid;
+    /* Use character units so columns line up in a monospace UI. */
+    grid-template-columns: 8ch 8ch 22ch 1fr;
+    column-gap: 3ch;
+    row-gap: 6px;
+    align-items: baseline;
+    font-size: 12px;
+}
+
+.col-header {
+    font-weight: bold;
+    color: var(--fg-color);
+    border-bottom: 2px solid var(--dim-text);
+    padding-bottom: 2px;
+    margin-bottom: 0;
+    line-height: 1.05;
+}
+
+.p-name {
+    font-weight: bold;
+    color: #fabd2f; /* Yellow */
+}
+
+.p-value {
+    color: #8ec07c; /* Aqua */
+}
+
+.p-level {
+    height: 14px;
+    background-color: #32302f;
+    position: relative;
+    width: 100%;
+    display: flex;
+}
+
+/* Sparklines */
+.p-history {
+    height: 18px;
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+}
+
+.hist-bar {
+    width: 4px;
+    background-color: #8ec07c;
+}
+
+/* Raw Data Box */
+.raw-data-box {
+    border-color: var(--border-green);
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0; /* Allow flex children to scroll */
+}
+
+.raw-data-box .tui-box-title {
+    color: var(--border-green);
+}
+
+#json-content {
+    color: #b8bb26; /* Green text */
+    white-space: pre-wrap;
+    margin: 0;
+    font-size: 11px;
+    overflow-y: auto;
+    flex: 1;
+    padding-top: 8px;
+}
+
+/* Scrollbars - minimal */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+    min-height: 2px;
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: #504945;
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #665c54;
+}
+
+
+

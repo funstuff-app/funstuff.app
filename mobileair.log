@@ -1,0 +1,13 @@
+2025-12-26 00:07:21,541 [INFO] MobileAirCore: SensorDataManager started.
+2025-12-26 00:07:21,548 [INFO] MobileAirServer: Serving dashboard at http://localhost:8000
+2025-12-26 00:07:21,700 [INFO] MobileAirCore: Data updated in 0.16s
+2025-12-26 00:07:25,144 [INFO] MobileAirCore: SensorDataManager stopped.
+2025-12-26 00:07:37,057 [INFO] MobileAirCore: SensorDataManager started.
+2025-12-26 00:07:37,070 [INFO] MobileAirServer: Serving dashboard at http://localhost:8000
+2025-12-26 00:07:37,249 [INFO] MobileAirCore: Data updated in 0.19s
+2025-12-26 00:08:40,878 [INFO] MobileAirCore: Data updated in 0.19s
+2025-12-26 00:09:23,579 [INFO] MobileAirCore: SensorDataManager stopped.
+2025-12-26 00:09:40,721 [INFO] MobileAirCore: SensorDataManager started.
+2025-12-26 00:09:40,728 [INFO] MobileAirServer: Serving dashboard at http://localhost:8766
+2025-12-26 00:09:40,857 [INFO] MobileAirCore: Data updated in 0.14s
+2025-12-26 00:10:43,414 [INFO] MobileAirCore: Data updated in 0.17s

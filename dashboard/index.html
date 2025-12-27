@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MobileAir Dashboard</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">MobileAir</div>
+      <div class="status">
+        <span id="statusText">Loading…</span>
+        <span class="sep">•</span>
+        <span id="lastUpdated">—</span>
+      </div>
+      <div class="controls">
+        <label class="select">
+          <span>Theme</span>
+          <select id="mapTheme" aria-label="Map theme"></select>
+        </label>
+        <label class="sliderCtl" title="Map dimming affects only the basemap tiles">
+          <span>Dim</span>
+          <input id="mapDim" type="range" min="0" max="100" step="1" />
+        </label>
+        <label class="sliderCtl" title="Basemap saturation; on dark themes values > 100 also lift shadows toward gray (tiles only)">
+          <span>Sat</span>
+          <input id="mapSat" type="range" min="0" max="150" step="1" />
+        </label>
+        <button id="zoomOut" title="Zoom out">−</button>
+        <button id="zoomIn" title="Zoom in">+</button>
+        <label class="toggle" title="DVR playback: scrub and play historical trails in sync">
+          <input type="checkbox" id="toggleTrace" />
+          <span>DVR</span>
+        </label>
+      </div>
+    </header>
+
+    <main id="layout">
+      <section id="mapPane">
+        <div id="mapRoot">
+          <canvas id="tilesCanvas"></canvas>
+          <canvas id="overlayCanvas"></canvas>
+
+          <div id="playbackBar" class="playbackBar hidden" role="group" aria-label="Playback controls">
+            <button id="pbPlay" type="button" title="Play/Pause">Play</button>
+            <div class="pbTimes" aria-hidden="true">
+              <span id="pbLeft">—</span>
+              <span class="sep">•</span>
+              <span id="pbNow">—</span>
+              <span class="sep">•</span>
+              <span id="pbRight">—</span>
+            </div>
+            <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" />
+            <label class="pbSpeed" title="Playback speed">
+              <span>Speed</span>
+              <select id="pbSpeed" aria-label="Playback speed">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+              </select>
+            </label>
+            <label class="pbDebug" title="Debug overlays (shows magnet/path helpers)">
+              <input id="pbDebugPath" type="checkbox" />
+              <span>Debug</span>
+            </label>
+          </div>
+
+          <aside id="sidebar" class="overlayPanel">
+            <div class="tabBar" role="tablist" aria-label="Sensor lists">
+              <button id="tabMobile" class="tab active" role="tab" aria-selected="true" type="button">Mobile</button>
+              <button id="tabPermanent" class="tab" role="tab" aria-selected="false" type="button">Permanent</button>
+            </div>
+            <div id="sensorListMobile" class="list" role="tabpanel" aria-labelledby="tabMobile"></div>
+            <div id="sensorListFixed" class="list hidden" role="tabpanel" aria-labelledby="tabPermanent"></div>
+          </aside>
+
+          <!-- <aside id="details" class="overlayPanel">
+            <div class="panelTitle">Details</div>
+            <div id="detailsBody" class="detailsBody">
+              <div class="muted">Select a vehicle…</div>
+            </div>
+          </aside> -->
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/map_nav_engine.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
+
+

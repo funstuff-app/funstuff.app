@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AirQualityApp</title>
+    <link rel="stylesheet" href="tui.css">
+</head>
+<body>
+    <div id="app">
+        <div id="header">AirQualityApp</div>
+        <div id="last-updated">Last updated: <span id="update-time">--:--:--</span></div>
+        
+        <div id="main-content">
+            <div id="left-pane">
+                <div id="sensor-list">
+                    <!-- Sensor items will be injected here -->
+                </div>
+            </div>
+            <div id="right-pane">
+                <div id="details-pane">
+                    <div id="details-content">
+                        <!-- Details will be injected here -->
+                        <div class="placeholder-text">Select a sensor to view details</div>
+                    </div>
+                </div>
+                <div id="raw-data-pane">
+                    <div class="pane-title">Raw API Data (Truncated)</div>
+                    <pre id="json-content"></pre>
+                </div>
+            </div>
+        </div>
+        
+        <div id="footer">
+            <span class="key-binding"><span class="key">r</span> Refresh Data</span>
+            <span class="key-binding"><span class="key">q</span> Quit</span>
+            <span class="key-binding"><span class="key">n</span> Name Sensor</span>
+            <span class="key-binding"><span class="key">m</span> Open Map</span>
+            <span class="key-binding"><span class="key">M</span> Open Overview Map</span>
+            <span class="key-binding"><span class="key">^p</span> palette</span>
+        </div>
+    </div>
+    <script src="tui.js"></script>
+</body>
+</html>
