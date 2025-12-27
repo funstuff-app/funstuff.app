@@ -547,11 +547,6 @@ class MapView {
     this._persistedTrailRev = 0;
     this.maxTrailLen = 1000;
 
-    // Subtle "runway lights" effect to call out newly-appended trail data.
-    // This animates opacity *along the existing dashed line* (dashes do not move).
-    this._trailFxById = new Map(); // id -> { t0Ms, durMs }
-    this._trailFxRAF = null;
-
     // Basemap tile cache (LRU bounded). Without eviction this grows unbounded as you pan/zoom.
     this.tileCache = new Map(); // key -> {img, ok}
     this._tileCacheMax = 420;
@@ -2107,7 +2102,6 @@ class MapView {
 
     let removedAny = false;
     removedAny = pruneMap(this._persistedTrailById) || removedAny;
-    removedAny = pruneMap(this._trailFxById) || removedAny;
     removedAny = pruneMap(this._tracePtsById) || removedAny;
     removedAny = pruneMap(this._traceLastSideById) || removedAny;
     removedAny = pruneMap(this._traceActiveRouteById) || removedAny;
@@ -2123,66 +2117,9 @@ class MapView {
     }
   }
 
-  _requestTrailFxRAF() {
-    if (this._trailFxRAF) return;
-    const targetFPS = 15;
-    const minDt = 1000 / targetFPS;
-    const tick = () => {
-      this._trailFxRAF = null;
-      const nowMs = performance.now();
-      // Remove expired FX entries.
-      let any = false;
-      let removedAny = false;
-      for (const [id, fx] of this._trailFxById.entries()) {
-        const t0 = Number(fx?.t0Ms);
-        const dur = Number(fx?.durMs);
-        if (!isFinite(t0) || !isFinite(dur) || (nowMs - t0) > dur) {
-          this._trailFxById.delete(id);
-          removedAny = true;
-        }
-        else any = true;
-      }
-      if (removedAny) this._invalidateOverlayStatic();
-      if (any && this.lastState) {
-        this.drawOverlay(this.lastState, { nowMs, fromTrailFxTick: true, cacheUnderlay: true });
-        // FX does not need rAF (60fps). Use a timer to reduce idle CPU.
-        this._trailFxRAF = window.setTimeout(tick, minDt);
-      }
-    };
-    this._trailFxRAF = window.setTimeout(tick, minDt);
-  }
-
   _getPersistedTrailEntry(id) {
     if (!id) return null;
     return this._persistedTrailById.get(String(id)) || null;
-  }
-
-  _trailFxBoostFor(id, midFrac, nowMs) {
-    const fx = id ? this._trailFxById.get(String(id)) : null;
-    if (!fx || !isFinite(fx.t0Ms) || !isFinite(fx.durMs)) return 1.0;
-    const age = nowMs - fx.t0Ms;
-    if (!(age >= 0 && age <= fx.durMs)) return 1.0;
-
-    // "Runway" chasing opacity pulse:
-    // - dashes do NOT move (no dash offset)
-    // - geometry does NOT move
-    // - only alpha varies per dashed segment in a traveling pattern
-    const t = Math.max(0, Math.min(1, age / Math.max(1, fx.durMs)));
-
-    // Keep the chase mostly near the newest half of the trail so it reads like
-    // "runway lights" rather than the whole line animating.
-    const headPeriodMs = 1500;
-    const headPhase = (age / headPeriodMs) % 1; // 0..1
-    const headPos = 0.55 + 0.45 * headPhase; // clamp chase to ~[0.55..1.0]
-
-    // Gaussian band centered at the moving head.
-    const sigma = 0.10;
-    const dist = Math.abs(midFrac - headPos);
-    const band = Math.exp(-0.5 * Math.pow(dist / sigma, 2));
-
-    // Overall amplitude decays out over the FX duration.
-    const amp = 0.65 * (1 - t * 0.75);
-    return 1.0 + (amp * band);
   }
 
   _updatePersistedTrails(state) {
@@ -2628,7 +2565,6 @@ class MapView {
       };
 
       any = del(this._persistedTrailById) || any;
-      any = del(this._trailFxById) || any;
       any = del(this._tracePtsById) || any;
       any = del(this._traceLastSideById) || any;
       any = del(this._traceActiveRouteById) || any;
@@ -2692,16 +2628,11 @@ class MapView {
       if (appendedCount > 0 || metaChanged || pinChanged) {
         this._persistedTrailById.set(id, { trail: nextTrail, color: nextColor, ghosted: nextGhosted, pin: nextPin });
         changed = true;
-
-        if (appendedCount > 0) {
-          this._trailFxById.set(id, { t0Ms: nowMs, durMs: 5200 });
-        }
       }
     }
 
     if (changed) {
       this._persistedTrailRev++;
-      if (this._trailFxById.size) this._requestTrailFxRAF();
     }
   }
 
@@ -3382,15 +3313,6 @@ class MapView {
       const isLive = !this.playbackMode || !!this._playbackLiveFollow;
       const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
 
-      // In trace mode, the static overlay must remain static.
-      // If this trail currently has an active FX window, skip it here and let the
-      // dynamic overlay draw it with per-segment opacity modulation.
-      const nowMs = performance.now();
-      const fx = id ? this._trailFxById.get(id) : null;
-      if (fx && isFinite(fx.t0Ms) && isFinite(fx.durMs) && (nowMs - fx.t0Ms) >= 0 && (nowMs - fx.t0Ms) <= fx.durMs) {
-        return false;
-      }
-
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
       const hasServerTrail = serverTrail.length >= 2;
       const persistedTrail = id ? (this._persistedTrailById.get(id)?.trail || []) : [];
@@ -3885,6 +3807,23 @@ class MapView {
         ? Number(pbTimeMs)
         : this._dataNowMs();
 
+      // Calculate pixels per meter at the trail's location (approximate using first point).
+      // This is needed to convert the pruned world distance into a screen-space dash offset.
+      let pixelsPerMeter = 1.0;
+      if (pts.length > 0) {
+        const lat = Number(trail[0].lat);
+        if (isFinite(lat)) {
+            const c = latLonToWorld(lat, 0, this.zoom);
+            // Earth circumference ~40,075,016m.
+            // World size at zoom = c.ws.
+            // Scale factor = ws / (40075016 * cos(lat)).
+            const cosLat = Math.cos(lat * Math.PI / 180);
+            if (cosLat > 1e-6) {
+                pixelsPerMeter = c.ws / (40075016 * cosLat);
+            }
+        }
+      }
+
       let batchColor = null;
       let batchAlpha = null;
       let batchPts = [];
@@ -3902,20 +3841,25 @@ class MapView {
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
         ctx.beginPath();
-        ctx.moveTo(batchPts[0].x, batchPts[0].y);
-        for (let k = 1; k < batchPts.length; k++) {
-            ctx.lineTo(batchPts[k].x, batchPts[k].y);
+        // Draw disconnected segments to ensure dash pattern resets at every vertex.
+        // This prevents "chasing" artifacts during zoom/pan, matching the original behavior.
+        for (let k = 0; k < batchPts.length - 1; k++) {
+            ctx.moveTo(batchPts[k].x, batchPts[k].y);
+            ctx.lineTo(batchPts[k+1].x, batchPts[k+1].y);
         }
         ctx.stroke();
         ctx.restore();
-        // Keep the last point as the start of the next batch to ensure continuity
-        batchPts = [batchPts[batchPts.length - 1]];
+        // Clear completely; do not carry over last point because we are drawing segments.
+        // The next iteration will push the start point of the next segment.
+        batchPts = [];
       };
 
       for (let i = 1; i < pts.length; i++) {
-        if (!pts[i - 1] || !pts[i]) {
+        const ptPrev = pts[i-1];
+        const ptCurr = pts[i];
+        
+        if (!ptPrev || !ptCurr) {
             flushBatch();
-            batchPts = [];
             continue;
         }
 
@@ -3947,14 +3891,14 @@ class MapView {
         
         const t1 = times[i];
         if (!(t1 != null && isFinite(t1) && isFinite(refNowMs))) {
-          flushBatch(); batchPts = [];
+          flushBatch();
           continue;
         }
 
         const ageMs = Math.max(0, Number(refNowMs) - Number(t1));
         const fTime = clamp(ageMs / Math.max(1, FADE_TIME_MS), 0, 1);
         if (fTime >= 1) {
-          flushBatch(); batchPts = [];
+          flushBatch();
           continue;
         }
 
@@ -3965,25 +3909,26 @@ class MapView {
         }
 
         if (tailAlpha <= 0.01) {
-          flushBatch(); batchPts = [];
+          flushBatch();
           continue;
         }
 
-        // Only compute FX boost for trails that actually have an active FX entry.
-        const boost = (id && this._trailFxById && this._trailFxById.has(String(id)))
-          ? this._trailFxBoostFor(id, mid, nowMs)
-          : 1.0;
-        
-        const finalAlpha = Math.min(1.0, alpha * boost * tailAlpha * alphaMul2);
+        const finalAlpha = Math.min(1.0, alpha * tailAlpha * alphaMul2);
 
         if (segColor !== batchColor || Math.abs(finalAlpha - batchAlpha) > 0.01) {
             flushBatch();
             batchColor = segColor;
             batchAlpha = finalAlpha;
-            if (batchPts.length === 0) batchPts.push(pts[i - 1]);
+            // New batch starts fresh.
+            // If we were accumulating points, we'd need to handle the transition.
+            // But here we push PAIRS.
+            // So if color changes, we flush the old pairs, and start pushing new pairs.
+            // We don't need to carry over ptPrev because we push (ptPrev, ptCurr) explicitly below.
+            batchPts = [];
         }
         
-        batchPts.push(pts[i]);
+        batchPts.push(ptPrev);
+        batchPts.push(ptCurr);
       }
       flushBatch();
 
@@ -4034,18 +3979,7 @@ class MapView {
       }
     }
 
-    // In trace mode, trails live in the cached static overlay EXCEPT those with active FX.
-    // For FX trails, redraw the ORIGINAL trail dynamically so the opacity chase is visible.
-    if (this.traceMode && this._trailFxById && this._trailFxById.size) {
-      const nowMs = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
-      for (const m of mobiles) {
-        const id = m && m.id != null ? String(m.id) : "";
-        const fx = id ? this._trailFxById.get(id) : null;
-        if (!fx || !isFinite(fx.t0Ms) || !isFinite(fx.durMs) || (nowMs - fx.t0Ms) < 0 || (nowMs - fx.t0Ms) > fx.durMs) continue;
-        // full strength; selection styling handled inside drawTrailFor
-        drawTrailFor(m, 1.0, worldToScreenFast);
-      }
-    }
+
 
     // Populate/refresh the playback underlay cache BEFORE drawing mobile markers.
     if (!this.traceMode && this.playbackMode && opts && opts.cacheUnderlay && !canUseUnderlay) {
