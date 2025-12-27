@@ -3885,8 +3885,39 @@ class MapView {
         ? Number(pbTimeMs)
         : this._dataNowMs();
 
+      let batchColor = null;
+      let batchAlpha = null;
+      let batchPts = [];
+
+      const flushBatch = () => {
+        if (batchPts.length < 2) {
+            batchPts = [];
+            return;
+        }
+        ctx.save();
+        ctx.globalAlpha = batchAlpha;
+        ctx.strokeStyle = batchColor;
+        ctx.lineWidth = lw;
+        ctx.setLineDash(dash);
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(batchPts[0].x, batchPts[0].y);
+        for (let k = 1; k < batchPts.length; k++) {
+            ctx.lineTo(batchPts[k].x, batchPts[k].y);
+        }
+        ctx.stroke();
+        ctx.restore();
+        // Keep the last point as the start of the next batch to ensure continuity
+        batchPts = [batchPts[batchPts.length - 1]];
+      };
+
       for (let i = 1; i < pts.length; i++) {
-        if (!pts[i - 1] || !pts[i]) continue;
+        if (!pts[i - 1] || !pts[i]) {
+            flushBatch();
+            batchPts = [];
+            continue;
+        }
 
         // Use the 'm' (moving) flag from the server point to determine if 
         // this segment should be hidden/faded (jitter) or bright (historical data).
@@ -3911,20 +3942,19 @@ class MapView {
         }
 
         // colored segment
-        ctx.save();
         const nowMs = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
         const mid = (pts.length > 1) ? ((i - 0.5) / (pts.length - 1)) : 1.0; // 0=oldest(tail), 1=newest(head)
         
         const t1 = times[i];
         if (!(t1 != null && isFinite(t1) && isFinite(refNowMs))) {
-          ctx.restore();
+          flushBatch(); batchPts = [];
           continue;
         }
 
         const ageMs = Math.max(0, Number(refNowMs) - Number(t1));
         const fTime = clamp(ageMs / Math.max(1, FADE_TIME_MS), 0, 1);
         if (fTime >= 1) {
-          ctx.restore();
+          flushBatch(); batchPts = [];
           continue;
         }
 
@@ -3935,7 +3965,7 @@ class MapView {
         }
 
         if (tailAlpha <= 0.01) {
-          ctx.restore();
+          flushBatch(); batchPts = [];
           continue;
         }
 
@@ -3943,18 +3973,19 @@ class MapView {
         const boost = (id && this._trailFxById && this._trailFxById.has(String(id)))
           ? this._trailFxBoostFor(id, mid, nowMs)
           : 1.0;
-        ctx.globalAlpha = Math.min(1.0, alpha * boost * tailAlpha * alphaMul2);
-        ctx.strokeStyle = segColor;
-        ctx.lineWidth = lw;
-        ctx.setLineDash(dash);
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.beginPath();
-        ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
-        ctx.lineTo(pts[i].x, pts[i].y);
-        ctx.stroke();
-        ctx.restore();
+        
+        const finalAlpha = Math.min(1.0, alpha * boost * tailAlpha * alphaMul2);
+
+        if (segColor !== batchColor || Math.abs(finalAlpha - batchAlpha) > 0.01) {
+            flushBatch();
+            batchColor = segColor;
+            batchAlpha = finalAlpha;
+            if (batchPts.length === 0) batchPts.push(pts[i - 1]);
+        }
+        
+        batchPts.push(pts[i]);
       }
+      flushBatch();
 
       return true;
     };
