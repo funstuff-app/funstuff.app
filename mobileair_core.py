@@ -537,10 +537,10 @@ def evaluate_mobility(
             tail_radius = max(tail_radius, haversine_distance(lat_f, lon_f, tail_centroid_lat, tail_centroid_lon))
 
         # "Clearly obvious" immobility thresholds (meters) over the last N samples.
-        strict_total = 45.0
-        strict_max_step = 18.0
-        strict_bbox = 40.0
-        strict_radius = 22.0
+        strict_total = 100.0
+        strict_max_step = 20.0
+        strict_bbox = 60.0
+        strict_radius = 30.0
         if tail_total <= strict_total and tail_max <= strict_max_step and tail_bbox <= strict_bbox and tail_radius <= strict_radius:
             info["samples"] = len(recent_tail)
             info["immobile"] = True
@@ -1513,10 +1513,11 @@ def normalize_state_for_dashboard(
         last = pts[-1]
         name = custom_names.get(sensor_id) or ""
 
-        # Mobility (match the TUI semantics as closely as possible):
+        # Mobility:
         # - We evaluate mobility from the merged breadcrumb trail (tracks) so it's consistent
         #   across pollutants and not sensitive to dict iteration order / per-pollutant cadence.
-        # - A mobile sensor becomes "ghosted/stale" when immobile (dashboard has no forced-active toggle).
+        # - Dashboard JSON semantics: "immobile" means stopped/idle; "ghosted" is reserved
+        #   for offline sensors and is set by dashboard_server.
         mobility_info: dict[str, Any] = {}
         # Build a minimal sensor_blob from the trail points for mobility evaluation.
         trail_lat: list[float] = []
@@ -1589,13 +1590,13 @@ def normalize_state_for_dashboard(
                 pts[idx]["m"] = 0 if is_window_immobile else 1
         is_immobile = bool(mobility_info.get("immobile"))
         forced_active = False
-        ghosted = bool(is_immobile and not forced_active)
+        ghosted = False
 
         stable_lat = _coerce_float(mobility_info.get("stable_lat"))
         stable_lon = _coerce_float(mobility_info.get("stable_lon"))
         pts2 = pts
         last2 = last
-        if ghosted and stable_lat is not None and stable_lon is not None:
+        if is_immobile and stable_lat is not None and stable_lon is not None:
             # Replace the reported position with the stable center and collapse the
             # stationary tail of the breadcrumb trail.
             pts2 = _collapse_stationary_suffix(pts, center_lat=float(stable_lat), center_lon=float(stable_lon), radius_m=70.0, min_pts=10)
