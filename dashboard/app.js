@@ -1568,7 +1568,7 @@ class MapView {
   _traceSampleForMobile(m, nowMs) {
     const id = m && m.id ? String(m.id) : "";
 
-    // If the backend says this vehicle is idle/ghosted, hide marker unless selected or in Debug mode.
+    // If the backend says this vehicle is idle/ghosted, dim marker unless selected or in Debug mode.
     if (m && m.ghosted) {
       const lat = Number(m.lat);
       const lon = Number(m.lon);
@@ -1579,7 +1579,8 @@ class MapView {
       
       const key = keyFor("mobile", m.id);
       const isSel = (this.selectedId === key);
-      const opacity = (this._pbDebugPath || isSel) ? 1 : 0;
+      const dimOpacity = 0.25;
+      const opacity = (this._pbDebugPath || isSel) ? 1 : dimOpacity;
       
       return { lat, lon, angle, flipX: false, speedMps: 0, opacity };
     }
@@ -2582,7 +2583,7 @@ class MapView {
       if (!id) continue;
 
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
-      const prev = this._persistedTrailById.get(id) || { trail: [], color: null, ghosted: false, pin: null };
+      const prev = this._persistedTrailById.get(id) || { trail: [], color: null, ghosted: false, parked: false, pin: null };
 
       // Trails now persist at the data level (server-side).
       // If the server trail is empty and we have no previous trail, skip.
@@ -2608,25 +2609,29 @@ class MapView {
       let nextPin = prevPin;
       const prevGhosted = !!prev?.ghosted;
       const nextGhosted = !!m?.ghosted;
-      const becameIdle = (!prevGhosted && nextGhosted);
+      const prevParked = !!prev?.parked;
+      const nextParked = !!m?.parked;
 
-      if (nextGhosted) {
-        if (!nextPin || becameIdle) nextPin = tailMedianLatLon(nextTrail, 24);
-      } else {
-        nextPin = null;
-        // If filters are disabled, do not create "stationary" pins based on distance thresholds.
-        const stationary = isEffectivelyStationary(nextTrail, { tailN: 22, maxRadiusM: 36, maxNetM: 26, minSpanMs: 90_000 });
-        if (stationary) nextPin = tailMedianLatLon(nextTrail, 24);
+      // Pins are used only for the parked display (not for offline sensors).
+      nextPin = null;
+      if (!nextGhosted) {
+        if (nextParked) {
+          nextPin = tailMedianLatLon(nextTrail, 24);
+        } else {
+          // Fallback: if server doesn't provide parked, use a strict parked heuristic.
+          const stationary = isEffectivelyStationary(nextTrail, { tailN: 28, maxRadiusM: 42, maxNetM: 30, minSpanMs: 900_000 });
+          if (stationary) nextPin = tailMedianLatLon(nextTrail, 24);
+        }
       }
 
       const pinChanged = (Boolean(prevPin) !== Boolean(nextPin))
         || (prevPin && nextPin && (haversineMeters(prevPin.lat, prevPin.lon, nextPin.lat, nextPin.lon) > 1.0));
 
       const nextColor = safeHex(m.color);
-      const metaChanged = (prev.color !== nextColor) || (prev.ghosted !== nextGhosted);
+      const metaChanged = (prev.color !== nextColor) || (prev.ghosted !== nextGhosted) || (prevParked !== nextParked);
 
       if (appendedCount > 0 || metaChanged || pinChanged) {
-        this._persistedTrailById.set(id, { trail: nextTrail, color: nextColor, ghosted: nextGhosted, pin: nextPin });
+        this._persistedTrailById.set(id, { trail: nextTrail, color: nextColor, ghosted: nextGhosted, parked: nextParked, pin: nextPin });
         changed = true;
       }
     }
@@ -2911,31 +2916,30 @@ class MapView {
     if (t >= tMax - 1) speedMps = 0;
 
     // Determine transient visibility:
-    // - Hide idle (non-moving) markers unless Debug/Selected.
-    // - Hide ghosted markers unless Debug/Selected (regardless of scrubbing).
+    // - Dim idle (non-moving) markers unless Debug/Selected.
+    // - Dim ghosted markers unless Debug/Selected (regardless of scrubbing).
     let opacity = 1.0;
+    const dimOpacity = 0.25;
     const movingFlag = !!(nextPoint && (nextPoint.m === 1 || nextPoint.m === "1" || nextPoint.m === true));
     const key = keyFor("mobile", m.id);
     const isSel = (this.selectedId === key);
 
     if (!movingFlag && !this._pbDebugPath && !isSel) {
-      opacity = 0.0;
+      opacity = dimOpacity;
     }
 
-    const isLive = !this.playbackMode || !!this._playbackLiveFollow;
-    // Hide ghosted sensors only in LIVE follow-tail. While scrubbing history, use the
-    // per-point moving flag for visibility (so “ghosted right now” doesn’t hide the past).
-    if (!!m.ghosted && isLive && !this._pbDebugPath && !isSel) {
-      opacity = 0.0;
+    // Offline sensors are always dimmed unless Debug/Selected.
+    if (!!m.ghosted && !this._pbDebugPath && !isSel) {
+      opacity = dimOpacity;
     }
-    // If we're in LIVE follow-tail and this sensor is ghosted/stale, it should not report motion.
-    if (!!m.ghosted && isLive) {
+    // Offline sensors should not report motion.
+    if (!!m.ghosted) {
       speedMps = 0;
     }
 
-    // Additional gap check (keep markers hidden in large data gaps)
+    // Additional gap check (dim markers in large data gaps)
     if (dtMs > 305000 && t > prevPoint.tMs + 5000 && t < nextPoint.tMs - 5000 && !this._pbDebugPath && !isSel) {
-      opacity = 0.0;
+      opacity = dimOpacity;
     }
 
     // Heading + flip side + smoothed render angle (reuse caches).
@@ -4028,12 +4032,11 @@ class MapView {
       const opacity = (typeof pose.opacity === "number" && isFinite(pose.opacity)) ? pose.opacity : 1;
       const key = keyFor("mobile", m.id);
       const isSel = (this.selectedId === key);
-      // In normal LIVE map mode (not trace/playback), ghosted/idle sensors used to be hidden
-      // unless Debug is enabled or the user explicitly selects them.
-      // New behavior: keep them visible but fade to 50% and slightly desaturate (so Debug isn't required).
       const debug = !!this._pbDebugPath;
-      const wouldHide = ((!this.traceMode && !this.playbackMode && !!m.ghosted) || (opacity <= 0.001));
-      const dimmed = (!debug && !isSel && wouldHide);
+      // Offline sensors are always hidden unless Debug/Selected.
+      if (!!m.ghosted && !debug && !isSel) return;
+      const isParked = !!m.parked;
+      const dimmed = (!debug && !isSel && isParked);
       if (!isFinite(lat) || !isFinite(lon)) return;
       const wpt = latLonToWorld(lat, lon, this.zoom);
       const sp = worldToScreenFast(wpt.x, wpt.y);
@@ -4044,9 +4047,8 @@ class MapView {
 
       const emoji = m.emoji || "🚌";
       const label = (m.name && m.name.length && String(m.name) !== String(m.id)) ? `${m.id} (${m.name})` : m.id;
-      const isGhost = !!m.ghosted;
       const color0 = safeHex(m.color);
-      const color = isGhost ? dimHex(color0, 0.65) : color0;
+      const color = isParked ? dimHex(color0, 0.65) : color0;
       // Base reading: worst AQI from the *full* sensor readings snapshot.
       // Important: trail points often carry only a subset of pollutants (commonly ozone-only),
       // so in DVR live-follow that subset must not override the actual current readings.
@@ -4067,13 +4069,12 @@ class MapView {
           pr = prHist;
         }
       }
-      const prColor = isGhost ? dimHex(pr.color || "#ffffff", 0.65) : (pr.color || "#ffffff");
+      const prColor = isParked ? dimHex(pr.color || "#ffffff", 0.65) : (pr.color || "#ffffff");
       const colorUse = dimmed ? desatHex(color, 0.25) : color;
       const prColorUse = dimmed ? desatHex(prColor, 0.25) : prColor;
 
       ctx.save();
-      // If we previously hid (opacity ~ 0), do not apply that hiding alpha; instead fade to 50%.
-      const baseAlpha = (dimmed && opacity <= 0.001) ? 1.0 : clamp(opacity, 0, 1);
+      const baseAlpha = clamp(opacity, 0, 1);
       if (baseAlpha < 1) ctx.globalAlpha = ctx.globalAlpha * baseAlpha;
       if (dimmed) {
         ctx.globalAlpha = ctx.globalAlpha * 0.5;
@@ -4203,12 +4204,13 @@ function roundRect(ctx, x, y, w, h, r) {
 
 function generateItemHTML(item, type, order) {
   const isGhost = !!item.ghosted;
+  const isParked = !!item.parked;
   const emoji = item.emoji || (type === "mobile" ? "🚌" : "📍");
   const nameText = item.name ? `${item.id} (${item.name})` : item.id;
   
   let pinText = "";
   if (type === "mobile") {
-    pinText = item.pinned ? (isGhost ? "pinned · idle" : "pinned") : (isGhost ? "idle" : "");
+    pinText = item.pinned ? (isParked ? "pinned · parked" : "pinned") : (isParked ? "parked" : "");
   }
 
   const readings = item.readings || {};
@@ -4231,7 +4233,7 @@ function generateItemHTML(item, type, order) {
   for (const k of show) {
     const val = readings[k]?.value ?? "—";
     const c = safeHex(readings[k]?.color);
-    const outC = isGhost ? dimHex(c, 0.65) : c;
+    const outC = isParked ? dimHex(c, 0.65) : c;
     rowsHTML += `<div class="reading">`;
     rowsHTML += `<span class="k">${escapeHtml(k)}</span>`;
     rowsHTML += `<span class="v" style="color:${outC}">${escapeHtml(String(val))}</span>`;
@@ -4251,6 +4253,8 @@ function reconcileList(container, items, type, selectedId, order) {
 
   const seenIds = new Set();
   items.forEach(item => {
+    // Offline sensors are hidden from the UI.
+    if (item && item.ghosted) return;
     const id = item.id;
     seenIds.add(id);
     const k = keyFor(type, id);
@@ -4269,7 +4273,7 @@ function reconcileList(container, items, type, selectedId, order) {
     }
 
     const isSelected = (k === selectedId);
-    const className = "item" + (isSelected ? " selected" : "") + (item.ghosted ? " ghosted" : "");
+    const className = "item" + (isSelected ? " selected" : "") + (item.parked ? " parked" : "");
     if (el.className !== className) el.className = className;
 
     const html = generateItemHTML(item, type, order);

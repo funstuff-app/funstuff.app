@@ -437,8 +437,9 @@ class TestTracksAndDashboardState(unittest.TestCase):
         self.assertEqual(len(tracks["BUS1"]), n_points)
         self.assertGreater(len(tracks["BUS1"]), 5)
 
-    def test_normalize_state_marks_immobile_mobile_as_ghosted(self):
-        # BUS01 has a static GPS fix -> should be immobile/ghosted in normalized dashboard state.
+    def test_normalize_state_does_not_ghost_when_immobile(self):
+        # Dashboard semantics: immobile (stopped/parked) does not imply ghosted.
+        # "ghosted" is reserved for offline sensors (handled by dashboard_server).
         times = []
         for i in range(12):
             mm = i * 3
@@ -469,7 +470,7 @@ class TestTracksAndDashboardState(unittest.TestCase):
         self.assertTrue(st["mobile"])
         m = st["mobile"][0]
         self.assertTrue(m.get("immobile"))
-        self.assertTrue(m.get("ghosted"))
+        self.assertFalse(m.get("ghosted"))
         self.assertIsInstance(m.get("mobility"), dict)
 
     def test_normalize_state_mobility_uses_merged_tracks_not_first_pollutant(self):

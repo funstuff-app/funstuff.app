@@ -122,7 +122,7 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
             if sid not in app_state.persistent_mobile:
                 app_state.persistent_mobile[sid] = incoming_mobile
                 incoming_mobile["_last_seen"] = now
-                incoming_mobile["_idle"] = bool(incoming_mobile.get("ghosted"))
+                incoming_mobile["_idle"] = bool(incoming_mobile.get("immobile"))
                 incoming_mobile["_idle_breakout_hits"] = 0
                 incoming_mobile["_idle_since_t"] = None
                 incoming_mobile["_last_trail_ts"] = None
@@ -149,7 +149,7 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                 old_trail = pm.get("trail", [])
                 prev_idle = bool(pm.get("_idle"))
                 idle_since_ts = pm.get("_idle_since_t")
-                backend_idle = bool(incoming_mobile.get("ghosted"))
+                backend_idle = bool(incoming_mobile.get("immobile"))
 
                 if backend_idle and not prev_idle:
                     prev_idle = True
@@ -197,7 +197,8 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                 pm["_last_seen"] = now
                 pm["_idle"] = prev_idle
                 pm["_idle_since_t"] = idle_since_ts
-                pm["ghosted"] = prev_idle
+                pm["ghosted"] = False
+                pm["_sticky_ghosted"] = False
 
         to_delete = [sid for sid, pm in app_state.persistent_mobile.items() if now - pm.get("_last_seen", 0) > 2700]
         for sid in to_delete: del app_state.persistent_mobile[sid]
