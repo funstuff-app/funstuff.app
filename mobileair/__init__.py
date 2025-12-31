@@ -1,27 +1,21 @@
 """
-Core / pure logic for MobileAir.
+MobileAir - Air quality monitoring for Utah.
 
-This module serves as a backward-compatible facade for the mobileair package.
-It intentionally avoids Textual/Rich imports so it can be unit-tested
-without a TUI runtime.
+This package provides core functionality for processing air quality data
+from Utah AQ endpoints, including:
 
-All functionality has been refactored into the mobileair package:
-- mobileair.config: Configuration constants
-- mobileair.utils: Pure utility functions
-- mobileair.aqi: AQI calculations
-- mobileair.mobility: Mobility detection
-- mobileair.trails: Trail extraction and cleaning
-- mobileair.outliers: Spatial outlier detection
-- mobileair.network: HTTP fetching with caching
-- mobileair.map_html: Leaflet map generation
-- mobileair.dashboard: Dashboard state normalization
+- AQI calculations and level determination
+- Mobility detection for mobile sensors
+- Trail extraction and cleaning
+- Spatial outlier detection
+- Network fetching with caching
+- Dashboard state normalization
 """
 
 from __future__ import annotations
 
-# Re-export everything from the mobileair package for backward compatibility
-from mobileair import (
-    # Configuration
+# Configuration
+from .config import (
     TREND_LOOKAHEAD_MINUTES,
     TREND_WINDOW_SAMPLES,
     TREND_THRESHOLDS,
@@ -36,15 +30,25 @@ from mobileair import (
     SPARSE_PROVE_MOVING_MAX_STEP_M,
     SPARSE_PROVE_MOVING_NET_M,
     SPARSE_ASSUME_IDLE_ROBUST_RADIUS_M,
+    STALE_DATA_THRESHOLD_MINUTES,
     AQI_LEVELS,
     POLLUTANT_BREAKPOINTS,
-    # Utilities
+    MOBILE_URL,
+    FIXED_URL,
+    HEADERS,
+)
+
+# Utilities
+from .utils import (
     parse_utc_timestamp,
     haversine_distance,
     bounding_box_distance,
     coerce_float,
     median,
-    # AQI
+)
+
+# AQI
+from .aqi import (
     normalize_pollutant_key,
     value_to_aqi,
     aqi_level,
@@ -53,30 +57,44 @@ from mobileair import (
     filter_history_outliers,
     extract_numeric_history,
     compute_trend_indicator,
-    # Mobility
-    evaluate_mobility,
-    # Trails
+)
+
+# Mobility
+from .mobility import evaluate_mobility
+
+# Trails
+from .trails import (
     extract_mobile_tracks,
     clean_trail,
     collapse_stationary_suffix,
-    # Outliers
-    detect_spatial_outliers,
-    # Network
-    default_cache_path,
-    fetch_json_with_cache,
-    # Map HTML
-    generate_leaflet_map_html,
-    # Dashboard
-    normalize_state_for_dashboard,
-    # Private/compat aliases
-    _coerce_float,
-    _median,
-    _clean_trail,
-    _collapse_stationary_suffix,
 )
 
-# For any code that might import these directly
+# Outliers
+from .outliers import detect_spatial_outliers
+
+# Network
+from .network import (
+    default_cache_path,
+    fetch_json_with_cache,
+)
+
+# Map HTML
+from .map_html import generate_leaflet_map_html
+
+# Dashboard
+from .dashboard import normalize_state_for_dashboard
+
+
+# For backwards compatibility, also expose private functions that may be used
+# These are prefixed with underscore but were part of the old API
+_coerce_float = coerce_float
+_median = median
+_clean_trail = clean_trail
+_collapse_stationary_suffix = collapse_stationary_suffix
+
+
 __all__ = [
+    # Config
     "TREND_LOOKAHEAD_MINUTES",
     "TREND_WINDOW_SAMPLES",
     "TREND_THRESHOLDS",
@@ -93,11 +111,16 @@ __all__ = [
     "SPARSE_ASSUME_IDLE_ROBUST_RADIUS_M",
     "AQI_LEVELS",
     "POLLUTANT_BREAKPOINTS",
+    "MOBILE_URL",
+    "FIXED_URL",
+    "HEADERS",
+    # Utils
     "parse_utc_timestamp",
     "haversine_distance",
     "bounding_box_distance",
     "coerce_float",
     "median",
+    # AQI
     "normalize_pollutant_key",
     "value_to_aqi",
     "aqi_level",
@@ -106,19 +129,24 @@ __all__ = [
     "filter_history_outliers",
     "extract_numeric_history",
     "compute_trend_indicator",
+    # Mobility
     "evaluate_mobility",
+    # Trails
     "extract_mobile_tracks",
     "clean_trail",
     "collapse_stationary_suffix",
+    # Outliers
     "detect_spatial_outliers",
+    # Network
     "default_cache_path",
     "fetch_json_with_cache",
+    # Map HTML
     "generate_leaflet_map_html",
+    # Dashboard
     "normalize_state_for_dashboard",
+    # Compat aliases
     "_coerce_float",
     "_median",
     "_clean_trail",
     "_collapse_stationary_suffix",
 ]
-
-
