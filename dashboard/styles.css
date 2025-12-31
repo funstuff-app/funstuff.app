@@ -240,6 +240,104 @@ aside, section { min-height: 0; }
 }
 .pbSpeed select:hover { border-color: rgba(255,255,255,0.16); }
 
+.pbDay {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.pbDay select {
+  height: 30px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(17,24,38,0.80);
+  color: rgba(232,238,247,0.92);
+  padding: 0 10px;
+  min-width: 100px;
+}
+.pbDay select:hover { border-color: rgba(255,255,255,0.16); }
+
+/* Save/Load buttons in playback bar */
+.pbSaveLoad {
+  height: 30px;
+  min-width: 70px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(17,24,38,0.80);
+  color: rgba(232,238,247,0.92);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+.pbSaveLoad:hover { border-color: rgba(255,255,255,0.16); background: rgba(24,32,48,0.90); }
+.pbSaveLoad:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Snapshot load modal */
+.snapshotModal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 100;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.snapshotModalContent {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  min-width: 300px;
+  max-width: 400px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.snapshotModalContent h3 {
+  margin: 0 0 16px 0;
+  font-size: 16px;
+  color: var(--text);
+}
+.snapshotList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.snapshotItem {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.03);
+  cursor: pointer;
+}
+.snapshotItem:hover { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.16); }
+.snapshotItem .date { font-weight: 600; }
+.snapshotItem .size { color: var(--muted); font-size: 12px; }
+.snapshotModalClose {
+  margin-top: 16px;
+  width: 100%;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(17,24,38,0.80);
+  color: var(--text);
+  cursor: pointer;
+}
+.snapshotModalClose:hover { background: rgba(24,32,48,0.90); }
+.snapshotEmpty { color: var(--muted); font-size: 13px; text-align: center; padding: 20px; }
+
 .pbDebug {
   display: inline-flex;
   align-items: center;

@@ -10,6 +10,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
+from .aqi import color_for_value
 from .utils import parse_utc_timestamp, haversine_distance, coerce_float, median
 
 
@@ -91,7 +92,9 @@ def extract_mobile_tracks(
                     s_map[key]["lon"] = lon_f
 
                 if v is not None:
-                    s_map[key]["readings"][str(pollutant_key)] = {"value": v, "color": c or "#ffffff"}
+                    # Compute AQI color if not provided by API
+                    color = c if c else color_for_value(pollutant_key, v)
+                    s_map[key]["readings"][str(pollutant_key)] = {"value": v, "color": color}
 
     out: dict[str, list[dict[str, Any]]] = {}
     for sensor_id, m in per_sensor.items():

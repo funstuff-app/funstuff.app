@@ -34,10 +34,9 @@ def value_to_aqi(pollutant_key: str, value: float | str | None) -> float | None:
     key = normalize_pollutant_key(pollutant_key)
 
     # Normalize units + apply EPA truncation rules.
-    # Note: our OZNE feed values are typically in ppb (e.g. 28-40). EPA breakpoints are in ppm.
     if key == "ozone":
-        if val >= 1.0:
-            val = val / 1000.0  # ppb -> ppm
+        # Ozone data is in ppb, EPA breakpoints are in ppm. Convert.
+        val = val / 1000.0
         # truncate to 3 decimals (ppm)
         val = math.floor(val * 1000.0) / 1000.0
     elif key == "pm2.5":
