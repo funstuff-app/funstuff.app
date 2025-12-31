@@ -9,8 +9,41 @@ import time
 import sys
 import subprocess
 from typing import Literal
-import mobileair_core as core
 from pathlib import Path
+
+# Import from the mobileair package
+from mobileair import (
+    # Configuration
+    IMMOBILITY_LOOKBACK_MINUTES,
+    IMMOBILITY_MIN_COVERAGE_MINUTES,
+    IMMOBILITY_MIN_SAMPLES,
+    IMMOBILITY_TOTAL_DISTANCE_THRESHOLD,
+    IMMOBILITY_MAX_STEP_THRESHOLD,
+    IMMOBILITY_BBOX_THRESHOLD,
+    IMMOBILITY_RADIUS_THRESHOLD,
+    TREND_LOOKAHEAD_MINUTES,
+    TREND_WINDOW_SAMPLES,
+    TREND_THRESHOLDS,
+    AQI_LEVELS,
+    POLLUTANT_BREAKPOINTS,
+    MOBILE_URL,
+    FIXED_URL,
+    HEADERS,
+    # Functions
+    parse_utc_timestamp,
+    haversine_distance,
+    bounding_box_distance,
+    value_to_aqi,
+    aqi_level,
+    color_for_value,
+    trend_threshold,
+    compute_trend_indicator,
+    evaluate_mobility,
+    default_cache_path,
+    fetch_json_with_cache,
+    generate_leaflet_map_html,
+    detect_spatial_outliers,
+)
 
 # Optional runtime dependencies (TUI). If missing, fail with an actionable message.
 try:
@@ -33,41 +66,6 @@ except ModuleNotFoundError as e:
         "Install deps with:\n"
         "  python -m pip install -r requirements.txt\n"
     ) from e
-# from rich.bar_chart import BarChart # Removed as it might not be available or needed for now
-
-MOBILE_URL = 'https://utahaq.chpc.utah.edu/jsondata/MobileMapData.json'
-FIXED_URL = 'https://utahaq.chpc.utah.edu/jsondata/FixedSiteMapData.json'
-
-HEADERS = {
-    'Pragma': 'no-cache',
-    'Accept': 'application/json, text/javascript, */*; q=0.01',
-    'Sec-Fetch-Site': 'same-origin',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Cache-Control': 'no-cache',
-    'Sec-Fetch-Mode': 'cors',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Safari/605.1.15',
-    'Referer': 'https://utahaq.chpc.utah.edu/',
-    'Connection': 'keep-alive',
-    'Sec-Fetch-Dest': 'empty',
-    'X-Requested-With': 'XMLHttpRequest',
-    'Priority': 'u=3, i'
-}
-
-IMMOBILITY_LOOKBACK_MINUTES = core.IMMOBILITY_LOOKBACK_MINUTES
-IMMOBILITY_MIN_COVERAGE_MINUTES = core.IMMOBILITY_MIN_COVERAGE_MINUTES
-IMMOBILITY_MIN_SAMPLES = core.IMMOBILITY_MIN_SAMPLES
-IMMOBILITY_TOTAL_DISTANCE_THRESHOLD = core.IMMOBILITY_TOTAL_DISTANCE_THRESHOLD
-IMMOBILITY_MAX_STEP_THRESHOLD = core.IMMOBILITY_MAX_STEP_THRESHOLD
-IMMOBILITY_BBOX_THRESHOLD = core.IMMOBILITY_BBOX_THRESHOLD
-IMMOBILITY_RADIUS_THRESHOLD = core.IMMOBILITY_RADIUS_THRESHOLD
-
-TREND_LOOKAHEAD_MINUTES = core.TREND_LOOKAHEAD_MINUTES
-TREND_WINDOW_SAMPLES = core.TREND_WINDOW_SAMPLES
-TREND_THRESHOLDS = core.TREND_THRESHOLDS
-
-AQI_LEVELS = core.AQI_LEVELS
-POLLUTANT_BREAKPOINTS = core.POLLUTANT_BREAKPOINTS
 
 
 def _dashboard_data_dir() -> Path:
@@ -417,13 +415,13 @@ class AirQualityApp(App):
                 self.data_dir = "" # Fallback to CWD if fails
 
     def _parse_utc_timestamp(self, timestamp: str | None):
-        return core.parse_utc_timestamp(timestamp)
+        return parse_utc_timestamp(timestamp)
 
     def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        return core.haversine_distance(lat1, lon1, lat2, lon2)
+        return haversine_distance(lat1, lon1, lat2, lon2)
 
     def _bounding_box_distance(self, coords: list[tuple[float, float, datetime | None]]) -> float:
-        return core.bounding_box_distance(coords)
+        return bounding_box_distance(coords)
 
     def _dim_color(self, color: str | None) -> str:
         base = color or "#888888"
@@ -432,25 +430,26 @@ class AirQualityApp(App):
         return f"dim {base}"
 
     def _value_to_aqi(self, pollutant_key: str, value: float | str | None):
-        return core.value_to_aqi(pollutant_key, value)
+        return value_to_aqi(pollutant_key, value)
 
     def _aqi_level(self, aqi: float | None):
-        return core.aqi_level(aqi)
+        return aqi_level(aqi)
 
     def _color_for_value(self, pollutant_key: str, value: float | str | None) -> str:
-        return core.color_for_value(pollutant_key, value)
+        return color_for_value(pollutant_key, value)
 
     def _trend_threshold(self, pollutant_key: str) -> float:
-        return core.trend_threshold(pollutant_key)
+        return trend_threshold(pollutant_key)
 
     def _extract_numeric_history(self, history) -> list[float]:
-        return core.extract_numeric_history(history)
+        from mobileair import extract_numeric_history
+        return extract_numeric_history(history)
 
     def _compute_trend_indicator(self, pollutant_key: str, unit: str, history, current_value):
-        return core.compute_trend_indicator(pollutant_key, unit, history, current_value)
+        return compute_trend_indicator(pollutant_key, unit, history, current_value)
 
     def _evaluate_mobility(self, sensor_blob: dict) -> dict:
-        return core.evaluate_mobility(sensor_blob)
+        return evaluate_mobility(sensor_blob)
 
     def get_file_path(self, filename):
         if getattr(self, 'data_dir', None):
@@ -546,7 +545,7 @@ class AirQualityApp(App):
     def fetch_data(self, url):
         # Put caches in the same directory as the app's other state (~/.mobileair by default)
         data_dir = getattr(self, "data_dir", "") or os.getcwd()
-        cache_path = core.default_cache_path(url, mobile_url=MOBILE_URL, fixed_url=FIXED_URL, data_dir=data_dir)
+        cache_path = default_cache_path(url, mobile_url=MOBILE_URL, fixed_url=FIXED_URL, data_dir=data_dir)
 
         def notify(msg: str, severity: str) -> None:
             sev: Literal["information", "warning", "error"]
@@ -558,7 +557,7 @@ class AirQualityApp(App):
                 sev = "information"
             self.notify(msg, severity=sev)
 
-        return core.fetch_json_with_cache(
+        return fetch_json_with_cache(
             url,
             headers=HEADERS,
             timeout=10,
@@ -826,7 +825,7 @@ class AirQualityApp(App):
                 continue
             fixed_candidates.append({'id': s_name, 'lat': lat_f, 'lon': lon_f, 'readings': {'PM25': {'value': v_f}}})
 
-        fixed_outliers = core.detect_spatial_outliers(fixed_candidates, pollutant_keys=("PM25", "PM2.5"))
+        fixed_outliers = detect_spatial_outliers(fixed_candidates, pollutant_keys=("PM25", "PM2.5"))
 
         filtered_sensors = []
         for s_name, s_info in unified_sensors.items():
@@ -1274,7 +1273,7 @@ class AirQualityApp(App):
             self.notify("No sensors with coordinates available to map.", severity="warning")
             return
 
-        html = core.generate_leaflet_map_html(
+        html = generate_leaflet_map_html(
             points,
             title=f"MobileAir Overview ({len(points)} sensors)",
             zoom=10,

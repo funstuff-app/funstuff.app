@@ -4779,36 +4779,23 @@ function main() {
   // Track when we first came to rest at the end (for 1s pause before rewind)
   let _pbAtEndSincePerf = null;   // performance.now() when we first stopped at end
   
-  // Track when ease-in phase started (for wall-time-based easing)
-  let _pbEaseStartPerf = null;
-  let _pbEaseStartVelocity = 0;
-  let _pbEaseStartPos = 0;  // playhead position when ease began
-  
-  // Flag to track active rewind (not based on velocity)
-  let _pbIsRewinding = false;
-  
   // Track data bounds to detect new data / trimmed data
   let _pbLastKnownMinMs = null;
   let _pbLastKnownMaxMs = null;
   
   // Physics constants
   const _pbPlaybackSpeed = 1.0;       // target velocity when playing forward
-  const _pbRewindSpeed = -100.0;      // target velocity when rewinding (negative = backward, FAST)
-  const _pbFriction = 0.997;          // velocity decay per ms when coasting (drag inertia)
-  const _pbWheelFriction = 0.985;     // velocity decay per ms for wheel scroll (stops faster)
+  const _pbRewindSpeed = -20.0;       // target velocity when rewinding (negative = backward)
+  const _pbFriction = 0.992;          // velocity decay per ms when no force applied
   const _pbForceStrength = 0.008;     // how quickly velocity changes toward target (per ms)
   const _pbEndPauseMs = 1000;         // wait 1 second at end before rewinding
-  const _pbVelocityThreshold = 0.1;   // below this, considered "at rest"
-  const _pbEaseInDistance = 0.02;     // start braking when within 2% of bounds (only near edges)
+  const _pbVelocityThreshold = 0.05;  // below this, considered "at rest"
+  const _pbEaseInDistance = 0.10;     // start braking when within 10% of bounds
   
   // Scroll wheel nudge (iPod-style momentum)
   let _pbWheelAccum = 0;              // accumulated wheel delta
-  const _pbWheelImpulse = 1.0;        // velocity added per wheel tick
-  const _pbWheelDecay = 0.8;          // wheel accumulator decay per frame
-
-  // Drag tracking
-  let _pbDidDrag = false;             // did the user actually drag (vs click)?
-  let _pbIsWheelCoasting = false;     // is current coast from wheel scroll?
+  const _pbWheelImpulse = 0.15;       // velocity added per wheel "tick"
+  const _pbWheelDecay = 0.85;         // wheel accumulator decay per frame
 
   const fmtTime = (ms) => {
     if (ms == null || !isFinite(ms)) return "—";
@@ -4868,235 +4855,162 @@ function main() {
     const b = map.getPlaybackBounds();
     let tMs = map.getPlaybackTimeMs();
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
-    const durMs = hasBounds ? (b.maxMs - b.minMs) : 1;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // DETECT DATA CHANGES (new data arrived, or data trimmed)
-    // ─────────────────────────────────────────────────────────────────────────
-    let newDataArrived = false;
-    
-    if (hasBounds) {
-      if (_pbLastKnownMaxMs != null && b.maxMs > _pbLastKnownMaxMs + 100) {
-        newDataArrived = true;
-      }
-      _pbLastKnownMinMs = b.minMs;
-      _pbLastKnownMaxMs = b.maxMs;
-      
-      // If playhead is now outside bounds (data trimmed), clamp it
-      if (tMs < b.minMs) {
-        tMs = b.minMs;
-        map.setPlaybackTimeMs(tMs);
-      }
-      if (tMs > b.maxMs) {
-        tMs = b.maxMs;
-        map.setPlaybackTimeMs(tMs);
-      }
-    }
+    // Global easing: ramp into/out of motion when play toggles.
+    // This provides a simple, consistent “ease start/stop” for all markers.
+    const playTarget = map.getPlaybackPlaying() ? 1 : 0;
+    const tauMs = 180;
+    const aEase = dt > 0 ? (1 - Math.exp(-dt / tauMs)) : 1;
+    _pbPlayEase = _pbPlayEase + (playTarget - _pbPlayEase) * aEase;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // PHYSICS SIMULATION
-    // ─────────────────────────────────────────────────────────────────────────
     let didAdvanceTime = false;
     const didMarkerInertia = (typeof map._stepPbMarkerInertia === "function")
       ? !!map._stepPbMarkerInertia(now, dt)
       : false;
 
-    if (didMarkerInertia) {
+    // Tape-reel rewind: constant speed in middle, ease at start/end
+    if (_pbRewindState === 'rewind' && hasBounds && _pbRewindTargetMs != null) {
+      const targetMs = _pbRewindTargetMs;
+      const durMs = b.maxMs - b.minMs;
+      const distToTarget = tMs - targetMs; // positive = we're ahead of target
+      const distFromStart = b.maxMs - tMs; // how far we've rewound from end
+      
+      // Compute target speed: cruise in middle, ease at both ends
+      const easeInThresh = durMs * _pbRewindEaseInDist;
+      let targetSpeed = _pbRewindCruiseSpeed;
+      
+      // Ease-in at start (ramp up from 0)
+      if (distFromStart < easeInThresh && distFromStart > 0) {
+        targetSpeed = _pbRewindCruiseSpeed * (distFromStart / easeInThresh);
+      }
+      // Ease-out near target (ramp down to 0)
+      if (distToTarget < easeInThresh && distToTarget > 0) {
+        targetSpeed = _pbRewindCruiseSpeed * (distToTarget / easeInThresh);
+      }
+      targetSpeed = Math.max(0.5, targetSpeed); // minimum speed to ensure arrival
+      
+      // Smooth speed changes
+      const alpha = dt > 0 ? (1 - Math.exp(-dt / _pbRewindRampTauMs)) : 1;
+      _pbRewindSpeed = _pbRewindSpeed + (targetSpeed - _pbRewindSpeed) * alpha;
+      
+      // Move backward
+      const moveMs = dt * _pbRewindSpeed;
+      const nextMs = tMs - moveMs;
+      
+      if (nextMs <= targetMs + 5) {
+        // Arrived at target, enter pause
+        map.setPlaybackTimeMs(targetMs);
+        tMs = targetMs;
+        _pbRewindState = 'pause';
+        _pbRewindPauseUntil = now + _pbRewindPauseDurMs;
+        _pbRewindSpeed = 0;
+      } else {
+        map.setPlaybackTimeMs(nextMs);
+        tMs = nextMs;
+      }
+      didAdvanceTime = true;
+    } else if (_pbRewindState === 'pause') {
+      // Wait for pause duration
+      if (now >= _pbRewindPauseUntil) {
+        _pbRewindState = null;
+        _pbRewindTargetMs = null;
+        _pbRewindSpeed = 0;
+        // Resume playing forward
+        map.setPlaybackPlaying(true);
+        _pbPlayEase = 0;
+        _pbLastPerf = 0;
+        updatePlaybackUi();
+      }
+    } else if (didMarkerInertia) {
       didAdvanceTime = true;
       tMs = map.getPlaybackTimeMs();
-      _pbAtEndSincePerf = null; // user interaction resets end timer
-    } else if (!_pbScrubbing && hasBounds && tMs != null && isFinite(tMs) && dt > 0) {
-      // Apply wheel nudge to velocity
-      if (Math.abs(_pbWheelAccum) > 0.1) {
-        _pbVelocity += _pbWheelAccum * _pbWheelImpulse;
-        _pbWheelAccum *= _pbWheelDecay;
-        if (Math.abs(_pbWheelAccum) < 0.1) _pbWheelAccum = 0;
-        _pbAtEndSincePerf = null; // wheel interaction resets end timer
+    } else if (map.getPlaybackPlaying() && hasBounds && tMs != null && isFinite(tMs)) {
+      const easedSpeed = (map.getPlaybackSpeed() || 1.0) * clamp(_pbPlayEase, 0, 1);
+      const next = tMs + dt * easedSpeed;
+      const clamped = clamp(next, b.minMs, b.maxMs);
+      if (clamped !== tMs) {
+        map.setPlaybackTimeMs(clamped);
+        didAdvanceTime = true;
+        tMs = clamped;
       }
-
-      // Determine velocity based on state
-      const atStart = (tMs <= b.minMs + 1);
-      const atEnd = (tMs >= b.maxMs - 1);
-      const speedMult = map.getPlaybackSpeed() || 1.0;
       
-      if (_pbIsRewinding) {
-        // Tape-reel rewind: ramp up, cruise, ease into start
-        const distFromStart = tMs - b.minMs;
-        const totalDist = durMs;
-        const progress = 1 - (distFromStart / totalDist); // 0 at end, 1 at start
-        
-        // Base cruise speed: complete full rewind in ~4 seconds
-        const cruiseSpeed = -totalDist / 4000;
-        const playbackSpeed = _pbPlaybackSpeed * speedMult;
-        
-        // Ease duration in wall time
-        const easeDurationMs = 1500;
-        
-        // Ease zone: last 15% of the recording (position-based trigger)
-        // This is independent of speed - we ease over the final portion of the timeline
-        const easeDistanceMs = totalDist * 0.15;
-        
-        const inEasePhase = _pbEaseStartPerf != null;
-        const shouldStartEase = !inEasePhase && distFromStart <= easeDistanceMs;
-        
-        if (progress < 0.15 && !inEasePhase) {
-          // Ramp up phase: accelerate from 0.3 to 1.0 of cruise speed
-          const speedFactor = 0.3 + (progress / 0.15) * 0.7;
-          _pbVelocity = cruiseSpeed * speedFactor;
-        } else if (inEasePhase || shouldStartEase) {
-          // NEWTONIAN PHYSICS: constant acceleration to reach playbackSpeed at b.minMs
-          if (_pbEaseStartPerf == null) {
-            _pbEaseStartPerf = now;
-            _pbEaseStartPos = tMs;
-            _pbEaseStartVelocity = _pbVelocity;
-          }
-          
-          // We want to go from v₀ (negative) to playbackSpeed (positive) over distance d
-          // Average velocity = (v₀ + v_final) / 2
-          // Time = d / |avg_v|
-          // Acceleration = (v_final - v₀) / t
-          const v0 = _pbEaseStartVelocity;
-          const vFinal = playbackSpeed;
-          const d = _pbEaseStartPos - b.minMs;
-          
-          const avgVel = (v0 + vFinal) / 2;
-          // Avoid division by zero
-          const accel = Math.abs(avgVel) > 0.1 ? (vFinal - v0) / (d / Math.abs(avgVel)) : 0.01;
-          
-          // Apply acceleration
-          _pbVelocity = _pbVelocity + accel * dt;
-          
-          // Clamp to not overshoot target velocity
-          if (_pbVelocity >= vFinal) {
-            _pbVelocity = vFinal;
-          }
-          
-          // End ease when we reach start or velocity reaches target
-          if (tMs <= b.minMs + 10 || _pbVelocity >= vFinal) {
-            _pbIsRewinding = false;
-            _pbEaseStartPerf = null;
-            _pbVelocity = playbackSpeed;
-          }
+      // Check if we've reached the end
+      if (clamped >= b.maxMs - 0.5) {
+        // In LIVE mode: just sit at end, wait for new data
+        if (map._playbackLiveFollow) {
+          map.setPlaybackTimeMs(b.maxMs);
+          tMs = b.maxMs;
+          // Stay playing so we continue when new data arrives
         } else {
-          // Cruise phase: full speed
-          _pbVelocity = cruiseSpeed;
-        }
-      } else if (map._playbackLiveFollow && atEnd) {
-        // LIVE mode at end: stay put, but resume when new data arrives
-        _pbVelocity = 0;
-        if (newDataArrived) {
-          _pbVelocity = _pbPlaybackSpeed * speedMult;
-        }
-      } else if (map.getPlaybackPlaying()) {
-        // Normal forward playback
-        if (atEnd) {
-          // At end, not LIVE, not rewinding: pause then auto-rewind
-          if (_pbAtEndSincePerf == null) {
-            _pbAtEndSincePerf = now;
-            _pbVelocity = 0; // stop at end
-          }
-          const timeAtEnd = now - _pbAtEndSincePerf;
-          if (timeAtEnd >= _pbEndPauseMs) {
-            // Time's up - start rewinding
-            _pbIsRewinding = true;
-            _pbVelocity = _pbRewindSpeed;
-            _pbAtEndSincePerf = null; // reset so we don't keep retriggering
-          }
-        } else {
-          // Normal forward - maintain playback speed
-          _pbVelocity = _pbPlaybackSpeed * speedMult;
-          _pbAtEndSincePerf = null;
-        }
-      } else if (!map.getPlaybackPlaying() && Math.abs(_pbVelocity) > _pbVelocityThreshold) {
-        // Coasting after wheel - apply friction
-        const friction = _pbIsWheelCoasting ? _pbWheelFriction : _pbFriction;
-        const frictionFactor = Math.pow(friction, dt);
-        _pbVelocity *= frictionFactor;
-        
-        // When velocity decays to playback speed, resume playback
-        const playbackSpeed = _pbPlaybackSpeed * speedMult;
-        if (_pbVelocity > 0 && _pbVelocity <= playbackSpeed) {
-          // Forward coasting reached playback speed - resume
-          _pbIsWheelCoasting = false;
-          _pbVelocity = playbackSpeed;
-          map.setPlaybackPlaying(true);
-          updatePlaybackUi();
-        } else if (_pbVelocity < 0 && Math.abs(_pbVelocity) < _pbVelocityThreshold) {
-          // Backward coasting stopped - resume forward playback
-          _pbIsWheelCoasting = false;
-          _pbVelocity = playbackSpeed;
-          map.setPlaybackPlaying(true);
-          updatePlaybackUi();
-        }
-      }
-      
-      // Note: No additional easing here - forward playback runs at constant speed
-      // Rewind easing is handled inside the _pbIsRewinding block above
-      
-      // Snap to zero if very slow
-      if (Math.abs(_pbVelocity) < _pbVelocityThreshold) {
-        _pbVelocity = 0;
-      }
-      
-      // Move playhead
-      if (Math.abs(_pbVelocity) > 0) {
-        let nextMs = tMs + _pbVelocity * dt;
-        
-        // Clamp to bounds
-        nextMs = clamp(nextMs, b.minMs, b.maxMs);
-        
-        // If we hit a bound, zero velocity (unless in active ease - let ease control it)
-        if (nextMs <= b.minMs && _pbVelocity < 0 && _pbEaseStartPerf == null) {
-          _pbVelocity = 0;
-          _pbIsRewinding = false; // rewind complete
-          nextMs = b.minMs;
-        }
-        if (nextMs >= b.maxMs && _pbVelocity > 0) {
-          _pbVelocity = 0;
-          nextMs = b.maxMs;
-        }
-        
-        if (nextMs !== tMs) {
-          map.setPlaybackTimeMs(nextMs);
-          tMs = nextMs;
-          didAdvanceTime = true;
-          // Force slider to update immediately during coasting
-          if (!map.getPlaybackPlaying()) {
-            updatePlaybackUi();
+          // Not in LIVE mode: check if we should rewind
+          // Only rewind if we haven't already rewound at this maxMs
+          const currentMax = b.maxMs;
+          if (_pbLastRewindTriggerMaxMs == null || currentMax > _pbLastRewindTriggerMaxMs + 500) {
+            // New data has arrived since last rewind, or first time - initiate rewind
+            map.setPlaybackPlaying(false);
+            _pbRewindState = 'rewind';
+            _pbRewindSpeed = 0.5; // start slow
+            _pbRewindTargetMs = b.minMs;
+            _pbLastRewindTriggerMaxMs = currentMax;
+          } else {
+            // We've already rewound at this data level - just wait
+            map.setPlaybackPlaying(false);
+            map.setPlaybackTimeMs(b.maxMs);
+            tMs = b.maxMs;
           }
         }
-        
-        // When AUTO-REWIND arrives at start, reset for forward playback
-        // But NOT when user is manually coasting backward
-        if (tMs <= b.minMs + 1 && _pbVelocity === 0 && _pbIsRewinding) {
-          // We've hit the start from auto-rewind - start playing forward
-          _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-          _pbAtEndSincePerf = null;
-          _pbIsRewinding = false;
-          if (!map.getPlaybackPlaying()) {
-            map.setPlaybackPlaying(true);
-          }
-          updatePlaybackUi();
-        }
+        didAdvanceTime = true;
       }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // RENDER
-    // ─────────────────────────────────────────────────────────────────────────
+    // Inertia for playback slider (spinning the DVR scrub).
+    if (!didMarkerInertia && !_pbScrubbing && _pbRewindState == null && Math.abs(_pbInertiaVel) > 1e-5) {
+      if (hasBounds && tMs != null) {
+        const durMs = (b.maxMs - b.minMs);
+        const currentRelMs = (tMs - b.minMs);
+        let nextRelMs = currentRelMs + _pbInertiaVel * dt;
+
+        // Friction: decay velocity over time.
+        const friction = Math.pow(0.994, dt); 
+        _pbInertiaVel *= friction;
+
+        if (nextRelMs <= 0 || nextRelMs >= durMs) {
+          _pbInertiaVel = 0;
+          nextRelMs = clamp(nextRelMs, 0, durMs);
+        }
+
+        const nextMs = b.minMs + nextRelMs;
+        map.setPlaybackTimeMs(nextMs);
+        map._playbackLiveFollow = map.isPlaybackAtEnd(100);
+        didAdvanceTime = true;
+        tMs = nextMs;
+      }
+    }
+
+    // Automatic resume after scrubbing (waits for inertia to settle).
+    if (!_pbScrubbing && _pbResumeAfterScrub && _pbRewindState == null && Math.abs(_pbInertiaVel) <= 1e-5) {
+      _pbResumeAfterScrub = false;
+      map.setPlaybackPlaying(true);
+      _pbPlayEase = 0;
+      _pbLastPerf = 0; 
+      updatePlaybackUi();
+    }
+
+    // Basemap is static; redraw overlay only when something changed or is active.
+    // When only god-physics is active (marker moving), reuse cached trails/fixed underlay
+    // and redraw at a lower FPS to cut CPU.
     if (didAdvanceTime) {
       map.drawOverlay(map.lastState, { cacheUnderlay: true });
     }
 
-    // UI updates
-    const isActive = Math.abs(_pbVelocity) > _pbVelocityThreshold || Math.abs(_pbWheelAccum) > 0.1;
-    const uiMinDt = isActive ? 16 : 250;
-    if ((didAdvanceTime || isActive) && (now - _pbLastUiPerf) >= uiMinDt) {
+    // UI updates are cheap-ish, but don't do them at 60fps for normal playback.
+    // We speed them up for inertia/dragging to keep the slider smooth.
+    const uiMinDt = (didMarkerInertia || Math.abs(_pbInertiaVel) > 1e-5) ? 16 : 250;
+    if (didAdvanceTime && (now - _pbLastUiPerf) >= uiMinDt) {
       updatePlaybackUi();
       _pbLastUiPerf = now;
     }
 
-    // Keep loop running if there's any motion or pending state
     const markerInertiaActive = (typeof map._hasPbMarkerInertia === "function") ? !!map._hasPbMarkerInertia() : false;
     const hasMotion = Math.abs(_pbVelocity) > _pbVelocityThreshold;
     const hasWheelMomentum = Math.abs(_pbWheelAccum) > 0.1;
@@ -5144,9 +5058,7 @@ function main() {
     }
     traceEl.addEventListener("change", () => {
       localStorage.setItem(TRACE_STORAGE_KEY, traceEl.checked ? "1" : "0");
-      _pbVelocity = 0;
-      _pbWheelAccum = 0;
-      _pbAtEndSincePerf = null;
+      _pbInertiaVel = 0;
       map.setPlaybackMode(traceEl.checked);
       if (pbBarEl) pbBarEl.classList.toggle("hidden", !traceEl.checked);
       if (traceEl.checked) {
@@ -5171,44 +5083,46 @@ function main() {
 
   if (pbPlayEl) {
     pbPlayEl.addEventListener("click", () => {
+      // Cancel any rewind in progress
+      _pbRewindState = null;
+      _pbRewindTargetMs = null;
+      _pbRewindSpeed = 0;
+      _pbInertiaVel = 0;
+      _pbResumeAfterScrub = false;
       if (!map.playbackMode) return;
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
-      // If currently playing, pause
       if (map.getPlaybackPlaying()) {
         map.setPlaybackPlaying(false);
-        map._playbackLiveFollow = false;
-        _pbVelocity = 0;
-        _pbWheelAccum = 0;
-        _pbAtEndSincePerf = null;
-        _pbIsRewinding = false;
+        map._playbackLiveFollow = false; // Stop following when pausing
         updatePlaybackUi();
         return;
       }
 
-      // If at the end, initiate immediate rewind
+      // If we're at the end (button says "LIVE"), rewind to START of entire dataset
       const atEnd = map.isPlaybackAtEnd(100);
       if (atEnd) {
-        map._playbackLiveFollow = false;
-        _pbAtEndSincePerf = null;
-        _pbWheelAccum = 0;
-        _pbIsRewinding = true;
-        _pbVelocity = _pbRewindSpeed; // immediate rewind velocity
-        map.setPlaybackPlaying(true);
+        // User clicked LIVE at end - rewind to beginning of all data
+        map.setPlaybackPlaying(false);
+        _pbRewindState = 'rewind';
+        _pbRewindSpeed = 0.5;
+        _pbRewindTargetMs = b.minMs;
+        _pbLastRewindTriggerMaxMs = b.maxMs; // mark that we've rewound at this point
+        map._playbackLiveFollow = false; // exit LIVE mode
         _pbLastPerf = 0;
+        _pbLastUiPerf = 0;
         if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
         updatePlaybackUi();
         return;
       }
 
-      // Normal play from current position
-      _pbAtEndSincePerf = null;
-      _pbWheelAccum = 0;
-      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      // Resume from wherever the user scrubbed
       map._playbackLiveFollow = false;
       map.setPlaybackPlaying(true);
+      _pbPlayEase = 0;
       _pbLastPerf = 0;
+      _pbLastUiPerf = 0;
       if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
       updatePlaybackUi();
     });
@@ -5240,35 +5154,43 @@ function main() {
     };
 
     pbScrubEl.addEventListener("pointerdown", () => {
-      // Cancel ALL physics immediately - user is taking control
-      _pbVelocity = 0;
-      _pbWheelAccum = 0;
-      _pbAtEndSincePerf = null;
-      _pbIsRewinding = false;
-      _pbEaseStartPerf = null;
-      _pbIsWheelCoasting = false;
+      // Cancel ALL rewind and easing immediately
+      _pbRewindState = null;
+      _pbRewindTargetMs = null;
+      _pbRewindSpeed = 0;
       _pbScrubbing = true;
-      _pbDidDrag = false; // track if user actually dragged
+      _pbResumeAfterScrub = false;
+      _pbInertiaVel = 0;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
       map.setPlaybackPlaying(false);
-      map._playbackLiveFollow = false; // exit live mode when user grabs slider
+      // leaving live-follow happens when the user actually moves off the end.
       updatePlaybackUi();
     });
     pbScrubEl.addEventListener("pointerup", () => {
       _pbScrubbing = false;
-      _pbVelocity = 0;
-      map.setPlaybackPlaying(true);
-      _pbLastPerf = performance.now();
+      _pbResumeAfterScrub = true;
+      // Ensure the loop is running to handle inertia decay and the eventual resume.
       if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
       applyScrub();
     });
     pbScrubEl.addEventListener("input", () => {
       const now = performance.now();
       const pos = Number(pbScrubEl.value);
+      const dt = now - _pbLastScrubTime;
 
-      // User is dragging
-      _pbDidDrag = true;
+      // If this is the very first move after a down, or a massive jump (click),
+      // do not accumulate inertia velocity. Clicking jumps the thumb immediately.
+      const isInitialJump = (dt < 50); 
+
+      if (dt > 0 && !isInitialJump) {
+        const v = (pos - _pbLastScrubPos) / dt;
+        // Cap velocity to prevent crazy jumps from UI glitches.
+        const cappedV = Math.max(-250, Math.min(250, v));
+        _pbInertiaVel = _pbInertiaVel * 0.6 + cappedV * 0.4;
+      } else {
+        _pbInertiaVel = 0;
+      }
       _pbLastScrubPos = pos;
       _pbLastScrubTime = now;
 
@@ -5276,43 +5198,13 @@ function main() {
       applyScrub();
     });
     pbScrubEl.addEventListener("change", () => {
-      // 'change' fires on release - only handle clicks here
-      // Drags with inertia are handled by pointerup
-      if (_pbDidDrag) {
-        // Drag was handled by pointerup - do nothing here
-        return;
-      }
-      // For clicks on the track (not drags), just resume playing
+      // For clicks on the track (not drags), just resume after inertia settles
       _pbScrubbing = false;
-      _pbVelocity = 0; // no inertia for clicks
-      map.setPlaybackPlaying(true);
-      _pbLastPerf = 0;
+      _pbResumeAfterScrub = true;
+      _pbInertiaVel = 0;
       if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
       applyScrub();
     });
-
-    // Scroll wheel on the scrub bar adds momentum (iPod-style)
-    pbScrubEl.addEventListener("wheel", (e) => {
-      e.preventDefault();
-      // Cancel any pending rewind and stop normal playback
-      _pbAtEndSincePerf = null;
-      _pbIsRewinding = false;
-      map.setPlaybackPlaying(false); // Let wheel nudge control velocity
-      // Exit LIVE mode on scroll
-      map._playbackLiveFollow = false;
-      _pbIsWheelCoasting = true;
-      // Horizontal scroll (two-finger swipe): deltaX > 0 = swipe right = backward in time
-      // Scale by timeline duration for proportional movement, reduced sensitivity
-      const b = map.getPlaybackBounds();
-      const durMs = (b.maxMs - b.minMs) || 1;
-      const nudge = (e.deltaX / 1000) * (durMs / 30); // ~0.3% of timeline per scroll tick
-      _pbVelocity -= nudge;
-      // Ensure loop is running
-      if (!_pbRAF) {
-        _pbLastPerf = performance.now(); // valid dt for next frame
-        _pbRAF = requestAnimationFrame(playbackLoop);
-      }
-    }, { passive: false });
   }
 
   if (pbDebugEl) {

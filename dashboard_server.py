@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-MobileAir browser dashboard server - FULL INTEGRATED OPTIMIZED VERSION.
-Preserves all original state-machine logic while eliminating CPU spikes.
+MobileAir browser dashboard server.
+
+Serves the browser dashboard UI and provides a JSON API for sensor state.
+Implements a persistent state machine for mobile sensors with trail merging,
+ghosting (offline detection), and cleanup of stale entries.
 """
 
 from __future__ import annotations
@@ -18,28 +21,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
 from typing import Any
-import traceback
 
 import requests
-import mobileair_core as core
 
-MOBILE_URL = "https://utahaq.chpc.utah.edu/jsondata/MobileMapData.json"
-FIXED_URL = "https://utahaq.chpc.utah.edu/jsondata/FixedSiteMapData.json"
-
-HEADERS = {
-    "Pragma": "no-cache",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Sec-Fetch-Site": "same-origin",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Sec-Fetch-Mode": "cors",
-    "Accept-Encoding": "gzip, deflate, br",
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://utahaq.chpc.utah.edu/",
-    "Connection": "keep-alive",
-    "Sec-Fetch-Dest": "empty",
-    "X-Requested-With": "XMLHttpRequest",
-}
+# Import from the mobileair package
+from mobileair import (
+    parse_utc_timestamp,
+    fetch_json_with_cache,
+    normalize_state_for_dashboard,
+    MOBILE_URL,
+    FIXED_URL,
+    HEADERS,
+)
 
 def default_data_dir() -> Path:
     return Path(os.path.expanduser("~/.mobileair"))
@@ -79,7 +72,7 @@ def build_state(
     pinned = set(pinned_list) if isinstance(pinned_list, list) else set()
 
     combined = {"mobile": mobile_json or {}, "fixed": fixed_json or {}}
-    return core.normalize_state_for_dashboard(
+    return normalize_state_for_dashboard(
         combined,
         custom_names=custom_names if isinstance(custom_names, dict) else {},
         pinned_sensors=pinned,
@@ -97,7 +90,7 @@ def _first_last_ts(trail: list[dict[str, Any]]) -> tuple[float | None, float | N
     def get_ms(point):
         if not isinstance(point, dict): return None
         ts = point.get("t")
-        dt = core.parse_utc_timestamp(ts) if isinstance(ts, str) else None
+        dt = parse_utc_timestamp(ts) if isinstance(ts, str) else None
         return float(dt.timestamp()) if dt else None
 
     return get_ms(trail[0]), get_ms(trail[-1])
@@ -185,7 +178,7 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                     # Merge only new points
                     _, last_old_ms = _first_last_ts(pm["trail"])
                     for np in incoming_trail:
-                        nt_dt = core.parse_utc_timestamp(np.get("t"))
+                        nt_dt = parse_utc_timestamp(np.get("t"))
                         if last_old_ms and nt_dt and nt_dt.timestamp() <= last_old_ms:
                             continue
                         if "m" not in np: np["m"] = 1
@@ -223,8 +216,8 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
     while not stop_event.is_set():
         attempt_ts = time.time()
         try:
-            mobile = core.fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=requests.get)
-            fixed = core.fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=requests.get)
+            mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=requests.get)
+            fixed = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=requests.get)
 
             st = build_state(data_dir=data_dir, mobile_json=mobile, fixed_json=fixed, max_points=5000)
             revision += 1
