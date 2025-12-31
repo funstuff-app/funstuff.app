@@ -213,7 +213,14 @@ def normalize_state_for_dashboard(
                     window_longitudes.append(float(lon_f))
                     window_timestamps.append(ts_str)
                 if len(window_latitudes) < 2:
-                    pts[idx]["m"] = 0
+                    # Not enough points in window to evaluate movement
+                    # Use overall mobility classification as the default
+                    overall_immobile = bool(mobility_info.get("immobile"))
+                    if idx > 0 and isinstance(pts[idx-1], dict) and pts[idx-1].get("m") is not None:
+                        pts[idx]["m"] = pts[idx-1].get("m")
+                    else:
+                        # For first point, use overall mobility status
+                        pts[idx]["m"] = 0 if overall_immobile else 1
                     continue
                 window_blob = {"Latitude": window_latitudes, "Longitude": window_longitudes, "TimeUTC": window_timestamps}
                 window_mobility = evaluate_mobility(

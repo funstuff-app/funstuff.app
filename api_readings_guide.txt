@@ -1,0 +1,148 @@
+Fact Sheet
+Hourly Data File
+Introduction
+The U.S. Environmental Protection Agency’s (EPA) nationwide, voluntary program, AirNow (www.airnow.gov),
+provides real-time air quality data and forecasts to protect public health across the United States, Canada,
+and parts of Mexico. AirNow receives real-time ozone and PM2.5 data from over 2,500 monitors and collects
+air quality forecasts for more than 500 cities.
+As part of the Global Earth Observation System of Systems (GEOSS) program, the AirNow API system
+broadens access to AirNow data and data products. AirNow API produces data products in several standard
+data formats and makes them available via FTP and web services. This document describes the hourly data
+file format.
+All data provided by AirNow API are made possible by the efforts of more than 150 local, state, tribal,
+provincial, and federal government agencies (https://www.airnow.gov/partners/). These data are not fully
+verified or validated; they should be considered preliminary and are subject to change. Data and information
+reported to AirNow from federal, state, local, and tribal agencies are for the express purpose of reporting
+and forecasting the Air Quality Index (AQI). Therefore, they should not be used to formulate or support
+regulation, trends, guidance, or any other government or public decision making. Official regulatory air
+quality data must be obtained from EPA’s Air Quality System (AQS) (https://www.epa.gov/aqs). See the
+AirNow Data Exchange Guidelines at http://airnowapi.org/docs/DataUseGuidelines.pdf.
+About the Air Quality Index
+The EPA developed the AQI, which reports levels of ozone, particle pollution, and other common air
+pollutants on the same scale. An AQI reading of 101 corresponds to a level that is above the national air
+quality standard—the higher the AQI rating, the greater the health impact.
+The AQI is divided into color-coded categories, and each category is identified by a simple informative
+descriptor. The descriptors are intended to convey information to the public about how air quality within
+each category relates to public health. The table below defines the AQI categories.
+AQI Numbers AQI Category
+(Descriptor) AQI Color (RGB) (CMYK)
+Color Formulas
+0 - 50 Good Green 0,228,0 40,0,100,0
+51 - 100 Moderate Yellow 255,255,0 0,0,100,0
+101 - 150 Unhealthy for Sensitive Groups Orange 255,126,0 0,52,100,0
+151 - 200 Unhealthy Red 255,0,0 0,100,100,0
+201 - 300 Very Unhealthy Purple 143,63,151 51,89,0,0
+301 - 500 Hazardous Maroon 126,0,35 30,100,100,30
+File Format Specifications
+Data are stored in an ASCII file that contains one hour of data from all publicly approved monitoring sites in
+AirNow. Only valid data are reported in the data file. This product may also contain valid raw concentrations in a
+negative range. Due to instrument drift over time, some instruments may report a negative concentration for a
+particular hour when atmospheric conditions are very clean. AirNow stores negative raw concentrations, typically
+greater than -5 µg/m3 or ppb, for use in NowCast and daily average calculations.
+The data file is updated twice per hour (at 25 and 55 minutes past the hour) or more frequently if possible. All
+hourly files for the preceding 48 hours will be updated every hour to ensure data completeness and quality. The
+date and hour specification in the filename and within the file is in GMT and marks the beginning of the
+measurement period. File specifications are as follows:
+File name format: HourlyData_yyyymmddhh.dat
+Update frequency: sub-hourly (:25 and :55 minutes past the hour)
+Field delimiter: | (ASCII character 124)
+Field specifications: see table on the next page
+Location of files: The latest available file can be found in the today directory
+Address: https://files.airnowtech.org
+Directory: /?prefix=airnow/today/
+The files are available in each day’s directory at the following URL
+Address: https://files.airnowtech.org
+Directory: /?prefix=airnow/YYYY/YYYYMMDD/
+Report units: Various. See the table on the next page.
+Sample record:
+Valid date|valid time|AQSID|sitename|GMT offset|parameter name|reporting units|value|data source
+For Data Field Definitions, see the table on the last page.
+Sample records:
+05/30/19|22:00|060410001|San Rafael|-8|OZONE|PPB|22|San Francisco Bay Area AQMD
+05/30/19|22:00|040191001|South Tucson|-7|PM10|UG/M3|12|Pima County Department of Environmental Quality
+05/30/19|22:00|271453052|St. Cloud|-6|PM2.5|UG/M3|11|Minnesota Pollution Control Agency
+05/30/19|22:00|250213003|E. Milton - Blue Hil|-5|BARPR|MILLIBAR|983.8|Massachusetts Dept. of Environmental
+Protection
+5/30/19|22:00|000030310|SYDNEY|-4|NO|PPB|1|Environment Canada
+05/30/19|22:00|UB1010001|Ulaanbaatar|8|PM2.5|UG/M3|5|U.S. Department of State Mongolia - Ulaanbaatar
+Air Quality and
+Meteorological Parameter
+NO (nitric oxide) NO2 (nitrogen dioxide), true measure NO2 computed, NOx-NO NO2 computed, NOy-NO NOx (nitrogen oxides) NOy (total reactive nitrogen) NO3 ion (nitrate, not adjusted for ammonium ion) SO4 ion (sulfate, not adjusted for ammonium ion) SO2 (sulfur dioxide), conventional SO2 24-hr average (midnight to midnight) SO2 trace levels CO (carbon monoxide), conventional Peak CO 8-hr average (midnight to midnight) CO trace levels EC (elemental carbon) – PM2.5 OC (organic carbon, not adjusted for oxygen and
+hydrogen) – PM2.5
+BC (black carbon at 880 nm) UV-AETH (second channel of Aethalometer at 370
+nm) PM2.5 mass PM10 mass Ozone Peak ozone 8-hr average (midnight to midnight) Peak ozone 1-hr maximum (midnight to midnight) PM2.5 mass 24-hr average (midnight to midnight) PM10 mass 24-hr average (midnight to midnight) Ambient temperature Wind speed Wind direction Relative humidity Barometric pressure Solar radiation Precipitation Parameter
+Name NO NO2T NO2 NO2Y NOX NOY NO3 SO4 SO2 SO2-24HR SO2T CO CO-8HR COT EC OC BC UV-AETH PM2.5 PM10 OZONE OZONE-8HR OZONE-1HR PM2.5-24HR PM10-24HR TEMP WS WD RHUM BARPR SRAD PRECIP Units Reporting Units Hourly Daily
+ppb PPB X
+ppb PPB X
+ppb PPB X
+ppb PPB X
+ppb PPB X
+ppb PPB X
+µg/m3 UG/M3 X
+µg/m3 UG/M3 X
+ppb PPB X
+ppb PPB X
+ppb PPB X
+ppm PPM X
+ppm PPM X
+ppb PPB X
+µg/m3 UG/M3 X
+µg/m3 UG/M3 X
+µg/m3 UG/M3 X
+µg/m3 UG/M3 X
+µg/m3 UG/M3 X
+µg/m3 UG/M3 X
+ppb PPB X
+ppb PPB X
+ppb PPB X
+µg/m3 UG/M3 X
+µg/m3 UG/M3 X
+oC C X
+m/s M/S X
+degrees DEGREES X
+% PERCENT X
+mb MILLIBAR X
+Watts/m2 WATTS/M2 X
+mm MM X
+Field Specifications
+Field Name Characters Units/Format Description Sample
+Valid date 8 mm/dd/yy Local date for which the data are valid. Date is in GMT. 05/30/19
+Valid time 5 hh:mm
+GMT
+Time of the measured data value. Note that time is
+reported in GMT and corresponds to the beginning of
+the measurement period. For example, a data value
+with a time of 17:00 represents a sample measured
+from 17:00 to 17:59 GMT.
+22:00
+AQSID 9 Numeric Nine-digit EPA AQS identifier. 060410001
+Sitename 20 Text Name of the monitoring site. San Rafael
+GMT offset 3 Numeric
+Number of hours to add to the time to convert to the
+local, standard time zone. For example: ET=-5, CT=-6,
+MT=-7, PT=-8.
+-8
+Parameter
+name
+10 Text
+Name of the parameter reported in that record. See
+table on the previous page for a list of valid parameter
+names.
+OZONE
+units Reporting
+8 Text Units of data value reported in the record. See table on
+the previous page for list of units. PPB
+Value 6 Numeric Data value for the site. 22
+Data
+Source 100 Text Name of the agency reporting the data.
+San
+Francisco
+Bay Area
+AQMD
+Contacts
+U.S. Environmental Protection Agency Phone Email
+John White, AirNow Program Manager (919) 541-2306 white.johne@epa.gov
+Susan Stone, Health Effects (919) 541-1146 stone.susan@epa.gov
+Data Management Center – Team Valiant
+AirNow Data Management Center (DMC) dmc@airnowtech.org
+Last Updated August 2025

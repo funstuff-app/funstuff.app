@@ -5,6 +5,8 @@ MobileAir browser dashboard server.
 Serves the browser dashboard UI and provides a JSON API for sensor state.
 Implements a persistent state machine for mobile sensors with trail merging,
 ghosting (offline detection), and cleanup of stale entries.
+
+Also integrates AirNow hourly data for fixed EPA monitoring sites.
 """
 
 from __future__ import annotations
@@ -16,11 +18,12 @@ import ssl
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
 from typing import Any
+from datetime import datetime, timedelta
 
 import requests
 
@@ -33,6 +36,22 @@ from mobileair import (
     FIXED_URL,
     HEADERS,
 )
+
+# Import AirNow data fetcher
+try:
+    from airnow_slc import (
+        fetch_monitoring_sites,
+        fetch_hourly_data,
+        filter_utah_hourly,
+        get_hourly_data_url,
+        get_hourly_data_url_historical,
+        list_available_hourly_files,
+        FILES_BASE_URL,
+        SLC_BOUNDS,
+    )
+    AIRNOW_AVAILABLE = True
+except ImportError:
+    AIRNOW_AVAILABLE = False
 
 def default_data_dir() -> Path:
     return Path(os.path.expanduser("~/.mobileair"))
@@ -53,12 +72,161 @@ class AppState:
     # Pre-serialized JSON bytes to prevent CPU spikes on every GET request.
     # Must be initialized from `state` so /api/state is valid immediately.
     cached_json_bytes: bytes = b"{}"
+    
+    # AirNow cached data
+    airnow_sites: dict[str, dict[str, Any]] = field(default_factory=dict)  # site_id -> site metadata
+    airnow_readings: dict[str, dict[str, Any]] = field(default_factory=dict)  # site_id -> latest readings
+    airnow_last_fetch: float = 0.0
+    airnow_readings_by_hour: dict[str, list[dict[str, Any]]] = field(default_factory=dict)  # hour_key -> readings
+    
+    # Persistent fixed sensor history (shared with TUI)
+    # Structure: { sensor_id: { pollutant: [{val, col, time, recorded_at}, ...] } }
+    fixed_history: dict[str, dict[str, list[dict[str, Any]]]] = field(default_factory=dict)
+    fixed_history_path: Path | None = None
+    fixed_history_dirty: bool = False
 
     def __post_init__(self) -> None:
         try:
             self.cached_json_bytes = json.dumps(self.state).encode("utf-8")
         except Exception:
             self.cached_json_bytes = b"{}"
+
+
+def load_fixed_history(app_state: AppState, data_dir: Path) -> None:
+    """Load fixed sensor history from disk."""
+    path = data_dir / "fixed_history.json"
+    app_state.fixed_history_path = path
+    app_state.fixed_history = load_json_file(path, {})
+    if not isinstance(app_state.fixed_history, dict):
+        app_state.fixed_history = {}
+
+
+def save_fixed_history(app_state: AppState) -> None:
+    """Save fixed sensor history to disk if dirty."""
+    if not app_state.fixed_history_dirty or not app_state.fixed_history_path:
+        return
+    try:
+        app_state.fixed_history_path.write_text(
+            json.dumps(app_state.fixed_history), encoding="utf-8"
+        )
+        app_state.fixed_history_dirty = False
+    except Exception as e:
+        print(f"[FixedHistory] Failed to save: {e}")
+
+
+def accumulate_fixed_reading(
+    app_state: AppState,
+    sensor_id: str,
+    pollutant: str,
+    value: Any,
+    color: str,
+    time_utc: str | None,
+) -> None:
+    """
+    Accumulate a fixed sensor reading into history.
+    Only appends if the value or time has changed from the last entry.
+    """
+    if sensor_id not in app_state.fixed_history:
+        app_state.fixed_history[sensor_id] = {}
+    if pollutant not in app_state.fixed_history[sensor_id]:
+        app_state.fixed_history[sensor_id][pollutant] = []
+    
+    hist = app_state.fixed_history[sensor_id][pollutant]
+    now_ts = time.time()
+    
+    # Dedupe: skip if same value and time as last entry
+    if hist:
+        last = hist[-1]
+        if last.get("val") == str(value) and last.get("time") == time_utc:
+            return
+    
+    # Append new reading
+    hist.append({
+        "val": str(value) if value is not None else None,
+        "col": color,
+        "time": time_utc,
+        "recorded_at": now_ts,
+    })
+    
+    # Keep last 100 entries (more than TUI's 50 for longer playback)
+    if len(hist) > 100:
+        app_state.fixed_history[sensor_id][pollutant] = hist[-100:]
+    
+    app_state.fixed_history_dirty = True
+
+
+def _accumulate_fixed_history_from_raw(app_state: AppState, fixed_raw: dict[str, Any] | None) -> None:
+    """Extract readings from raw Utah fixed sensor data and accumulate into history."""
+    if not isinstance(fixed_raw, dict):
+        return
+    
+    for pollutant_key, sensors in fixed_raw.items():
+        if not isinstance(sensors, dict):
+            continue
+        for sensor_id, s_data in sensors.items():
+            # Skip metadata keys
+            if sensor_id in ("LastUpdateUTC", "LastUpdateLocal", "APITimeStart", "APITimeEnd", "VarName", "VarUnit"):
+                continue
+            if not isinstance(s_data, dict):
+                continue
+            
+            value = s_data.get("Value")
+            color = s_data.get("ValueColor", "#cccccc")
+            time_utc = s_data.get("TimeUTC")
+            
+            if value is not None:
+                accumulate_fixed_reading(app_state, sensor_id, str(pollutant_key), value, color, time_utc)
+
+
+def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
+    """Inject history arrays into fixed sensor readings from accumulated history."""
+    fixed_list = st.get("fixed", [])
+    if not isinstance(fixed_list, list):
+        return
+    
+    for sensor in fixed_list:
+        sensor_id = sensor.get("id")
+        if not sensor_id:
+            continue
+        
+        hist_for_sensor = app_state.fixed_history.get(sensor_id, {})
+        if not hist_for_sensor:
+            continue
+        
+        readings = sensor.get("readings", {})
+        if not isinstance(readings, dict):
+            continue
+        
+        for pollutant, reading in readings.items():
+            if not isinstance(reading, dict):
+                continue
+            
+            hist_entries = hist_for_sensor.get(pollutant, [])
+            if not hist_entries:
+                continue
+            
+            # Build history arrays
+            history_values = []
+            history_colors = []
+            history_times = []
+            
+            for entry in hist_entries:
+                val = entry.get("val")
+                col = entry.get("col", "#cccccc")
+                t = entry.get("time")
+                
+                # Try to parse value as float for consistency
+                try:
+                    history_values.append(float(val) if val is not None else None)
+                except (ValueError, TypeError):
+                    history_values.append(val)
+                history_colors.append(col)
+                history_times.append(t)
+            
+            reading["history"] = history_values
+            reading["history_colors"] = history_colors
+            reading["history_times"] = history_times
+
 
 def build_state(
     *,
@@ -204,6 +372,10 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
             combined_mobile.append(pm)
         st["mobile"] = combined_mobile
 
+        # Merge AirNow readings into fixed sensors
+        if app_state.airnow_readings:
+            _merge_airnow_into_fixed(st, app_state)
+
         prev_meta = app_state.state.get("meta", {}) if isinstance(app_state.state, dict) else {}
         if "server_start_ts" in prev_meta: meta["server_start_ts"] = prev_meta["server_start_ts"]
 
@@ -211,19 +383,345 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
         app_state.state = st
         app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
 
+
+def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
+    """Merge AirNow hourly readings into fixed sensors or add new AirNow-only sensors."""
+    fixed_list = st.get("fixed", [])
+    if not isinstance(fixed_list, list):
+        return
+    
+    # Get mobile data time range for filtering
+    mobile_time_range = _get_mobile_time_range(st.get("mobile", []))
+    
+    # Build a lookup of existing fixed sensors by approximate location
+    fixed_by_loc: dict[tuple[float, float], dict[str, Any]] = {}
+    for fs in fixed_list:
+        lat = fs.get("lat")
+        lon = fs.get("lon")
+        if lat is not None and lon is not None:
+            # Round to ~100m precision for matching
+            key = (round(lat, 3), round(lon, 3))
+            fixed_by_loc[key] = fs
+    
+    # Track which AirNow sites we've added
+    added_airnow_sites: set[str] = set()
+    
+    for site_id, readings in app_state.airnow_readings.items():
+        if not readings:
+            continue
+        
+        site_meta = app_state.airnow_sites.get(site_id, {})
+        lat = site_meta.get("latitude")
+        lon = site_meta.get("longitude")
+        site_name = site_meta.get("site_name", site_id)
+        
+        if lat is None or lon is None:
+            continue
+        
+        # Check if within SLC bounds
+        if not (SLC_BOUNDS["lat_min"] <= lat <= SLC_BOUNDS["lat_max"] and
+                SLC_BOUNDS["lon_min"] <= lon <= SLC_BOUNDS["lon_max"]):
+            continue
+        
+        # Filter readings to mobile time range if available
+        filtered_readings = readings
+        if mobile_time_range:
+            filtered_readings = _filter_readings_to_timerange(readings, mobile_time_range)
+        
+        if not filtered_readings:
+            continue
+        
+        # Try to find matching existing fixed sensor
+        key = (round(lat, 3), round(lon, 3))
+        existing = fixed_by_loc.get(key)
+        
+        # Build readings dict from AirNow data with history
+        airnow_readings_dict = _airnow_to_readings_dict(
+            filtered_readings,
+            site_id=site_id,
+            app_state=app_state,
+            time_range=mobile_time_range,
+        )
+        
+        if existing:
+            # Merge into existing sensor
+            existing_readings = existing.get("readings", {})
+            if not isinstance(existing_readings, dict):
+                existing_readings = {}
+            
+            # Add AirNow readings that don't already exist
+            for param, data in airnow_readings_dict.items():
+                if param not in existing_readings:
+                    existing_readings[param] = data
+            
+            existing["readings"] = existing_readings
+            existing["airnow_source"] = True
+        else:
+            # Add as new AirNow-only sensor
+            if site_id not in added_airnow_sites:
+                added_airnow_sites.add(site_id)
+                fixed_list.append({
+                    "id": f"AIRNOW_{site_id}",
+                    "name": site_name,
+                    "pinned": False,
+                    "emoji": "🏛️",  # Government/EPA marker
+                    "lat": lat,
+                    "lon": lon,
+                    "readings": airnow_readings_dict,
+                    "color": _pick_color_from_readings(airnow_readings_dict),
+                    "airnow_source": True,
+                    "primary_key": _pick_primary_key(airnow_readings_dict),
+                    "primary_value": None,
+                    "primary_color": _pick_color_from_readings(airnow_readings_dict),
+                    "primary_aqi": None,
+                })
+    
+    st["fixed"] = fixed_list
+    
+    # Add AirNow metadata
+    meta = st.get("meta", {})
+    meta["airnow_last_fetch"] = app_state.airnow_last_fetch
+    meta["airnow_sites_count"] = len(app_state.airnow_sites)
+    meta["airnow_readings_count"] = len(app_state.airnow_readings)
+
+
+def _get_mobile_time_range(mobile_list: list[dict[str, Any]]) -> tuple[datetime, datetime] | None:
+    """Get the time range covered by mobile sensor trails."""
+    min_dt: datetime | None = None
+    max_dt: datetime | None = None
+    
+    for m in mobile_list:
+        trail = m.get("trail", [])
+        if not isinstance(trail, list):
+            continue
+        for pt in trail:
+            if not isinstance(pt, dict):
+                continue
+            ts = pt.get("t")
+            if isinstance(ts, str):
+                dt = parse_utc_timestamp(ts)
+                if dt:
+                    if min_dt is None or dt < min_dt:
+                        min_dt = dt
+                    if max_dt is None or dt > max_dt:
+                        max_dt = dt
+    
+    if min_dt and max_dt:
+        return (min_dt, max_dt)
+    return None
+
+
+def _filter_readings_to_timerange(
+    readings: dict[str, Any],
+    time_range: tuple[datetime, datetime]
+) -> dict[str, Any]:
+    """Filter readings to only include data within the time range."""
+    # For now, just return all readings since AirNow hourly data is already
+    # fetched based on available hours. Future enhancement could filter by
+    # individual reading timestamps.
+    return readings
+
+
+# Map AirNow parameter names to dashboard keys
+AIRNOW_PARAM_MAP = {
+    "PM2.5": "PM25",
+    "PM10": "PM10",
+    "OZONE": "OZNE",
+    "O3": "OZNE",
+    "NO2": "NO2",
+    "CO": "CO",
+    "SO2": "SO2",
+}
+
+
+def _build_airnow_history(
+    site_id: str,
+    app_state: AppState,
+    time_range: tuple[datetime, datetime] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """
+    Build historical readings for an AirNow site from cached hourly data.
+    
+    Returns a dict of parameter -> {value, color, history, history_colors}
+    matching the format used by Utah fixed sensors.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    
+    # Collect all readings for this site across all cached hours
+    # Structure: param -> [(datetime, value), ...]
+    param_history: dict[str, list[tuple[datetime, float]]] = {}
+    
+    for hour_key in sorted(app_state.airnow_readings_by_hour.keys()):
+        readings = app_state.airnow_readings_by_hour[hour_key]
+        for r in readings:
+            if r.get("site_id") != site_id:
+                continue
+            
+            dt = r.get("datetime")
+            if not isinstance(dt, datetime):
+                continue
+            
+            # Filter to time range if specified
+            if time_range:
+                # Expand range by 1 hour on each end for context
+                range_start = time_range[0] - timedelta(hours=1)
+                range_end = time_range[1] + timedelta(hours=1)
+                if not (range_start <= dt <= range_end):
+                    continue
+            
+            param = r.get("parameter")
+            value = r.get("value")
+            if param and value is not None:
+                if param not in param_history:
+                    param_history[param] = []
+                param_history[param].append((dt, float(value)))
+    
+    # Build readings dict with history arrays
+    for param, history_list in param_history.items():
+        # Sort by time
+        history_list.sort(key=lambda x: x[0])
+        
+        # Get mapped parameter name
+        mapped_key = AIRNOW_PARAM_MAP.get(param, param)
+        
+        # Extract values, times, and compute colors
+        history_values = [v for dt, v in history_list]
+        history_times = [dt.isoformat() + "Z" for dt, v in history_list]  # UTC ISO strings
+        history_colors = [_get_aqi_color(mapped_key, v) for v in history_values]
+        
+        # Latest value
+        if history_values:
+            latest_value = history_values[-1]
+            latest_color = history_colors[-1]
+        else:
+            continue
+        
+        result[mapped_key] = {
+            "value": latest_value,
+            "color": latest_color,
+            "history": history_values,
+            "history_times": history_times,  # UTC timestamps for playback interpolation
+            "history_colors": history_colors,
+            "scrubbed": 0,  # No outlier filtering for AirNow data (already QC'd)
+        }
+    
+    return result
+
+
+def _airnow_to_readings_dict(
+    readings: dict[str, Any],
+    site_id: str | None = None,
+    app_state: AppState | None = None,
+    time_range: tuple[datetime, datetime] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """
+    Convert AirNow readings dict to dashboard readings format.
+    
+    If site_id and app_state are provided, builds full history arrays
+    from cached hourly data. Otherwise, just returns current values.
+    """
+    # If we have app_state, build proper history
+    if site_id and app_state:
+        result = _build_airnow_history(site_id, app_state, time_range)
+        if result:
+            return result
+    
+    # Fallback: just current values (no history)
+    result = {}
+    for param, value in readings.items():
+        if param in ("datetime", "time", "date", "site_id", "site_name", "unit", "agency"):
+            continue
+        
+        mapped_key = AIRNOW_PARAM_MAP.get(param, param)
+        color = _get_aqi_color(mapped_key, value)
+        
+        result[mapped_key] = {
+            "value": value,
+            "color": color,
+        }
+    
+    return result
+
+
+def _get_aqi_color(pollutant: str, value: Any) -> str:
+    """Get AQI color for a pollutant value."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "#cccccc"
+    
+    # Simplified AQI breakpoints for coloring
+    if pollutant in ("PM25", "PM2.5"):
+        if v <= 12.0: return "#00E400"  # Good
+        if v <= 35.4: return "#FFFF00"  # Moderate
+        if v <= 55.4: return "#FF7E00"  # USG
+        if v <= 150.4: return "#FF0000"  # Unhealthy
+        if v <= 250.4: return "#8F3F97"  # Very Unhealthy
+        return "#7E0023"  # Hazardous
+    elif pollutant in ("PM10",):
+        if v <= 54: return "#00E400"
+        if v <= 154: return "#FFFF00"
+        if v <= 254: return "#FF7E00"
+        if v <= 354: return "#FF0000"
+        if v <= 424: return "#8F3F97"
+        return "#7E0023"
+    elif pollutant in ("OZNE", "OZONE", "O3"):
+        # ppb values
+        if v <= 54: return "#00E400"
+        if v <= 70: return "#FFFF00"
+        if v <= 85: return "#FF7E00"
+        if v <= 105: return "#FF0000"
+        if v <= 200: return "#8F3F97"
+        return "#7E0023"
+    
+    return "#cccccc"
+
+
+def _pick_color_from_readings(readings: dict[str, dict[str, Any]]) -> str:
+    """Pick the primary color from readings."""
+    priority = ["PM25", "PM2.5", "PM10", "OZNE"]
+    for k in priority:
+        if k in readings and isinstance(readings[k], dict):
+            return readings[k].get("color", "#3388ff")
+    for v in readings.values():
+        if isinstance(v, dict):
+            return v.get("color", "#3388ff")
+    return "#3388ff"
+
+
+def _pick_primary_key(readings: dict[str, dict[str, Any]]) -> str | None:
+    """Pick the primary pollutant key."""
+    priority = ["PM25", "PM2.5", "PM10", "OZNE"]
+    for k in priority:
+        if k in readings:
+            return k
+    return next(iter(readings.keys()), None)
+
+
 def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_event: threading.Event) -> None:
     revision = 0
     while not stop_event.is_set():
         attempt_ts = time.time()
         try:
             mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=requests.get)
-            fixed = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=requests.get)
+            fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=requests.get)
 
-            st = build_state(data_dir=data_dir, mobile_json=mobile, fixed_json=fixed, max_points=5000)
+            # Accumulate fixed sensor history from raw data
+            _accumulate_fixed_history_from_raw(app_state, fixed_raw)
+
+            st = build_state(data_dir=data_dir, mobile_json=mobile, fixed_json=fixed_raw, max_points=5000)
+            
+            # Inject history arrays into fixed sensors
+            _inject_fixed_history(app_state, st)
+            
             revision += 1
             meta = st.setdefault("meta", {})
             meta.update({"last_fetch_attempt_ts": attempt_ts, "last_fetch_ok_ts": attempt_ts, "server_revision": revision})
             update_app_state_with_new_data(app_state, st)
+            
+            # Periodically save history
+            if revision % 10 == 0:
+                save_fixed_history(app_state)
         except Exception as e:
             with app_state.lock:
                 st = app_state.state if isinstance(app_state.state, dict) else {"ts": time.time(), "mobile": [], "fixed": [], "meta": {}}
@@ -231,6 +729,189 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
                 meta["last_fetch_error"] = f"{type(e).__name__}: {e}"
                 app_state.state = st
         stop_event.wait(interval_s)
+
+
+def airnow_fetch_loop(
+    *,
+    app_state: AppState,
+    interval_s: float = 1200.0,  # 20 minutes
+    stop_event: threading.Event
+) -> None:
+    """Background loop to fetch AirNow hourly data every 20 minutes."""
+    if not AIRNOW_AVAILABLE:
+        return
+    
+    # Initial delay to let main fetch loop populate mobile data first
+    stop_event.wait(5.0)
+    
+    while not stop_event.is_set():
+        try:
+            _fetch_airnow_data(app_state)
+        except Exception as e:
+            print(f"[AirNow] Fetch error: {type(e).__name__}: {e}")
+        
+        stop_event.wait(interval_s)
+
+
+def _fetch_airnow_data(app_state: AppState) -> None:
+    """Fetch AirNow site metadata and hourly readings."""
+    now = time.time()
+    
+    # Fetch site metadata (once, or refresh occasionally)
+    with app_state.lock:
+        sites_empty = not app_state.airnow_sites
+    
+    if sites_empty:
+        try:
+            print("[AirNow] Fetching site metadata...")
+            all_sites = fetch_monitoring_sites()
+            
+            # Filter to SLC-area sites and build lookup
+            sites_by_id: dict[str, dict[str, Any]] = {}
+            for s in all_sites:
+                lat = s.get("latitude")
+                lon = s.get("longitude")
+                if lat is None or lon is None:
+                    continue
+                if (SLC_BOUNDS["lat_min"] <= lat <= SLC_BOUNDS["lat_max"] and
+                    SLC_BOUNDS["lon_min"] <= lon <= SLC_BOUNDS["lon_max"]):
+                    site_id = s.get("aqsid", "")
+                    if site_id and site_id not in sites_by_id:
+                        sites_by_id[site_id] = s
+            
+            with app_state.lock:
+                app_state.airnow_sites = sites_by_id
+            
+            print(f"[AirNow] Loaded {len(sites_by_id)} SLC-area sites")
+        except Exception as e:
+            print(f"[AirNow] Error fetching sites: {e}")
+    
+    # Determine which hours to fetch based on mobile data time range
+    with app_state.lock:
+        mobile_list = app_state.state.get("mobile", []) if isinstance(app_state.state, dict) else []
+    
+    time_range = _get_mobile_time_range(mobile_list)
+    
+    # Fetch hourly data
+    try:
+        # Try to get the most recent available hourly file
+        available_files = list_available_hourly_files()
+        
+        hours_to_fetch: list[str] = []
+        
+        if time_range:
+            # Calculate hours within mobile data range
+            start_dt, end_dt = time_range
+            # Extend a bit to ensure coverage
+            start_dt = start_dt - timedelta(hours=1)
+            
+            current = start_dt.replace(minute=0, second=0, microsecond=0)
+            while current <= end_dt:
+                hour_key = current.strftime("%Y%m%d%H")
+                hours_to_fetch.append(hour_key)
+                current += timedelta(hours=1)
+            
+            # Limit to last 24 hours to avoid too many requests
+            hours_to_fetch = hours_to_fetch[-24:]
+        else:
+            # No mobile data yet, just get recent hours
+            if available_files:
+                # Get last 3 available files
+                hours_to_fetch = [f.replace("HourlyData_", "").replace(".dat", "") 
+                                  for f in available_files[-3:]]
+        
+        if not hours_to_fetch:
+            print("[AirNow] No hours to fetch")
+            return
+        
+        # Fetch hourly data for each hour
+        all_readings: dict[str, dict[str, Any]] = {}
+        
+        for hour_key in hours_to_fetch:
+            cache_key = hour_key
+            
+            # Check if already cached
+            with app_state.lock:
+                if cache_key in app_state.airnow_readings_by_hour:
+                    # Use cached data
+                    for r in app_state.airnow_readings_by_hour[cache_key]:
+                        site_id = r.get("site_id", "")
+                        if site_id:
+                            if site_id not in all_readings:
+                                all_readings[site_id] = {}
+                            param = r.get("parameter", "")
+                            val = r.get("value")
+                            if param and val is not None:
+                                all_readings[site_id][param] = val
+                    continue
+            
+            # Fetch from server
+            try:
+                # Determine URL - try today's folder first, then archive
+                dt = datetime.strptime(hour_key, "%Y%m%d%H")
+                today = datetime.now().strftime("%Y%m%d")
+                
+                if hour_key.startswith(today):
+                    url = f"{FILES_BASE_URL}/today/HourlyData_{hour_key}.dat"
+                else:
+                    url = get_hourly_data_url_historical(dt)
+                
+                readings = fetch_hourly_data(url)
+                utah_readings = filter_utah_hourly(readings)
+                
+                # Cache the readings
+                with app_state.lock:
+                    app_state.airnow_readings_by_hour[cache_key] = utah_readings
+                
+                # Aggregate by site
+                for r in utah_readings:
+                    site_id = r.get("site_id", "")
+                    if site_id:
+                        if site_id not in all_readings:
+                            all_readings[site_id] = {}
+                        param = r.get("parameter", "")
+                        val = r.get("value")
+                        if param and val is not None:
+                            all_readings[site_id][param] = val
+                        
+                        # Also accumulate into persistent history
+                        dt = r.get("datetime")
+                        time_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
+                        sensor_key = f"AIRNOW_{site_id}"
+                        accumulate_fixed_reading(
+                            app_state, sensor_key, param, val,
+                            _get_aqi_color(param, val), time_str
+                        )
+                
+            except Exception as e:
+                # File might not exist yet, that's OK
+                pass
+        
+        # Update app state with aggregated readings
+        with app_state.lock:
+            app_state.airnow_readings = all_readings
+            app_state.airnow_last_fetch = now
+            
+            # Clean up old cached hours (keep last 48)
+            if len(app_state.airnow_readings_by_hour) > 48:
+                sorted_keys = sorted(app_state.airnow_readings_by_hour.keys())
+                for k in sorted_keys[:-48]:
+                    del app_state.airnow_readings_by_hour[k]
+        
+        print(f"[AirNow] Updated {len(all_readings)} sites with hourly data")
+        
+        # Trigger a state rebuild to merge new data
+        with app_state.lock:
+            if app_state.airnow_readings and isinstance(app_state.state, dict):
+                _merge_airnow_into_fixed(app_state.state, app_state)
+                app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
+        
+        # Save accumulated history
+        save_fixed_history(app_state)
+        
+    except Exception as e:
+        print(f"[AirNow] Error fetching hourly data: {e}")
+
 
 def apply_sensor_names_inplace(state: dict[str, Any], custom_names: dict[str, Any]) -> bool:
     if not isinstance(state, dict) or not isinstance(custom_names, dict): return False
@@ -351,10 +1032,26 @@ def main() -> int:
         state={"ts": time.time(), "mobile": [], "fixed": [], "meta": {"server_start_ts": time.time()}},
         persistent_mobile={},
     )
+    
+    # Load persistent fixed sensor history
+    load_fixed_history(app_state, data_dir)
+    print(f"[FixedHistory] Loaded {len(app_state.fixed_history)} sensors from history")
+    
     stop_event = threading.Event()
 
     threading.Thread(target=fetch_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=args.interval, stop_event=stop_event), daemon=True).start()
     threading.Thread(target=watch_sensor_names_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event), daemon=True).start()
+    
+    # Start AirNow hourly data fetch loop (20-minute interval)
+    if AIRNOW_AVAILABLE:
+        threading.Thread(
+            target=airnow_fetch_loop,
+            kwargs=dict(app_state=app_state, interval_s=1200.0, stop_event=stop_event),
+            daemon=True
+        ).start()
+        print("[AirNow] Hourly data integration enabled (20-min refresh)")
+    else:
+        print("[AirNow] Integration not available (airnow_slc.py not found)")
 
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir))
     if args.https:

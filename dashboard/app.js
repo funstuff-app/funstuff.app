@@ -249,7 +249,7 @@ function valueToAqi(pollutantKey, value) {
 
   // unit normalization + truncation
   if (k === "ozone") {
-    if (v > 1.0) v = v / 1000.0; // ppb -> ppm
+    if (v >= 1.0) v = v / 1000.0; // ppb -> ppm
     v = Math.floor(v * 1000) / 1000; // 3 decimals
   } else if (k === "pm2.5") {
     v = Math.floor(v * 10) / 10; // 1 decimal
@@ -429,6 +429,110 @@ function primaryReadingForSensor(s) {
     return { key: s.primary_key, value: s.primary_value, color: safeHex(s.primary_color) };
   }
   return { key: null, value: null, color: "#ffffff" };
+}
+
+/**
+ * Check if a fixed sensor has time-indexed history data (from AirNow).
+ * @param {object} f - fixed sensor object
+ * @returns {boolean}
+ */
+function fixedSensorHasHistoryTimes(f) {
+  const readings = f && f.readings;
+  if (!readings) return false;
+  for (const key of Object.keys(readings)) {
+    const r = readings[key];
+    if (r && Array.isArray(r.history_times) && r.history_times.length >= 2) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Interpolate fixed sensor readings at a given playback time.
+ * Uses history_times arrays to find the appropriate value for each pollutant.
+ * 
+ * @param {object} f - fixed sensor object with readings that have history_times
+ * @param {number} playbackTimeMs - playback time in UTC milliseconds
+ * @returns {object} - interpolated readings object in same format as original
+ */
+function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
+  const readings = f && f.readings;
+  if (!readings || !isFinite(playbackTimeMs)) return readings;
+  
+  const result = {};
+  
+  for (const key of Object.keys(readings)) {
+    const r = readings[key];
+    if (!r) continue;
+    
+    // If no history_times, just copy the current value
+    if (!Array.isArray(r.history_times) || !Array.isArray(r.history) || r.history_times.length < 2) {
+      result[key] = r;
+      continue;
+    }
+    
+    const times = r.history_times;
+    const values = r.history;
+    const colors = r.history_colors || [];
+    
+    // Convert ISO strings to ms timestamps
+    const timesMs = times.map(t => new Date(t).getTime());
+    
+    // Find the appropriate value for this time
+    const tMin = timesMs[0];
+    const tMax = timesMs[timesMs.length - 1];
+    
+    let idx;
+    if (playbackTimeMs <= tMin) {
+      idx = 0;
+    } else if (playbackTimeMs >= tMax) {
+      idx = values.length - 1;
+    } else {
+      // Binary search for the right interval
+      let lo = 0;
+      let hi = timesMs.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (timesMs[mid] <= playbackTimeMs) lo = mid;
+        else hi = mid - 1;
+      }
+      idx = lo;
+    }
+    
+    result[key] = {
+      value: values[idx],
+      color: colors[idx] || r.color || "#cccccc",
+      // Keep original arrays for sparklines
+      history: values,
+      history_times: times,
+      history_colors: colors,
+      scrubbed: r.scrubbed || 0,
+    };
+  }
+  
+  return result;
+}
+
+/**
+ * Get primary reading for a fixed sensor at a specific playback time.
+ * Falls back to primaryReadingForSensor if no history_times.
+ * 
+ * @param {object} f - fixed sensor object
+ * @param {number|null} playbackTimeMs - playback time in UTC ms, or null for current
+ * @returns {object} - { key, value, color, aqi }
+ */
+function primaryReadingForFixedAtTime(f, playbackTimeMs) {
+  if (playbackTimeMs == null || !fixedSensorHasHistoryTimes(f)) {
+    return primaryReadingForSensor(f);
+  }
+  
+  const interpolated = interpolateFixedReadingsAtTime(f, playbackTimeMs);
+  const w = pickWorstReadingKey(interpolated);
+  if (w && w.key && interpolated[w.key]) {
+    return { key: w.key, value: interpolated[w.key].value, color: safeHex(interpolated[w.key].color), aqi: w.aqi };
+  }
+  return primaryReadingForSensor(f);
 }
 
 class MapView {
@@ -3596,6 +3700,9 @@ class MapView {
     // Fixed markers - same interaction model as mobile
     // In trace mode, fixed markers are part of the cached static overlay.
     // In playback underlay mode, fixed markers are already present.
+    // Get playback time for fixed sensors with history
+    const fixedPbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    
     if (!this.traceMode && !canUseUnderlay) {
       for (const f of fixed) {
         const lat = Number(f.lat), lon = Number(f.lon);
@@ -3609,7 +3716,8 @@ class MapView {
         const emoji = f.emoji || "📍";
         const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? `${f.id} (${f.name})` : f.id;
         const color = safeHex(f.color);
-        const pr = primaryReadingForSensor(f);
+        // Use time-indexed reading in playback mode
+        const pr = primaryReadingForFixedAtTime(f, fixedPbTimeMs);
 
         // halo
         ctx.save();
