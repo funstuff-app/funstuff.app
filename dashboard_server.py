@@ -36,6 +36,7 @@ from mobileair import (
     FIXED_URL,
     HEADERS,
 )
+from mobileair.dashboard import _pick_worst_reading_by_aqi
 
 # Import AirNow data fetcher
 try:
@@ -249,6 +250,193 @@ def build_state(
         fixed_url=FIXED_URL,
         data_dir=str(data_dir),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Historical data fetching (week-long timeseries from CHPC)
+# ─────────────────────────────────────────────────────────────────────────────
+
+HISTORY_BASE_URL = "https://utahaq.chpc.utah.edu/jsondata"
+HISTORY_SENSORS = [
+    "BUS01", "BUS02", "BUS03", "BUS04", "BUS05", "BUS06", "BUS07", "BUS08",
+    "BUS09", "BUS10", "BUS11", "BUS12", "BUS13", "BUS14", "BUS15",
+    "TRX01", "TRX02", "TRX03",
+]
+HISTORY_VARS = ["GLAT", "GLON", "PM25", "PM10", "OZNE"]
+
+
+def fetch_historical_day(date_str: str) -> dict[str, Any]:
+    """Fetch week-long data and filter to a specific day.
+    
+    Returns data in RAW API FORMAT so it can be processed by 
+    normalize_state_for_dashboard like live data.
+    
+    Args:
+        date_str: Date in YYYY-MM-DD format (UTC)
+    
+    Returns:
+        Dict with 'mobile' in raw API format (same as MobileMapData.json)
+    """
+    from datetime import datetime, timezone, timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    # Parse date and compute day boundaries (UTC)
+    try:
+        day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise ValueError(f"Invalid date format: {date_str}. Use YYYY-MM-DD.")
+    
+    day_end = day_start + timedelta(days=1)
+    start_ms = int(day_start.timestamp() * 1000)
+    end_ms = int(day_end.timestamp() * 1000)
+    
+    # Fetch data for all sensors in parallel
+    def fetch_sensor_var(sensor: str, var: str) -> tuple[str, str, list]:
+        url = f"{HISTORY_BASE_URL}/{sensor}_{var}_TS_10080.json"
+        try:
+            resp = requests.get(url, timeout=30, headers=HEADERS)
+            resp.raise_for_status()
+            data = resp.json()
+            # Filter to requested day
+            points = [
+                (ts, val) for ts, val in data.get("TimeDataUTC", [])
+                if start_ms <= ts < end_ms
+            ]
+            return sensor, var, points
+        except Exception:
+            return sensor, var, []
+    
+    # Parallel fetch
+    raw_data: dict[str, dict[str, list]] = {s: {} for s in HISTORY_SENSORS}
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [
+            executor.submit(fetch_sensor_var, sensor, var)
+            for sensor in HISTORY_SENSORS
+            for var in HISTORY_VARS
+        ]
+        for future in as_completed(futures):
+            sensor, var, points = future.result()
+            raw_data[sensor][var] = points
+    
+    # Build raw API format: {PM25: {sensor: {TimeUTC, GLAT, GLON, Value}}, PM10: {...}, OZNE: {...}}
+    # This matches the format of MobileMapData.json so normalize_state_for_dashboard can process it
+    
+    last_update_str = day_end.strftime("%Y-%m-%d %H:%M UTC")
+    
+    mobile_raw: dict[str, Any] = {
+        "PM25": {"LastUpdateUTC": last_update_str, "VarName": "PM2.5 Concentration", "VarUnit": "ug/m3"},
+        "PM10": {"LastUpdateUTC": last_update_str, "VarName": "PM10 Concentration", "VarUnit": "ug/m3"},
+        "OZNE": {"LastUpdateUTC": last_update_str, "VarName": "Ozone Concentration", "VarUnit": "ppbv"},
+    }
+    
+    for sensor_id in HISTORY_SENSORS:
+        sensor_data = raw_data[sensor_id]
+        lat_pts = sensor_data.get("GLAT", [])
+        lon_pts = sensor_data.get("GLON", [])
+        pm25_pts = sensor_data.get("PM25", [])
+        pm10_pts = sensor_data.get("PM10", [])
+        ozne_pts = sensor_data.get("OZNE", [])
+        
+        if not lat_pts or not lon_pts:
+            continue
+        
+        # Build arrays for each variable in API format
+        lat_by_ts = {ts: val for ts, val in lat_pts if val is not None}
+        lon_by_ts = {ts: val for ts, val in lon_pts if val is not None}
+        
+        # Use GPS timestamps as primary (they're most frequent)
+        all_gps_times = sorted(set(lat_by_ts.keys()) & set(lon_by_ts.keys()))
+        
+        if not all_gps_times:
+            continue
+        
+        # Convert timestamps to UTC strings
+        def ts_to_utc(ts_ms):
+            dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        
+        # GPS data - format as strings to match live API format
+        gps_times_utc = [ts_to_utc(ts) for ts in all_gps_times]
+        gps_lats = [str(lat_by_ts[ts]) for ts in all_gps_times]
+        gps_lons = [str(lon_by_ts[ts]) for ts in all_gps_times]
+        
+        def fmt_val(v):
+            """Format value as string like live API does."""
+            if v is None:
+                return None
+            return f"{v:.2f}"
+        
+        # Add sensor data for each pollutant using GPS timestamps
+        # NOTE: We do NOT include ValueColor here - let normalize_state_for_dashboard
+        # compute colors the same way it does for live data
+        
+        # PM25
+        pm25_by_ts = {ts: val for ts, val in pm25_pts}
+        pm25_vals = []
+        last_pm25 = None
+        for ts in all_gps_times:
+            if ts in pm25_by_ts:
+                last_pm25 = pm25_by_ts[ts]
+            pm25_vals.append(fmt_val(last_pm25))
+        
+        mobile_raw["PM25"][sensor_id] = {
+            "TimeUTC": gps_times_utc,
+            "Latitude": gps_lats,
+            "Longitude": gps_lons,
+            "Value": pm25_vals,
+        }
+        
+        # PM10
+        pm10_by_ts = {ts: val for ts, val in pm10_pts}
+        pm10_vals = []
+        last_pm10 = None
+        for ts in all_gps_times:
+            if ts in pm10_by_ts:
+                last_pm10 = pm10_by_ts[ts]
+            pm10_vals.append(fmt_val(last_pm10))
+        
+        mobile_raw["PM10"][sensor_id] = {
+            "TimeUTC": gps_times_utc,
+            "Latitude": gps_lats,
+            "Longitude": gps_lons,
+            "Value": pm10_vals,
+        }
+        
+        # OZNE - filter out negative values (bad sensor data)
+        ozne_by_ts = {ts: val for ts, val in ozne_pts if val is None or val >= 0}
+        ozne_vals = []
+        last_ozne = None
+        for ts in all_gps_times:
+            if ts in ozne_by_ts:
+                last_ozne = ozne_by_ts[ts]
+            ozne_vals.append(fmt_val(last_ozne))
+        
+        mobile_raw["OZNE"][sensor_id] = {
+            "TimeUTC": gps_times_utc,
+            "Latitude": gps_lats,
+            "Longitude": gps_lons,
+            "Value": ozne_vals,
+        }
+    
+    # Now process through normalize_state_for_dashboard like live data
+    combined = {"mobile": mobile_raw, "fixed": {}}
+    
+    result = normalize_state_for_dashboard(
+        combined,
+        custom_names={},
+        pinned_sensors=set(),
+        max_points=5000,  # Allow more points for historical data
+        mobile_url=MOBILE_URL,
+        fixed_url=FIXED_URL,
+        data_dir=str(default_data_dir()),
+    )
+    
+    # Add historical metadata
+    result["meta"]["historical"] = True
+    result["meta"]["date"] = date_str
+    
+    return result
+
 
 def _first_last_ts(trail: list[dict[str, Any]]) -> tuple[float | None, float | None]:
     """O(1) optimization: Avoids iterating thousands of points."""
@@ -941,7 +1129,52 @@ def watch_sensor_names_loop(*, app_state: AppState, data_dir: Path, stop_event: 
         except Exception: pass
         stop_event.wait(5.0)
 
-def make_handler(*, app_state: AppState, static_dir: Path):
+def _get_snapshots_dir(data_dir: Path) -> Path:
+    """Return the directory for saved snapshots."""
+    snapshots_dir = data_dir / "snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    return snapshots_dir
+
+def list_snapshots(data_dir: Path) -> list[dict[str, Any]]:
+    """List all saved snapshots with metadata."""
+    snapshots_dir = _get_snapshots_dir(data_dir)
+    result = []
+    for f in sorted(snapshots_dir.glob("*.json"), reverse=True):
+        try:
+            stat = f.stat()
+            # Extract date from filename (e.g., "2025-12-31.json" -> "2025-12-31")
+            date_str = f.stem
+            result.append({
+                "date": date_str,
+                "filename": f.name,
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat() + "Z",
+            })
+        except Exception:
+            pass
+    return result
+
+def save_snapshot(data_dir: Path, date_str: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Save current state as a snapshot for the given date."""
+    snapshots_dir = _get_snapshots_dir(data_dir)
+    # Sanitize date string for filename
+    safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
+    if not safe_date:
+        safe_date = datetime.now().strftime("%Y-%m-%d")
+    filepath = snapshots_dir / f"{safe_date}.json"
+    filepath.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    return {"success": True, "filename": filepath.name, "size_bytes": filepath.stat().st_size}
+
+def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
+    """Load a saved snapshot by date."""
+    snapshots_dir = _get_snapshots_dir(data_dir)
+    safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
+    filepath = snapshots_dir / f"{safe_date}.json"
+    if not filepath.exists():
+        return None
+    return json.loads(filepath.read_text(encoding="utf-8"))
+
+def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, body: bytes, content_type: str):
             self.send_response(code)
@@ -969,7 +1202,86 @@ def make_handler(*, app_state: AppState, static_dir: Path):
             if self.path.startswith("/api/state"):
                 with app_state.lock:
                     return self._send(200, app_state.cached_json_bytes, "application/json")
+            if self.path.startswith("/api/history"):
+                return self._handle_history_request()
+            if self.path.startswith("/api/snapshots"):
+                return self._handle_list_snapshots()
+            if self.path.startswith("/api/snapshot/load"):
+                return self._handle_load_snapshot()
             return self._send(404, b"not found", "text/plain")
+
+        def do_POST(self):
+            if self.path.startswith("/api/snapshot/save"):
+                return self._handle_save_snapshot()
+            return self._send(404, b"not found", "text/plain")
+
+        def _handle_list_snapshots(self):
+            """List all saved snapshots."""
+            try:
+                snapshots = list_snapshots(data_dir)
+                body = json.dumps({"snapshots": snapshots}).encode("utf-8")
+                return self._send(200, body, "application/json")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode("utf-8")
+                return self._send(500, body, "application/json")
+
+        def _handle_save_snapshot(self):
+            """Save current state as a snapshot."""
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            date_str = query.get("date", [None])[0]
+            
+            if not date_str:
+                # Default to today's date
+                date_str = datetime.now().strftime("%Y-%m-%d")
+            
+            try:
+                # Get current state
+                with app_state.lock:
+                    current_state = json.loads(app_state.cached_json_bytes.decode("utf-8"))
+                
+                result = save_snapshot(data_dir, date_str, current_state)
+                body = json.dumps(result).encode("utf-8")
+                return self._send(200, body, "application/json")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode("utf-8")
+                return self._send(500, body, "application/json")
+
+        def _handle_load_snapshot(self):
+            """Load a saved snapshot by date."""
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            date_str = query.get("date", [None])[0]
+            
+            if not date_str:
+                return self._send(400, b'{"error": "date parameter required"}', "application/json")
+            
+            try:
+                state = load_snapshot(data_dir, date_str)
+                if state is None:
+                    return self._send(404, b'{"error": "snapshot not found"}', "application/json")
+                body = json.dumps(state).encode("utf-8")
+                return self._send(200, body, "application/json")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode("utf-8")
+                return self._send(500, body, "application/json")
+
+        def _handle_history_request(self):
+            """Fetch week-long historical data for all sensors for a specific date."""
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            date_str = query.get("date", [None])[0]  # e.g. "2025-12-29"
+            
+            if not date_str:
+                return self._send(400, b'{"error": "date parameter required"}', "application/json")
+            
+            try:
+                result = fetch_historical_day(date_str)
+                body = json.dumps(result).encode("utf-8")
+                return self._send(200, body, "application/json")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode("utf-8")
+                return self._send(500, body, "application/json")
 
         def log_message(self, format, *args):
             return
@@ -1053,7 +1365,7 @@ def main() -> int:
     else:
         print("[AirNow] Integration not available (airnow_slc.py not found)")
 
-    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir))
+    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir))
     if args.https:
         cert_path = Path(args.cert) if args.cert else (data_dir / "dev-cert.pem")
         key_path = Path(args.key) if args.key else (data_dir / "dev-key.pem")

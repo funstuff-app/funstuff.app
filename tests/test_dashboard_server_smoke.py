@@ -41,7 +41,7 @@ class TestDashboardServerSmoke(unittest.TestCase):
             with app_state.lock:
                 app_state.state = {"ts": time.time(), "mobile": [{"id": "BUS1"}], "fixed": [], "meta": {}}
 
-            handler = srv.make_handler(app_state=app_state, static_dir=static_dir)
+            handler = srv.make_handler(app_state=app_state, static_dir=static_dir, data_dir=static_dir)
             port = _free_port()
             httpd = srv.ThreadingHTTPServer(("127.0.0.1", port), handler)
 

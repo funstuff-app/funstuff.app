@@ -65,6 +65,13 @@
                 <option value="20">20×</option>
               </select>
             </label>
+            <label class="pbDay" title="Select day for historical playback">
+              <select id="pbDaySelect" aria-label="Day selector">
+                <option value="live" selected>Today (Live)</option>
+              </select>
+            </label>
+            <button id="pbSave" type="button" class="pbSaveLoad" title="Save current day's data">💾 Save</button>
+            <button id="pbLoad" type="button" class="pbSaveLoad" title="Load a saved day">📂 Load</button>
             <label class="pbDebug" title="Debug overlays (shows magnet/path helpers)">
               <input id="pbDebugPath" type="checkbox" />
               <span>Debug</span>

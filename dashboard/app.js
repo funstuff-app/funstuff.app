@@ -2951,7 +2951,8 @@ class MapView {
       if (!id) continue;
 
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
-      const persisted = (this._persistedTrailById.get(id)?.trail || []);
+      // When viewing historical data, always use server trail (not live-accumulated persisted trail)
+      const persisted = this._historicalMode ? [] : (this._persistedTrailById.get(id)?.trail || []);
       const src = (persisted.length >= 2) ? persisted : serverTrail;
       if (!Array.isArray(src) || src.length < 2) continue;
 
@@ -3423,7 +3424,8 @@ class MapView {
 
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
       const hasServerTrail = serverTrail.length >= 2;
-      const persistedTrail = id ? (this._persistedTrailById.get(id)?.trail || []) : [];
+      // When in historical mode, always use server trail (not live-accumulated persisted trail)
+      const persistedTrail = (id && !this._historicalMode) ? (this._persistedTrailById.get(id)?.trail || []) : [];
       const trail = (persistedTrail.length >= 2) ? persistedTrail : (hasServerTrail ? serverTrail : []);
       if (!Array.isArray(trail) || trail.length < 2) return false;
       const isGhost = !!m.ghosted;
@@ -3798,7 +3800,8 @@ class MapView {
       // Idle trails remain visible as dimmed historical data.
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
       const hasServerTrail = serverTrail.length >= 2;
-      const persistedTrail = id ? (this._persistedTrailById.get(id)?.trail || []) : [];
+      // When in historical mode, always use server trail (not live-accumulated persisted trail)
+      const persistedTrail = (id && !this._historicalMode) ? (this._persistedTrailById.get(id)?.trail || []) : [];
       const trail = (persistedTrail.length >= 2) ? persistedTrail : (hasServerTrail ? serverTrail : []);
       if (!Array.isArray(trail) || trail.length < 2) return false;
       const isGhost = !!m.ghosted;
@@ -4163,18 +4166,24 @@ class MapView {
       let pr = primaryReadingForSensor(m);
       if (this.playbackMode && pose && pose.reading) {
         const prHist = pose.reading;
-        const followingLive = !!this._playbackLiveFollow || this.isPlaybackAtEnd(200);
-        if (followingLive) {
-          const aNow = (pr && pr.aqi != null) ? Number(pr.aqi) : valueToAqi(pr?.key, pr?.value);
-          const aHist = (prHist && prHist.aqi != null) ? Number(prHist.aqi) : valueToAqi(prHist?.key, prHist?.value);
-          const aNowF = (aNow != null && isFinite(Number(aNow))) ? Number(aNow) : -1;
-          const aHistF = (aHist != null && isFinite(Number(aHist))) ? Number(aHist) : -1;
-          // Choose the worse (higher AQI). If either is missing, keep the one that exists.
-          if (!pr || !pr.key) pr = prHist;
-          else if (prHist && prHist.key && aHistF > aNowF) pr = prHist;
-        } else {
-          // While scrubbing history, show the per-point reading (historical).
+        // When in historical mode (viewing past days), always use historical trail reading.
+        // Only compare with live sensor readings when viewing today's live data.
+        if (this._historicalMode) {
           pr = prHist;
+        } else {
+          const followingLive = !!this._playbackLiveFollow || this.isPlaybackAtEnd(200);
+          if (followingLive) {
+            const aNow = (pr && pr.aqi != null) ? Number(pr.aqi) : valueToAqi(pr?.key, pr?.value);
+            const aHist = (prHist && prHist.aqi != null) ? Number(prHist.aqi) : valueToAqi(prHist?.key, prHist?.value);
+            const aNowF = (aNow != null && isFinite(Number(aNow))) ? Number(aNow) : -1;
+            const aHistF = (aHist != null && isFinite(Number(aHist))) ? Number(aHist) : -1;
+            // Choose the worse (higher AQI). If either is missing, keep the one that exists.
+            if (!pr || !pr.key) pr = prHist;
+            else if (prHist && prHist.key && aHistF > aNowF) pr = prHist;
+          } else {
+            // While scrubbing history, show the per-point reading (historical).
+            pr = prHist;
+          }
         }
       }
       const prColor = isParked ? dimHex(pr.color || "#ffffff", 0.65) : (pr.color || "#ffffff");
@@ -4393,6 +4402,97 @@ function reconcileList(container, items, type, selectedId, order) {
   });
 }
 
+/**
+ * Update sidebar reading values during playback without full re-render.
+ * This is called from the playback loop to show interpolated values at current playback time.
+ */
+function updateSidebarPlaybackValues() {
+  const map = window.__map;
+  if (!map || !map.playbackMode) return;
+  
+  const listMobileEl = document.getElementById("sensorListMobile");
+  if (!listMobileEl) return;
+  
+  const state = map._historicalMode ? window._historicalState : window.__lastState;
+  if (!state || !Array.isArray(state.mobile)) return;
+  
+  const nowPerfMs = performance.now();
+  const t = map.getPlaybackTimeMs();
+  if (t == null || !isFinite(t)) return;
+  
+  for (const m of state.mobile) {
+    if (!m || m.id == null) continue;
+    
+    // Find the DOM element for this sensor
+    const itemEl = listMobileEl.querySelector(`[data-id="${m.id}"]`);
+    if (!itemEl) continue;
+    
+    // Check if marker is visible at current playback time using the same logic as the map
+    const sample = map._playbackSampleForMobile(m, nowPerfMs);
+    const isVisible = sample && sample.visible !== false;
+    
+    if (!isVisible) {
+      if (!itemEl.classList.contains("hidden")) {
+        itemEl.classList.add("hidden");
+      }
+      continue;
+    }
+    
+    if (itemEl.classList.contains("hidden")) {
+      itemEl.classList.remove("hidden");
+    }
+    
+    if (!sample || !sample.reading) continue;
+    
+    // Get playback points for this sensor
+    const pts = map._playbackPtsById.get(String(m.id));
+    if (!pts || !pts.length) continue;
+    
+    // Binary search for current point
+    let idxHi = 1;
+    const tMin = pts[0].tMs;
+    const tMax = pts[pts.length - 1].tMs;
+    if (t <= tMin) idxHi = 1;
+    else if (t >= tMax) idxHi = pts.length - 1;
+    else {
+      let lo = 1, hi = pts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (pts[mid].tMs >= t) hi = mid;
+        else lo = mid + 1;
+      }
+      idxHi = lo;
+    }
+    
+    const currentPt = pts[idxHi];
+    if (!currentPt || !currentPt.readings) continue;
+    
+    // Update the reading values in the DOM
+    const row2 = itemEl.querySelector(".row2");
+    if (!row2) continue;
+    
+    const readingEls = row2.querySelectorAll(".reading");
+    for (const rEl of readingEls) {
+      const kEl = rEl.querySelector(".k");
+      const vEl = rEl.querySelector(".v");
+      if (!kEl || !vEl) continue;
+      
+      const k = kEl.textContent;
+      const r = currentPt.readings[k];
+      if (r && r.value != null) {
+        const newVal = String(r.value);
+        if (vEl.textContent !== newVal) {
+          vEl.textContent = newVal;
+        }
+        const newColor = safeHex(r.color);
+        if (vEl.style.color !== newColor) {
+          vEl.style.color = newColor;
+        }
+      }
+    }
+  }
+}
+
 function renderLists(state, selectedId) {
   const listMobileEl = document.getElementById("sensorListMobile");
   const listFixedEl = document.getElementById("sensorListFixed");
@@ -4603,6 +4703,7 @@ function main() {
   const tiles = document.getElementById("tilesCanvas");
   const overlay = document.getElementById("overlayCanvas");
   const map = new MapView(tiles, overlay);
+  window.__map = map;  // Expose for updateSidebarPlaybackValues
 
   let selectedId = null; // key: "mobile:ID" or "fixed:ID"
 
@@ -5201,6 +5302,7 @@ function main() {
     const uiMinDt = isActive ? 16 : 250;
     if ((didAdvanceTime || isActive) && (now - _pbLastUiPerf) >= uiMinDt) {
       updatePlaybackUi();
+      updateSidebarPlaybackValues();
       _pbLastUiPerf = now;
     }
 
@@ -5279,7 +5381,10 @@ function main() {
 
   if (pbPlayEl) {
     pbPlayEl.addEventListener("click", () => {
-      if (!map.playbackMode) return;
+      // Enable playback mode if not already (e.g. historical data)
+      if (!map.playbackMode) {
+        map.setPlaybackMode(true);
+      }
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
@@ -5313,11 +5418,14 @@ function main() {
       // Normal play from current position
       _pbAtEndSincePerf = null;
       _pbWheelAccum = 0;
+      _pbIsRewinding = false;
       _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
       map._playbackLiveFollow = false;
       map.setPlaybackPlaying(true);
       _pbLastPerf = 0;
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+      // Always restart the loop
+      if (_pbRAF) cancelAnimationFrame(_pbRAF);
+      _pbRAF = requestAnimationFrame(playbackLoop);
       updatePlaybackUi();
     });
   }
@@ -5327,6 +5435,319 @@ function main() {
       map.setPlaybackSpeed(pbSpeedEl.value);
       updatePlaybackUi();
     });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // DAY SELECTOR: Load historical data for past days
+  // ─────────────────────────────────────────────────────────────────────────────
+  const pbDaySelectEl = document.getElementById("pbDaySelect");
+  window._historicalState = null;  // Cached historical data when not "live"
+  
+  function populateDaySelector() {
+    if (!pbDaySelectEl) return;
+    pbDaySelectEl.innerHTML = "";
+    
+    const now = new Date();
+    const options = [];
+    
+    // Today (live)
+    options.push({ value: "live", label: "Today (Live)" });
+    
+    // Past 6 days
+    for (let i = 1; i <= 6; i++) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().split("T")[0];
+      const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
+      const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      const label = i === 1 ? `Yesterday (${monthDay})` : `${dayName} ${monthDay}`;
+      options.push({ value: dateStr, label });
+    }
+    
+    for (const opt of options) {
+      const el = document.createElement("option");
+      el.value = opt.value;
+      el.textContent = opt.label;
+      pbDaySelectEl.appendChild(el);
+    }
+  }
+  
+  async function loadHistoricalDay(dateStr) {
+    if (dateStr === "live") {
+      window._historicalState = null;
+      map._historicalMode = false;
+      // Clear persisted trails so old data doesn't linger
+      map._persistedTrailById = new Map();
+      return;
+    }
+    
+    const statusEl = document.getElementById("statusText");
+    if (statusEl) {
+      statusEl.textContent = "Loading...";
+      statusEl.classList.remove("live");
+    }
+    
+    try {
+      const resp = await fetch(`/api/history?date=${encodeURIComponent(dateStr)}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      window._historicalState = await resp.json();
+      
+      // Reset ALL playback state for fresh historical data
+      map._historicalMode = true;
+      map._playbackPtsById = new Map();
+      map._playbackPtsKey = null;
+      map._persistedTrailById = new Map();  // Clear persisted trails
+      map._playbackNowMs = null;  // Reset playback time
+      
+      // Enable DVR/playback mode for historical data
+      // NOTE: setPlaybackMode(true) sets _playbackLiveFollow=true and draws overlay,
+      // so we must disable live follow AFTER and avoid the internal draw.
+      map.playbackMode = true;  // Set directly to avoid immediate draw
+      map._playbackLiveFollow = false;  // Historical always starts at beginning, not live tail
+      if (traceEl) traceEl.checked = true;
+      if (pbBarEl) pbBarEl.classList.remove("hidden");
+      
+      // Build playback points and set time to START
+      map._ensurePlaybackPoints(window._historicalState);
+      const b = map.getPlaybackBounds();
+      if (isFinite(b.minMs)) {
+        map.setPlaybackTimeMs(b.minMs);
+      }
+      
+      // Store state, render sidebar, draw ONLY tiles (no overlay yet)
+      map.lastState = window._historicalState;
+      map.drawTiles();
+      renderLists(window._historicalState, selectedId);
+      
+      if (statusEl) {
+        statusEl.textContent = `Historical: ${dateStr}`;
+        statusEl.classList.remove("live");
+      }
+      
+      updatePlaybackUi();
+      
+      // Draw overlay NOW with playback time already set
+      map.drawOverlay(window._historicalState);
+      
+      // Start playback loop
+      _pbLastPerf = 0;
+      _pbLastUiPerf = 0;
+      _pbRAF = requestAnimationFrame(playbackLoop);
+    } catch (e) {
+      console.error("Failed to load historical data:", e);
+      if (statusEl) {
+        statusEl.textContent = "Error loading history";
+        statusEl.classList.add("offline");
+      }
+    }
+  }
+  
+  if (pbDaySelectEl) {
+    populateDaySelector();
+    pbDaySelectEl.addEventListener("change", () => {
+      loadHistoricalDay(pbDaySelectEl.value);
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // SAVE/LOAD: Persist and restore daily snapshots
+  // ─────────────────────────────────────────────────────────────────────────────
+  const pbSaveEl = document.getElementById("pbSave");
+  const pbLoadEl = document.getElementById("pbLoad");
+
+  function getSnapshotDateStr() {
+    // Determine the date to use for saving based on the data being viewed
+    // 1. If viewing a historical day via the day selector, use that date
+    if (pbDaySelectEl && pbDaySelectEl.value && pbDaySelectEl.value !== "live") {
+      return pbDaySelectEl.value;  // Already in YYYY-MM-DD format
+    }
+    
+    // 2. Otherwise, derive from the newest reading timestamp in the current state
+    const state = map._historicalMode ? window._historicalState : window.__lastState;
+    const newestMs = newestReadingMsFromState(state);
+    if (newestMs != null && isFinite(newestMs)) {
+      const d = new Date(newestMs);
+      return d.toISOString().split("T")[0];
+    }
+    
+    // 3. Fallback to today
+    return new Date().toISOString().split("T")[0];
+  }
+
+  async function saveSnapshot() {
+    const statusEl = document.getElementById("statusText");
+    const dateStr = getSnapshotDateStr();
+    
+    if (pbSaveEl) pbSaveEl.disabled = true;
+    
+    try {
+      const resp = await fetch(`/api/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
+        method: "POST"
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const result = await resp.json();
+      
+      if (statusEl) {
+        const prevText = statusEl.textContent;
+        statusEl.textContent = `Saved ${dateStr}`;
+        setTimeout(() => {
+          if (statusEl.textContent === `Saved ${dateStr}`) {
+            statusEl.textContent = prevText;
+          }
+        }, 2000);
+      }
+      console.log("Snapshot saved:", result);
+    } catch (e) {
+      console.error("Failed to save snapshot:", e);
+      if (statusEl) {
+        statusEl.textContent = "Save failed";
+        statusEl.classList.add("offline");
+      }
+    } finally {
+      if (pbSaveEl) pbSaveEl.disabled = false;
+    }
+  }
+
+  async function showLoadModal() {
+    // Fetch available snapshots
+    let snapshots = [];
+    try {
+      const resp = await fetch("/api/snapshots");
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      snapshots = data.snapshots || [];
+    } catch (e) {
+      console.error("Failed to list snapshots:", e);
+      return;
+    }
+
+    // Create modal
+    const modal = document.createElement("div");
+    modal.className = "snapshotModal";
+    
+    const content = document.createElement("div");
+    content.className = "snapshotModalContent";
+    
+    const title = document.createElement("h3");
+    title.textContent = "Load Saved Day";
+    content.appendChild(title);
+    
+    const list = document.createElement("div");
+    list.className = "snapshotList";
+    
+    if (snapshots.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "snapshotEmpty";
+      empty.textContent = "No saved snapshots found";
+      list.appendChild(empty);
+    } else {
+      for (const snap of snapshots) {
+        const item = document.createElement("div");
+        item.className = "snapshotItem";
+        
+        const dateSpan = document.createElement("span");
+        dateSpan.className = "date";
+        // Format date nicely
+        const d = new Date(snap.date + "T12:00:00");
+        const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
+        const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+        dateSpan.textContent = `${dayName} ${monthDay}`;
+        
+        const sizeSpan = document.createElement("span");
+        sizeSpan.className = "size";
+        const sizeMB = (snap.size_bytes / (1024 * 1024)).toFixed(1);
+        sizeSpan.textContent = `${sizeMB} MB`;
+        
+        item.appendChild(dateSpan);
+        item.appendChild(sizeSpan);
+        
+        item.addEventListener("click", async () => {
+          modal.remove();
+          await loadSnapshotByDate(snap.date);
+        });
+        
+        list.appendChild(item);
+      }
+    }
+    content.appendChild(list);
+    
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "snapshotModalClose";
+    closeBtn.textContent = "Cancel";
+    closeBtn.addEventListener("click", () => modal.remove());
+    content.appendChild(closeBtn);
+    
+    modal.appendChild(content);
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) modal.remove();
+    });
+    
+    document.body.appendChild(modal);
+  }
+
+  async function loadSnapshotByDate(dateStr) {
+    const statusEl = document.getElementById("statusText");
+    if (statusEl) {
+      statusEl.textContent = "Loading...";
+      statusEl.classList.remove("live");
+    }
+    
+    try {
+      const resp = await fetch(`/api/snapshot/load?date=${encodeURIComponent(dateStr)}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      window._historicalState = await resp.json();
+      
+      // Reset ALL playback state for fresh historical data
+      map._historicalMode = true;
+      map._playbackPtsById = new Map();
+      map._playbackPtsKey = null;
+      map._persistedTrailById = new Map();
+      map._playbackNowMs = null;
+      
+      // Enable DVR/playback mode
+      map.playbackMode = true;
+      map._playbackLiveFollow = false;
+      if (traceEl) traceEl.checked = true;
+      if (pbBarEl) pbBarEl.classList.remove("hidden");
+      
+      // Build playback points and set time to START
+      map._ensurePlaybackPoints(window._historicalState);
+      const b = map.getPlaybackBounds();
+      if (isFinite(b.minMs)) {
+        map.setPlaybackTimeMs(b.minMs);
+      }
+      
+      // Store state, render sidebar, draw
+      map.lastState = window._historicalState;
+      map.drawTiles();
+      renderLists(window._historicalState, selectedId);
+      
+      if (statusEl) {
+        statusEl.textContent = `Snapshot: ${dateStr}`;
+        statusEl.classList.remove("live");
+      }
+      
+      updatePlaybackUi();
+      map.drawOverlay(window._historicalState);
+      
+      // Start playback loop
+      _pbLastPerf = 0;
+      _pbLastUiPerf = 0;
+      _pbRAF = requestAnimationFrame(playbackLoop);
+    } catch (e) {
+      console.error("Failed to load snapshot:", e);
+      if (statusEl) {
+        statusEl.textContent = "Load failed";
+        statusEl.classList.add("offline");
+      }
+    }
+  }
+
+  if (pbSaveEl) {
+    pbSaveEl.addEventListener("click", saveSnapshot);
+  }
+  if (pbLoadEl) {
+    pbLoadEl.addEventListener("click", showLoadModal);
   }
 
   if (pbScrubEl) {
@@ -5440,6 +5861,13 @@ function main() {
 
   async function tick() {
     if (_tickInFlight) return;
+    
+    // Skip live data fetching when viewing historical data
+    // Playback loop handles all drawing in historical mode
+    if (window._historicalState) {
+      return;
+    }
+    
     _tickInFlight = true;
     let st = null;
     const statusEl = document.getElementById("statusText");
