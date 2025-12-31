@@ -127,6 +127,24 @@ def extract_mobile_tracks(
             merged.append(p2)
         deduped = merged
 
+        # Carry-backward: fill early points with first available readings
+        # (handles case where e.g. OZNE starts before PM25 due to different update rates)
+        if deduped:
+            first_complete: dict[str, dict[str, Any]] = {}
+            for p in deduped:
+                r = p.get("readings")
+                if isinstance(r, dict):
+                    for pk, pv in r.items():
+                        if pk not in first_complete and isinstance(pv, dict):
+                            first_complete[str(pk)] = dict(pv)
+            # Apply to points missing those readings
+            for p in deduped:
+                r = p.get("readings")
+                if isinstance(r, dict):
+                    for pk, pv in first_complete.items():
+                        if pk not in r:
+                            r[pk] = dict(pv)
+
         if len(deduped) > max_points:
             deduped = deduped[-max_points:]
 

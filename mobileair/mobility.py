@@ -141,8 +141,31 @@ def evaluate_mobility(
         else:
             rr = 0.0
 
-        # Prove moving only if there is meaningful displacement.
-        if net >= sparse_prove_moving_net_m or (max_step >= sparse_prove_moving_max_step_m and net >= (sparse_prove_moving_net_m * 0.5)):
+        # Also check speed: if recent movement speed exceeds walking pace, it's definitely moving.
+        # This catches newly appearing sensors that are clearly in motion.
+        speed_mps = 0.0
+        if len(coords) >= 2 and steps:
+            last_step = steps[-1] if steps else 0.0
+            # Estimate time between last two points
+            dt0 = coords[-2][2]
+            dt1 = coords[-1][2]
+            if dt0 is not None and dt1 is not None:
+                dt_seconds = (dt1 - dt0).total_seconds()
+                if dt_seconds > 0:
+                    speed_mps = last_step / dt_seconds
+        
+        # ~2 m/s = ~4.5 mph = brisk walking. Anything faster is definitely moving.
+        speed_threshold_mps = 2.0
+
+        # Prove moving if there is meaningful displacement.
+        # Check: net distance, max step, total distance traveled, OR speed.
+        # Total distance catches cases where a bus moves in a curve (low net but high total).
+        # Speed catches newly appearing sensors that are clearly in motion.
+        sparse_prove_moving_total_m = sparse_prove_moving_net_m * 1.5  # 150m default
+        if (net >= sparse_prove_moving_net_m or 
+            total >= sparse_prove_moving_total_m or
+            speed_mps >= speed_threshold_mps or
+            (max_step >= sparse_prove_moving_max_step_m and net >= (sparse_prove_moving_net_m * 0.5))):
             return info
 
         if assume_immobile_when_sparse:
