@@ -5443,6 +5443,54 @@ function main() {
   const pbDaySelectEl = document.getElementById("pbDaySelect");
   window._historicalState = null;  // Cached historical data when not "live"
   
+  // Loading state tracking - shared between historical and snapshot loading
+  let _isLoadingData = false;
+  
+  /**
+   * Validate that a state object has the expected schema.
+   * Returns true if valid, false if not.
+   * This is a security boundary - validates structure before any processing.
+   */
+  function validateStateSchema(state) {
+    if (!state || typeof state !== "object") return false;
+    // Must have mobile or fixed arrays
+    if (!Array.isArray(state.mobile) && !Array.isArray(state.fixed)) return false;
+    // Check mobile entries have id
+    if (Array.isArray(state.mobile)) {
+      for (const m of state.mobile) {
+        if (!m || typeof m !== "object" || !("id" in m)) return false;
+      }
+    }
+    // Check fixed entries have id
+    if (Array.isArray(state.fixed)) {
+      for (const f of state.fixed) {
+        if (!f || typeof f !== "object" || !("id" in f)) return false;
+      }
+    }
+    return true;
+  }
+  
+  /**
+   * Check if we have valid data that can be saved.
+   */
+  function canSaveSnapshot() {
+    if (_isLoadingData) return false;
+    const state = map._historicalMode ? window._historicalState : window.__lastState;
+    if (!state) return false;
+    if (!validateStateSchema(state)) return false;
+    // Must have at least some data
+    const mobileCount = Array.isArray(state.mobile) ? state.mobile.length : 0;
+    const fixedCount = Array.isArray(state.fixed) ? state.fixed.length : 0;
+    return (mobileCount > 0 || fixedCount > 0);
+  }
+
+  function updateSaveButtonState() {
+    const pbSaveEl = document.getElementById("pbSave");
+    if (pbSaveEl) {
+      pbSaveEl.disabled = !canSaveSnapshot();
+    }
+  }
+  
   function populateDaySelector() {
     if (!pbDaySelectEl) return;
     pbDaySelectEl.innerHTML = "";
@@ -5478,6 +5526,7 @@ function main() {
       map._historicalMode = false;
       // Clear persisted trails so old data doesn't linger
       map._persistedTrailById = new Map();
+      updateSaveButtonState();
       return;
     }
     
@@ -5487,10 +5536,21 @@ function main() {
       statusEl.classList.remove("live");
     }
     
+    // Disable save while loading
+    _isLoadingData = true;
+    updateSaveButtonState();
+    
     try {
       const resp = await fetch(`/api/history?date=${encodeURIComponent(dateStr)}`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      window._historicalState = await resp.json();
+      const loadedState = await resp.json();
+      
+      // Validate the loaded data before using it
+      if (!validateStateSchema(loadedState)) {
+        throw new Error("Invalid data structure received from server");
+      }
+      
+      window._historicalState = loadedState;
       
       // Reset ALL playback state for fresh historical data
       map._historicalMode = true;
@@ -5539,6 +5599,9 @@ function main() {
         statusEl.textContent = "Error loading history";
         statusEl.classList.add("offline");
       }
+    } finally {
+      _isLoadingData = false;
+      updateSaveButtonState();
     }
   }
   
@@ -5575,16 +5638,33 @@ function main() {
   }
 
   async function saveSnapshot() {
+    if (!canSaveSnapshot()) {
+      console.warn("Cannot save: no valid data loaded");
+      return;
+    }
+    
     const statusEl = document.getElementById("statusText");
     const dateStr = getSnapshotDateStr();
+    
+    // Get the state to save - historical if viewing historical, else live
+    const stateToSave = map._historicalMode ? window._historicalState : window.__lastState;
+    if (!stateToSave) {
+      console.warn("Cannot save: no state data available");
+      return;
+    }
     
     if (pbSaveEl) pbSaveEl.disabled = true;
     
     try {
       const resp = await fetch(`/api/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
-        method: "POST"
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(stateToSave)
       });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${resp.status}`);
+      }
       const result = await resp.json();
       
       if (statusEl) {
@@ -5604,7 +5684,7 @@ function main() {
         statusEl.classList.add("offline");
       }
     } finally {
-      if (pbSaveEl) pbSaveEl.disabled = false;
+      updateSaveButtonState();
     }
   }
 
@@ -5692,10 +5772,24 @@ function main() {
       statusEl.classList.remove("live");
     }
     
+    // Disable save while loading
+    _isLoadingData = true;
+    updateSaveButtonState();
+    
     try {
       const resp = await fetch(`/api/snapshot/load?date=${encodeURIComponent(dateStr)}`);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      window._historicalState = await resp.json();
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${resp.status}`);
+      }
+      const loadedState = await resp.json();
+      
+      // Validate the loaded data before using it
+      if (!validateStateSchema(loadedState)) {
+        throw new Error("Invalid data structure in snapshot");
+      }
+      
+      window._historicalState = loadedState;
       
       // Reset ALL playback state for fresh historical data
       map._historicalMode = true;
@@ -5740,11 +5834,16 @@ function main() {
         statusEl.textContent = "Load failed";
         statusEl.classList.add("offline");
       }
+    } finally {
+      _isLoadingData = false;
+      updateSaveButtonState();
     }
   }
 
   if (pbSaveEl) {
     pbSaveEl.addEventListener("click", saveSnapshot);
+    // Initialize button state
+    updateSaveButtonState();
   }
   if (pbLoadEl) {
     pbLoadEl.addEventListener("click", showLoadModal);
@@ -5889,6 +5988,10 @@ function main() {
     st = injectCastleFixedMarker(st);
 
     window.__lastState = st;
+    
+    // Update save button now that we have data
+    updateSaveButtonState();
+    
     if (statusEl) {
       statusEl.textContent = "Live";
       statusEl.classList.remove("offline");
