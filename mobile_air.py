@@ -169,35 +169,41 @@ class SensorItem(ListItem):
         title_class = "fixed" if self.is_fixed else "mobile"
         yield Label(title, classes=f"sensor-title {title_class}")
         
-        # Readings section
-        readings_text = Text()
-        for i, row_data in enumerate(self.sensor_readings):
+        # Build a dict of pollutant -> reading data for fixed-column layout
+        readings_dict = {}
+        for row_data in self.sensor_readings:
             if len(row_data) >= 3:
                 key = row_data[0]
+                readings_dict[key] = row_data
+        
+        # Define fixed column order - always show these in this order
+        column_order = ["PM25", "PM10", "OZNE"]
+        
+        # Build readings text with fixed-width columns
+        readings_text = Text()
+        for i, pollutant in enumerate(column_order):
+            if i > 0:
+                readings_text.append("  ")  # Column separator (2 spaces)
+            
+            if pollutant in readings_dict:
+                row_data = readings_dict[pollutant]
                 val = row_data[1]
                 col = row_data[2]
                 trend = row_data[5] if len(row_data) > 5 else None
                 
-                if i > 0:
-                    readings_text.append(" | ", style="#444444")
-                
-                # Pad Key to 4 chars (PM25, PM10, OZNE are 4)
-                readings_text.append(f"{key:<4}: ", style="#928374 bold")
-                
-                # Value + space + Trend + Padding to maintain alignment
-                val_str = str(val)
-                t_sym = trend.get("symbol", " ") if trend else " "
-                t_col = trend.get("color", col) if trend else col
-                
+                # Format: "PM25: 21.10 ▲" - fixed width per column
+                readings_text.append(f"{pollutant}: ", style="#928374")
+                val_str = f"{val:>5}" if isinstance(val, (int, float)) else f"{str(val):>5}"
                 readings_text.append(val_str, style=col)
                 readings_text.append(" ")
+                t_sym = trend.get("symbol", " ") if trend else " "
+                t_col = trend.get("color", col) if trend else col
                 readings_text.append(t_sym, style=t_col)
-                
-                # Target width was 7.
-                # We used 1 char for space.
-                padding = max(0, 7 - len(val_str) - 1 - len(t_sym))
-                readings_text.append(" " * padding)
-            
+            else:
+                # Empty placeholder for missing pollutant - same width as filled
+                # "PM25: 21.10 ▲" = 4 + 2 + 5 + 1 + 1 = 13 chars
+                readings_text.append(" " * 13)
+        
         yield Label(readings_text, classes="sensor-readings")
 
 class AirQualityApp(App):
@@ -246,41 +252,44 @@ class AirQualityApp(App):
     }
     .main-content {
         height: 1fr;
-    }
-    ListView {
-        height: 100%;
-        width: 40%;
-        min-width: 52;
-        border-right: solid #458588;
-        background: #1d2021;
+        layout: vertical;
     }
     #details_container {
         width: 100%;
         height: auto;
+        max-height: 50%;
         padding: 0;
+        border-bottom: solid #458588;
     }
     #details_view {
         width: 100%;
         height: auto;
         padding: 0;
     }
-    #json_container {
+    #bottom_pane {
         width: 100%;
         height: 1fr;
+    }
+    ListView {
+        height: 100%;
+        width: 1fr;
+        max-width: 70;
+        min-width: 45;
+        border-right: solid #458588;
+        background: #1d2021;
+    }
+    #json_container {
+        width: 1fr;
+        height: 100%;
         background: #1d2021;
         padding: 0;
+        overflow: hidden;
     }
     #json_view {
         width: 100%;
         height: 100%;
         padding: 0;
-    }
-    #right_pane {
-        width: 60%;
-        height: 100%;
-        border-left: solid #458588;
-        layout: vertical;
-        background: #1d2021;
+        overflow: hidden auto;
     }
     ListItem {
         padding: 0 1;
@@ -364,11 +373,11 @@ class AirQualityApp(App):
         # Ensure mouse support is enabled (it is by default in Textual, but ensuring scrollable containers work)
         yield Header()
         yield Static("Fetching data...", id="status", classes="status-bar")
-        with Horizontal(classes="main-content"):
-            yield ListView(id="sensors_list")
-            with Vertical(id="right_pane"):
-                with VerticalScroll(id="details_container"):
-                    yield Static(id="details_view")
+        with Vertical(classes="main-content"):
+            with VerticalScroll(id="details_container"):
+                yield Static(id="details_view")
+            with Horizontal(id="bottom_pane"):
+                yield ListView(id="sensors_list")
                 with VerticalScroll(id="json_container"):
                     yield Static(id="json_view")
         yield Footer()

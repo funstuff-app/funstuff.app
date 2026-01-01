@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import ssl
 import socket
 import threading
@@ -53,6 +54,180 @@ try:
     AIRNOW_AVAILABLE = True
 except ImportError:
     AIRNOW_AVAILABLE = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON SANITIZATION & VALIDATION
+# All external data must pass through these functions before touching app logic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Maximum sizes to prevent DoS
+MAX_SNAPSHOT_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_STRING_LENGTH = 10000  # Max length for any string value
+MAX_RECURSION_DEPTH = 50  # Prevent stack overflow from deeply nested structures
+
+# Patterns that might indicate prompt injection or other attacks
+# These are checked AFTER JSON parsing to avoid regex-based exploits on raw input
+_SUSPICIOUS_PATTERNS = [
+    re.compile(r'<\s*script', re.IGNORECASE),
+    re.compile(r'javascript\s*:', re.IGNORECASE),
+    re.compile(r'on\w+\s*=', re.IGNORECASE),  # onclick=, onerror=, etc.
+    re.compile(r'\{\{\s*.*\s*\}\}'),  # Template injection {{ }}
+    re.compile(r'\$\{\s*.*\s*\}'),  # Template literals ${...}
+    re.compile(r'<\s*iframe', re.IGNORECASE),
+    re.compile(r'<\s*object', re.IGNORECASE),
+    re.compile(r'<\s*embed', re.IGNORECASE),
+    # Prompt injection patterns - match various orderings
+    re.compile(r'ignore\s+.{0,20}(previous|prior|above|all|earlier)\s+.{0,10}instructions?', re.IGNORECASE),
+    re.compile(r'disregard\s+.{0,20}(previous|prior|above|all|earlier)\s+.{0,10}instructions?', re.IGNORECASE),
+    re.compile(r'forget\s+.{0,20}(previous|prior|above|all|earlier)\s+.{0,10}instructions?', re.IGNORECASE),
+    re.compile(r'new\s+instructions?\s*:', re.IGNORECASE),
+    re.compile(r'system\s*:\s*you\s+are', re.IGNORECASE),
+    re.compile(r'<\s*/?\s*system\s*>', re.IGNORECASE),
+    re.compile(r'\[\s*INST\s*\]', re.IGNORECASE),
+    re.compile(r'\[\s*/\s*INST\s*\]', re.IGNORECASE),
+    re.compile(r'<\|im_start\|>', re.IGNORECASE),
+    re.compile(r'<\|im_end\|>', re.IGNORECASE),
+]
+
+class JsonValidationError(Exception):
+    """Raised when JSON validation/sanitization fails."""
+    pass
+
+
+def _sanitize_string(s: str, max_length: int = MAX_STRING_LENGTH) -> str:
+    """
+    Sanitize a string value from JSON.
+    - Truncates to max length
+    - Checks for suspicious patterns and removes them
+    - Strips control characters except common whitespace
+    """
+    if not isinstance(s, str):
+        return str(s)[:max_length]
+    
+    # Truncate first to limit processing time
+    if len(s) > max_length:
+        s = s[:max_length]
+    
+    # Remove control characters except tab, newline, carriage return
+    s = "".join(c for c in s if c >= ' ' or c in '\t\n\r')
+    
+    # Check for and neutralize suspicious patterns
+    for pattern in _SUSPICIOUS_PATTERNS:
+        if pattern.search(s):
+            # Replace the suspicious content with a safe placeholder
+            s = pattern.sub("[REMOVED]", s)
+    
+    return s
+
+
+def _sanitize_value(value: Any, depth: int = 0) -> Any:
+    """
+    Recursively sanitize a JSON value.
+    Only allows: None, bool, int, float, str, list, dict
+    """
+    if depth > MAX_RECURSION_DEPTH:
+        raise JsonValidationError("JSON structure too deeply nested")
+    
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        # Prevent huge integers that could cause issues
+        if abs(value) > 10**15:
+            return float(value)  # Convert to float for very large numbers
+        return value
+    if isinstance(value, float):
+        # Handle inf/nan
+        if not (-1e308 < value < 1e308):
+            return None
+        return value
+    if isinstance(value, str):
+        return _sanitize_string(value)
+    if isinstance(value, list):
+        return [_sanitize_value(item, depth + 1) for item in value]
+    if isinstance(value, dict):
+        return {
+            _sanitize_string(str(k), max_length=200): _sanitize_value(v, depth + 1)
+            for k, v in value.items()
+        }
+    
+    # Unknown type - convert to string and sanitize
+    return _sanitize_string(str(value))
+
+
+def parse_and_sanitize_json(raw_bytes: bytes, max_size: int = MAX_SNAPSHOT_SIZE_BYTES) -> dict[str, Any]:
+    """
+    Parse raw bytes as JSON and sanitize the result.
+    
+    This is the ONLY function that should be used to parse external JSON.
+    It validates syntax, size, and sanitizes all values before returning.
+    
+    Raises JsonValidationError if validation fails.
+    """
+    # Check size first (before any parsing)
+    if len(raw_bytes) > max_size:
+        raise JsonValidationError(f"JSON too large: {len(raw_bytes)} bytes (max {max_size})")
+    
+    # Validate it's valid UTF-8
+    try:
+        raw_str = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise JsonValidationError(f"Invalid UTF-8 encoding: {e}")
+    
+    # Parse JSON (this validates syntax)
+    try:
+        parsed = json.loads(raw_str)
+    except json.JSONDecodeError as e:
+        raise JsonValidationError(f"Invalid JSON syntax: {e}")
+    
+    # Must be a dict at top level for our state format
+    if not isinstance(parsed, dict):
+        raise JsonValidationError(f"JSON root must be object, got {type(parsed).__name__}")
+    
+    # Sanitize all values recursively
+    try:
+        sanitized = _sanitize_value(parsed)
+    except JsonValidationError:
+        raise
+    except Exception as e:
+        raise JsonValidationError(f"Sanitization failed: {e}")
+    
+    return sanitized
+
+
+def validate_state_schema(state: dict[str, Any]) -> dict[str, Any]:
+    """
+    Validate that a state dict has the expected schema for dashboard state.
+    Returns the validated state or raises JsonValidationError.
+    """
+    if not isinstance(state, dict):
+        raise JsonValidationError("State must be a dict")
+    
+    # Must have mobile and fixed arrays
+    if "mobile" in state and not isinstance(state.get("mobile"), list):
+        raise JsonValidationError("'mobile' must be an array")
+    if "fixed" in state and not isinstance(state.get("fixed"), list):
+        raise JsonValidationError("'fixed' must be an array")
+    
+    # Validate mobile entries have required fields
+    for i, m in enumerate(state.get("mobile", [])):
+        if not isinstance(m, dict):
+            raise JsonValidationError(f"mobile[{i}] must be an object")
+        # id is required
+        if "id" not in m:
+            raise JsonValidationError(f"mobile[{i}] missing 'id'")
+    
+    # Validate fixed entries have required fields
+    for i, f in enumerate(state.get("fixed", [])):
+        if not isinstance(f, dict):
+            raise JsonValidationError(f"fixed[{i}] must be an object")
+        if "id" not in f:
+            raise JsonValidationError(f"fixed[{i}] missing 'id'")
+    
+    return state
+
 
 def default_data_dir() -> Path:
     return Path(os.path.expanduser("~/.mobileair"))
@@ -264,6 +439,37 @@ HISTORY_SENSORS = [
 ]
 HISTORY_VARS = ["GLAT", "GLON", "PM25", "PM10", "OZNE"]
 
+# In-memory cache for week-long history files (they change slowly)
+# Key: (sensor, var), Value: (fetch_time, data)
+_history_cache: dict[tuple[str, str], tuple[float, list]] = {}
+_HISTORY_CACHE_TTL = 3600  # 1 hour
+
+
+def _fetch_history_file(sensor: str, var: str) -> list:
+    """Fetch a single history file with caching."""
+    cache_key = (sensor, var)
+    now = time.time()
+    
+    # Check cache
+    if cache_key in _history_cache:
+        fetch_time, data = _history_cache[cache_key]
+        if now - fetch_time < _HISTORY_CACHE_TTL:
+            return data
+    
+    # Fetch from server
+    url = f"{HISTORY_BASE_URL}/{sensor}_{var}_TS_10080.json"
+    try:
+        resp = requests.get(url, timeout=30, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json().get("TimeDataUTC", [])
+        _history_cache[cache_key] = (now, data)
+        return data
+    except Exception:
+        # On error, return stale cache if available, else empty
+        if cache_key in _history_cache:
+            return _history_cache[cache_key][1]
+        return []
+
 
 def fetch_historical_day(date_str: str) -> dict[str, Any]:
     """Fetch week-long data and filter to a specific day.
@@ -290,16 +496,13 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
     start_ms = int(day_start.timestamp() * 1000)
     end_ms = int(day_end.timestamp() * 1000)
     
-    # Fetch data for all sensors in parallel
+    # Fetch data for all sensors in parallel (using cached week files)
     def fetch_sensor_var(sensor: str, var: str) -> tuple[str, str, list]:
-        url = f"{HISTORY_BASE_URL}/{sensor}_{var}_TS_10080.json"
         try:
-            resp = requests.get(url, timeout=30, headers=HEADERS)
-            resp.raise_for_status()
-            data = resp.json()
+            all_points = _fetch_history_file(sensor, var)
             # Filter to requested day
             points = [
-                (ts, val) for ts, val in data.get("TimeDataUTC", [])
+                (ts, val) for ts, val in all_points
                 if start_ms <= ts < end_ms
             ]
             return sensor, var, points
@@ -1155,24 +1358,58 @@ def list_snapshots(data_dir: Path) -> list[dict[str, Any]]:
     return result
 
 def save_snapshot(data_dir: Path, date_str: str, state: dict[str, Any]) -> dict[str, Any]:
-    """Save current state as a snapshot for the given date."""
+    """Save current state as a snapshot for the given date.
+    
+    The state is validated before saving to ensure we don't persist bad data.
+    """
+    # Validate the state has the expected structure before saving
+    try:
+        validate_state_schema(state)
+    except JsonValidationError as e:
+        raise ValueError(f"Invalid state to save: {e}")
+    
+    # Ensure there's actually data to save
+    mobile_count = len(state.get("mobile", []))
+    fixed_count = len(state.get("fixed", []))
+    if mobile_count == 0 and fixed_count == 0:
+        raise ValueError("Cannot save empty state (no mobile or fixed sensors)")
+    
     snapshots_dir = _get_snapshots_dir(data_dir)
-    # Sanitize date string for filename
+    # Sanitize date string for filename - only allow YYYY-MM-DD format chars
     safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
-    if not safe_date:
+    if not safe_date or len(safe_date) > 20:
         safe_date = datetime.now().strftime("%Y-%m-%d")
     filepath = snapshots_dir / f"{safe_date}.json"
     filepath.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
     return {"success": True, "filename": filepath.name, "size_bytes": filepath.stat().st_size}
 
 def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
-    """Load a saved snapshot by date."""
+    """Load a saved snapshot by date.
+    
+    The loaded data is fully validated and sanitized before returning.
+    This is a security boundary - untrusted file content is made safe here.
+    """
     snapshots_dir = _get_snapshots_dir(data_dir)
     safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
+    if not safe_date or len(safe_date) > 20:
+        return None
     filepath = snapshots_dir / f"{safe_date}.json"
     if not filepath.exists():
         return None
-    return json.loads(filepath.read_text(encoding="utf-8"))
+    
+    # Check file size before reading
+    file_size = filepath.stat().st_size
+    if file_size > MAX_SNAPSHOT_SIZE_BYTES:
+        raise JsonValidationError(f"Snapshot file too large: {file_size} bytes")
+    
+    # Read raw bytes and sanitize (never parse without sanitization)
+    raw_bytes = filepath.read_bytes()
+    sanitized = parse_and_sanitize_json(raw_bytes, max_size=MAX_SNAPSHOT_SIZE_BYTES)
+    
+    # Validate schema
+    validate_state_schema(sanitized)
+    
+    return sanitized
 
 def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
     class Handler(BaseHTTPRequestHandler):
@@ -1226,7 +1463,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 return self._send(500, body, "application/json")
 
         def _handle_save_snapshot(self):
-            """Save current state as a snapshot."""
+            """Save POSTed state as a snapshot."""
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             date_str = query.get("date", [None])[0]
@@ -1236,13 +1473,26 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 date_str = datetime.now().strftime("%Y-%m-%d")
             
             try:
-                # Get current state
-                with app_state.lock:
-                    current_state = json.loads(app_state.cached_json_bytes.decode("utf-8"))
+                # Read POSTed body
+                content_length = int(self.headers.get("Content-Length", 0))
+                if content_length > MAX_SNAPSHOT_SIZE_BYTES:
+                    return self._send(413, b'{"error": "Request too large"}', "application/json")
                 
-                result = save_snapshot(data_dir, date_str, current_state)
+                if content_length > 0:
+                    # Client sent state data - parse and sanitize it
+                    raw_body = self.rfile.read(content_length)
+                    state_to_save = parse_and_sanitize_json(raw_body, max_size=MAX_SNAPSHOT_SIZE_BYTES)
+                else:
+                    # No body - save current live state (legacy behavior)
+                    with app_state.lock:
+                        state_to_save = json.loads(app_state.cached_json_bytes.decode("utf-8"))
+                
+                result = save_snapshot(data_dir, date_str, state_to_save)
                 body = json.dumps(result).encode("utf-8")
                 return self._send(200, body, "application/json")
+            except JsonValidationError as e:
+                body = json.dumps({"error": f"Invalid data: {e}"}).encode("utf-8")
+                return self._send(400, body, "application/json")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 return self._send(500, body, "application/json")
