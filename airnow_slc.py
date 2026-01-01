@@ -18,6 +18,7 @@ Set via: export AIRNOW_API_KEY='your-key'
 
 import json
 import os
+import urllib.error
 import urllib.request
 import urllib.parse
 from datetime import datetime, date, timedelta
@@ -455,7 +456,7 @@ def get_slc_site_ids(sites: list[dict]) -> set[str]:
         Set of site IDs in SLC area
     """
     slc_sites = filter_slc_area(sites)
-    return {s.get("aqsid") for s in slc_sites if s.get("aqsid")}
+    return {aqsid for s in slc_sites if (aqsid := s.get("aqsid")) is not None}
 
 
 def main():

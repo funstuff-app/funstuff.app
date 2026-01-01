@@ -42,18 +42,44 @@ from mobileair.dashboard import _pick_worst_reading_by_aqi
 # Import AirNow data fetcher
 try:
     from airnow_slc import (
-        fetch_monitoring_sites,
-        fetch_hourly_data,
-        filter_utah_hourly,
-        get_hourly_data_url,
-        get_hourly_data_url_historical,
-        list_available_hourly_files,
+        fetch_monitoring_sites as _fetch_monitoring_sites,
+        fetch_hourly_data as _fetch_hourly_data,
+        filter_utah_hourly as _filter_utah_hourly,
+        get_hourly_data_url as _get_hourly_data_url,
+        get_hourly_data_url_historical as _get_hourly_data_url_historical,
+        list_available_hourly_files as _list_available_hourly_files,
         FILES_BASE_URL,
         SLC_BOUNDS,
     )
+    fetch_monitoring_sites = _fetch_monitoring_sites
+    fetch_hourly_data = _fetch_hourly_data
+    filter_utah_hourly = _filter_utah_hourly
+    get_hourly_data_url = _get_hourly_data_url
+    get_hourly_data_url_historical = _get_hourly_data_url_historical
+    list_available_hourly_files = _list_available_hourly_files
     AIRNOW_AVAILABLE = True
 except ImportError:
     AIRNOW_AVAILABLE = False
+    FILES_BASE_URL = ""
+    SLC_BOUNDS = {"lat_min": 0.0, "lat_max": 0.0, "lon_min": 0.0, "lon_max": 0.0}
+    
+    def fetch_monitoring_sites(url: str | None = None) -> list[dict]:
+        return []
+    
+    def fetch_hourly_data(url: str) -> list[dict]:
+        return []
+    
+    def filter_utah_hourly(readings: list[dict]) -> list[dict]:
+        return []
+    
+    def get_hourly_data_url() -> str:
+        return ""
+    
+    def get_hourly_data_url_historical(dt: datetime) -> str:
+        return ""
+    
+    def list_available_hourly_files() -> list[str]:
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
