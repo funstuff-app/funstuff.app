@@ -43,6 +43,12 @@ from mobileair import (
     fetch_json_with_cache,
     generate_leaflet_map_html,
     detect_spatial_outliers,
+    # TUI formatting (shared with web console)
+    get_pollutant_columns,
+    format_json_view,
+    POLLUTANT_ORDER,
+    VALUE_WIDTH,
+    MAX_NAME_LEN,
 )
 
 # Optional runtime dependencies (TUI). If missing, fail with an actionable message.
@@ -148,7 +154,7 @@ class SensorItem(ListItem):
     ) -> None:
         super().__init__()
         self.sensor_name = sensor_name
-        self.sensor_readings = sensor_readings # list of tuples: (key, value, color)
+        self.sensor_readings = sensor_readings # list of tuples: (key, value, color, history, history_colors, trend_info)
         self.coords = coords # (lat, lon)
         self.is_fixed = is_fixed
         self.custom_name = custom_name
@@ -156,12 +162,31 @@ class SensorItem(ListItem):
         self.is_ghost = ghosted
         self.pinned = pinned
 
+    def _to_readings_dict(self) -> dict:
+        """Convert sensor_readings list to dict format for shared formatting functions."""
+        readings = {}
+        for row_data in self.sensor_readings:
+            if len(row_data) >= 3:
+                key = row_data[0]
+                value = row_data[1]
+                color = row_data[2]
+                history = row_data[3] if len(row_data) > 3 else []
+                history_colors = row_data[4] if len(row_data) > 4 else []
+                trend_info = row_data[5] if len(row_data) > 5 else None
+                readings[key] = {
+                    "value": value,
+                    "color": color,
+                    "history": history,
+                    "history_colors": history_colors,
+                    "trend": trend_info,
+                }
+        return readings
+
     def compose(self) -> ComposeResult:
         display_name = self.sensor_name
         if self.custom_name:
             display_name = f"{self.sensor_name} ({self.custom_name})"
             
-        # title = f"{display_name} (Fixed)" if self.is_fixed else display_name
         title = f"{display_name}"
         if self.pinned:
             title = f"📌 {title}"
@@ -169,40 +194,36 @@ class SensorItem(ListItem):
         title_class = "fixed" if self.is_fixed else "mobile"
         yield Label(title, classes=f"sensor-title {title_class}")
         
-        # Build a dict of pollutant -> reading data for fixed-column layout
-        readings_dict = {}
-        for row_data in self.sensor_readings:
-            if len(row_data) >= 3:
-                key = row_data[0]
-                readings_dict[key] = row_data
+        # Convert to dict format and use shared pollutant columns
+        readings_dict = self._to_readings_dict()
+        columns = get_pollutant_columns(readings_dict)
         
-        # Define fixed column order - always show these in this order
-        column_order = ["PM25", "PM10", "OZNE"]
-        
-        # Build readings text with fixed-width columns
+        # Build readings text with fixed-width columns (using shared format)
         readings_text = Text()
-        for i, pollutant in enumerate(column_order):
+        for i, col in enumerate(columns):
             if i > 0:
                 readings_text.append("  ")  # Column separator (2 spaces)
             
-            if pollutant in readings_dict:
-                row_data = readings_dict[pollutant]
-                val = row_data[1]
-                col = row_data[2]
-                trend = row_data[5] if len(row_data) > 5 else None
-                
-                # Format: "PM25: 21.10 ▲" - fixed width per column
-                readings_text.append(f"{pollutant}: ", style="#928374")
-                val_str = f"{val:>5}" if isinstance(val, (int, float)) else f"{str(val):>5}"
-                readings_text.append(val_str, style=col)
+            if col["has_value"]:
+                # Format: "PM25: 21.10 ▲" - uses shared VALUE_WIDTH
+                readings_text.append(f"{col['label']}: ", style="#928374")
+                readings_text.append(col["formatted"], style=col["color"])
                 readings_text.append(" ")
-                t_sym = trend.get("symbol", " ") if trend else " "
-                t_col = trend.get("color", col) if trend else col
+                # Get trend from our stored data (more accurate than recalculating)
+                reading = readings_dict.get(col["key"], {})
+                trend_info = reading.get("trend")
+                if trend_info and isinstance(trend_info, dict):
+                    t_sym = trend_info.get("symbol", " ")
+                    t_col = trend_info.get("color", col["color"])
+                else:
+                    t_sym = col["trend_symbol"]
+                    t_col = col["trend_color"]
                 readings_text.append(t_sym, style=t_col)
             else:
-                # Empty placeholder for missing pollutant - same width as filled
-                # "PM25: 21.10 ▲" = 4 + 2 + 5 + 1 + 1 = 13 chars
-                readings_text.append(" " * 13)
+                # Empty placeholder - same width as filled column
+                # label(4) + ": "(2) + value(VALUE_WIDTH) + " "(1) + trend(1) = 13
+                placeholder_width = len(col["label"]) + 2 + VALUE_WIDTH + 2
+                readings_text.append(" " * placeholder_width)
         
         yield Label(readings_text, classes="sensor-readings")
 
@@ -1154,30 +1175,26 @@ class AirQualityApp(App):
         
         details_view.update(panel)
         
-        # Update JSON view
+        # Update JSON view - use shared format matching web TUI
         json_view = self.query_one("#json_view", Static)
-        raw_data = {}
         
-        if self.current_data:
-            root_key = "fixed" if item.is_fixed else "mobile"
-            source_data = self.current_data.get(root_key, {})
-            
-            # Iterate over all pollutants to find data for this sensor
-            for p_key, details in source_data.items():
-                if not isinstance(details, dict): continue
-                if item.sensor_name in details:
-                     raw_data[p_key] = details[item.sensor_name]
+        # Use shared format_json_view function for consistency with web TUI
+        readings_dict = item._to_readings_dict()
+        view = format_json_view(
+            sensor_id=item.sensor_name,
+            readings=readings_dict,
+            coords=item.coords,
+            mobility_info=item.mobility_info if item.mobility_info else None,
+            is_ghosted=item.is_ghost,
+            sensor_type="fixed" if item.is_fixed else "mobile",
+        )
         
-        if raw_data:
-            # Apply truncation to raw data for display
-            display_data = self._truncate_raw_data(raw_data)
-            
-            # Create a nice JSON display
-            json_str = json.dumps(display_data, indent=2)
+        if view:
+            json_str = json.dumps(view, indent=2)
             json_view.update(
                 Panel(
                     JSON(json_str),
-                    title=Text("Raw API Data (Truncated)", style="#b8bb26 bold"),
+                    title=Text("Raw API Data (Live)", style="#b8bb26 bold"),
                     border_style="#b8bb26",
                     style="#ebdbb2 on #1d2021",
                     padding=(0, 1),
@@ -1186,7 +1203,7 @@ class AirQualityApp(App):
         else:
             json_view.update(
                 Panel(
-                    "No raw data found",
+                    "No data available",
                     title=Text("Raw API Data", style="#b8bb26 bold"),
                     border_style="#b8bb26",
                     style="#ebdbb2 on #1d2021",

@@ -1439,6 +1439,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
             if self.path.startswith("/api/state"):
                 with app_state.lock:
                     return self._send(200, app_state.cached_json_bytes, "application/json")
+            if self.path.startswith("/api/tui"):
+                return self._handle_tui_state()
             if self.path.startswith("/api/history"):
                 return self._handle_history_request()
             if self.path.startswith("/api/snapshots"):
@@ -1451,6 +1453,15 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
             if self.path.startswith("/api/snapshot/save"):
                 return self._handle_save_snapshot()
             return self._send(404, b"not found", "text/plain")
+
+        def _handle_tui_state(self):
+            """Return state formatted for TUI rendering (shared format for terminal and web)."""
+            from mobileair.tui_format import format_tui_state
+            with app_state.lock:
+                state = json.loads(app_state.cached_json_bytes.decode("utf-8"))
+            tui_state = format_tui_state(state)
+            body = json.dumps(tui_state).encode("utf-8")
+            return self._send(200, body, "application/json")
 
         def _handle_list_snapshots(self):
             """List all saved snapshots."""

@@ -1,11 +1,32 @@
+/**
+ * Browser-based TUI console interface.
+ * 
+ * This file consumes the shared TUI format from /api/tui endpoint,
+ * which provides pre-formatted sensor data that mirrors the Python
+ * Textual TUI rendering logic.
+ * 
+ * The goal is to have consistent display between terminal and web.
+ */
 
-const API_URL = '/api/state';
+// ============================================================================
+// Shared format constants (must match mobileair/tui_format.py)
+// ============================================================================
+const POLLUTANT_ORDER = ["PM25", "PM10", "OZNE"];
+const VALUE_WIDTH = 5;
+const MAX_NAME_LEN = 25;
+
+// ============================================================================
+// State
+// ============================================================================
+const API_URL = '/api/state';        // Raw state for detail views
+const TUI_API_URL = '/api/tui';       // Pre-formatted TUI state
 let appState = {
     mobile: [],
     fixed: [],
     meta: {},
     ts: 0
 };
+let tuiState = null;  // Cached TUI-formatted state
 let selectedSensorId = null;
 let selectedSensorType = null; // 'mobile' or 'fixed'
 let lastOutlierToastKey = null;
@@ -65,13 +86,24 @@ function handleAction(key) {
 async function fetchData() {
     document.getElementById('update-time').textContent = 'Fetching...';
     try {
-        const res = await fetch(API_URL);
-        const data = await res.json();
+        // Fetch both raw state and TUI-formatted state in parallel
+        const [rawRes, tuiRes] = await Promise.all([
+            fetch(API_URL),
+            fetch(TUI_API_URL)
+        ]);
+        
+        const data = await rawRes.json();
         appState = data;
+        
+        if (tuiRes.ok) {
+            tuiState = await tuiRes.json();
+        }
 
         maybeShowOutlierToast(data);
         
-        const date = new Date(data.ts * 1000);
+        // Use TUI state timestamp if available, otherwise raw state
+        const ts = tuiState?.ts || data.ts;
+        const date = new Date(ts * 1000);
         // Format: YYYY-MM-DD HH:MM:SS
         const dateStr = date.getFullYear() + "-" + 
             String(date.getMonth()+1).padStart(2, '0') + "-" + 
@@ -145,6 +177,12 @@ function maybeShowOutlierToast(state) {
 }
 
 function getAllSensors() {
+    // Use pre-formatted TUI state if available (already sorted and filtered)
+    if (tuiState && tuiState.sensors && tuiState.sensors.length > 0) {
+        return tuiState.sensors;
+    }
+    
+    // Fallback to raw state processing
     const mobile = appState.mobile.map(s => ({...s, type: 'mobile'}));
     const fixed = appState.fixed.map(s => ({...s, type: 'fixed'}));
     
@@ -188,14 +226,16 @@ function renderList() {
         const el = document.createElement('div');
         el.className = 'sensor-item ' + s.type;
         if (s.id === selectedSensorId) el.classList.add('selected');
-        // Removed ghosted class logic that dims the item
         
         // Name/ID line
         const nameLine = document.createElement('div');
         nameLine.className = 'sensor-header';
         
-        let displayName = s.id;
-        if (s.name) displayName += ` (${s.name})`;
+        // Use pre-formatted name from TUI state if available
+        let displayName = s.display_name || s.id;
+        if (!s.display_name && s.name) {
+            displayName = `${s.id} (${s.name})`;
+        }
         
         // Pin icon
         if (s.pinned) {
@@ -205,7 +245,7 @@ function renderList() {
             nameLine.appendChild(pin);
         }
 
-        // Parked indicator
+        // Parked/Ghosted indicator
         if (s.ghosted) {
             const parked = document.createElement('span');
             parked.textContent = '(Parked)';
@@ -221,55 +261,17 @@ function renderList() {
         
         el.appendChild(nameLine);
         
-        // Readings line
+        // Readings line - use pre-formatted columns if available
         const readingsLine = document.createElement('div');
         readingsLine.className = 'sensor-readings';
         
-        ['PM25', 'PM10', 'OZNE'].forEach(key => {
-            let rKey = key;
-            if (key === 'PM25' && !s.readings['PM25']) rKey = 'PM2.5';
-            if (key === 'OZNE' && !s.readings['OZNE']) rKey = 'Ozone';
-            
-            let reading = s.readings[rKey] || s.readings[key] || s.readings[key.toLowerCase()];
-            
-            if (reading) {
-                const rEl = document.createElement('div');
-                rEl.className = 'reading';
-                
-                const label = document.createElement('span');
-                label.className = 'reading-label';
-                label.textContent = key + ':';
-                
-                const val = document.createElement('span');
-                val.className = 'reading-value';
-                val.textContent = parseFloat(reading.value).toFixed(1); // 1 decimal place
-                
-                // Color logic: if selected, use white/bright. If not, use reading color.
-                // Actually TUI screenshot shows colored values even when not selected.
-                // When selected, TUI shows white values? No, screenshot shows "0.7 -" in Cyan.
-                // Wait, the selected item in screenshot has "PM25: 0.7 - | PM10: 6.3 - | OZNE: 33.4 -"
-                // The values are colored Cyan.
-                val.style.color = reading.color;
-                
-                const trend = document.createElement('span');
-                trend.className = 'reading-trend';
-                trend.textContent = getTrendSymbol(reading, key);
-                // Trend color usually dim
-                trend.style.color = '#666';
-                
-                rEl.appendChild(label);
-                rEl.appendChild(val);
-                rEl.appendChild(trend);
-                readingsLine.appendChild(rEl);
-                
-                if (key !== 'OZNE') {
-                    const sep = document.createElement('span');
-                    sep.textContent = '|';
-                    sep.style.color = '#444';
-                    readingsLine.appendChild(sep);
-                }
-            }
-        });
+        if (s.columns && Array.isArray(s.columns)) {
+            // Use shared format columns from /api/tui
+            renderColumnsFromSharedFormat(readingsLine, s.columns);
+        } else if (s.readings) {
+            // Fallback to legacy rendering from raw state
+            renderColumnsFromRawReadings(readingsLine, s.readings);
+        }
         
         el.appendChild(readingsLine);
         
@@ -288,6 +290,106 @@ function renderList() {
     if (selectedEl) {
         selectedEl.scrollIntoView({ block: 'nearest' });
     }
+}
+
+/**
+ * Render pollutant columns using the shared format from /api/tui.
+ * This mirrors the Python TUI rendering exactly.
+ */
+function renderColumnsFromSharedFormat(container, columns) {
+    columns.forEach((col, i) => {
+        if (i > 0) {
+            // Add separator between columns
+            const sep = document.createElement('span');
+            sep.textContent = '  ';
+            sep.className = 'col-separator';
+            container.appendChild(sep);
+        }
+        
+        if (col.has_value) {
+            const rEl = document.createElement('div');
+            rEl.className = 'reading';
+            
+            const label = document.createElement('span');
+            label.className = 'reading-label';
+            label.textContent = col.label + ':';
+            
+            const val = document.createElement('span');
+            val.className = 'reading-value';
+            // Use pre-formatted value (already right-aligned)
+            val.textContent = col.formatted;
+            val.style.color = col.color;
+            
+            const trend = document.createElement('span');
+            trend.className = 'reading-trend';
+            trend.textContent = ' ' + col.trend_symbol;
+            trend.style.color = col.trend_color;
+            
+            rEl.appendChild(label);
+            rEl.appendChild(val);
+            rEl.appendChild(trend);
+            container.appendChild(rEl);
+        } else {
+            // Empty placeholder for alignment (matches Python TUI)
+            const placeholder = document.createElement('span');
+            placeholder.className = 'reading-placeholder';
+            // label(4) + ": "(2) + value(VALUE_WIDTH=5) + " "(1) + trend(1) = 13
+            const width = col.label.length + 2 + VALUE_WIDTH + 2;
+            placeholder.textContent = ' '.repeat(width);
+            container.appendChild(placeholder);
+        }
+    });
+}
+
+/**
+ * Fallback: Render columns from raw readings (legacy format).
+ */
+function renderColumnsFromRawReadings(container, readings) {
+    POLLUTANT_ORDER.forEach((key, i) => {
+        let rKey = key;
+        if (key === 'PM25' && !readings['PM25']) rKey = 'PM2.5';
+        if (key === 'OZNE' && !readings['OZNE']) rKey = 'Ozone';
+        
+        let reading = readings[rKey] || readings[key] || readings[key.toLowerCase()];
+        
+        if (i > 0) {
+            const sep = document.createElement('span');
+            sep.textContent = '  ';
+            sep.className = 'col-separator';
+            container.appendChild(sep);
+        }
+        
+        if (reading) {
+            const rEl = document.createElement('div');
+            rEl.className = 'reading';
+            
+            const label = document.createElement('span');
+            label.className = 'reading-label';
+            label.textContent = key + ':';
+            
+            const val = document.createElement('span');
+            val.className = 'reading-value';
+            val.textContent = parseFloat(reading.value).toFixed(1).padStart(VALUE_WIDTH);
+            val.style.color = reading.color;
+            
+            const trend = document.createElement('span');
+            trend.className = 'reading-trend';
+            trend.textContent = ' ' + getTrendSymbol(reading, key);
+            trend.style.color = '#666';
+            
+            rEl.appendChild(label);
+            rEl.appendChild(val);
+            rEl.appendChild(trend);
+            container.appendChild(rEl);
+        } else {
+            // Empty placeholder
+            const placeholder = document.createElement('span');
+            placeholder.className = 'reading-placeholder';
+            const width = key.length + 2 + VALUE_WIDTH + 2;
+            placeholder.textContent = ' '.repeat(width);
+            container.appendChild(placeholder);
+        }
+    });
 }
 
 function getTrendSymbol(reading, pollutantKey) {
@@ -351,6 +453,46 @@ function getTrendSymbol(reading, pollutantKey) {
     if (symbol === '▼' && lastStep > threshold * 0.5) symbol = '-';
 
     return symbol;
+}
+
+/**
+ * Get raw reading data for a column (needed for history sparklines).
+ * This looks up the reading in either the shared format or raw state.
+ */
+function getReadingForColumn(sensor, pollutantKey) {
+    // First try the readings property from shared format
+    if (sensor.readings && typeof sensor.readings === 'object') {
+        // Try exact key first
+        let reading = sensor.readings[pollutantKey];
+        if (reading) return reading;
+        
+        // Try alternate key names
+        if (pollutantKey === 'PM25') {
+            reading = sensor.readings['PM2.5'] || sensor.readings['pm25'];
+        } else if (pollutantKey === 'OZNE') {
+            reading = sensor.readings['Ozone'] || sensor.readings['ozone'] || sensor.readings['O3'];
+        } else {
+            reading = sensor.readings[pollutantKey.toLowerCase()];
+        }
+        if (reading) return reading;
+    }
+    
+    // Fallback: look up in raw appState
+    const rawSensor = [...(appState.mobile || []), ...(appState.fixed || [])]
+        .find(s => s.id === sensor.id);
+    
+    if (rawSensor && rawSensor.readings) {
+        let reading = rawSensor.readings[pollutantKey];
+        if (!reading && pollutantKey === 'PM25') {
+            reading = rawSensor.readings['PM2.5'];
+        }
+        if (!reading && pollutantKey === 'OZNE') {
+            reading = rawSensor.readings['Ozone'] || rawSensor.readings['ozone'];
+        }
+        return reading;
+    }
+    
+    return null;
 }
 
 function valueToAqi(pollutantKey, value) {
@@ -493,111 +635,126 @@ function renderDetails() {
     
     const nameHeader = document.createElement('div');
     nameHeader.className = 'sensor-name-large';
-    let displayName = s.id;
-    if (s.type === 'mobile') displayName += ' (Mobile Sensor)';
-    if (s.type === 'fixed') displayName += ' (Fixed Sensor)';
+    // Use pre-formatted type_label from shared format if available
+    let displayName = s.display_name || s.id;
+    const typeLabel = s.type_label || (s.type === 'mobile' ? 'Mobile Sensor' : 'Fixed Sensor');
+    displayName += ` (${typeLabel})`;
     nameHeader.textContent = displayName;
     box.appendChild(nameHeader);
     
     const loc = document.createElement('div');
     loc.className = 'sensor-location';
-    loc.textContent = `Location: ${s.lat.toFixed(5)}, ${s.lon.toFixed(5)}`;
+    if (s.lat != null && s.lon != null) {
+        loc.textContent = `Location: ${s.lat.toFixed(5)}, ${s.lon.toFixed(5)}`;
+    } else {
+        loc.textContent = 'Location: Unknown';
+    }
     box.appendChild(loc);
     
     const table = document.createElement('div');
     table.className = 'pollutant-table';
     
-    ['Pollu...', 'Value', 'Level', 'History'].forEach(h => {
+    ['Pollutant', 'Value', 'Level', 'History'].forEach(h => {
         const th = document.createElement('div');
         th.className = 'col-header';
         th.textContent = h;
         table.appendChild(th);
     });
     
-    const pollutants = [
-        { key: 'PM25', label: 'PM25' },
-        { key: 'PM10', label: 'PM10' },
-        { key: 'OZNE', label: 'OZNE' }
-    ];
-    
-    pollutants.forEach(p => {
-        let rKey = p.key;
-        if (p.key === 'PM25' && !s.readings['PM25']) rKey = 'PM2.5';
-        if (p.key === 'OZNE' && !s.readings['OZNE']) rKey = 'Ozone';
-        
-        const reading = s.readings[rKey] || s.readings[p.key.toLowerCase()];
+    // Use columns from shared format if available, otherwise fall back to readings
+    const columnsToRender = s.columns || POLLUTANT_ORDER.map(key => {
+        // Build column from raw readings
+        const readings = s.readings || {};
+        let rKey = key;
+        if (key === 'PM25' && !readings['PM25']) rKey = 'PM2.5';
+        if (key === 'OZNE' && !readings['OZNE']) rKey = 'Ozone';
+        const reading = readings[rKey] || readings[key] || readings[key.toLowerCase()];
         
         if (reading) {
-            const nameEl = document.createElement('div');
-            nameEl.className = 'p-name';
-            nameEl.textContent = p.label;
-            table.appendChild(nameEl);
-            
-            const valEl = document.createElement('div');
-            valEl.className = 'p-value';
-            valEl.textContent = parseFloat(reading.value).toFixed(1) + ' ' + getTrendSymbol(reading, p.key);
-            valEl.style.color = reading.color;
-            table.appendChild(valEl);
-            
-            const levelEl = document.createElement('div');
-            levelEl.className = 'p-level';
-            
-            // Create segments for the bar to look like characters
-            // TUI uses block characters. We can simulate with a gradient or multiple divs.
-            // Let's use a simple filled div for now, but maybe dotted background?
-            // TUI screenshot shows solid blocks.
-            
-            const bar = document.createElement('div');
-            bar.style.height = '100%';
-
-            // Level bar = severity by AQI/harm (not raw concentration).
-            let pct = aqiPct(p.key, reading.value);
-            // Tiny visible stub for non-zero severity (like the TUI's ▌).
-            if (pct > 0 && pct < 2) pct = 2;
-            
-            bar.style.width = pct + '%';
-            bar.style.backgroundColor = reading.color;
-            levelEl.appendChild(bar);
-            
-            // Add dotted background for the rest
-            const bg = document.createElement('div');
-            bg.style.position = 'absolute';
-            bg.style.top = '0';
-            bg.style.left = '0';
-            bg.style.width = '100%';
-            bg.style.height = '100%';
-            bg.style.backgroundImage = 'radial-gradient(#555 1px, transparent 1px)';
-            bg.style.backgroundSize = '4px 4px';
-            bg.style.opacity = '0.5';
-            bg.style.zIndex = '0';
-            levelEl.appendChild(bg);
-            bar.style.zIndex = '1';
-            bar.style.position = 'relative';
-            
-            table.appendChild(levelEl);
-            
-            const histEl = document.createElement('div');
-            histEl.className = 'p-history';
-            if (reading.history && reading.history.length) {
-                const points = reading.history.slice(-20);
-                const colors = reading.history_colors ? reading.history_colors.slice(-20) : [];
-                
-                points.forEach((pt, i) => {
-                    const hBar = document.createElement('div');
-                    hBar.className = 'hist-bar';
-                    // Sparkline = relative history for readability at low levels.
-                    const scale = sparkSeverityScale(p.key, points);
-                    let hPct = sparkPct(points, pt) * scale;
-                    if (hPct > 0 && hPct < 2) hPct = 2;
-                    hBar.style.height = hPct + '%';
-                    hBar.style.backgroundColor = colors[i] || reading.color;
-                    histEl.appendChild(hBar);
-                });
-            } else {
-                histEl.textContent = '...';
-            }
-            table.appendChild(histEl);
+            return {
+                key: key,
+                label: key,
+                value: reading.value,
+                formatted: parseFloat(reading.value).toFixed(1).padStart(VALUE_WIDTH),
+                color: reading.color,
+                has_value: true,
+                trend_symbol: getTrendSymbol(reading, key),
+                trend_color: '#888888',
+            };
         }
+        return { key: key, label: key, has_value: false };
+    });
+    
+    columnsToRender.forEach(col => {
+        if (!col.has_value) return;
+        
+        const nameEl = document.createElement('div');
+        nameEl.className = 'p-name';
+        nameEl.textContent = col.label;
+        table.appendChild(nameEl);
+        
+        const valEl = document.createElement('div');
+        valEl.className = 'p-value';
+        valEl.textContent = col.formatted + ' ' + col.trend_symbol;
+        valEl.style.color = col.color;
+        table.appendChild(valEl);
+        
+        const levelEl = document.createElement('div');
+        levelEl.className = 'p-level';
+        
+        // Get reading data for level bar and history
+        const reading = getReadingForColumn(s, col.key);
+        
+        const bar = document.createElement('div');
+        bar.style.height = '100%';
+
+        // Level bar = severity by AQI/harm (not raw concentration).
+        let pct = aqiPct(col.key, col.value);
+        // Tiny visible stub for non-zero severity (like the TUI's ▌).
+        if (pct > 0 && pct < 2) pct = 2;
+        
+        bar.style.width = pct + '%';
+        bar.style.backgroundColor = col.color;
+        levelEl.appendChild(bar);
+        
+        // Add dotted background for the rest
+        const bg = document.createElement('div');
+        bg.style.position = 'absolute';
+        bg.style.top = '0';
+        bg.style.left = '0';
+        bg.style.width = '100%';
+        bg.style.height = '100%';
+        bg.style.backgroundImage = 'radial-gradient(#555 1px, transparent 1px)';
+        bg.style.backgroundSize = '4px 4px';
+        bg.style.opacity = '0.5';
+        bg.style.zIndex = '0';
+        levelEl.appendChild(bg);
+        bar.style.zIndex = '1';
+        bar.style.position = 'relative';
+        
+        table.appendChild(levelEl);
+        
+        const histEl = document.createElement('div');
+        histEl.className = 'p-history';
+        if (reading && reading.history && reading.history.length) {
+            const points = reading.history.slice(-20);
+            const colors = reading.history_colors ? reading.history_colors.slice(-20) : [];
+            
+            points.forEach((pt, i) => {
+                const hBar = document.createElement('div');
+                hBar.className = 'hist-bar';
+                // Sparkline = relative history for readability at low levels.
+                const scale = sparkSeverityScale(col.key, points);
+                let hPct = sparkPct(points, pt) * scale;
+                if (hPct > 0 && hPct < 2) hPct = 2;
+                hBar.style.height = hPct + '%';
+                hBar.style.backgroundColor = colors[i] || col.color;
+                histEl.appendChild(hBar);
+            });
+        } else {
+            histEl.textContent = '...';
+        }
+        table.appendChild(histEl);
     });
     
     box.appendChild(table);
