@@ -84,6 +84,22 @@ from .map_html import generate_leaflet_map_html
 # Dashboard
 from .dashboard import normalize_state_for_dashboard
 
+# TUI Formatting (shared between terminal and web TUI)
+from .tui_format import (
+    format_sensor_for_list,
+    format_all_sensors,
+    format_tui_state,
+    format_json_view,
+    get_pollutant_columns,
+    get_trend_symbol,
+    format_value,
+    truncate_name,
+    POLLUTANT_ORDER,
+    POLLUTANT_LABELS,
+    VALUE_WIDTH,
+    MAX_NAME_LEN,
+)
+
 
 # For backwards compatibility, also expose private functions that may be used
 # These are prefixed with underscore but were part of the old API
@@ -144,6 +160,19 @@ __all__ = [
     "generate_leaflet_map_html",
     # Dashboard
     "normalize_state_for_dashboard",
+    # TUI Format
+    "format_sensor_for_list",
+    "format_all_sensors",
+    "format_tui_state",
+    "format_json_view",
+    "get_pollutant_columns",
+    "get_trend_symbol",
+    "format_value",
+    "truncate_name",
+    "POLLUTANT_ORDER",
+    "POLLUTANT_LABELS",
+    "VALUE_WIDTH",
+    "MAX_NAME_LEN",
     # Compat aliases
     "_coerce_float",
     "_median",
