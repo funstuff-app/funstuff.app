@@ -310,7 +310,7 @@ def format_json_view(
     """
     from datetime import datetime
     
-    view = {"id": sensor_id}
+    view: dict[str, Any] = {"id": sensor_id}
     
     # Metadata section
     view["_meta"] = {
