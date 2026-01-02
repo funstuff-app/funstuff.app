@@ -539,8 +539,10 @@ class MapView {
   constructor(tilesCanvas, overlayCanvas) {
     this.tilesCanvas = tilesCanvas;
     this.overlayCanvas = overlayCanvas;
-    this.tctx = tilesCanvas.getContext("2d");
-    this.octx = overlayCanvas.getContext("2d");
+    // Use willReadFrequently: false (default) to hint GPU-accelerated rendering.
+    // This is especially important for iPad/iOS performance.
+    this.tctx = tilesCanvas.getContext("2d", { willReadFrequently: false });
+    this.octx = overlayCanvas.getContext("2d", { willReadFrequently: false });
 
     // fractional zoom for smooth pinch / button zooming
     this.zoom = 12;
@@ -652,8 +654,17 @@ class MapView {
     this.maxTrailLen = 1000;
 
     // Basemap tile cache (LRU bounded). Without eviction this grows unbounded as you pan/zoom.
+    // Lower limit on mobile/tablet for memory constraints; detect via coarse heuristic.
     this.tileCache = new Map(); // key -> {img, ok}
-    this._tileCacheMax = 420;
+    const isMobileDevice = /iPad|iPhone|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1);
+    this._tileCacheMax = isMobileDevice ? 180 : 420;
+
+    // Touch pan/pinch state (iPad, iOS, Android)
+    this._touchState = null; // null or { startTouches, startCenter, startZoom, startCenterLatLon, lastPinchDist, lastMidpoint }
+    this._touchActive = false; // true while any touch is in progress (for skipping expensive ops)
+
+    // Debounce tile-load redraws to avoid cascading redraws when multiple tiles load at once
+    this._tileLoadRedrawTimer = null;
     // Snapshot of the last rendered basemap frame to avoid flicker while tiles load.
     this._tilesSnapshotCanvas = null; // offscreen canvas
     this._tilesSnapshotMeta = null; // { zoom, centerLat, centerLon }
@@ -690,6 +701,11 @@ class MapView {
     this.overlayCanvas.addEventListener("mousedown", (e) => this.onMouseDown(e));
     window.addEventListener("mousemove", (e) => this.onMouseMove(e));
     window.addEventListener("mouseup", () => this.onMouseUp());
+    // Touch events for iPad/iOS/Android pan and pinch-zoom
+    this.overlayCanvas.addEventListener("touchstart", (e) => this.onTouchStart(e), { passive: false });
+    this.overlayCanvas.addEventListener("touchmove", (e) => this.onTouchMove(e), { passive: false });
+    this.overlayCanvas.addEventListener("touchend", (e) => this.onTouchEnd(e), { passive: false });
+    this.overlayCanvas.addEventListener("touchcancel", (e) => this.onTouchEnd(e), { passive: false });
 
     this.resize();
   }
@@ -798,6 +814,48 @@ class MapView {
     const state = this.lastState;
     if (!state) return;
 
+    // FAST PATH: During active touch, just translate/scale cached canvases instead of redrawing.
+    // This avoids expensive path operations on every 120Hz touch event.
+    if (this._touchActive && this._panSnapshotOverlay && this._panSnapshotTiles && this._panSnapshotCenter) {
+      const dpr = this._dpr || 1;
+      const w = this._cssW || 1;
+      const h = this._cssH || 1;
+      
+      // Compute scale factor if zoom changed (pinch-zoom)
+      const sZoom = Math.pow(2, this.zoom - this._panSnapshotZoom);
+      
+      // Compute pixel offset from snapshot center to current center (at snapshot zoom level)
+      const prevC = latLonToWorld(this._panSnapshotCenter.lat, this._panSnapshotCenter.lon, this._panSnapshotZoom);
+      const currC = latLonToWorld(this.center.lat, this.center.lon, this._panSnapshotZoom);
+      const txPan = (prevC.x - currC.x) * sZoom;
+      const tyPan = (prevC.y - currC.y) * sZoom;
+      
+      // Tiles: translate + scale snapshot
+      if (this.tctx) {
+        this.tctx.save();
+        this.tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this.tctx.clearRect(0, 0, w, h);
+        this.tctx.translate(w / 2, h / 2);
+        this.tctx.scale(sZoom, sZoom);
+        this.tctx.translate(-w / 2 + txPan / sZoom, -h / 2 + tyPan / sZoom);
+        this.tctx.drawImage(this._panSnapshotTiles, 0, 0, w, h);
+        this.tctx.restore();
+      }
+      
+      // Overlay: translate + scale snapshot  
+      if (this.octx) {
+        this.octx.save();
+        this.octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this.octx.clearRect(0, 0, w, h);
+        this.octx.translate(w / 2, h / 2);
+        this.octx.scale(sZoom, sZoom);
+        this.octx.translate(-w / 2 + txPan / sZoom, -h / 2 + tyPan / sZoom);
+        this.octx.drawImage(this._panSnapshotOverlay, 0, 0, w, h);
+        this.octx.restore();
+      }
+      return;
+    }
+
     const viewSig = (() => {
       const z = Number(this.zoom);
       const lat = Number(this.center?.lat);
@@ -889,6 +947,189 @@ class MapView {
     e.stopPropagation();
     this._gesture = null;
     this._startPinchInertia();
+  }
+
+  // Touch event handlers for iPad/iOS/Android pan and pinch-zoom
+  onTouchStart(e) {
+    // Prevent browser's default behavior (page scroll, zoom)
+    e.preventDefault();
+    
+    // Mark touch as active to skip expensive operations during interaction
+    this._touchActive = true;
+    
+    // Cancel any in-progress pinch inertia
+    this._stopPinchInertia();
+    
+    const touches = e.touches;
+    if (touches.length === 0) return;
+
+    const rect = this.overlayCanvas.getBoundingClientRect();
+    
+    // Compute touch midpoint in canvas-local coordinates
+    let sumX = 0, sumY = 0;
+    for (let i = 0; i < touches.length; i++) {
+      sumX += touches[i].clientX - rect.left;
+      sumY += touches[i].clientY - rect.top;
+    }
+    const midX = sumX / touches.length;
+    const midY = sumY / touches.length;
+
+    // For pinch: compute initial distance
+    let pinchDist = 0;
+    if (touches.length >= 2) {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      pinchDist = Math.sqrt(dx * dx + dy * dy);
+      this._pinchZooming = true;
+    }
+
+    // Store initial touch state
+    const cw = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
+    this._touchState = {
+      startTouches: touches.length,
+      startMidpoint: { x: midX, y: midY },
+      startCenterWorld: { x: cw.x, y: cw.y, ws: cw.ws },
+      startZoom: this.zoom,
+      lastPinchDist: pinchDist,
+      lastMidpoint: { x: midX, y: midY },
+    };
+    
+    // Store anchor for inertia
+    this._pinchAnchorSX = midX;
+    this._pinchAnchorSY = midY;
+    
+    // Capture pan snapshots for fast-path translation during touch
+    // This avoids expensive redraw operations on every touch move
+    this._capturePanSnapshots();
+  }
+  
+  _capturePanSnapshots() {
+    const dpr = this._dpr || 1;
+    const w = this._cssW || 1;
+    const h = this._cssH || 1;
+    const pw = Math.floor(w * dpr);
+    const ph = Math.floor(h * dpr);
+    
+    // Capture current center and zoom for offset/scale calculation
+    this._panSnapshotCenter = { lat: this.center.lat, lon: this.center.lon };
+    this._panSnapshotZoom = this.zoom;
+    
+    // Snapshot tiles canvas
+    if (!this._panSnapshotTiles || this._panSnapshotTiles.width !== pw || this._panSnapshotTiles.height !== ph) {
+      this._panSnapshotTiles = document.createElement("canvas");
+      this._panSnapshotTiles.width = pw;
+      this._panSnapshotTiles.height = ph;
+    }
+    const tCtx = this._panSnapshotTiles.getContext("2d");
+    if (tCtx && this.tilesCanvas) {
+      tCtx.clearRect(0, 0, pw, ph);
+      tCtx.drawImage(this.tilesCanvas, 0, 0);
+    }
+    
+    // Snapshot overlay canvas
+    if (!this._panSnapshotOverlay || this._panSnapshotOverlay.width !== pw || this._panSnapshotOverlay.height !== ph) {
+      this._panSnapshotOverlay = document.createElement("canvas");
+      this._panSnapshotOverlay.width = pw;
+      this._panSnapshotOverlay.height = ph;
+    }
+    const oCtx = this._panSnapshotOverlay.getContext("2d");
+    if (oCtx && this.overlayCanvas) {
+      oCtx.clearRect(0, 0, pw, ph);
+      oCtx.drawImage(this.overlayCanvas, 0, 0);
+    }
+  }
+
+  onTouchMove(e) {
+    if (!this._touchState) return;
+    e.preventDefault();
+
+    const touches = e.touches;
+    if (touches.length === 0) return;
+
+    const rect = this.overlayCanvas.getBoundingClientRect();
+
+    // Compute current touch midpoint
+    let sumX = 0, sumY = 0;
+    for (let i = 0; i < touches.length; i++) {
+      sumX += touches[i].clientX - rect.left;
+      sumY += touches[i].clientY - rect.top;
+    }
+    const midX = sumX / touches.length;
+    const midY = sumY / touches.length;
+
+    // Pinch-zoom if 2+ fingers
+    if (touches.length >= 2) {
+      this._pinchZooming = true;
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      const pinchDist = Math.sqrt(dx * dx + dy * dy);
+
+      if (this._touchState.lastPinchDist > 0 && pinchDist > 0) {
+        const scale = pinchDist / this._touchState.lastPinchDist;
+        const dz = Math.log2(scale);
+        const prevZ = this.zoom;
+        const z2 = clamp(this.zoom + dz, this._zoomMin, this._zoomMax);
+        this._setZoomAroundScreenPoint(z2, midX, midY);
+        this._notePinchVelocity(z2 - prevZ, performance.now());
+      }
+      this._touchState.lastPinchDist = pinchDist;
+    }
+
+    // Pan: translate based on midpoint delta from last frame
+    const dmx = midX - this._touchState.lastMidpoint.x;
+    const dmy = midY - this._touchState.lastMidpoint.y;
+    
+    if (Math.abs(dmx) > 0.5 || Math.abs(dmy) > 0.5) {
+      const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
+      const nx = c.x - dmx;
+      const ny = clamp(c.y - dmy, 0, c.ws - 1);
+      const ll = worldToLatLon(nx, ny, this.zoom);
+      this.center = { lat: ll.lat, lon: ll.lon };
+    }
+
+    this._touchState.lastMidpoint = { x: midX, y: midY };
+    this._pinchAnchorSX = midX;
+    this._pinchAnchorSY = midY;
+
+    // Use lightweight redraw during touch - just reposition existing content
+    this._requestPanRedraw();
+  }
+
+  onTouchEnd(e) {
+    if (!this._touchState) return;
+    e.preventDefault();
+
+    const remaining = e.touches.length;
+    
+    if (remaining === 0) {
+      // Mark touch as ended
+      this._touchActive = false;
+      // Clear pan snapshots so next redraw is full
+      this._panSnapshotCenter = null;
+      // All fingers lifted - start inertia if we were pinching
+      if (this._pinchZooming) {
+        this._startPinchInertia();
+      } else {
+        // No pinch inertia - do a full redraw now
+        this._requestZoomRedraw();
+      }
+      this._touchState = null;
+    } else if (remaining === 1 && this._touchState.startTouches >= 2) {
+      // Went from 2+ fingers to 1 - reset pan origin to avoid jump
+      // Also re-capture snapshots from current state for continued pan
+      this._capturePanSnapshots();
+      const rect = this.overlayCanvas.getBoundingClientRect();
+      const t = e.touches[0];
+      const mx = t.clientX - rect.left;
+      const my = t.clientY - rect.top;
+      this._touchState.lastMidpoint = { x: mx, y: my };
+      this._touchState.lastPinchDist = 0;
+      this._touchState.startTouches = 1;
+      this._pinchZooming = false;
+      // End zoom inertia; continue panning only
+      this._stopPinchInertia();
+      this._requestZoomRedraw();
+    }
   }
 
   setTheme(themeKey) {
@@ -1939,6 +2180,29 @@ class MapView {
         flipX = !!smp.flipX;
         speedMps = Number(smp.speedMps) || 0;
         opacity = (typeof smp.opacity === "number" && isFinite(smp.opacity)) ? smp.opacity : 1;
+        // Dim markers that haven't "started" yet in the timeline
+        if (smp.beforeFirst) {
+          opacity = 0.3;
+        }
+      } else {
+        // Fallback: if no playback sample but we have trail data, use first/last trail point
+        const id = m && m.id != null ? String(m.id) : "";
+        const pts = id ? this._playbackPtsById.get(id) : null;
+        const t = this._playbackNowMs;
+        if (pts && pts.length >= 1 && t != null && isFinite(t)) {
+          // Before first point: show at first position (dimmed)
+          // After last point: show at last position
+          const tMin = pts[0].tMs;
+          const tMax = pts[pts.length - 1].tMs;
+          if (t < tMin) {
+            lat = pts[0].lat;
+            lon = pts[0].lon;
+            opacity = 0.3; // Dimmed - hasn't "started" yet
+          } else if (t >= tMax) {
+            lat = pts[pts.length - 1].lat;
+            lon = pts[pts.length - 1].lon;
+          }
+        }
       }
 
       const held = !!(
@@ -2834,22 +3098,31 @@ class MapView {
 
     // No vignette: it reads like a “tunnel/bokeh” during zooming.
 
-    // Capture snapshot for the next frame.
-    try {
-      if (!this._tilesSnapshotCanvas) {
-        this._tilesSnapshotCanvas = document.createElement("canvas");
+    // Capture snapshot for the next frame - but skip during active touch to avoid blocking input.
+    // Also avoid resizing the snapshot canvas every frame (causes GPU texture reallocation).
+    if (!this._touchActive) {
+      try {
+        const tw = this.tilesCanvas.width;
+        const th = this.tilesCanvas.height;
+        if (!this._tilesSnapshotCanvas) {
+          this._tilesSnapshotCanvas = document.createElement("canvas");
+          this._tilesSnapshotCanvas.width = tw;
+          this._tilesSnapshotCanvas.height = th;
+        } else if (this._tilesSnapshotCanvas.width !== tw || this._tilesSnapshotCanvas.height !== th) {
+          // Only resize when dimensions actually change
+          this._tilesSnapshotCanvas.width = tw;
+          this._tilesSnapshotCanvas.height = th;
+        }
+        const sctx = this._tilesSnapshotCanvas.getContext("2d");
+        if (sctx) {
+          sctx.setTransform(1, 0, 0, 1, 0, 0);
+          sctx.clearRect(0, 0, tw, th);
+          sctx.drawImage(this.tilesCanvas, 0, 0);
+          this._tilesSnapshotMeta = { zoom: this.zoom, centerLat: this.center.lat, centerLon: this.center.lon };
+        }
+      } catch {
+        // ignore snapshot capture errors
       }
-      this._tilesSnapshotCanvas.width = this.tilesCanvas.width;
-      this._tilesSnapshotCanvas.height = this.tilesCanvas.height;
-      const sctx = this._tilesSnapshotCanvas.getContext("2d");
-      if (sctx) {
-        sctx.setTransform(1, 0, 0, 1, 0, 0);
-        sctx.clearRect(0, 0, this._tilesSnapshotCanvas.width, this._tilesSnapshotCanvas.height);
-        sctx.drawImage(this.tilesCanvas, 0, 0);
-        this._tilesSnapshotMeta = { zoom: this.zoom, centerLat: this.center.lat, centerLon: this.center.lon };
-      }
-    } catch {
-      // ignore snapshot capture errors
     }
   }
 
@@ -2896,7 +3169,8 @@ class MapView {
         // Ignore late loads from a previous theme.
         if (epoch !== this._tileEpoch) return;
         this._tileCacheSet(key, { img, ok: true });
-        this.drawTiles();
+        // Debounce tile-load redraws to avoid cascading redraws when many tiles load at once
+        this._scheduleTileRedraw();
       };
       img.onerror = () => {
         if (epoch !== this._tileEpoch) return;
@@ -2921,6 +3195,18 @@ class MapView {
       ctx.strokeStyle = "rgba(255,255,255,0.04)";
       ctx.strokeRect(Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
     }
+  }
+
+  _scheduleTileRedraw() {
+    // Debounce tile-load redraws: wait a short time for more tiles to finish loading
+    // before redrawing, to avoid N separate redraws when N tiles load in quick succession.
+    if (this._tileLoadRedrawTimer) return; // already scheduled
+    this._tileLoadRedrawTimer = setTimeout(() => {
+      this._tileLoadRedrawTimer = null;
+      // Skip if touch is active - will redraw when touch ends
+      if (this._touchActive) return;
+      this.drawTiles();
+    }, 50); // 50ms debounce - batches tiles that load within this window
   }
 
   _tracePointsKeyForState(state) {
@@ -2967,7 +3253,8 @@ class MapView {
         minMs = Math.min(minMs, tMs);
         maxMs = Math.max(maxMs, tMs);
       }
-      if (pts.length >= 2) {
+      // Allow single-point trails so marker is visible at that position
+      if (pts.length >= 1) {
         pts.sort((a, b) => a.tMs - b.tMs);
         nextPtsById.set(id, pts);
       }
@@ -2988,11 +3275,17 @@ class MapView {
     if (t == null || !isFinite(t)) return null;
 
     const pts = this._playbackPtsById.get(id);
-    if (!pts || pts.length < 2) return null;
+    if (!pts || pts.length < 1) return null;
 
     const tMin = pts[0].tMs;
     const tMax = pts[pts.length - 1].tMs;
     if (!isFinite(tMin) || !isFinite(tMax)) return null;
+
+    // Single point: always return that point
+    if (pts.length === 1) {
+      const p = pts[0];
+      return { lat: p.lat, lon: p.lon, m: p.m, readings: p.readings, beforeFirst: t < tMin, afterLast: t > tMax };
+    }
 
     let idxHi = 1;
     if (t <= tMin) idxHi = 1;
@@ -3096,7 +3389,7 @@ class MapView {
     const pRaw = pts[idxHi];
     const reading = primaryReadingKeyedFromPoint(pRaw);
 
-    return { lat, lon, angle: nextA, flipX: (side === "L"), speedMps, opacity, reading };
+    return { lat, lon, angle: nextA, flipX: (side === "L"), speedMps, opacity, reading, beforeFirst: t < tMin };
   }
 
   _ensureTracePoints(state) {
@@ -3365,15 +3658,20 @@ class MapView {
         ctx.fillText(emoji, sp.x, sp.y);
 
         // label pill (2 lines): ID line (white) + reading value line (colored)
-        ctx.font = "12px -apple-system, system-ui, sans-serif";
+        // Use web-safe font stack that works reliably on iOS Safari
+        ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
         const line1 = label;
         const line2Key = pr.key ? String(pr.key) : "";
         const line2Val = formatTagValue(pr.value);
+        // Ensure we have actual text widths (iOS Safari can return 0 for some fonts)
         const m1 = ctx.measureText(line1);
         const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
         const m2b = ctx.measureText(line2Val);
+        const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
+        const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
+        const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
         const padX = 8;
-        const bw = Math.max(m1.width, (m2a.width + m2b.width)) + padX * 2;
+        const bw = Math.max(m1w, (m2aw + m2bw)) + padX * 2;
         const bh = (line2Key || line2Val) ? 30 : 18;
         const bx = sp.x - bw / 2;
         const by = sp.y + 18;
@@ -3392,12 +3690,12 @@ class MapView {
         const y2 = by + padY + lineH * 1.5;
         ctx.fillText(line1, sp.x, y1);
         if (line2Key || line2Val) {
-          // draw key in muted, value in pollutant color
-          const x0 = sp.x - (m2a.width + m2b.width) / 2;
+          // draw key in muted, value in pollutant color - use safe widths
+          const x0 = sp.x - (m2aw + m2bw) / 2;
           ctx.fillStyle = "rgba(232,238,247,0.70)";
-          ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2a.width / 2, y2);
+          ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
           ctx.fillStyle = pr.color || "#ffffff";
-          ctx.fillText(line2Val, x0 + m2a.width + m2b.width / 2, y2);
+          ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
         }
         ctx.restore();
     }
@@ -3671,29 +3969,9 @@ class MapView {
     const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
     const fixed = Array.isArray(state.fixed) ? state.fixed : [];
 
-    // Playback-mode underlay caching:
-    // - "underlay" includes fixed markers + trails
-    // - mobile markers are drawn on top every frame
-    const stateKey = this._tracePointsKeyForState(state);
-    const pbTimeForKeyMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
-    const pbKey = (!this.playbackMode) ? ""
-      : (this._playbackLiveFollow ? "live" : (pbTimeForKeyMs != null && isFinite(pbTimeForKeyMs) ? String(Math.floor(pbTimeForKeyMs)) : "none"));
-    const underlayKey = `${stateKey}|persist:${this._persistedTrailRev}|sel:${this.selectedId || ""}|pb:${pbKey}|debug:${this._pbDebugPath ? 1 : 0}|view:${this._cssW}x${this._cssH}@${Math.round(dpr * 1000) / 1000}|z:${Math.round(Number(this.zoom) * 1000) / 1000}|c:${Math.round(Number(this.center.lat) * 1e6) / 1e6},${Math.round(Number(this.center.lon) * 1e6) / 1e6}|theme:${this.themeKey}`;
-
-    const canUseUnderlay = !!(
-      opts && opts.useUnderlay && this.playbackMode && !this.traceMode &&
-      this._overlayUnderlayCanvas && this._overlayUnderlayKey === underlayKey
-    );
-
-    if (canUseUnderlay) {
-      const pw = this.overlayCanvas.width;
-      const ph = this.overlayCanvas.height;
-      ctx.save();
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, pw, ph);
-      ctx.drawImage(this._overlayUnderlayCanvas, 0, 0);
-      ctx.restore();
-    }
+    // Playback-mode: trails are clipped to playback time, so we redraw them each frame.
+    // Caching doesn't help here since the visible trail changes as time advances.
+    const canUseUnderlay = false;
 
     // Precompute center world once per frame; avoids repeated center projection in worldToScreen().
     const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
@@ -3739,15 +4017,20 @@ class MapView {
         ctx.fillText(emoji, sp.x, sp.y);
 
         // label pill (2 lines): ID line (white) + reading value line (colored)
-        ctx.font = "12px -apple-system, system-ui, sans-serif";
+        // Use web-safe font stack that works reliably on iOS Safari
+        ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
         const line1 = label;
         const line2Key = pr.key ? String(pr.key) : "";
         const line2Val = formatTagValue(pr.value);
+        // Ensure we have actual text widths (iOS Safari can return 0 for some fonts)
         const m1 = ctx.measureText(line1);
         const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
         const m2b = ctx.measureText(line2Val);
+        const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
+        const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
+        const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
         const padX = 8;
-        const bw = Math.max(m1.width, (m2a.width + m2b.width)) + padX*2;
+        const bw = Math.max(m1w, (m2aw + m2bw)) + padX*2;
         const bh = (line2Key || line2Val) ? 30 : 18;
         const bx = sp.x - bw/2;
         const by = sp.y + 18;
@@ -3766,12 +4049,12 @@ class MapView {
         const y2 = by + padY + lineH * 1.5;
         ctx.fillText(line1, sp.x, y1);
         if (line2Key || line2Val) {
-          // draw key in muted, value in pollutant color
-          const x0 = sp.x - (m2a.width + m2b.width) / 2;
+          // draw key in muted, value in pollutant color - use safe widths
+          const x0 = sp.x - (m2aw + m2bw) / 2;
           ctx.fillStyle = "rgba(232,238,247,0.70)";
-          ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2a.width / 2, y2);
+          ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
           ctx.fillStyle = pr.color || "#ffffff";
-          ctx.fillText(line2Val, x0 + m2a.width + m2b.width / 2, y2);
+          ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
         }
         ctx.restore();
       }
@@ -3943,31 +4226,31 @@ class MapView {
       let batchAlpha = null;
       let batchPts = [];
 
+      // Set up trail drawing context once, only change what varies per batch
+      ctx.lineWidth = lw;
+      ctx.setLineDash(dash);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+
       const flushBatch = () => {
         if (batchPts.length < 2) {
             batchPts = [];
             return;
         }
-        ctx.save();
         ctx.globalAlpha = batchAlpha;
         ctx.strokeStyle = batchColor;
-        ctx.lineWidth = lw;
-        ctx.setLineDash(dash);
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
         ctx.beginPath();
         // Draw disconnected segments to ensure dash pattern resets at every vertex.
-        // This prevents "chasing" artifacts during zoom/pan, matching the original behavior.
         for (let k = 0; k < batchPts.length - 1; k++) {
             ctx.moveTo(batchPts[k].x, batchPts[k].y);
             ctx.lineTo(batchPts[k+1].x, batchPts[k+1].y);
         }
         ctx.stroke();
-        ctx.restore();
-        // Clear completely; do not carry over last point because we are drawing segments.
-        // The next iteration will push the start point of the next segment.
         batchPts = [];
       };
+
+      // Pre-compute fade threshold: points newer than this don't need fade calculation
+      const fadeStartAgeMs = FADE_TIME_MS * FADE_START_FRAC;
 
       for (let i = 1; i < pts.length; i++) {
         const ptPrev = pts[i-1];
@@ -4000,45 +4283,37 @@ class MapView {
           alphaMul2 = 0.5;
         }
 
-        // colored segment
-        const nowMs = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
-        const mid = (pts.length > 1) ? ((i - 0.5) / (pts.length - 1)) : 1.0; // 0=oldest(tail), 1=newest(head)
-        
         const t1 = times[i];
         if (!(t1 != null && isFinite(t1) && isFinite(refNowMs))) {
           flushBatch();
           continue;
         }
 
-        const ageMs = Math.max(0, Number(refNowMs) - Number(t1));
-        const fTime = clamp(ageMs / Math.max(1, FADE_TIME_MS), 0, 1);
-        if (fTime >= 1) {
+        const ageMs = refNowMs - t1;
+        
+        // Skip points older than fade window
+        if (ageMs >= FADE_TIME_MS) {
           flushBatch();
           continue;
         }
 
+        // Only compute fade for points in the last 20% of the window
         let tailAlpha = 1.0;
-        if (fTime > FADE_START_FRAC) {
-          const u = clamp((fTime - FADE_START_FRAC) / Math.max(1e-6, FADE_TAIL_FRAC), 0, 1);
-          tailAlpha = Math.pow(1 - u, 2);
+        if (ageMs > fadeStartAgeMs) {
+          const u = (ageMs - fadeStartAgeMs) / (FADE_TIME_MS - fadeStartAgeMs);
+          tailAlpha = (1 - u) * (1 - u); // squared falloff
+          if (tailAlpha <= 0.01) {
+            flushBatch();
+            continue;
+          }
         }
 
-        if (tailAlpha <= 0.01) {
-          flushBatch();
-          continue;
-        }
-
-        const finalAlpha = Math.min(1.0, alpha * tailAlpha * alphaMul2);
+        const finalAlpha = alpha * tailAlpha * alphaMul2;
 
         if (segColor !== batchColor || Math.abs(finalAlpha - batchAlpha) > 0.01) {
             flushBatch();
             batchColor = segColor;
             batchAlpha = finalAlpha;
-            // New batch starts fresh.
-            // If we were accumulating points, we'd need to handle the transition.
-            // But here we push PAIRS.
-            // So if color changes, we flush the old pairs, and start pushing new pairs.
-            // We don't need to carry over ptPrev because we push (ptPrev, ptCurr) explicitly below.
             batchPts = [];
         }
         
@@ -4046,6 +4321,9 @@ class MapView {
         batchPts.push(ptCurr);
       }
       flushBatch();
+      // Reset context state for subsequent drawing
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1.0;
 
       return true;
     };
@@ -4095,27 +4373,6 @@ class MapView {
     }
 
 
-
-    // Populate/refresh the playback underlay cache BEFORE drawing mobile markers.
-    if (!this.traceMode && this.playbackMode && opts && opts.cacheUnderlay && !canUseUnderlay) {
-      if (this._overlayUnderlayKey !== underlayKey) {
-        this._overlayUnderlayKey = underlayKey;
-        try {
-          if (!this._overlayUnderlayCanvas) this._overlayUnderlayCanvas = document.createElement("canvas");
-          this._overlayUnderlayCanvas.width = this.overlayCanvas.width;
-          this._overlayUnderlayCanvas.height = this.overlayCanvas.height;
-          const uctx = this._overlayUnderlayCanvas.getContext("2d");
-          if (uctx) {
-            uctx.setTransform(1, 0, 0, 1, 0, 0);
-            uctx.clearRect(0, 0, this._overlayUnderlayCanvas.width, this._overlayUnderlayCanvas.height);
-            // Snapshot current overlay (which, at this point, contains fixed markers + trails).
-            uctx.drawImage(this.overlayCanvas, 0, 0);
-          }
-        } catch {
-          // ignore caching errors
-        }
-      }
-    }
 
     // Emoji markers
     const nowMs = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
@@ -4195,8 +4452,7 @@ class MapView {
       if (baseAlpha < 1) ctx.globalAlpha = ctx.globalAlpha * baseAlpha;
       if (dimmed) {
         ctx.globalAlpha = ctx.globalAlpha * 0.5;
-        // Slight desaturation; safe even if some browsers ignore canvas filters.
-        ctx.filter = "saturate(0.75)";
+        // NOTE: ctx.filter is expensive on iPad - we already desaturated colors above
       }
 
       const liftScale = (this.playbackMode && held) ? 1.16 : 1.0;
