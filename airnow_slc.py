@@ -905,5 +905,173 @@ def print_api_forecast(forecasts: list[dict], title: str = "Forecast"):
             print(f"  📝 {discussion[:100]}{'...' if len(discussion) > 100 else ''}")
 
 
+def extract_wind_data(readings: list[dict], sites: Optional[dict[str, dict]] = None) -> dict:
+    """
+    Extract wind data (speed, direction) from hourly readings.
+    
+    Aggregates wind data from all available stations, computing an average
+    weighted by data freshness if multiple readings exist.
+    
+    Args:
+        readings: List of hourly readings (from fetch_hourly_data)
+        sites: Optional dict of site metadata keyed by site_id (for location info)
+    
+    Returns:
+        Dict with keys:
+            - wind_speed: Average wind speed in m/s (or None)
+            - wind_speed_mph: Average wind speed in mph (or None)
+            - wind_dir: Predominant wind direction in degrees (or None)
+            - wind_dir_cardinal: Cardinal direction string (N, NE, etc.)
+            - temp_c: Average temperature in Celsius (or None)
+            - temp_f: Average temperature in Fahrenheit (or None)
+            - humidity: Average relative humidity % (or None)
+            - gust_level: 0-4 scale (calm, light, moderate, strong, gale)
+            - stations: Number of stations reporting wind data
+            - readings_time: ISO timestamp of most recent reading
+    """
+    import math
+    
+    wind_speeds: list[float] = []
+    wind_dirs: list[float] = []
+    temps: list[float] = []
+    humidities: list[float] = []
+    latest_time: Optional[datetime] = None
+    
+    for r in readings:
+        param = r.get("parameter", "")
+        val = r.get("value")
+        dt = r.get("datetime")
+        
+        if val is None:
+            continue
+        
+        if param == "WS":
+            wind_speeds.append(val)
+        elif param == "WD":
+            wind_dirs.append(val)
+        elif param == "TEMP":
+            temps.append(val)
+        elif param == "RHUM":
+            humidities.append(val)
+        
+        if dt and (latest_time is None or dt > latest_time):
+            latest_time = dt
+    
+    result: dict = {
+        "wind_speed": None,
+        "wind_speed_mph": None,
+        "wind_dir": None,
+        "wind_dir_cardinal": None,
+        "temp_c": None,
+        "temp_f": None,
+        "humidity": None,
+        "gust_level": 0,
+        "stations": len(set(r.get("site_id") for r in readings if r.get("parameter") in ("WS", "WD"))),
+        "readings_time": latest_time.isoformat() if latest_time else None,
+    }
+    
+    # Calculate averages
+    if wind_speeds:
+        avg_speed = sum(wind_speeds) / len(wind_speeds)
+        max_speed = max(wind_speeds)
+        result["wind_speed"] = round(avg_speed, 1)
+        result["wind_speed_mph"] = round(avg_speed * 2.237, 1)  # m/s to mph
+        result["max_wind_speed"] = round(max_speed, 1)
+        result["max_wind_speed_mph"] = round(max_speed * 2.237, 1)
+        
+        # Gust level based on max speed (Beaufort-inspired)
+        # 0: Calm (<0.5 m/s, <1 mph)
+        # 1: Light (0.5-3 m/s, 1-7 mph)  
+        # 2: Moderate (3-8 m/s, 7-18 mph)
+        # 3: Strong (8-14 m/s, 18-31 mph)
+        # 4: Gale (>14 m/s, >31 mph)
+        if max_speed < 0.5:
+            result["gust_level"] = 0
+        elif max_speed < 3:
+            result["gust_level"] = 1
+        elif max_speed < 8:
+            result["gust_level"] = 2
+        elif max_speed < 14:
+            result["gust_level"] = 3
+        else:
+            result["gust_level"] = 4
+    
+    if wind_dirs:
+        # Circular mean for wind direction
+        sin_sum = sum(math.sin(math.radians(d)) for d in wind_dirs)
+        cos_sum = sum(math.cos(math.radians(d)) for d in wind_dirs)
+        avg_dir = math.degrees(math.atan2(sin_sum, cos_sum))
+        if avg_dir < 0:
+            avg_dir += 360
+        result["wind_dir"] = round(avg_dir)
+        
+        # Cardinal direction
+        cardinals = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                     "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+        idx = round(avg_dir / 22.5) % 16
+        result["wind_dir_cardinal"] = cardinals[idx]
+    
+    if temps:
+        avg_temp = sum(temps) / len(temps)
+        result["temp_c"] = round(avg_temp, 1)
+        result["temp_f"] = round(avg_temp * 9/5 + 32, 1)
+    
+    if humidities:
+        result["humidity"] = round(sum(humidities) / len(humidities), 1)
+    
+    return result
+
+
+def format_wind_ascii(wind_data: dict) -> str:
+    """
+    Create an ASCII art wind indicator.
+    
+    Returns a multi-line string with:
+    - Wind direction arrow
+    - Speed reading
+    - Gust meter bar
+    
+    Example output:
+        ╭─ WIND ──────╮
+        │    ↗ NE     │
+        │  5.2 mph    │
+        │ ▂▃▅▇  Mod   │
+        ╰─────────────╯
+    """
+    if wind_data.get("wind_speed") is None:
+        return "╭─ WIND ─╮\n│  N/A   │\n╰────────╯"
+    
+    speed_mph = wind_data.get("wind_speed_mph", 0) or 0
+    direction = wind_data.get("wind_dir", 0) or 0
+    cardinal = wind_data.get("wind_dir_cardinal", "?")
+    gust_level = wind_data.get("gust_level", 0)
+    
+    # Direction arrows (pointing where wind is going TO, i.e., opposite of "from")
+    # Wind direction is where wind comes FROM, so arrow points opposite
+    arrows = ["↓", "↙", "←", "↖", "↑", "↗", "→", "↘"]
+    arrow_idx = round(direction / 45) % 8
+    arrow = arrows[arrow_idx]
+    
+    # Gust meter using block characters
+    gust_chars = ["▁", "▂", "▃", "▅", "▇"]
+    gust_bar = "".join(gust_chars[:gust_level + 1])
+    gust_labels = ["Calm", "Light", "Mod", "Strong", "Gale!"]
+    gust_label = gust_labels[min(gust_level, 4)]
+    
+    # Format speed
+    speed_str = f"{speed_mph:.0f}" if speed_mph >= 10 else f"{speed_mph:.1f}"
+    
+    # Build the box
+    lines = [
+        f"╭─ WIND ──────╮",
+        f"│   {arrow} {cardinal:3}      │",
+        f"│  {speed_str:>4} mph   │",
+        f"│ {gust_bar:<5} {gust_label:<5} │",
+        f"╰─────────────╯",
+    ]
+    
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     main()

@@ -17,6 +17,7 @@ import os
 import re
 import ssl
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,13 +27,21 @@ import subprocess
 from typing import Any
 from datetime import datetime, timedelta
 
-import requests
+
+def _get_bundle_dir() -> Path:
+    """Get the base directory for bundled resources (PyInstaller or normal)."""
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # Running as PyInstaller bundle
+        return Path(sys._MEIPASS)
+    # Running as normal Python script
+    return Path(__file__).resolve().parent
 
 # Import from the mobileair package
 from mobileair import (
     parse_utc_timestamp,
     fetch_json_with_cache,
     normalize_state_for_dashboard,
+    stdlib_get,
     MOBILE_URL,
     FIXED_URL,
     HEADERS,
@@ -48,6 +57,7 @@ try:
         get_hourly_data_url as _get_hourly_data_url,
         get_hourly_data_url_historical as _get_hourly_data_url_historical,
         list_available_hourly_files as _list_available_hourly_files,
+        extract_wind_data as _extract_wind_data,
         FILES_BASE_URL,
         SLC_BOUNDS,
     )
@@ -57,6 +67,7 @@ try:
     get_hourly_data_url = _get_hourly_data_url
     get_hourly_data_url_historical = _get_hourly_data_url_historical
     list_available_hourly_files = _list_available_hourly_files
+    extract_wind_data = _extract_wind_data
     AIRNOW_AVAILABLE = True
 except ImportError:
     AIRNOW_AVAILABLE = False
@@ -68,6 +79,9 @@ except ImportError:
     
     def fetch_hourly_data(url: str) -> list[dict]:
         return []
+    
+    def extract_wind_data(readings: list[dict], sites=None) -> dict:
+        return {}
     
     def filter_utah_hourly(readings: list[dict]) -> list[dict]:
         return []
@@ -281,6 +295,9 @@ class AppState:
     airnow_last_fetch: float = 0.0
     airnow_readings_by_hour: dict[str, list[dict[str, Any]]] = field(default_factory=dict)  # hour_key -> readings
     
+    # Wind/weather data from AirNow
+    wind_data: dict[str, Any] = field(default_factory=dict)
+    
     # Persistent fixed sensor history (shared with TUI)
     # Structure: { sensor_id: { pollutant: [{val, col, time, recorded_at}, ...] } }
     fixed_history: dict[str, dict[str, list[dict[str, Any]]]] = field(default_factory=dict)
@@ -485,7 +502,7 @@ def _fetch_history_file(sensor: str, var: str) -> list:
     # Fetch from server
     url = f"{HISTORY_BASE_URL}/{sensor}_{var}_TS_10080.json"
     try:
-        resp = requests.get(url, timeout=30, headers=HEADERS)
+        resp = stdlib_get(url, timeout=30, headers=HEADERS)
         resp.raise_for_status()
         data = resp.json().get("TimeDataUTC", [])
         _history_cache[cache_key] = (now, data)
@@ -1120,8 +1137,8 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
     while not stop_event.is_set():
         attempt_ts = time.time()
         try:
-            mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=requests.get)
-            fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=requests.get)
+            mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=stdlib_get)
+            fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=stdlib_get)
 
             # Accumulate fixed sensor history from raw data
             _accumulate_fixed_history_from_raw(app_state, fixed_raw)
@@ -1317,10 +1334,28 @@ def _fetch_airnow_data(app_state: AppState) -> None:
         
         print(f"[AirNow] Updated {len(all_readings)} sites with hourly data")
         
+        # Extract wind data from the most recent hour
+        try:
+            with app_state.lock:
+                sorted_hours = sorted(app_state.airnow_readings_by_hour.keys())
+            if sorted_hours:
+                latest_hour = sorted_hours[-1]
+                with app_state.lock:
+                    latest_readings = app_state.airnow_readings_by_hour.get(latest_hour, [])
+                wind_data = extract_wind_data(latest_readings)
+                with app_state.lock:
+                    app_state.wind_data = wind_data
+                if wind_data.get("wind_speed") is not None:
+                    print(f"[AirNow] Wind: {wind_data.get('wind_speed_mph', 0):.1f} mph from {wind_data.get('wind_dir_cardinal', '?')} (gust level {wind_data.get('gust_level', 0)})")
+        except Exception as e:
+            print(f"[AirNow] Wind extraction error: {e}")
+        
         # Trigger a state rebuild to merge new data
         with app_state.lock:
             if app_state.airnow_readings and isinstance(app_state.state, dict):
                 _merge_airnow_into_fixed(app_state.state, app_state)
+                # Include wind data in state
+                app_state.state["wind"] = app_state.wind_data
                 app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
         
         # Save accumulated history
@@ -1624,7 +1659,7 @@ def main() -> int:
 
     data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
-    static_dir = Path(__file__).resolve().parent / "dashboard"
+    static_dir = _get_bundle_dir() / "dashboard"
 
     app_state = AppState(
         lock=threading.Lock(),
@@ -1657,7 +1692,21 @@ def main() -> int:
         cert_path = Path(args.cert) if args.cert else (data_dir / "dev-cert.pem")
         key_path = Path(args.key) if args.key else (data_dir / "dev-key.pem")
         if not (cert_path.exists() and key_path.exists()):
-            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "365", "-keyout", str(key_path), "-out", str(cert_path), "-subj", "/CN=mobileair-dev"], check=True)
+            # Generate self-signed cert with SAN for local dev (Safari requires SAN)
+            lan_ips = _guess_lan_ips()
+            san_entries = ["DNS:localhost", "DNS:mobileair.local"]
+            san_entries.extend(f"IP:{ip}" for ip in lan_ips[:10])
+            san_entries.append("IP:127.0.0.1")
+            san_str = ",".join(san_entries)
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-days", "365",
+                "-keyout", str(key_path),
+                "-out", str(cert_path),
+                "-subj", "/CN=MobileAir Dev",
+                "-addext", f"subjectAltName={san_str}",
+            ], check=True)
+            print(f"Generated dev certificate with SANs: {san_str}")
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
@@ -1665,14 +1714,14 @@ def main() -> int:
     # print(f"Server optimized. Dashboard: {'https' if args.https else 'http'}://{args.host}:{args.port}")
     scheme = "https" if args.https else "http"
     print(f"Server optimized. Dashboard listening on {args.host}:{args.port} ({scheme})")
-    if scheme == "http":
-        # Provide explicit http:// URLs to minimize client-side HTTPS auto-upgrade friction.
-        ips = _guess_lan_ips()
-        if args.host in ("0.0.0.0", "::"):
-            for ip in ips[:5]:
-                print(f"Open: http://{ip}:{args.port}/")
-        elif args.host and args.host not in ("127.0.0.1", "localhost"):
-            print(f"Open: http://{args.host}:{args.port}/")
+    ips = _guess_lan_ips()
+    if args.host in ("0.0.0.0", "::"):
+        for ip in ips[:5]:
+            print(f"Open: {scheme}://{ip}:{args.port}/")
+    elif args.host and args.host not in ("127.0.0.1", "localhost"):
+        print(f"Open: {scheme}://{args.host}:{args.port}/")
+    if args.https:
+        print(f"Note: On iOS/macOS, trust the cert at: Settings > General > About > Certificate Trust Settings")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt: pass
@@ -1680,6 +1729,53 @@ def main() -> int:
         stop_event.set()
         httpd.shutdown()
     return 0
+
+
+def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: float = 60.0) -> tuple[threading.Event, threading.Thread]:
+    """Start the dashboard server in a background thread.
+    
+    Returns (stop_event, server_thread) so the caller can stop it later.
+    Used when running as a bundled executable where subprocess isn't available.
+    """
+    data_dir = default_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    static_dir = _get_bundle_dir() / "dashboard"
+
+    app_state = AppState(
+        lock=threading.Lock(),
+        state={"ts": time.time(), "mobile": [], "fixed": [], "meta": {"server_start_ts": time.time()}},
+        persistent_mobile={},
+    )
+    
+    load_fixed_history(app_state, data_dir)
+    
+    stop_event = threading.Event()
+
+    threading.Thread(target=fetch_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=interval, stop_event=stop_event), daemon=True).start()
+    threading.Thread(target=watch_sensor_names_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event), daemon=True).start()
+    
+    if AIRNOW_AVAILABLE:
+        threading.Thread(
+            target=airnow_fetch_loop,
+            kwargs=dict(app_state=app_state, interval_s=1200.0, stop_event=stop_event),
+            daemon=True
+        ).start()
+
+    httpd = ThreadingHTTPServer((host, port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir))
+    
+    def serve():
+        try:
+            httpd.serve_forever()
+        except Exception:
+            pass
+        finally:
+            stop_event.set()
+    
+    server_thread = threading.Thread(target=serve, daemon=True)
+    server_thread.start()
+    
+    return stop_event, httpd
+
 
 if __name__ == "__main__":
     main()

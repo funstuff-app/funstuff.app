@@ -201,3 +201,50 @@ Use the conversion functions: `latLonToWorld()`, `worldToScreen()`, `worldToScre
 3. **Is this logic or UI?** Put logic in `mobileair/`, UI in respective frontend.
 4. **Does this affect playback?** Check `m` flag handling.
 5. **Could this be slow in a loop?** Consider caching or pre-computation.
+
+## Building the Native macOS Binary
+
+The TUI can be packaged as a standalone macOS executable using PyInstaller.
+
+### Build Command
+```bash
+cd /Users/johusha/Stuff/mobileair
+python -m PyInstaller --noconfirm mobileair.spec
+```
+
+### Deploy Command
+```bash
+sudo rm -rf /opt/mobileair && sudo mv dist/mobileair /opt/mobileair
+```
+
+### Run the Binary
+```bash
+/opt/mobileair/mobileair
+```
+
+### Build + Deploy One-Liner
+```bash
+cd /Users/johusha/Stuff/mobileair && python -m PyInstaller --noconfirm mobileair.spec 2>&1 | tail -3 && sudo rm -rf /opt/mobileair && sudo mv dist/mobileair /opt/mobileair && echo "Done"
+```
+
+### Key Details
+- **Spec file**: `mobileair.spec` - PyInstaller configuration
+- **Output**: `dist/mobileair/` directory containing the executable and dependencies
+- **Install location**: `/opt/mobileair/`
+- **Binary size**: ~34 MB
+- **Startup time**: ~1.6s warm, ~2.5s cold
+
+### Widget Development Notes
+When creating TUI widgets with Rich:
+- Use `rich.panel.Panel` for bordered boxes - it handles alignment correctly
+- Use `rich.text.Text` for styled content inside panels
+- Do NOT manually draw box characters with Rich markup - the markup tags break width calculations
+- Example:
+```python
+from rich.panel import Panel
+from rich.text import Text
+
+content = Text()
+content.append("value", style="#b8bb26")
+return Panel(content, title="TITLE", width=21, height=6)
+```
