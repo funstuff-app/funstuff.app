@@ -1,4 +1,3 @@
-import requests
 import json
 import webbrowser
 from datetime import datetime, timedelta, timezone
@@ -8,6 +7,8 @@ import hashlib
 import time
 import sys
 import subprocess
+import urllib.request
+import urllib.error
 from typing import Literal
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from mobileair import (
     fetch_json_with_cache,
     generate_leaflet_map_html,
     detect_spatial_outliers,
+    stdlib_get,
     # TUI formatting (shared with web console)
     get_pollutant_columns,
     format_json_view,
@@ -78,11 +80,21 @@ def _dashboard_data_dir() -> Path:
     return Path(os.path.expanduser("~/.mobileair"))
 
 
-def _start_dashboard_server_process() -> subprocess.Popen | None:
+def _is_bundled() -> bool:
+    """Check if running as a PyInstaller bundle."""
+    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+
+
+def _start_dashboard_server_process() -> subprocess.Popen | tuple | None:
     """Start the browser dashboard server in the background.
 
-    This is intentionally a subprocess (not a thread) so its HTTP server loop
-    doesn't interfere with Textual's event loop, and to keep concerns isolated.
+    When running normally, this starts a subprocess.
+    When running as a PyInstaller bundle, this starts an in-process thread.
+    
+    Returns:
+        - subprocess.Popen when running normally
+        - (stop_event, httpd) tuple when bundled
+        - None if disabled or failed
     """
 
     # Allow users to disable auto-start.
@@ -96,6 +108,16 @@ def _start_dashboard_server_process() -> subprocess.Popen | None:
 
     data_dir = _dashboard_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
+    
+    # When bundled, run server in-process as a thread
+    if _is_bundled():
+        try:
+            from dashboard_server import start_server_in_thread
+            return start_server_in_thread(host=host, port=port)
+        except Exception:
+            return None
+
+    # Normal mode: run as subprocess
     log_path = data_dir / "dashboard_server.log"
 
     # Keep server logs out of the TUI terminal by default.
@@ -250,6 +272,14 @@ class AirQualityApp(App):
         text-style: bold;
     }
 
+    .footer-status {
+        height: 1;
+        background: #282828;
+        color: #928374;
+        padding: 0 1;
+        text-align: center;
+    }
+
     #dialog {
         grid-size: 2;
         grid-gutter: 1 2;
@@ -363,10 +393,20 @@ class AirQualityApp(App):
     }
     .status-bar {
         height: auto;
-        padding: 1;
+        padding: 0 1;
         background: #1d2021;
         color: #928374;
         border-bottom: solid #32302f;
+        width: 100%;
+    }
+    .status-bar Static {
+        width: auto;
+        padding: 0 1;
+    }
+    .status-bar #wind_indicator {
+        width: auto;
+        padding: 0;
+        color: #83a598;
     }
     """
 
@@ -393,7 +433,12 @@ class AirQualityApp(App):
         # For simple usage, we can just set the app.theme property in on_mount.
         # Ensure mouse support is enabled (it is by default in Textual, but ensuring scrollable containers work)
         yield Header()
-        yield Static("Fetching data...", id="status", classes="status-bar")
+        with Horizontal(classes="status-bar"):
+            yield Static("", id="summary_widget")
+            yield Static("", id="alerts_widget")
+            yield Static("", id="sparkline_widget")
+            yield Static("", id="region_widget")
+            yield Static("", id="wind_indicator")
         with Vertical(classes="main-content"):
             with VerticalScroll(id="details_container"):
                 yield Static(id="details_view")
@@ -401,6 +446,7 @@ class AirQualityApp(App):
                 yield ListView(id="sensors_list")
                 with VerticalScroll(id="json_container"):
                     yield Static(id="json_view")
+        yield Static("", id="footer_status", classes="footer-status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -592,7 +638,7 @@ class AirQualityApp(App):
             headers=HEADERS,
             timeout=10,
             cache_path=cache_path,
-            request_get=requests.get,
+            request_get=stdlib_get,
             notify=notify,
         )
 
@@ -602,6 +648,9 @@ class AirQualityApp(App):
         
         mobile_data = self.fetch_data(MOBILE_URL)
         fixed_data = self.fetch_data(FIXED_URL)
+        
+        # Also fetch wind data
+        self.fetch_wind_data()
         
         if mobile_data or fixed_data:
             combined_data = {
@@ -615,9 +664,354 @@ class AirQualityApp(App):
         else:
             self.call_from_thread(self.update_status, "Failed to fetch data.")
 
-    def update_status(self, message: str) -> None:
+    def fetch_wind_data(self) -> None:
+        """Fetch wind data from dashboard server or directly from AirNow."""
+        wind_data = None
+        
+        # Try dashboard server first (faster, already cached)
+        port = int(os.environ.get("MOBILEAIR_DASHBOARD_PORT", "8766"))
         try:
-            self.query_one("#status", Static).update(message)
+            resp = stdlib_get(f"http://127.0.0.1:{port}/api/state", timeout=2)
+            if resp.status_code == 200:
+                state = resp.json()
+                wind_data = state.get("wind", {})
+        except Exception:
+            pass
+        
+        # Fall back to direct AirNow fetch
+        if not wind_data or wind_data.get("wind_speed") is None:
+            try:
+                from airnow_slc import fetch_hourly_data, filter_utah_hourly, get_hourly_data_url, extract_wind_data
+                url = get_hourly_data_url()
+                readings = fetch_hourly_data(url)
+                utah_readings = filter_utah_hourly(readings)
+                wind_data = extract_wind_data(utah_readings)
+            except Exception:
+                pass
+        
+        if wind_data:
+            self.call_from_thread(self.update_wind_indicator, wind_data)
+    
+    def update_wind_indicator(self, wind_data: dict) -> None:
+        """Update the wind indicator display with ASCII art."""
+        try:
+            indicator = self._format_wind_indicator(wind_data)
+            self.query_one("#wind_indicator", Static).update(indicator)
+        except Exception:
+            pass
+    
+    def _format_wind_indicator(self, wind_data: dict) -> Panel:
+        """Create a wind indicator widget using Rich Panel."""
+        if not wind_data or wind_data.get("wind_speed") is None:
+            return Panel("No data", title="WIND", width=21, height=6)
+        
+        speed_mph = wind_data.get("wind_speed_mph", 0) or 0
+        direction = wind_data.get("wind_dir", 0) or 0
+        cardinal = wind_data.get("wind_dir_cardinal", "?")
+        gust_level = wind_data.get("gust_level", 0)
+        temp_f = wind_data.get("temp_f")
+        humidity = wind_data.get("humidity")
+        
+        # 16 cardinal directions with visual distinction
+        # Main arrow + side indicator for "between" directions
+        arrows_16 = [
+            "↓",   # N
+            "↓·",  # NNE (down, dot right = slightly east)
+            "↙",   # NE
+            "·←",  # ENE
+            "←",   # E
+            "←·",  # ESE
+            "↖",   # SE
+            "·↑",  # SSE
+            "↑",   # S
+            "↑·",  # SSW
+            "↗",   # SW
+            "·→",  # WSW
+            "→",   # W
+            "→·",  # WNW
+            "↘",   # NW
+            "·↓",  # NNW
+        ]
+        idx16 = round(direction / 22.5) % 16
+        arrow = arrows_16[idx16]
+        
+        gust_blocks = ["▁", "▂", "▃", "▅", "▇"]
+        gust_bar = "".join(gust_blocks[:gust_level + 1])
+        gust_labels = ["Calm", "Light", "Mod", "Strong", "Gale!"]
+        gust_label = gust_labels[min(gust_level, 4)]
+        
+        gust_colors = ["#b8bb26", "#b8bb26", "#fabd2f", "#fe8019", "#fb4934"]
+        gust_color = gust_colors[min(gust_level, 4)]
+        
+        content = Text()
+        content.append(f"{arrow} ", style="bold #83a598")
+        content.append(f"{cardinal:>3} ", style="#ebdbb2")
+        content.append(f"{speed_mph:.1f}", style=gust_color)
+        content.append(" mph\n")
+        content.append(gust_bar, style=gust_color)
+        content.append(f" {gust_label}\n")
+        if temp_f is not None:
+            content.append(f"{temp_f:.0f}°F", style="#ebdbb2")
+            if humidity:
+                content.append(f" {humidity:.0f}%", style="#83a598")
+        
+        return Panel(content, title="WIND", width=21, height=6)
+
+    def _get_latest_value(self, s_data: dict) -> float | None:
+        """Extract the latest numeric value from sensor data (handles array or scalar)."""
+        val = s_data.get('Value')
+        if val is None:
+            return None
+        result = None
+        # API returns Value as array of strings
+        if isinstance(val, list) and len(val) > 0:
+            try:
+                result = float(val[-1])  # Latest value
+            except (ValueError, TypeError):
+                return None
+        # Single value case
+        elif isinstance(val, (int, float)):
+            result = float(val)
+        elif isinstance(val, str):
+            try:
+                result = float(val)
+            except (ValueError, TypeError):
+                return None
+        # Filter outliers - PM2.5 > 500 µg/m³ or negative values are likely bad data
+        if result is not None and (result < 0 or result > 500):
+            return None
+        return result
+
+    def _format_summary_widget(self) -> Panel:
+        """Create summary stats widget."""
+        data = self.current_data
+        if not data:
+            return Panel("No data", title="SUMMARY", width=21, height=6)
+        
+        mobile_data = data.get("mobile", {})
+        fixed_data = data.get("fixed", {})
+        
+        # Count sensors
+        mobile_sensors = set()
+        fixed_sensors = set()
+        all_readings = []  # (aqi, sensor_name, pollutant)
+        
+        # Map API pollutant names to our AQI names
+        poll_map = {"PM25": "PM2_5", "PM10": "PM10", "OZNE": "O3"}
+        
+        for p_key, details in mobile_data.items():
+            if not isinstance(details, dict):
+                continue
+            aqi_key = poll_map.get(p_key, p_key)
+            for s_key, s_data in details.items():
+                if s_key in ['LastUpdateUTC', 'LastUpdateLocal', 'VarName', 'VarUnit']:
+                    continue
+                if isinstance(s_data, dict) and 'Value' in s_data:
+                    mobile_sensors.add(s_key)
+                    val = self._get_latest_value(s_data)
+                    if val is not None:
+                        aqi = self._value_to_aqi(aqi_key, val)
+                        if aqi is not None:
+                            all_readings.append((aqi, s_key, p_key))
+        
+        for p_key, details in fixed_data.items():
+            if not isinstance(details, dict):
+                continue
+            aqi_key = poll_map.get(p_key, p_key)
+            for s_key, s_data in details.items():
+                if s_key in ['LastUpdateUTC', 'LastUpdateLocal', 'VarName', 'VarUnit']:
+                    continue
+                if isinstance(s_data, dict) and 'Value' in s_data:
+                    fixed_sensors.add(s_key)
+                    val = self._get_latest_value(s_data)
+                    if val is not None:
+                        aqi = self._value_to_aqi(aqi_key, val)
+                        if aqi is not None:
+                            all_readings.append((aqi, s_key, p_key))
+        
+        n_mobile = len(mobile_sensors)
+        n_fixed = len(fixed_sensors)
+        
+        # Calculate avg and worst AQI
+        avg_aqi = 0
+        worst = None
+        if all_readings:
+            avg_aqi = sum(r[0] for r in all_readings) / len(all_readings)
+            worst = max(all_readings, key=lambda x: x[0])
+        
+        level_info = self._aqi_level(avg_aqi)
+        level = level_info.get("label", "Good") if isinstance(level_info, dict) else str(level_info)
+        level_colors = {"Good": "#b8bb26", "Moderate": "#fabd2f", "USG": "#fe8019", 
+                        "Unhealthy": "#fb4934", "Very Unhealthy": "#d3869b", "Hazardous": "#cc241d"}
+        avg_color = level_colors.get(level, "#928374")
+        
+        content = Text()
+        content.append(f"{n_mobile}", style="#83a598")
+        content.append(" mobile ")
+        content.append(f"{n_fixed}", style="#fabd2f")
+        content.append(" fixed\n")
+        content.append("Avg: ")
+        content.append(f"{avg_aqi:.0f}", style=avg_color)
+        content.append(f" ({level[:4]})\n")
+        if worst:
+            w_info = self._aqi_level(worst[0])
+            w_level = w_info.get("label", "Good") if isinstance(w_info, dict) else str(w_info)
+            w_color = level_colors.get(w_level, "#928374")
+            content.append("Max: ")
+            content.append(f"{worst[0]:.0f}", style=w_color)
+            content.append(f" {worst[2][:4]}")
+        else:
+            content.append("Max: -")
+        
+        return Panel(content, title="SUMMARY", width=21, height=6)
+
+    def _format_alerts_widget(self) -> Panel:
+        """Create alerts panel widget."""
+        data = self.current_data
+        if not data:
+            return Panel("No data", title="ALERTS", width=21, height=6)
+        
+        alerts = []  # (aqi, sensor, pollutant, level_label)
+        
+        mobile_data = data.get("mobile", {})
+        fixed_data = data.get("fixed", {})
+        
+        poll_map = {"PM25": "PM2_5", "PM10": "PM10", "OZNE": "O3"}
+        
+        for source in [mobile_data, fixed_data]:
+            for p_key, details in source.items():
+                if not isinstance(details, dict):
+                    continue
+                aqi_key = poll_map.get(p_key, p_key)
+                for s_key, s_data in details.items():
+                    if s_key in ['LastUpdateUTC', 'LastUpdateLocal', 'VarName', 'VarUnit']:
+                        continue
+                    if isinstance(s_data, dict) and 'Value' in s_data:
+                        val = self._get_latest_value(s_data)
+                        if val is not None:
+                            aqi = self._value_to_aqi(aqi_key, val)
+                            # Alert if USG or worse
+                            if aqi and aqi > 100:
+                                level_info = self._aqi_level(aqi)
+                                level = level_info.get("label", "USG") if isinstance(level_info, dict) else "USG"
+                                name = self.custom_names.get(s_key, s_key)[:12]
+                                alerts.append((aqi, name, p_key, level))
+        
+        # Sort by AQI descending
+        alerts.sort(key=lambda x: x[0], reverse=True)
+        alerts = alerts[:2]  # Top 2 to fit
+        
+        level_colors = {"USG": "#fe8019", "Unhealthy": "#fb4934", 
+                        "Very Unhealthy": "#d3869b", "Hazardous": "#cc241d"}
+        
+        content = Text()
+        if not alerts:
+            content.append("✓ All normal", style="#b8bb26")
+        else:
+            for i, (aqi, name, poll, level) in enumerate(alerts):
+                if i > 0:
+                    content.append("\n")
+                color = level_colors.get(level, "#fe8019")
+                content.append(f"{name[:8]:<8} {poll[:4]:<4} ")
+                content.append(f"{aqi:.0f}", style=color)
+        
+        return Panel(content, title="ALERTS", width=21, height=6)
+
+    def _format_sparkline_widget(self) -> Panel:
+        """Create sparkline trend widget for PM2.5."""
+        data = self.current_data
+        if not data:
+            return Panel("No data", title="PM2.5", width=21, height=6)
+        
+        # Collect recent PM2.5 values - API uses "PM25" key
+        pm25_values = []
+        mobile_data = data.get("mobile", {})
+        
+        pm25_data = mobile_data.get("PM25", {})  # API uses PM25, not PM2_5
+        if isinstance(pm25_data, dict):
+            for s_key, s_data in pm25_data.items():
+                if s_key in ['LastUpdateUTC', 'LastUpdateLocal', 'VarName', 'VarUnit']:
+                    continue
+                if isinstance(s_data, dict) and 'Value' in s_data:
+                    val = self._get_latest_value(s_data)
+                    if val is not None:
+                        pm25_values.append(val)
+        
+        if not pm25_values:
+            return Panel("No data", title="PM2.5", width=21, height=6)
+        
+        # Create sparkline from current values across sensors
+        blocks = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        min_val = min(pm25_values)
+        max_val = max(pm25_values)
+        avg_val = sum(pm25_values) / len(pm25_values)
+        
+        # Normalize and create sparkline
+        spark = ""
+        if max_val > min_val:
+            for v in pm25_values[:10]:  # Limit to 10 points
+                idx = int((v - min_val) / (max_val - min_val) * 7)
+                idx = max(0, min(7, idx))
+                spark += blocks[idx]
+        else:
+            spark = blocks[4] * min(len(pm25_values), 10)
+        
+        # Color based on avg AQI
+        avg_aqi = self._value_to_aqi("PM2_5", avg_val) or 0
+        level_info = self._aqi_level(avg_aqi)
+        level = level_info.get("label", "Good") if isinstance(level_info, dict) else "Good"
+        level_colors = {"Good": "#b8bb26", "Moderate": "#fabd2f", "USG": "#fe8019", 
+                        "Unhealthy": "#fb4934", "Very Unhealthy": "#d3869b", "Hazardous": "#cc241d"}
+        spark_color = level_colors.get(level, "#83a598")
+        
+        content = Text()
+        content.append(spark, style=spark_color)
+        content.append("\n")
+        content.append("Lo: ")
+        content.append(f"{min_val:.0f}", style="#b8bb26")
+        content.append(" Avg: ")
+        content.append(f"{avg_val:.0f}", style=spark_color)
+        content.append("\n")
+        content.append("Hi: ")
+        content.append(f"{max_val:.0f}", style="#fb4934")
+        content.append(f" n={len(pm25_values)}")
+        
+        return Panel(content, title="PM2.5", width=21, height=6)
+
+    def _format_region_widget(self) -> Panel:
+        """Create region/location info widget."""
+        content = Text()
+        content.append("Salt Lake Valley\n", style="bold #ebdbb2")
+        content.append("40.76°N 111.89°W\n", style="#83a598")
+        content.append("Elev: ")
+        content.append("4,226", style="#fabd2f")
+        content.append(" ft")
+        
+        return Panel(content, title="REGION", width=21, height=6)
+
+    def update_widgets(self) -> None:
+        """Update all dashboard widgets."""
+        try:
+            self.query_one("#summary_widget", Static).update(self._format_summary_widget())
+        except Exception:
+            pass
+        try:
+            self.query_one("#alerts_widget", Static).update(self._format_alerts_widget())
+        except Exception:
+            pass
+        try:
+            self.query_one("#sparkline_widget", Static).update(self._format_sparkline_widget())
+        except Exception:
+            pass
+        try:
+            self.query_one("#region_widget", Static).update(self._format_region_widget())
+        except Exception:
+            pass
+
+    def update_status(self, message: str) -> None:
+        """Update the footer status line."""
+        try:
+            self.query_one("#footer_status", Static).update(message)
         except Exception:
             pass
 
@@ -627,6 +1021,7 @@ class AirQualityApp(App):
     def update_data_state(self, data, update_history: bool = False):
         self.current_data = data
         self.update_list(data, update_history)
+        self.update_widgets()
 
     def _apply_ghost_classes(self, list_view: ListView):
         current_idx = list_view.index
@@ -680,12 +1075,10 @@ class AirQualityApp(App):
                                 cleaned_vals.append(v)
 
                         val = cleaned_vals[-1]
-                        col = "#ffffff"
-                        if isinstance(cols, list) and len(cols) == len(vals): 
-                            col = cols[-1]
-                            hist_cols = cols
-                        else:
-                            hist_cols = [col] * len(vals)
+                        # Calculate color based on AQI rather than using API color
+                        col = color_for_value(p_key, val)
+                        # Calculate history colors based on values too
+                        hist_cols = [color_for_value(p_key, v) for v in cleaned_vals]
                             
                         lat = lats[-1] if isinstance(lats, list) and lats else None
                         lon = lons[-1] if isinstance(lons, list) and lons else None
@@ -703,7 +1096,6 @@ class AirQualityApp(App):
                 if s_key in ['LastUpdateUTC', 'LastUpdateLocal', 'APITimeStart', 'APITimeEnd', 'VarName', 'VarUnit']: continue
                 if isinstance(s_data, dict) and 'Value' in s_data:
                     val = s_data['Value']
-                    col = s_data.get('ValueColor', "#ffffff")
                     lat = s_data.get('Latitude')
                     lon = s_data.get('Longitude')
                     time_utc = s_data.get('TimeUTC')
@@ -719,6 +1111,9 @@ class AirQualityApp(App):
                     if val_num < 0:
                         val_num = 0.0
                         val = "0.0"
+                    
+                    # Calculate color based on AQI rather than using API color
+                    col = color_for_value(p_key, val)
                     
                     # Filter Fixed Sensors for SLC area only
                     # Approx Salt Lake Valley: Lat 40.4 to 41.0, Lon -112.2 to -111.7
@@ -772,7 +1167,8 @@ class AirQualityApp(App):
                         history_updated = True
                         
                     current_history = [x['val'] for x in self.fixed_history[s_key][p_key]]
-                    current_history_cols = [x['col'] for x in self.fixed_history[s_key][p_key]]
+                    # Recalculate history colors based on values for consistency
+                    current_history_cols = [color_for_value(p_key, x['val']) for x in self.fixed_history[s_key][p_key]]
                     
                     unified_sensors[s_key]['readings'][p_key] = (val, col, lat, lon, p_unit, current_history, current_history_cols)
         
@@ -1147,6 +1543,11 @@ class AirQualityApp(App):
                 Text.from_markup(spark)
             )
 
+        # Pad table to always have 3 rows for consistent height
+        rows_added = len(item.sensor_readings)
+        for _ in range(3 - rows_added):
+            table.add_row("", "", "", "")
+
         sensor_type_label = "(Fixed Station)" if item.is_fixed else "(Mobile Sensor)"
         
         # Align location text with the second column (Value)
@@ -1338,17 +1739,29 @@ class AirQualityApp(App):
                 self.notify(f"Sensor {s_name} {state}")
 
 if __name__ == "__main__":
-    dashboard_proc = _start_dashboard_server_process()
+    dashboard_handle = _start_dashboard_server_process()
     try:
         app = AirQualityApp()
         app.run()
     finally:
-        if dashboard_proc and dashboard_proc.poll() is None:
-            try:
-                dashboard_proc.terminate()
-                dashboard_proc.wait(timeout=2.0)
-            except Exception:
+        # Clean up dashboard server
+        if dashboard_handle is not None:
+            if isinstance(dashboard_handle, tuple):
+                # Bundled mode: (stop_event, httpd)
+                stop_event, httpd = dashboard_handle
                 try:
-                    dashboard_proc.kill()
+                    stop_event.set()
+                    httpd.shutdown()
                 except Exception:
                     pass
+            elif hasattr(dashboard_handle, 'poll'):
+                # Subprocess mode
+                if dashboard_handle.poll() is None:
+                    try:
+                        dashboard_handle.terminate()
+                        dashboard_handle.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            dashboard_handle.kill()
+                        except Exception:
+                            pass

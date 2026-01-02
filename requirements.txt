@@ -1,5 +1,6 @@
 requests>=2.31.0
 textual>=0.55.0
 rich>=13.7.0
+certifi>=2023.0.0
 
 

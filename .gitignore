@@ -1,2 +1,22 @@
 __pycache__/
 *.pyc
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# Environment
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Logs
+*.log

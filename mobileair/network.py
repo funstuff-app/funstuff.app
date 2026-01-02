@@ -2,6 +2,7 @@
 Network operations for MobileAir.
 
 Handles HTTP fetching with on-disk caching for resilience.
+Uses Python stdlib (urllib.request) to avoid heavy dependencies like requests/urllib3.
 """
 
 from __future__ import annotations
@@ -9,15 +10,78 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import ssl
+import sys
 import time
+import urllib.request
+import urllib.error
 from typing import Any, Callable
 
 
-# Optional requests import for tests/injection
-try:
-    import requests
-except Exception:  # pragma: no cover
-    requests = None  # type: ignore
+def _get_ssl_context() -> ssl.SSLContext:
+    """Get SSL context with proper CA certificates for PyInstaller bundles."""
+    ctx = ssl.create_default_context()
+    
+    # For PyInstaller bundles, try to find bundled certifi CA bundle
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # Look for bundled certifi CA bundle
+        bundle_dir = sys._MEIPASS
+        certifi_path = os.path.join(bundle_dir, 'certifi', 'cacert.pem')
+        if os.path.exists(certifi_path):
+            ctx.load_verify_locations(certifi_path)
+            return ctx
+    
+    # Try certifi if available (normal Python environment)
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except ImportError:
+        pass  # Use system certs
+    
+    return ctx
+
+
+class StdlibResponse:
+    """Simple response wrapper to match requests-like interface."""
+    def __init__(self, data: bytes, status: int):
+        self.content = data
+        self.text = data.decode("utf-8", errors="replace")
+        self.status_code = status
+    
+    def json(self) -> Any:
+        return json.loads(self.text)
+    
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise urllib.error.HTTPError(
+                None, self.status_code, f"HTTP {self.status_code}", {}, None
+            )
+
+
+# Cache SSL context to avoid recreating it on every request
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def stdlib_get(url: str, headers: dict | None = None, timeout: float = 10) -> StdlibResponse:
+    """Simple HTTP GET using Python stdlib (no requests/urllib3 needed)."""
+    global _SSL_CONTEXT
+    
+    req = urllib.request.Request(url)
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+    req.add_header("User-Agent", "MobileAir/1.0")
+    
+    # Use cached SSL context for HTTPS requests
+    context = None
+    if url.startswith('https://'):
+        if _SSL_CONTEXT is None:
+            _SSL_CONTEXT = _get_ssl_context()
+        context = _SSL_CONTEXT
+    
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+        data = resp.read()
+        return StdlibResponse(data, resp.status)
 
 
 def default_cache_path(url: str, *, mobile_url: str, fixed_url: str, data_dir: str) -> str:
@@ -49,16 +113,14 @@ def fetch_json_with_cache(
         headers: Optional HTTP headers.
         timeout: Request timeout in seconds.
         cache_path: Path to cache file (optional).
-        request_get: Optional replacement for requests.get (for testing).
+        request_get: Optional replacement for stdlib_get (for testing).
         notify: Optional callback for status messages (message, severity).
 
     Returns:
         Parsed JSON data, or None on failure.
     """
     if request_get is None:
-        if requests is None:  # pragma: no cover
-            raise RuntimeError("requests not available; pass request_get for tests.")
-        request_get = requests.get
+        request_get = stdlib_get
 
     def _notify(msg: str, severity: str) -> None:
         if notify:

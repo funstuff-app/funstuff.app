@@ -76,6 +76,7 @@ from .outliers import detect_spatial_outliers
 from .network import (
     default_cache_path,
     fetch_json_with_cache,
+    stdlib_get,
 )
 
 # Map HTML
@@ -156,6 +157,7 @@ __all__ = [
     # Network
     "default_cache_path",
     "fetch_json_with_cache",
+    "stdlib_get",
     # Map HTML
     "generate_leaflet_map_html",
     # Dashboard
