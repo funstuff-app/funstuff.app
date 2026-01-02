@@ -1738,30 +1738,57 @@ class AirQualityApp(App):
                     self.update_list(self.current_data)
                 self.notify(f"Sensor {s_name} {state}")
 
-if __name__ == "__main__":
-    dashboard_handle = _start_dashboard_server_process()
+def _run_headless_server(host: str, port: int):
+    """Run the dashboard server in headless mode (no TUI, stdout/stderr visible)."""
+    from dashboard_server import main as dashboard_main
+    print("[Headless] Starting MobileAir dashboard server (no TUI)...")
+    print("[Headless] Press Ctrl+C to stop.")
+    # Replace sys.argv so dashboard_server.main() sees the right args
+    sys.argv = [sys.argv[0], "--host", host, "--port", str(port)]
     try:
-        app = AirQualityApp()
-        app.run()
-    finally:
-        # Clean up dashboard server
-        if dashboard_handle is not None:
-            if isinstance(dashboard_handle, tuple):
-                # Bundled mode: (stop_event, httpd)
-                stop_event, httpd = dashboard_handle
-                try:
-                    stop_event.set()
-                    httpd.shutdown()
-                except Exception:
-                    pass
-            elif hasattr(dashboard_handle, 'poll'):
-                # Subprocess mode
-                if dashboard_handle.poll() is None:
+        sys.exit(dashboard_main())
+    except KeyboardInterrupt:
+        print("\n[Headless] Shutting down...")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="MobileAir TUI and dashboard server")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run dashboard server only (no TUI). Stdout/stderr visible.")
+    parser.add_argument("--host", default=os.environ.get("MOBILEAIR_DASHBOARD_HOST", "0.0.0.0"),
+                        help="Dashboard server host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("MOBILEAIR_DASHBOARD_PORT", "8766")),
+                        help="Dashboard server port (default: 8766)")
+    args = parser.parse_args()
+
+    if args.headless:
+        _run_headless_server(args.host, args.port)
+    else:
+        dashboard_handle = _start_dashboard_server_process()
+        try:
+            app = AirQualityApp()
+            app.run()
+        finally:
+            # Clean up dashboard server
+            if dashboard_handle is not None:
+                if isinstance(dashboard_handle, tuple):
+                    # Bundled mode: (stop_event, httpd)
+                    stop_event, httpd = dashboard_handle
                     try:
-                        dashboard_handle.terminate()
-                        dashboard_handle.wait(timeout=2.0)
+                        stop_event.set()
+                        httpd.shutdown()
                     except Exception:
+                        pass
+                elif hasattr(dashboard_handle, 'poll'):
+                    # Subprocess mode
+                    if dashboard_handle.poll() is None:
                         try:
-                            dashboard_handle.kill()
+                            dashboard_handle.terminate()
+                            dashboard_handle.wait(timeout=2.0)
                         except Exception:
-                            pass
+                            try:
+                                dashboard_handle.kill()
+                            except Exception:
+                                pass

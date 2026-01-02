@@ -1474,13 +1474,39 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
 
 def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
     class Handler(BaseHTTPRequestHandler):
+        # Disable keep-alive to avoid Safari/iOS hanging on connections
+        protocol_version = "HTTP/1.1"
+        
+        def log_message(self, format, *args):
+            # Suppress default logging to avoid cluttering output
+            pass
+        
+        def handle_one_request(self):
+            """Override to handle broken pipe errors gracefully (Safari can drop connections)."""
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # Client closed connection prematurely - this is normal for Safari preflight
+                pass
+            except ssl.SSLError:
+                # TLS handshake failed - common with untrusted certs
+                pass
+        
         def _send(self, code: int, body: bytes, content_type: str):
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store, max-age=0")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                # Connection: close helps Safari/iOS release connections properly
+                self.send_header("Connection", "close")
+                # Allow cross-origin requests (useful for dev/testing)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # Client disconnected while we were sending - ignore
+                pass
 
         def do_GET(self):
             if self.path in ("/", "/index.html"):
@@ -1688,6 +1714,8 @@ def main() -> int:
         print("[AirNow] Integration not available (airnow_slc.py not found)")
 
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir))
+    # Timeout for individual requests - helps with Safari/iOS connection issues
+    httpd.timeout = 30
     if args.https:
         cert_path = Path(args.cert) if args.cert else (data_dir / "dev-cert.pem")
         key_path = Path(args.key) if args.key else (data_dir / "dev-key.pem")
@@ -1762,6 +1790,8 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
         ).start()
 
     httpd = ThreadingHTTPServer((host, port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir))
+    # Timeout for individual requests - helps with Safari/iOS connection issues
+    httpd.timeout = 30
     
     def serve():
         try:

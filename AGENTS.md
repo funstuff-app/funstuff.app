@@ -202,6 +202,21 @@ Use the conversion functions: `latLonToWorld()`, `worldToScreen()`, `worldToScre
 4. **Does this affect playback?** Check `m` flag handling.
 5. **Could this be slow in a loop?** Consider caching or pre-computation.
 
+### Widget Development Notes
+When creating TUI widgets with Rich:
+- Use `rich.panel.Panel` for bordered boxes - it handles alignment correctly
+- Use `rich.text.Text` for styled content inside panels
+- Do NOT manually draw box characters with Rich markup - the markup tags break width calculations
+- Example:
+```python
+from rich.panel import Panel
+from rich.text import Text
+
+content = Text()
+content.append("value", style="#b8bb26")
+return Panel(content, title="TITLE", width=21, height=6)
+```
+
 ## Building the Native macOS Binary
 
 The TUI can be packaged as a standalone macOS executable using PyInstaller.
@@ -222,6 +237,18 @@ sudo rm -rf /opt/mobileair && sudo mv dist/mobileair /opt/mobileair
 /opt/mobileair/mobileair
 ```
 
+### Headless Mode (Server Only)
+To run the dashboard server without the TUI (useful for logging/debugging):
+```bash
+/opt/mobileair/mobileair --headless
+```
+This prints all stdout/stderr to the terminal instead of redirecting to a log file.
+
+You can also specify host and port:
+```bash
+/opt/mobileair/mobileair --headless --host 0.0.0.0 --port 8766
+```
+
 ### Build + Deploy One-Liner
 ```bash
 cd /Users/johusha/Stuff/mobileair && python -m PyInstaller --noconfirm mobileair.spec 2>&1 | tail -3 && sudo rm -rf /opt/mobileair && sudo mv dist/mobileair /opt/mobileair && echo "Done"
@@ -233,18 +260,3 @@ cd /Users/johusha/Stuff/mobileair && python -m PyInstaller --noconfirm mobileair
 - **Install location**: `/opt/mobileair/`
 - **Binary size**: ~34 MB
 - **Startup time**: ~1.6s warm, ~2.5s cold
-
-### Widget Development Notes
-When creating TUI widgets with Rich:
-- Use `rich.panel.Panel` for bordered boxes - it handles alignment correctly
-- Use `rich.text.Text` for styled content inside panels
-- Do NOT manually draw box characters with Rich markup - the markup tags break width calculations
-- Example:
-```python
-from rich.panel import Panel
-from rich.text import Text
-
-content = Text()
-content.append("value", style="#b8bb26")
-return Panel(content, title="TITLE", width=21, height=6)
-```

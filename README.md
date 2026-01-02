@@ -75,5 +75,3 @@ python run_tests.py
 ```
 
 If your terminal doesn’t show colors, ensure you’re not setting `NO_COLOR`, and that `TERM` is not `dumb`.
-
-
