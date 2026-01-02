@@ -6195,12 +6195,16 @@ function main() {
   const pbDebugCheck = document.getElementById("pbDebugCheck");
   
   function closePlaybackMenu() {
-    if (pbMenu) pbMenu.classList.remove("visible");
+    if (pbMenu) {
+      pbMenu.classList.remove("visible");
+      pbMenu.classList.add("hidden");
+    }
     if (pbMenuBtn) pbMenuBtn.classList.remove("open");
   }
   
   function openPlaybackMenu() {
     if (!pbMenu) return;
+    pbMenu.classList.remove("hidden");
     pbMenu.classList.add("visible");
     if (pbMenuBtn) pbMenuBtn.classList.add("open");
     updateDaysSubmenu();
@@ -6306,7 +6310,7 @@ function main() {
   
   // Close menu when clicking outside
   document.addEventListener("click", (e) => {
-    if (pbMenu && !pbMenu.classList.contains("hidden")) {
+    if (pbMenu && pbMenu.classList.contains("visible")) {
       if (!e.target.closest(".pbMenuWrap")) {
         closePlaybackMenu();
       }
