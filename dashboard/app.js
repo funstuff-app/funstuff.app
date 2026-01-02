@@ -6194,16 +6194,38 @@ function main() {
   const pbDaysSubmenu = document.getElementById("pbDaysSubmenu");
   const pbDebugCheck = document.getElementById("pbDebugCheck");
   
-  function closePlaybackMenu() {
+  // Menu close delay for better UX
+  let _menuHideTimer = null;
+  const MENU_HIDE_DELAY = 150; // ms before hiding main menu
+  
+  function closePlaybackMenuImmediate() {
+    if (_menuHideTimer) {
+      clearTimeout(_menuHideTimer);
+      _menuHideTimer = null;
+    }
     if (pbMenu) {
       pbMenu.classList.remove("visible");
       pbMenu.classList.add("hidden");
     }
     if (pbMenuBtn) pbMenuBtn.classList.remove("open");
+    // Also hide submenu
+    if (pbDaysSubmenu) pbDaysSubmenu.classList.remove("visible");
+  }
+  
+  function closePlaybackMenu() {
+    closePlaybackMenuImmediate();
+  }
+  
+  function cancelMenuHide() {
+    if (_menuHideTimer) {
+      clearTimeout(_menuHideTimer);
+      _menuHideTimer = null;
+    }
   }
   
   function openPlaybackMenu() {
     if (!pbMenu) return;
+    cancelMenuHide();
     pbMenu.classList.remove("hidden");
     pbMenu.classList.add("visible");
     if (pbMenuBtn) pbMenuBtn.classList.add("open");
@@ -6217,8 +6239,37 @@ function main() {
     if (isOpen) {
       closePlaybackMenu();
     } else {
-      openPlaybackMenu();
+      openPlaybackMenu();;
     }
+  }
+  
+  // Submenu hover handling with delay
+  let _submenuHideTimer = null;
+  const SUBMENU_HIDE_DELAY = 200; // ms before hiding submenu
+  
+  function showSubmenu() {
+    if (_submenuHideTimer) {
+      clearTimeout(_submenuHideTimer);
+      _submenuHideTimer = null;
+    }
+    if (pbDaysSubmenu) pbDaysSubmenu.classList.add("visible");
+  }
+  
+  function hideSubmenuDelayed() {
+    if (_submenuHideTimer) clearTimeout(_submenuHideTimer);
+    _submenuHideTimer = setTimeout(() => {
+      if (pbDaysSubmenu) pbDaysSubmenu.classList.remove("visible");
+      _submenuHideTimer = null;
+    }, SUBMENU_HIDE_DELAY);
+  }
+  
+  // Wire up submenu parent hover
+  const pbMenuSubEl = document.querySelector(".pbMenuSub");
+  if (pbMenuSubEl && pbDaysSubmenu) {
+    pbMenuSubEl.addEventListener("mouseenter", showSubmenu);
+    pbMenuSubEl.addEventListener("mouseleave", hideSubmenuDelayed);
+    pbDaysSubmenu.addEventListener("mouseenter", showSubmenu);
+    pbDaysSubmenu.addEventListener("mouseleave", hideSubmenuDelayed);
   }
   
   function updateDaysSubmenu() {
