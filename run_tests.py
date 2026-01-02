@@ -65,7 +65,7 @@ class CheckmarkResult(unittest.TextTestResult):
 
 
 class CheckmarkRunner(unittest.TextTestRunner):
-    resultclass = CheckmarkResult
+    resultclass = CheckmarkResult  # type: ignore[assignment]
 
 
 def main() -> int:
