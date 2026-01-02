@@ -3315,7 +3315,8 @@ class MapView {
 
     // Determine transient visibility:
     // - Dim idle (non-moving) markers unless Debug/Selected.
-    // - Dim ghosted markers unless Debug/Selected (regardless of scrubbing).
+    // Note: ghosted status is irrelevant here - it's current live state, not historical.
+    // During playback, we use the trail's `m` flag to determine if it was moving at that time.
     let opacity = 1.0;
     const dimOpacity = 0.25;
     const movingFlag = !!(nextPoint && (nextPoint.m === 1 || nextPoint.m === "1" || nextPoint.m === true));
@@ -3324,15 +3325,6 @@ class MapView {
 
     if (!movingFlag && !this._pbDebugPath && !isSel) {
       opacity = dimOpacity;
-    }
-
-    // Offline sensors are always dimmed unless Debug/Selected.
-    if (!!m.ghosted && !this._pbDebugPath && !isSel) {
-      opacity = dimOpacity;
-    }
-    // Offline sensors should not report motion.
-    if (!!m.ghosted) {
-      speedMps = 0;
     }
 
     // Additional gap check (dim markers in large data gaps)
@@ -4401,8 +4393,10 @@ class MapView {
       const key = keyFor("mobile", m.id);
       const isSel = (this.selectedId === key);
       const debug = !!this._pbDebugPath;
-      // Offline sensors are always hidden unless Debug/Selected.
-      if (!!m.ghosted && !debug && !isSel) return;
+      // In playback mode, show ghosted sensors if they have trail data (they were active in the past).
+      // In live mode, hide ghosted sensors unless Debug/Selected.
+      const hasPlaybackData = this.playbackMode && this._playbackPtsById.has(String(m.id));
+      if (!!m.ghosted && !debug && !isSel && !hasPlaybackData) return;
       const isParked = !!m.parked;
       const dimmed = (!debug && !isSel && isParked);
       if (!isFinite(lat) || !isFinite(lon)) return;
