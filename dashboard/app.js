@@ -3649,7 +3649,8 @@ class MapView {
         ctx.fillStyle = isSel ? "rgba(16, 20, 28, 0.78)" : "rgba(16, 20, 28, 0.68)";
         ctx.arc(sp.x, sp.y, 16, 0, Math.PI * 2);
         ctx.fill();
-        ctx.strokeStyle = isSel ? "rgba(108,195,255,0.90)" : "rgba(0,0,0,0.35)";
+        // Border matches AQI color (like label pills)
+        ctx.strokeStyle = isSel ? "rgba(108,195,255,0.90)" : safeHex((pr && pr.color) || color);
         ctx.lineWidth = 2.0;
         ctx.stroke();
 
@@ -4009,7 +4010,8 @@ class MapView {
         ctx.fillStyle = isSel ? "rgba(16, 20, 28, 0.78)" : "rgba(16, 20, 28, 0.68)";
         ctx.arc(sp.x, sp.y, 16, 0, Math.PI*2);
         ctx.fill();
-        ctx.strokeStyle = isSel ? "rgba(108,195,255,0.90)" : "rgba(0,0,0,0.35)";
+        // Border matches AQI color (like label pills)
+        ctx.strokeStyle = isSel ? "rgba(108,195,255,0.90)" : safeHex((pr && pr.color) || color);
         ctx.lineWidth = 2.0;
         ctx.stroke();
 
@@ -4470,7 +4472,8 @@ class MapView {
       ctx.fillStyle = (this.selectedId === key) ? "rgba(16, 20, 28, 0.78)" : "rgba(16, 20, 28, 0.68)";
       ctx.arc(spx, spy, 18 * liftScale, 0, Math.PI*2);
       ctx.fill();
-      ctx.strokeStyle = (this.selectedId === key) ? "rgba(108,195,255,0.90)" : "rgba(0,0,0,0.35)";
+      // Border matches AQI color (like label pills)
+      ctx.strokeStyle = (this.selectedId === key) ? "rgba(108,195,255,0.90)" : safeHex(prColorUse);
       ctx.lineWidth = 2.2;
       ctx.stroke();
 

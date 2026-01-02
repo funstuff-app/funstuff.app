@@ -1517,6 +1517,15 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 return self._send(200, (static_dir / "map_nav_engine.js").read_bytes(), "text/javascript")
             if self.path == "/styles.css":
                 return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css")
+            if self.path == "/manifest.json":
+                return self._send(200, (static_dir / "manifest.json").read_bytes(), "application/manifest+json")
+            if self.path == "/icon.svg":
+                return self._send(200, (static_dir / "icon.svg").read_bytes(), "image/svg+xml")
+            if self.path.startswith("/icon-") and self.path.endswith(".png"):
+                fname = self.path.lstrip("/")
+                fpath = static_dir / fname
+                if fpath.exists():
+                    return self._send(200, fpath.read_bytes(), "image/png")
             if self.path == "/tui.html":
                 return self._send(200, (static_dir / "tui.html").read_bytes(), "text/html")
             if self.path == "/tui.css":
