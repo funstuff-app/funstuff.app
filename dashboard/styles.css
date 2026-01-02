@@ -316,44 +316,184 @@ aside, section { min-height: 0; }
 }
 .pbSpeed select:hover { border-color: rgba(255,255,255,0.16); }
 
-.pbDay {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 12px;
-  white-space: nowrap;
+/* Playback menu (dropup) */
+.pbMenuWrap {
+  position: relative;
 }
 
-.pbDay select {
+.pbMenuBtn {
+  width: 32px;
   height: 30px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: rgba(17,24,38,0.80);
-  color: rgba(232,238,247,0.92);
-  padding: 0 10px;
-  min-width: 100px;
-}
-.pbDay select:hover { border-color: rgba(255,255,255,0.16); }
-
-/* Save/Load buttons in playback bar */
-.pbSaveLoad {
-  height: 30px;
-  min-width: 70px;
   border-radius: 10px;
   border: 1px solid var(--border);
   background: rgba(17,24,38,0.80);
   color: rgba(232,238,247,0.92);
   cursor: pointer;
-  font-size: 12px;
-  padding: 0 10px;
-  display: inline-flex;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  display: flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  transition: all 0.12s ease;
 }
-.pbSaveLoad:hover { border-color: rgba(255,255,255,0.16); background: rgba(24,32,48,0.90); }
-.pbSaveLoad:disabled { opacity: 0.5; cursor: not-allowed; }
+.pbMenuBtn:hover {
+  border-color: rgba(255,255,255,0.22);
+  background: rgba(24,32,48,0.95);
+}
+.pbMenuBtn:active {
+  transform: scale(0.96);
+}
+.pbMenuBtn.open {
+  background: rgba(108, 195, 255, 0.15);
+  border-color: var(--accent);
+}
+
+.pbMenu {
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  margin-bottom: 8px;
+  min-width: 200px;
+  background: rgba(17, 24, 38, 0.97);
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 14px;
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0,0,0,0.2);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  padding: 8px 0;
+  z-index: 50;
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.pbMenu.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.pbMenuItem {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 16px;
+  cursor: pointer;
+  color: rgba(232,238,247,0.95);
+  font-size: 14px;
+  font-weight: 450;
+  transition: background 0.08s;
+  position: relative;
+  user-select: none;
+}
+.pbMenuItem:hover {
+  background: rgba(108, 195, 255, 0.14);
+}
+.pbMenuItem:active {
+  background: rgba(108, 195, 255, 0.22);
+}
+.pbMenuIcon {
+  width: 22px;
+  text-align: center;
+  font-size: 16px;
+  flex-shrink: 0;
+}
+.pbMenuLabel {
+  flex: 1;
+}
+.pbMenuArrow {
+  color: rgba(232,238,247,0.5);
+  font-size: 18px;
+  font-weight: 300;
+}
+.pbMenuSub:hover .pbMenuArrow {
+  color: var(--accent);
+}
+.pbMenuCheck {
+  width: 18px;
+  height: 18px;
+  border: 1.5px solid rgba(232,238,247,0.35);
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+}
+.pbMenuCheck.checked {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #000;
+  box-shadow: 0 0 8px rgba(108, 195, 255, 0.4);
+}
+.pbMenuCheck.checked::after {
+  content: "✓";
+  font-weight: 600;
+}
+
+.pbMenuDivider {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+  margin: 8px 12px;
+}
+
+/* Submenu (expands right and UP from bottom) */
+.pbMenuSub {
+  position: relative;
+}
+.pbSubmenu {
+  position: absolute;
+  left: calc(100% + 4px);
+  bottom: -8px;
+  min-width: 180px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: rgba(17, 24, 38, 0.97);
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 14px;
+  box-shadow: 8px 0 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0,0,0,0.2);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  padding: 8px 0;
+  opacity: 0;
+  transform: translateX(-4px);
+  pointer-events: none;
+  transition: opacity 0.1s, transform 0.1s;
+}
+.pbMenuSub:hover .pbSubmenu,
+.pbSubmenu:hover {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+.pbSubmenuItem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  cursor: pointer;
+  color: rgba(232,238,247,0.95);
+  font-size: 14px;
+  font-weight: 450;
+  transition: background 0.08s;
+  user-select: none;
+}
+.pbSubmenuItem:hover {
+  background: rgba(108, 195, 255, 0.14);
+}
+.pbSubmenuItem:active {
+  background: rgba(108, 195, 255, 0.22);
+}
+.pbSubmenuItem.active {
+  background: rgba(108, 195, 255, 0.18);
+  color: var(--accent);
+}
+.pbSubmenuItem.active::before {
+  content: "●";
+  font-size: 8px;
+  margin-right: 6px;
+  color: var(--accent);
+}
 
 /* Snapshot load modal */
 .snapshotModal {

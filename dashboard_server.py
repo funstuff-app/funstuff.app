@@ -1518,7 +1518,26 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
             if self.path == "/styles.css":
                 return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css")
             if self.path == "/manifest.json":
-                return self._send(200, (static_dir / "manifest.json").read_bytes(), "application/manifest+json")
+                # Generate manifest dynamically with explicit http:// URL for PWA
+                host_header = self.headers.get("Host", "localhost:8765")
+                base_url = f"http://{host_header}"
+                manifest = {
+                    "name": "MobileAir Dashboard",
+                    "short_name": "MobileAir",
+                    "description": "Real-time air quality monitoring dashboard for Utah mobile and fixed sensors",
+                    "start_url": base_url + "/",
+                    "scope": base_url + "/",
+                    "display": "standalone",
+                    "background_color": "#0b0f14",
+                    "theme_color": "#111826",
+                    "orientation": "any",
+                    "icons": [
+                        {"src": base_url + "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                        {"src": base_url + "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+                        {"src": base_url + "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+                    ]
+                }
+                return self._send(200, json.dumps(manifest).encode(), "application/manifest+json")
             if self.path == "/icon.svg":
                 return self._send(200, (static_dir / "icon.svg").read_bytes(), "image/svg+xml")
             if self.path.startswith("/icon-") and self.path.endswith(".png"):

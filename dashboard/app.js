@@ -5827,11 +5827,13 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   // DAY SELECTOR: Load historical data for past days
   // ─────────────────────────────────────────────────────────────────────────────
-  const pbDaySelectEl = document.getElementById("pbDaySelect");
   window._historicalState = null;  // Cached historical data when not "live"
   
   // Loading state tracking - shared between historical and snapshot loading
   let _isLoadingData = false;
+  
+  // Track current selected day for menu display
+  let _selectedDayValue = "live";
   
   /**
    * Validate that a state object has the expected schema.
@@ -5872,39 +5874,7 @@ function main() {
   }
 
   function updateSaveButtonState() {
-    const pbSaveEl = document.getElementById("pbSave");
-    if (pbSaveEl) {
-      pbSaveEl.disabled = !canSaveSnapshot();
-    }
-  }
-  
-  function populateDaySelector() {
-    if (!pbDaySelectEl) return;
-    pbDaySelectEl.innerHTML = "";
-    
-    const now = new Date();
-    const options = [];
-    
-    // Today (live)
-    options.push({ value: "live", label: "Today (Live)" });
-    
-    // Past 6 days
-    for (let i = 1; i <= 6; i++) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
-      const dateStr = d.toISOString().split("T")[0];
-      const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
-      const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-      const label = i === 1 ? `Yesterday (${monthDay})` : `${dayName} ${monthDay}`;
-      options.push({ value: dateStr, label });
-    }
-    
-    for (const opt of options) {
-      const el = document.createElement("option");
-      el.value = opt.value;
-      el.textContent = opt.label;
-      pbDaySelectEl.appendChild(el);
-    }
+    // No-op: old button removed, menu handles state dynamically
   }
   
   async function loadHistoricalDay(dateStr) {
@@ -5992,24 +5962,15 @@ function main() {
     }
   }
   
-  if (pbDaySelectEl) {
-    populateDaySelector();
-    pbDaySelectEl.addEventListener("change", () => {
-      loadHistoricalDay(pbDaySelectEl.value);
-    });
-  }
-
   // ─────────────────────────────────────────────────────────────────────────────
   // SAVE/LOAD: Persist and restore daily snapshots
   // ─────────────────────────────────────────────────────────────────────────────
-  const pbSaveEl = document.getElementById("pbSave");
-  const pbLoadEl = document.getElementById("pbLoad");
 
   function getSnapshotDateStr() {
     // Determine the date to use for saving based on the data being viewed
-    // 1. If viewing a historical day via the day selector, use that date
-    if (pbDaySelectEl && pbDaySelectEl.value && pbDaySelectEl.value !== "live") {
-      return pbDaySelectEl.value;  // Already in YYYY-MM-DD format
+    // 1. If viewing a historical day via the menu, use that date
+    if (_selectedDayValue && _selectedDayValue !== "live") {
+      return _selectedDayValue;  // Already in YYYY-MM-DD format
     }
     
     // 2. Otherwise, derive from the newest reading timestamp in the current state
@@ -6039,8 +6000,6 @@ function main() {
       console.warn("Cannot save: no state data available");
       return;
     }
-    
-    if (pbSaveEl) pbSaveEl.disabled = true;
     
     try {
       const resp = await fetch(`/api/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
@@ -6227,14 +6186,132 @@ function main() {
     }
   }
 
-  if (pbSaveEl) {
-    pbSaveEl.addEventListener("click", saveSnapshot);
-    // Initialize button state
-    updateSaveButtonState();
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PLAYBACK MENU: Dropup menu for save/load/days
+  // ─────────────────────────────────────────────────────────────────────────────
+  const pbMenuBtn = document.getElementById("pbMenuBtn");
+  const pbMenu = document.getElementById("pbMenu");
+  const pbDaysSubmenu = document.getElementById("pbDaysSubmenu");
+  const pbDebugCheck = document.getElementById("pbDebugCheck");
+  
+  function closePlaybackMenu() {
+    if (pbMenu) pbMenu.classList.remove("visible");
+    if (pbMenuBtn) pbMenuBtn.classList.remove("open");
   }
-  if (pbLoadEl) {
-    pbLoadEl.addEventListener("click", showLoadModal);
+  
+  function openPlaybackMenu() {
+    if (!pbMenu) return;
+    pbMenu.classList.add("visible");
+    if (pbMenuBtn) pbMenuBtn.classList.add("open");
+    updateDaysSubmenu();
+    updateDebugCheckState();
   }
+  
+  function togglePlaybackMenu() {
+    if (!pbMenu) return;
+    const isOpen = pbMenu.classList.contains("visible");
+    if (isOpen) {
+      closePlaybackMenu();
+    } else {
+      openPlaybackMenu();
+    }
+  }
+  
+  function updateDaysSubmenu() {
+    if (!pbDaysSubmenu) return;
+    pbDaysSubmenu.innerHTML = "";
+    
+    const now = new Date();
+    const options = [];
+    
+    // Today (live)
+    options.push({ value: "live", label: "📡 Today (Live)" });
+    
+    // Past 6 days
+    for (let i = 1; i <= 6; i++) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().split("T")[0];
+      const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
+      const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      const label = i === 1 ? `Yesterday (${monthDay})` : `${dayName} ${monthDay}`;
+      options.push({ value: dateStr, label });
+    }
+    
+    for (const opt of options) {
+      const item = document.createElement("div");
+      item.className = "pbSubmenuItem";
+      if (opt.value === _selectedDayValue) {
+        item.classList.add("active");
+      }
+      item.textContent = opt.label;
+      item.dataset.value = opt.value;
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        _selectedDayValue = opt.value;
+        loadHistoricalDay(opt.value);
+        closePlaybackMenu();
+      });
+      pbDaysSubmenu.appendChild(item);
+    }
+  }
+  
+  function updateDebugCheckState() {
+    if (!pbDebugCheck) return;
+    const isDebug = pbDebugEl && pbDebugEl.checked;
+    if (isDebug) {
+      pbDebugCheck.classList.add("checked");
+    } else {
+      pbDebugCheck.classList.remove("checked");
+    }
+  }
+  
+  function handleMenuAction(action) {
+    switch (action) {
+      case "save":
+        saveSnapshot();
+        break;
+      case "load":
+        showLoadModal();
+        break;
+      case "debug":
+        if (pbDebugEl) {
+          pbDebugEl.checked = !pbDebugEl.checked;
+          pbDebugEl.dispatchEvent(new Event("change"));
+        }
+        updateDebugCheckState();
+        return; // Don't close menu for toggles
+    }
+    closePlaybackMenu();
+  }
+  
+  if (pbMenuBtn) {
+    pbMenuBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      togglePlaybackMenu();
+    });
+  }
+  
+  // Handle clicks on menu items
+  if (pbMenu) {
+    pbMenu.addEventListener("click", (e) => {
+      const item = e.target.closest(".pbMenuItem");
+      if (!item) return;
+      // Skip if it's the submenu parent (handled by hover)
+      if (item.classList.contains("pbMenuSub")) return;
+      const action = item.dataset.action;
+      if (action) handleMenuAction(action);
+    });
+  }
+  
+  // Close menu when clicking outside
+  document.addEventListener("click", (e) => {
+    if (pbMenu && !pbMenu.classList.contains("hidden")) {
+      if (!e.target.closest(".pbMenuWrap")) {
+        closePlaybackMenu();
+      }
+    }
+  });
 
   if (pbScrubEl) {
     const applyScrub = () => {
