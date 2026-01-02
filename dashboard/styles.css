@@ -144,8 +144,27 @@ aside, section { min-height: 0; }
 .reading .v { font-weight: 700; }
 
 #mapPane { position: relative; background: #081018; }
-#mapRoot { position: relative; width: 100%; height: 100%; overflow: hidden; }
-#tilesCanvas { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0; }
+#mapRoot {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  /* Prevent browser overscroll/bounce effects */
+  overscroll-behavior: none;
+  /* Prevent double-tap zoom on iOS */
+  touch-action: manipulation;
+}
+#tilesCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  /* Prevent browser default touch gestures (scroll, zoom) on the map */
+  touch-action: none;
+  /* GPU layer compositing hint for smoother panning/zooming */
+  will-change: transform;
+}
 /* Shadow-lift mix layer lives between tiles and overlays. */
 #mapRoot::before {
   content: "";
@@ -157,7 +176,17 @@ aside, section { min-height: 0; }
   opacity: var(--map-shadow-lift);
   mix-blend-mode: screen; /* lifts dark areas much more than light labels/roads */
 }
-#overlayCanvas { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; }
+#overlayCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2;
+  /* Prevent browser default touch gestures - this canvas receives touch events */
+  touch-action: none;
+  /* GPU layer compositing hint for smoother panning/zooming */
+  will-change: transform;
+}
 
 /* DVR playback controls (bottom center) */
 .playbackBar {
@@ -349,9 +378,8 @@ aside, section { min-height: 0; }
 
 .pbDebug input { accent-color: var(--accent); }
 
-/* Basemap: keep “dark theme” but don’t alter saturation/brightness beyond the provider. */
+/* Basemap */
 #tilesCanvas {
-  /* Adjustable per-theme via CSS vars; affects tiles only. */
   filter: saturate(var(--map-saturate)) brightness(var(--map-brightness)) contrast(var(--map-contrast));
 }
 
