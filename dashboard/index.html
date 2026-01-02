@@ -78,17 +78,34 @@
                 <option value="20">20×</option>
               </select>
             </label>
-            <label class="pbDay" title="Select day for historical playback">
-              <select id="pbDaySelect" aria-label="Day selector">
-                <option value="live" selected>Today (Live)</option>
-              </select>
-            </label>
-            <button id="pbSave" type="button" class="pbSaveLoad" title="Save current day's data">💾 Save</button>
-            <button id="pbLoad" type="button" class="pbSaveLoad" title="Load a saved day">📂 Load</button>
-            <label class="pbDebug" title="Debug overlays (shows magnet/path helpers)">
-              <input id="pbDebugPath" type="checkbox" />
-              <span>Debug</span>
-            </label>
+            <!-- Menu button with dropup -->
+            <div class="pbMenuWrap">
+              <button id="pbMenuBtn" type="button" class="pbMenuBtn" title="More options">⋮</button>
+              <div id="pbMenu" class="pbMenu hidden">
+                <div class="pbMenuItem" data-action="save">
+                  <span class="pbMenuIcon">💾</span>
+                  <span class="pbMenuLabel">Save Day</span>
+                </div>
+                <div class="pbMenuItem" data-action="load">
+                  <span class="pbMenuIcon">📂</span>
+                  <span class="pbMenuLabel">Load Day</span>
+                </div>
+                <div class="pbMenuDivider"></div>
+                <div class="pbMenuItem pbMenuSub" data-submenu="days">
+                  <span class="pbMenuIcon">📅</span>
+                  <span class="pbMenuLabel">Select Day</span>
+                  <span class="pbMenuArrow">›</span>
+                  <div class="pbSubmenu" id="pbDaysSubmenu"></div>
+                </div>
+                <div class="pbMenuDivider"></div>
+                <div class="pbMenuItem pbMenuToggle" data-action="debug">
+                  <span class="pbMenuIcon">🐛</span>
+                  <span class="pbMenuLabel">Debug Mode</span>
+                  <span class="pbMenuCheck" id="pbDebugCheck"></span>
+                </div>
+              </div>
+            </div>
+            <input type="checkbox" id="pbDebugPath" class="hidden" />
           </div>
 
           <!-- Sidebar panel (integrated, overlays map) -->
