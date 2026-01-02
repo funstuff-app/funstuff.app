@@ -12,6 +12,9 @@
 <body>
   <div id="app">
     <header id="topbar">
+      <button id="menuBtn" class="menuBtn" type="button" title="Toggle sensor list" aria-label="Toggle menu">
+        <span class="hamburger"></span>
+      </button>
       <div class="brand">MobileAir</div>
       <div class="status">
         <span id="statusText">Loading…</span>
@@ -78,13 +81,17 @@
             </label>
           </div>
 
-          <aside id="sidebar" class="overlayPanel">
+          <!-- Sidebar panel (integrated, overlays map) -->
+          <aside id="sidebar" class="sidebarPanel">
+            <div class="sidebarHeader">
+              <span class="sidebarTitle">Sensors</span>
+              <button id="sidebarClose" class="sidebarClose" type="button" title="Close" aria-label="Close sidebar">✕</button>
+            </div>
             <div class="tabBar" role="tablist" aria-label="Sensor lists">
               <button id="tabMobile" class="tab active" role="tab" aria-selected="true" type="button">Mobile</button>
               <button id="tabPermanent" class="tab" role="tab" aria-selected="false" type="button">Permanent</button>
               <button id="tabLabels" class="tab mini active" role="button" type="button" title="Toggle marker labels">🏷️</button>
             </div>
-            <div id="sidebarHandle" class="sidebarHandle" title="Toggle sensor list"><span class="chevron">▾</span></div>
             <div id="sensorListMobile" class="list" role="tabpanel" aria-labelledby="tabMobile"></div>
             <div id="sensorListFixed" class="list hidden" role="tabpanel" aria-labelledby="tabPermanent"></div>
           </aside>

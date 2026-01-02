@@ -4492,7 +4492,7 @@ class MapView {
 
       // Trace-mode speed indicator (buses only): show reproduced playback speed.
       // TODO: also for trax.
-      if (this.traceMode || this.playbackMode) {
+      if ((this.traceMode || this.playbackMode) && this.showLabels) {
         const sid = (m && m.id != null) ? String(m.id).toUpperCase() : "";
         const isBus = (emoji === "🚍") || sid.startsWith("BUS");
         if (isBus) {
@@ -4973,7 +4973,7 @@ function main() {
   let selectedId = null; // key: "mobile:ID" or "fixed:ID"
 
   const TAB_STORAGE_KEY = "mobileair.sidebarTab";
-  const SIDEBAR_HIDDEN_KEY = "mobileair.sidebarHidden";
+  const SIDEBAR_OPEN_KEY = "mobileair.sidebarOpen";
   const SHOW_MOBILE_KEY = "mobileair.showMobile";
   const SHOW_FIXED_KEY = "mobileair.showFixed";
   const SHOW_LABELS_KEY = "mobileair.showLabels";
@@ -4983,18 +4983,31 @@ function main() {
   const listMobileEl = document.getElementById("sensorListMobile");
   const listFixedEl = document.getElementById("sensorListFixed");
   const sidebarEl = document.getElementById("sidebar");
+  const menuBtnEl = document.getElementById("menuBtn");
+  const sidebarCloseEl = document.getElementById("sidebarClose");
+  
   let activeTab = (localStorage.getItem(TAB_STORAGE_KEY) === "fixed") ? "fixed" : "mobile";
-  let sidebarHidden = localStorage.getItem(SIDEBAR_HIDDEN_KEY) === "true";
+  let sidebarOpen = localStorage.getItem(SIDEBAR_OPEN_KEY) !== "false"; // Default open
   
   // Restore visibility states
   map.showMobile = localStorage.getItem(SHOW_MOBILE_KEY) !== "false";
   map.showFixed = localStorage.getItem(SHOW_FIXED_KEY) !== "false";
   map.showLabels = localStorage.getItem(SHOW_LABELS_KEY) !== "false";
 
+  function updateSidebarVisibility() {
+    if (sidebarEl) sidebarEl.classList.toggle("hidden", !sidebarOpen);
+    localStorage.setItem(SIDEBAR_OPEN_KEY, sidebarOpen ? "true" : "false");
+  }
+  
+  function toggleSidebar() {
+    sidebarOpen = !sidebarOpen;
+    updateSidebarVisibility();
+  }
+
   function applySidebarTab() {
     const isMobile = (activeTab === "mobile");
     // "active" = which list is shown in sidebar
-    // "disabled" = markers hidden on map (strikethrough/dimmed look)
+    // "disabled" = markers hidden on map (dimmed look)
     if (tabMobileEl) {
       tabMobileEl.classList.toggle("active", isMobile);
       tabMobileEl.classList.toggle("disabled", !map.showMobile);
@@ -5009,18 +5022,29 @@ function main() {
       tabLabelsEl.classList.toggle("active", map.showLabels);
       tabLabelsEl.classList.toggle("disabled", !map.showLabels);
     }
-    if (listMobileEl) listMobileEl.classList.toggle("hidden", !isMobile || sidebarHidden);
-    if (listFixedEl) listFixedEl.classList.toggle("hidden", isMobile || sidebarHidden);
-    if (sidebarEl) sidebarEl.classList.toggle("collapsed", sidebarHidden);
+    if (listMobileEl) listMobileEl.classList.toggle("hidden", !isMobile);
+    if (listFixedEl) listFixedEl.classList.toggle("hidden", isMobile);
     localStorage.setItem(TAB_STORAGE_KEY, isMobile ? "mobile" : "fixed");
-    localStorage.setItem(SIDEBAR_HIDDEN_KEY, sidebarHidden ? "true" : "false");
     localStorage.setItem(SHOW_MOBILE_KEY, map.showMobile ? "true" : "false");
     localStorage.setItem(SHOW_FIXED_KEY, map.showFixed ? "true" : "false");
     localStorage.setItem(SHOW_LABELS_KEY, map.showLabels ? "true" : "false");
   }
 
+  // Hamburger menu button toggles sidebar
+  if (menuBtnEl) {
+    menuBtnEl.addEventListener("click", toggleSidebar);
+  }
+  
+  // Close button in sidebar
+  if (sidebarCloseEl) {
+    sidebarCloseEl.addEventListener("click", () => {
+      sidebarOpen = false;
+      updateSidebarVisibility();
+    });
+  }
+
   // Tab click behavior:
-  // - Click inactive tab: switch to that list, expand sidebar, make markers visible if hidden
+  // - Click inactive tab: switch to that list, make markers visible if hidden
   // - Click active tab: toggle marker visibility on/off
   if (tabMobileEl) {
     tabMobileEl.addEventListener("click", () => {
@@ -5030,7 +5054,6 @@ function main() {
       } else {
         // Switch to this tab
         activeTab = "mobile";
-        sidebarHidden = false;
         // Make visible if hidden
         if (!map.showMobile) map.showMobile = true;
       }
@@ -5048,7 +5071,6 @@ function main() {
       } else {
         // Switch to this tab
         activeTab = "fixed";
-        sidebarHidden = false;
         // Make visible if hidden
         if (!map.showFixed) map.showFixed = true;
       }
@@ -5067,15 +5089,8 @@ function main() {
     });
   }
   
-  const sidebarHandleEl = document.getElementById("sidebarHandle");
-  if (sidebarHandleEl) {
-    sidebarHandleEl.addEventListener("click", () => {
-      sidebarHidden = !sidebarHidden;
-      applySidebarTab();
-    });
-  }
-  
   applySidebarTab();
+  updateSidebarVisibility();
 
   // Persist and restore view (pan/zoom). Keep it simple: store center+zoom with debounce.
   let _viewSaveTimer = null;
@@ -5790,8 +5805,18 @@ function main() {
   }
 
   if (pbSpeedEl) {
+    // Restore saved speed
+    const savedSpeed = localStorage.getItem("mobileair.playbackSpeed");
+    if (savedSpeed) {
+      const n = Number(savedSpeed);
+      if (isFinite(n) && n > 0) {
+        map.setPlaybackSpeed(n);
+        pbSpeedEl.value = String(n);
+      }
+    }
     pbSpeedEl.addEventListener("change", () => {
       map.setPlaybackSpeed(pbSpeedEl.value);
+      localStorage.setItem("mobileair.playbackSpeed", pbSpeedEl.value);
       updatePlaybackUi();
     });
   }
