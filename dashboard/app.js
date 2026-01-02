@@ -6367,6 +6367,27 @@ function main() {
       }
     }
   });
+  
+  // Close menu immediately when mouse leaves viewport
+  document.addEventListener("mouseleave", () => {
+    if (pbMenu && pbMenu.classList.contains("visible")) {
+      closePlaybackMenuImmediate();
+    }
+  });
+  
+  // Fallback: close menu if mouse re-enters document and menu is still open
+  // (handles edge cases where menu got stuck open)
+  document.addEventListener("mouseenter", () => {
+    // Give a brief moment then check if mouse is actually over the menu
+    setTimeout(() => {
+      if (pbMenu && pbMenu.classList.contains("visible")) {
+        const menuWrap = document.querySelector(".pbMenuWrap");
+        if (menuWrap && !menuWrap.matches(":hover")) {
+          closePlaybackMenuImmediate();
+        }
+      }
+    }, 100);
+  });
 
   if (pbScrubEl) {
     const applyScrub = () => {
