@@ -365,11 +365,18 @@ function parseUtcMs(t) {
 
 function formatTagValue(v) {
   if (v == null) return "";
-  if (typeof v === "number" && isFinite(v)) return String(Math.ceil(v));
+  if (typeof v === "number" && isFinite(v)) {
+    // Show 1 decimal place for values < 10, integers for larger values
+    if (v < 10) return v.toFixed(1);
+    return String(Math.round(v));
+  }
   const s = String(v).trim();
   if (!s) return "";
   const n = Number(s);
-  if (isFinite(n)) return String(Math.ceil(n));
+  if (isFinite(n)) {
+    if (n < 10) return n.toFixed(1);
+    return String(Math.round(n));
+  }
   return s;
 }
 
@@ -560,8 +567,10 @@ class MapView {
     // macOS trackpad UX: two-finger pan + pinch zoom (avoid mouse-drag schema)
     this._centerAnimRAF = null;
     this.selectedId = null;
-    // Fixed markers are always visible (UI toggle removed).
+    // Marker visibility toggles
     this.showFixed = true;
+    this.showMobile = true;
+    this.showLabels = true;
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
     this._traceRAF = null;
@@ -3619,6 +3628,7 @@ class MapView {
     const worldToScreenFast = (wx, wy) => ({ x: wx - centerW.x + cssW / 2, y: wy - centerW.y + cssH / 2 });
 
     // Fixed markers - same interaction model as mobile
+    if (this.showFixed) {
     for (const f of fixed) {
         const lat = Number(f.lat), lon = Number(f.lon);
         if (!isFinite(lat) || !isFinite(lon)) continue;
@@ -3691,6 +3701,7 @@ class MapView {
         }
         ctx.restore();
     }
+    } // end if showFixed
 
     // Trails:
     const sel = parseKey(this.selectedId);
@@ -3975,7 +3986,7 @@ class MapView {
     // Get playback time for fixed sensors with history
     const fixedPbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
     
-    if (!this.traceMode && !canUseUnderlay) {
+    if (!this.traceMode && !canUseUnderlay && this.showFixed) {
       for (const f of fixed) {
         const lat = Number(f.lat), lon = Number(f.lon);
         if (!isFinite(lat) || !isFinite(lon)) continue;
@@ -4509,51 +4520,55 @@ class MapView {
         }
       }
 
-      // tiny label pill
-      const txt1 = label;
-      const txt2Key = pr.key ? String(pr.key) : "";
-      const txt2Val = formatTagValue(pr.value);
-      ctx.font = "12px -apple-system, system-ui, sans-serif";
-      const m1 = ctx.measureText(txt1);
-      const m2a = ctx.measureText(txt2Key ? `${txt2Key} ` : "");
-      const m2b = ctx.measureText(txt2Val);
-      const padX = 8;
-      const bw = Math.max(m1.width, (m2a.width + m2b.width)) + padX*2;
-      const bh = (txt2Key || txt2Val) ? 30 : 18;
-      const bx = spx - bw/2;
-      const by = spy + 18;
-      ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
-      ctx.strokeStyle = safeHex(prColorUse || colorUse);
-      ctx.lineWidth = 1.8;
-      roundRect(ctx, bx, by, bw, bh, 9);
-      ctx.fill();
-      ctx.stroke();
-      ctx.fillStyle = "#e8eef7";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      const padY = 4;
-      const lineH = (bh - padY * 2) / ((txt2Key || txt2Val) ? 2 : 1);
-      const y1 = by + padY + lineH * 0.5;
-      const y2 = by + padY + lineH * 1.5;
-      ctx.fillText(txt1, spx, y1);
-      if (txt2Key || txt2Val) {
-        const x0 = spx - (m2a.width + m2b.width) / 2;
-        ctx.fillStyle = "rgba(232,238,247,0.70)";
-        ctx.fillText(txt2Key ? `${txt2Key} ` : "", x0 + m2a.width / 2, y2);
-        ctx.fillStyle = prColorUse;
-        ctx.fillText(txt2Val, x0 + m2a.width + m2b.width / 2, y2);
+      // tiny label pill (hideable via showLabels toggle)
+      if (this.showLabels) {
+        const txt1 = label;
+        const txt2Key = pr.key ? String(pr.key) : "";
+        const txt2Val = formatTagValue(pr.value);
+        ctx.font = "12px -apple-system, system-ui, sans-serif";
+        const m1 = ctx.measureText(txt1);
+        const m2a = ctx.measureText(txt2Key ? `${txt2Key} ` : "");
+        const m2b = ctx.measureText(txt2Val);
+        const padX = 8;
+        const bw = Math.max(m1.width, (m2a.width + m2b.width)) + padX*2;
+        const bh = (txt2Key || txt2Val) ? 30 : 18;
+        const bx = spx - bw/2;
+        const by = spy + 18;
+        ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
+        ctx.strokeStyle = safeHex(prColorUse || colorUse);
+        ctx.lineWidth = 1.8;
+        roundRect(ctx, bx, by, bw, bh, 9);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "#e8eef7";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const padY = 4;
+        const lineH = (bh - padY * 2) / ((txt2Key || txt2Val) ? 2 : 1);
+        const y1 = by + padY + lineH * 0.5;
+        const y2 = by + padY + lineH * 1.5;
+        ctx.fillText(txt1, spx, y1);
+        if (txt2Key || txt2Val) {
+          const x0 = spx - (m2a.width + m2b.width) / 2;
+          ctx.fillStyle = "rgba(232,238,247,0.70)";
+          ctx.fillText(txt2Key ? `${txt2Key} ` : "", x0 + m2a.width / 2, y2);
+          ctx.fillStyle = prColorUse;
+          ctx.fillText(txt2Val, x0 + m2a.width + m2b.width / 2, y2);
+        }
       }
       ctx.restore();
     };
 
     // Draw mobiles in two passes so the interacted/selected marker is on top.
-    for (const m of mobiles) {
-      if (topMobileId && m && m.id != null && String(m.id) === String(topMobileId)) continue;
-      drawMobileMarker(m);
-    }
-    if (topMobileId) {
-      const top = mobiles.find(mm => (mm && mm.id != null && String(mm.id) === String(topMobileId))) || null;
-      if (top) drawMobileMarker(top);
+    if (this.showMobile) {
+      for (const m of mobiles) {
+        if (topMobileId && m && m.id != null && String(m.id) === String(topMobileId)) continue;
+        drawMobileMarker(m);
+      }
+      if (topMobileId) {
+        const top = mobiles.find(mm => (mm && mm.id != null && String(mm.id) === String(topMobileId))) || null;
+        if (top) drawMobileMarker(top);
+      }
     }
   }
 }
@@ -4958,29 +4973,108 @@ function main() {
   let selectedId = null; // key: "mobile:ID" or "fixed:ID"
 
   const TAB_STORAGE_KEY = "mobileair.sidebarTab";
+  const SIDEBAR_HIDDEN_KEY = "mobileair.sidebarHidden";
+  const SHOW_MOBILE_KEY = "mobileair.showMobile";
+  const SHOW_FIXED_KEY = "mobileair.showFixed";
+  const SHOW_LABELS_KEY = "mobileair.showLabels";
   const tabMobileEl = document.getElementById("tabMobile");
   const tabFixedEl = document.getElementById("tabPermanent");
+  const tabLabelsEl = document.getElementById("tabLabels");
   const listMobileEl = document.getElementById("sensorListMobile");
   const listFixedEl = document.getElementById("sensorListFixed");
+  const sidebarEl = document.getElementById("sidebar");
   let activeTab = (localStorage.getItem(TAB_STORAGE_KEY) === "fixed") ? "fixed" : "mobile";
+  let sidebarHidden = localStorage.getItem(SIDEBAR_HIDDEN_KEY) === "true";
+  
+  // Restore visibility states
+  map.showMobile = localStorage.getItem(SHOW_MOBILE_KEY) !== "false";
+  map.showFixed = localStorage.getItem(SHOW_FIXED_KEY) !== "false";
+  map.showLabels = localStorage.getItem(SHOW_LABELS_KEY) !== "false";
 
   function applySidebarTab() {
     const isMobile = (activeTab === "mobile");
+    // "active" = which list is shown in sidebar
+    // "disabled" = markers hidden on map (strikethrough/dimmed look)
     if (tabMobileEl) {
       tabMobileEl.classList.toggle("active", isMobile);
+      tabMobileEl.classList.toggle("disabled", !map.showMobile);
       tabMobileEl.setAttribute("aria-selected", isMobile ? "true" : "false");
     }
     if (tabFixedEl) {
       tabFixedEl.classList.toggle("active", !isMobile);
+      tabFixedEl.classList.toggle("disabled", !map.showFixed);
       tabFixedEl.setAttribute("aria-selected", !isMobile ? "true" : "false");
     }
-    if (listMobileEl) listMobileEl.classList.toggle("hidden", !isMobile);
-    if (listFixedEl) listFixedEl.classList.toggle("hidden", isMobile);
+    if (tabLabelsEl) {
+      tabLabelsEl.classList.toggle("active", map.showLabels);
+      tabLabelsEl.classList.toggle("disabled", !map.showLabels);
+    }
+    if (listMobileEl) listMobileEl.classList.toggle("hidden", !isMobile || sidebarHidden);
+    if (listFixedEl) listFixedEl.classList.toggle("hidden", isMobile || sidebarHidden);
+    if (sidebarEl) sidebarEl.classList.toggle("collapsed", sidebarHidden);
     localStorage.setItem(TAB_STORAGE_KEY, isMobile ? "mobile" : "fixed");
+    localStorage.setItem(SIDEBAR_HIDDEN_KEY, sidebarHidden ? "true" : "false");
+    localStorage.setItem(SHOW_MOBILE_KEY, map.showMobile ? "true" : "false");
+    localStorage.setItem(SHOW_FIXED_KEY, map.showFixed ? "true" : "false");
+    localStorage.setItem(SHOW_LABELS_KEY, map.showLabels ? "true" : "false");
   }
 
-  if (tabMobileEl) tabMobileEl.addEventListener("click", () => { activeTab = "mobile"; applySidebarTab(); });
-  if (tabFixedEl) tabFixedEl.addEventListener("click", () => { activeTab = "fixed"; applySidebarTab(); });
+  // Tab click behavior:
+  // - Click inactive tab: switch to that list, expand sidebar, make markers visible if hidden
+  // - Click active tab: toggle marker visibility on/off
+  if (tabMobileEl) {
+    tabMobileEl.addEventListener("click", () => {
+      if (activeTab === "mobile") {
+        // Already on this tab - toggle visibility
+        map.showMobile = !map.showMobile;
+      } else {
+        // Switch to this tab
+        activeTab = "mobile";
+        sidebarHidden = false;
+        // Make visible if hidden
+        if (!map.showMobile) map.showMobile = true;
+      }
+      applySidebarTab();
+      map._invalidateOverlayStatic();
+      map.drawOverlay(map.lastState);
+    });
+  }
+  
+  if (tabFixedEl) {
+    tabFixedEl.addEventListener("click", () => {
+      if (activeTab === "fixed") {
+        // Already on this tab - toggle visibility
+        map.showFixed = !map.showFixed;
+      } else {
+        // Switch to this tab
+        activeTab = "fixed";
+        sidebarHidden = false;
+        // Make visible if hidden
+        if (!map.showFixed) map.showFixed = true;
+      }
+      applySidebarTab();
+      map._invalidateOverlayStatic();
+      map.drawOverlay(map.lastState);
+    });
+  }
+  
+  if (tabLabelsEl) {
+    tabLabelsEl.addEventListener("click", () => {
+      map.showLabels = !map.showLabels;
+      applySidebarTab();
+      map._invalidateOverlayStatic();
+      map.drawOverlay(map.lastState);
+    });
+  }
+  
+  const sidebarHandleEl = document.getElementById("sidebarHandle");
+  if (sidebarHandleEl) {
+    sidebarHandleEl.addEventListener("click", () => {
+      sidebarHidden = !sidebarHidden;
+      applySidebarTab();
+    });
+  }
+  
   applySidebarTab();
 
   // Persist and restore view (pan/zoom). Keep it simple: store center+zoom with debounce.
@@ -5638,7 +5732,23 @@ function main() {
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
-      // If currently playing, pause
+      const atEnd = map.isPlaybackAtEnd(100);
+      
+      // If in LIVE follow mode (lit button), clicking initiates rewind
+      if (map._playbackLiveFollow && atEnd) {
+        map._playbackLiveFollow = false;
+        _pbAtEndSincePerf = null;
+        _pbWheelAccum = 0;
+        _pbIsRewinding = true;
+        _pbVelocity = _pbRewindSpeed;
+        map.setPlaybackPlaying(true);
+        _pbLastPerf = 0;
+        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        updatePlaybackUi();
+        return;
+      }
+
+      // If currently playing (not live-follow), pause
       if (map.getPlaybackPlaying()) {
         map.setPlaybackPlaying(false);
         map._playbackLiveFollow = false;
@@ -5650,8 +5760,7 @@ function main() {
         return;
       }
 
-      // If at the end, initiate immediate rewind
-      const atEnd = map.isPlaybackAtEnd(100);
+      // If at the end (paused), initiate immediate rewind
       if (atEnd) {
         map._playbackLiveFollow = false;
         _pbAtEndSincePerf = null;
