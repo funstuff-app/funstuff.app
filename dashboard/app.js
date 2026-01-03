@@ -1161,6 +1161,8 @@ class MapView {
     if (e.button !== 0) return;
 
     // DVR: drag a marker to scrub playback time along its path.
+    // NOTE: Click-to-drag marker scrubbing is temporarily disabled.
+    /*
     if (this.playbackMode) {
       const nowMs = performance.now();
       const hit = this._hitTestMobileAtClientXY(e.clientX, e.clientY, nowMs);
@@ -1200,6 +1202,7 @@ class MapView {
         return;
       }
     }
+    */
 
     this._mouseDragging = true;
     this._mouseDragMoved = false;
@@ -3367,15 +3370,167 @@ class MapView {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // SMOOTH PATH GENERATION: Convert raw GPS points into smoothed waypoints
-  // that remove GPS jitter while preserving actual road geometry.
+  // SLIDING WINDOW WAYPOINT STEERING
   // 
-  // CONSERVATIVE smoothing: only removes small-angle GPS noise, preserves
-  // straight lines and real corners. Salt Lake is a grid city - 90° turns are real.
+  // Waypoints are computed incrementally in sliding window chunks around the
+  // vehicle position. Each chunk depends on previous waypoints (memoizable).
+  // The look-ahead distance varies with playback speed.
+  // 
+  // This avoids reprocessing the entire path - only computes what's needed.
   // ═══════════════════════════════════════════════════════════════════════════
+  
+  static WAYPOINT_CHUNK_SIZE = 50;      // Points per computed chunk
+  static WAYPOINT_BEHIND = 15;          // Points behind vehicle to keep
+  static WAYPOINT_AHEAD_BASE = 5;       // Base points ahead at 1x speed
+  static WAYPOINT_AHEAD_PER_SPEED = 3;  // Additional points per speed multiplier
+  static JITTER_THRESHOLD_M = 8;        // Only smooth deviations < 8 meters
+  static JITTER_BLEND = 0.3;            // Blend factor for jitter smoothing
 
-  // Get or compute smoothed waypoint path for a vehicle
-  // Returns { waypoints, cumDist, totalDist, curvature, origIdxMap }
+  // Get sliding window of smoothed waypoints around vehicle position
+  // Returns { waypoints, startIdx, endIdx, cumDist, curvature }
+  // vehicleIdx: current position index in raw pts
+  // playbackSpeed: current speed multiplier (affects look-ahead)
+  _getWaypointWindow(id, pts, vehicleIdx, playbackSpeed) {
+    if (!this._waypointWindowCache) this._waypointWindowCache = new Map();
+    
+    const n = pts.length;
+    if (n < 2) return null;
+    
+    // Calculate window bounds based on speed
+    const aheadCount = MapView.WAYPOINT_AHEAD_BASE + 
+                       Math.floor(MapView.WAYPOINT_AHEAD_PER_SPEED * Math.max(1, playbackSpeed));
+    const behindCount = MapView.WAYPOINT_BEHIND;
+    
+    const startIdx = Math.max(0, vehicleIdx - behindCount);
+    const endIdx = Math.min(n - 1, vehicleIdx + aheadCount);
+    
+    // Check cache for this window
+    const cached = this._waypointWindowCache.get(id);
+    if (cached && 
+        cached.ptsLen === n && 
+        cached.startIdx <= startIdx && 
+        cached.endIdx >= endIdx &&
+        cached.ptsKey === this._playbackPtsKey) {
+      // Cached window contains our needed range
+      return cached;
+    }
+    
+    // Compute new window (extend if we have partial overlap)
+    let computeStart = startIdx;
+    let computeEnd = endIdx;
+    let prevWaypoints = null;
+    
+    if (cached && cached.ptsLen === n && cached.ptsKey === this._playbackPtsKey) {
+      // Reuse overlapping portion
+      prevWaypoints = cached.waypoints;
+      if (cached.startIdx <= startIdx && cached.endIdx >= startIdx) {
+        // Overlap at start - only compute new end portion
+        computeStart = cached.endIdx + 1;
+      } else if (cached.startIdx <= endIdx && cached.endIdx >= endIdx) {
+        // Overlap at end - only compute new start portion
+        computeEnd = cached.startIdx - 1;
+      }
+    }
+    
+    // Compute waypoints for the window
+    const windowPts = [];
+    for (let i = startIdx; i <= endIdx; i++) {
+      const p = pts[i];
+      
+      // Check if we can reuse from previous cache
+      if (prevWaypoints) {
+        const prevIdx = i - (cached?.startIdx || 0);
+        if (prevIdx >= 0 && prevIdx < prevWaypoints.length && 
+            prevWaypoints[prevIdx]?.origIdx === i) {
+          windowPts.push(prevWaypoints[prevIdx]);
+          continue;
+        }
+      }
+      
+      // Compute smoothed position using local average
+      let sumLat = 0, sumLon = 0, count = 0;
+      for (let j = Math.max(0, i - 1); j <= Math.min(n - 1, i + 1); j++) {
+        sumLat += pts[j].lat;
+        sumLon += pts[j].lon;
+        count++;
+      }
+      const avgLat = sumLat / count;
+      const avgLon = sumLon / count;
+      
+      const deviationM = haversineMeters(p.lat, p.lon, avgLat, avgLon);
+      
+      let smoothLat, smoothLon;
+      if (deviationM < MapView.JITTER_THRESHOLD_M && i > 0 && i < n - 1) {
+        // Apply speed-dependent smoothing - faster = more smoothing (look further ahead)
+        const speedBlend = MapView.JITTER_BLEND * (1 + 0.1 * Math.max(0, playbackSpeed - 1));
+        const blend = Math.min(0.5, speedBlend); // Cap at 50%
+        smoothLat = p.lat + blend * (avgLat - p.lat);
+        smoothLon = p.lon + blend * (avgLon - p.lon);
+      } else {
+        smoothLat = p.lat;
+        smoothLon = p.lon;
+      }
+      
+      windowPts.push({
+        lat: smoothLat,
+        lon: smoothLon,
+        origIdx: i,
+        tMs: p.tMs,
+        m: p.m,
+        readings: p.readings
+      });
+    }
+    
+    // Build cumulative distance for window
+    const wn = windowPts.length;
+    const cumDist = new Array(wn);
+    cumDist[0] = 0;
+    for (let i = 1; i < wn; i++) {
+      const segDist = haversineMeters(
+        windowPts[i-1].lat, windowPts[i-1].lon,
+        windowPts[i].lat, windowPts[i].lon
+      );
+      cumDist[i] = cumDist[i-1] + segDist;
+    }
+    const totalDist = cumDist[wn - 1] || 1;
+    
+    // Compute curvature for window
+    const curvature = new Array(wn).fill(0);
+    if (wn >= 3) {
+      for (let i = 1; i < wn - 1; i++) {
+        const wp = windowPts;
+        const dx1 = wp[i].lon - wp[i-1].lon;
+        const dy1 = wp[i].lat - wp[i-1].lat;
+        const dx2 = wp[i+1].lon - wp[i].lon;
+        const dy2 = wp[i+1].lat - wp[i-1].lat;
+        
+        const a1 = Math.atan2(dy1, dx1);
+        const a2 = Math.atan2(dy2, dx2);
+        let angleDiff = Math.abs(a2 - a1);
+        if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+        
+        const dist = (cumDist[i] - cumDist[i-1] + cumDist[i+1] - cumDist[i]) / 2;
+        curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
+      }
+    }
+    
+    const result = {
+      waypoints: windowPts,
+      startIdx,
+      endIdx,
+      cumDist,
+      totalDist,
+      curvature,
+      ptsLen: n,
+      ptsKey: this._playbackPtsKey
+    };
+    
+    this._waypointWindowCache.set(id, result);
+    return result;
+  }
+
+  // Legacy: Get full smooth path (for compatibility with debug display)
+  // Delegates to window-based computation
   _getSmoothPath(id, pts) {
     if (!this._smoothPathCache) this._smoothPathCache = new Map();
     const cached = this._smoothPathCache.get(id);
@@ -3398,14 +3553,16 @@ class MapView {
       return single;
     }
 
-    // Step 1: CONSERVATIVE jitter removal using moving average
-    // Only smooth positions, don't change path topology
-    // This preserves straight lines and sharp corners
-    const WINDOW_SIZE = 3; // Small window = subtle smoothing
-    const JITTER_THRESHOLD_M = 8; // Only smooth if deviation < 8 meters (GPS noise range)
+    // Compute full path using window function (for debug display)
+    const playbackSpeed = this._playbackSpeed || 1.0;
+    const fullWindow = this._getWaypointWindow(id, pts, Math.floor(n / 2), playbackSpeed);
     
-    const waypoints = pts.map((p, i) => {
-      // Compute local average position
+    // If window doesn't cover full path, compute remaining
+    const waypoints = [];
+    for (let i = 0; i < n; i++) {
+      const p = pts[i];
+      
+      // Simple jitter smoothing for full path
       let sumLat = 0, sumLon = 0, count = 0;
       for (let j = Math.max(0, i - 1); j <= Math.min(n - 1, i + 1); j++) {
         sumLat += pts[j].lat;
@@ -3415,32 +3572,29 @@ class MapView {
       const avgLat = sumLat / count;
       const avgLon = sumLon / count;
       
-      // Only apply smoothing if the deviation is small (GPS jitter)
       const deviationM = haversineMeters(p.lat, p.lon, avgLat, avgLon);
       
       let smoothLat, smoothLon;
-      if (deviationM < JITTER_THRESHOLD_M && i > 0 && i < n - 1) {
-        // Blend toward average (subtle: 30% smooth, 70% original)
-        const blend = 0.3;
+      if (deviationM < MapView.JITTER_THRESHOLD_M && i > 0 && i < n - 1) {
+        const blend = MapView.JITTER_BLEND;
         smoothLat = p.lat + blend * (avgLat - p.lat);
         smoothLon = p.lon + blend * (avgLon - p.lon);
       } else {
-        // Keep original (this is a real corner or endpoint)
         smoothLat = p.lat;
         smoothLon = p.lon;
       }
       
-      return {
+      waypoints.push({
         lat: smoothLat,
         lon: smoothLon,
         origIdx: i,
         tMs: p.tMs,
         m: p.m,
         readings: p.readings
-      };
-    });
+      });
+    }
 
-    // Step 2: Build distance table for waypoints
+    // Build distance table
     const wn = waypoints.length;
     const cumDist = new Array(wn);
     cumDist[0] = 0;
@@ -3450,7 +3604,7 @@ class MapView {
     }
     const totalDist = cumDist[wn - 1] || 1;
 
-    // Step 3: Compute curvature at each waypoint
+    // Compute curvature
     const curvature = new Array(wn).fill(0);
     if (wn >= 3) {
       for (let i = 1; i < wn - 1; i++) {
@@ -3668,16 +3822,31 @@ class MapView {
     // Get raw path geometry for physics (distance, curvature from original GPS points)
     const { cumDist, totalDist, curvature } = this._getPathDistances(id, pts);
     
-    // Get smoothed waypoints for attraction bias (separate from path following)
-    const smoothPath = this._getSmoothPath(id, pts);
-    const smoothWaypoints = smoothPath.waypoints;
-    const smoothCumDist = smoothPath.cumDist;
-    
     // Target distance along raw path based on playback time
     const targetD = this._getTargetDistance(pts, cumDist, totalDist, t);
     
-    // Physics state and per-vehicle parameters
+    // Get physics state and determine reference distance for sliding window
     const phys = this._getPhysicsState(id);
+    // Use phys.d if initialized, otherwise use targetD (where we WILL be)
+    const refD = (phys.d > 0) ? phys.d : targetD;
+    
+    // Find index corresponding to reference distance
+    let vehicleIdx = 0;
+    for (let i = 0; i < cumDist.length - 1; i++) {
+      if (cumDist[i + 1] >= refD) {
+        vehicleIdx = i;
+        break;
+      }
+      vehicleIdx = i;
+    }
+    
+    // Get sliding window of smoothed waypoints around vehicle position
+    const playbackSpeed = this._playbackSpeed || 1.0;
+    const waypointWindow = this._getWaypointWindow(id, pts, vehicleIdx, playbackSpeed);
+    const smoothWaypoints = waypointWindow?.waypoints || pts;
+    const smoothCumDist = waypointWindow?.cumDist || cumDist;
+    
+    // Vehicle physics parameters
     const vp = this._getVehiclePhysics(id);
     
     // Detect scrubbing: if playback time jumped significantly, snap to new position
@@ -3706,7 +3875,7 @@ class MapView {
     // allowing granular pathfinding without complex heuristics.
     // ═══════════════════════════════════════════════════════════════════════════
     
-    const playbackSpeed = this._playbackSpeed || 1.0;
+    // (playbackSpeed already declared above for waypoint window)
     
     // Normalized position error: ε = (targetD - vehicleD) / referenceDistance
     // Positive = behind target (need to catch up)
@@ -3753,7 +3922,10 @@ class MapView {
     const visibleEnd = Math.min(targetD, totalDist);
     
     // Initialize or handle scrub: snap to target, reset velocity
-    if (phys.totalDist !== totalDist || isScrub) {
+    // Also snap if physics hasn't been initialized yet (d=0 but targetD is far ahead)
+    const needsSnap = phys.totalDist !== totalDist || isScrub || 
+                      (phys.d === 0 && targetD > 100); // Snap if >100m behind on init
+    if (needsSnap) {
       phys.totalDist = totalDist;
       phys.d = targetD;
       phys.v = 0; // Start from rest after scrub
@@ -3833,15 +4005,48 @@ class MapView {
     // Sample raw path position (where GPS says we should be)
     const rawSample = this._samplePathAtDistance(pts, cumDist, curvature, phys.d);
     
-    // Sample smooth waypoint position (jitter-free target)
-    const smoothTotalDist = smoothPath.totalDist;
-    const smoothD = (phys.d / totalDist) * smoothTotalDist;
-    const waypointSample = this._samplePathAtDistance(
-      smoothWaypoints, smoothCumDist, smoothPath.curvature, smoothD
-    );
+    // Sample smooth waypoint position from sliding window
+    // The window covers [startIdx, endIdx] of the raw path
+    // We need to find the corresponding position within the window
+    let waypointSample;
+    if (waypointWindow && smoothWaypoints.length >= 2) {
+      // Find waypoint in window closest to vehicle's raw position
+      const winStartRawIdx = waypointWindow.startIdx;
+      const winEndRawIdx = waypointWindow.endIdx;
+      
+      // Map vehicle's raw index to window index
+      const rawIdx = Math.max(0, Math.min(pts.length - 1, vehicleIdx));
+      const winIdx = clamp(rawIdx - winStartRawIdx, 0, smoothWaypoints.length - 1);
+      
+      // Use fractional index based on phys.d position within window
+      // Find where phys.d falls in the window's cumDist
+      let wD = 0;
+      for (let i = 0; i < smoothWaypoints.length - 1; i++) {
+        const origIdx = smoothWaypoints[i].origIdx;
+        if (origIdx != null && cumDist[origIdx] != null && cumDist[origIdx] >= phys.d) {
+          // Found the segment - interpolate position
+          const prevOrigIdx = smoothWaypoints[Math.max(0, i - 1)].origIdx || 0;
+          const segStart = cumDist[prevOrigIdx] || 0;
+          const segEnd = cumDist[origIdx] || 0;
+          const segLen = segEnd - segStart;
+          wD = smoothCumDist[Math.max(0, i - 1)] + 
+               (segLen > 0 ? (phys.d - segStart) / segLen * (smoothCumDist[i] - smoothCumDist[Math.max(0, i - 1)]) : 0);
+          break;
+        }
+        wD = smoothCumDist[i];
+      }
+      wD = clamp(wD, 0, waypointWindow.totalDist);
+      
+      waypointSample = this._samplePathAtDistance(
+        smoothWaypoints, smoothCumDist, waypointWindow.curvature, wD
+      );
+    } else {
+      // Fallback: use raw sample
+      waypointSample = rawSample;
+    }
     
-    // Initialize 2D physics state if needed
-    if (phys.lat == null || phys.lon == null || isScrub) {
+    // Initialize 2D physics state if needed (use needsSnap from earlier)
+    if (phys.lat == null || phys.lon == null || needsSnap) {
       // Start at waypoint position
       phys.lat = waypointSample.lat;
       phys.lon = waypointSample.lon;
@@ -4185,12 +4390,9 @@ class MapView {
     const id = m && m.id != null ? String(m.id) : "";
     
     // Get reveal time (for clipping trail at vehicle position)
+    // Use playback time directly - vehicle physics are synced to this
     const pbTimeMs = this.getPlaybackTimeMs();
-    const vehicleInfo = this._vehicleRevealDist?.get(id);
-    const vehicleTMs = vehicleInfo?.vehicleTMs;
-    const revealTimeMs = this._pbDebugPath
-      ? pbTimeMs  // Debug: show trail ahead
-      : ((vehicleTMs != null && isFinite(vehicleTMs)) ? vehicleTMs : pbTimeMs);
+    const revealTimeMs = pbTimeMs;
     
     // Get trail source - always use raw trail for rendering
     const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
@@ -4915,55 +5117,76 @@ class MapView {
         const m = mobiles.find(x => x.id === selectedId);
         if (m) drawTrailFor(m, 1.0, worldToScreenFast);
       }
-      
-      // ═══════════════════════════════════════════════════════════════════════════
-      // DEBUG: Draw smoothed waypoints overlay when debug flag is enabled
-      // Shows the waypoint path that vehicles steer toward
-      // ═══════════════════════════════════════════════════════════════════════════
-      if (this._pbDebugPath) {
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEBUG: Draw smoothed waypoints overlay when debug flag is enabled
+    // Only shows for the currently selected marker, windowed around vehicle position
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (this._pbDebugPath && this.playbackMode) {
+      const sel = parseKey(this.selectedId);
+      const selId = (sel && sel.type === "mobile" && sel.id) ? sel.id : null;
+      if (selId) {
+        const DEBUG_WAYPOINTS_BEHIND = 15;
+        const DEBUG_WAYPOINTS_AHEAD = 5;
+        
         const ws = worldSizeForZoom(this.zoom);
-        for (const m of mobiles) {
-          const id = m && m.id != null ? String(m.id) : "";
-          const playbackPts = this._playbackPtsById.get(id);
-          if (!playbackPts || playbackPts.length < 2) continue;
-          
-          const smoothPath = this._getSmoothPath(id, playbackPts);
-          const waypoints = smoothPath.waypoints;
-          
-          // Draw waypoint path - light gray, 75% opacity
-          ctx.save();
-          ctx.strokeStyle = "#b0b0b0"; // Light gray
-          ctx.lineWidth = 1.5;
-          ctx.setLineDash([]);
-          ctx.globalAlpha = 0.75;
-          ctx.beginPath();
-          
-          let started = false;
-          for (const wp of waypoints) {
-            const norm = latLonToNorm(wp.lat, wp.lon);
-            const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
-            if (!started) {
-              ctx.moveTo(sp.x, sp.y);
-              started = true;
-            } else {
-              ctx.lineTo(sp.x, sp.y);
+        const mobs = Array.isArray(state.mobile) ? state.mobile : [];
+        const mm = mobs.find(x => x.id === selId);
+        if (mm) {
+          const mid = String(mm.id);
+          const playbackPts = this._playbackPtsById.get(mid);
+          if (playbackPts && playbackPts.length >= 2) {
+            const smoothPath = this._getSmoothPath(mid, playbackPts);
+            const waypoints = smoothPath?.waypoints;
+            
+            if (waypoints && waypoints.length >= 2) {
+              const phys = this._getPhysicsState(mid);
+              const { cumDist, totalDist } = this._getPathDistances(mid, playbackPts);
+              const physD = (phys.d != null && isFinite(phys.d)) ? phys.d : 0;
+              const smoothD = totalDist > 0 ? (physD / totalDist) * smoothPath.totalDist : 0;
+              
+              let vehicleIdx = 0;
+              for (let i = 0; i < smoothPath.cumDist.length; i++) {
+                if (smoothPath.cumDist[i] <= smoothD) vehicleIdx = i;
+                else break;
+              }
+            
+              const startIdx = Math.max(0, vehicleIdx - DEBUG_WAYPOINTS_BEHIND);
+              const endIdx = Math.min(waypoints.length - 1, vehicleIdx + DEBUG_WAYPOINTS_AHEAD);
+              
+              ctx.save();
+              ctx.strokeStyle = "#b0b0b0";
+              ctx.lineWidth = 1.5;
+              ctx.setLineDash([]);
+              ctx.globalAlpha = 0.75;
+              ctx.beginPath();
+              
+              let started = false;
+              for (let i = startIdx; i <= endIdx; i++) {
+                const wp = waypoints[i];
+                const norm = latLonToNorm(wp.lat, wp.lon);
+                const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
+                if (!started) { ctx.moveTo(sp.x, sp.y); started = true; }
+                else { ctx.lineTo(sp.x, sp.y); }
+              }
+              ctx.stroke();
+              
+              for (let i = startIdx; i <= endIdx; i++) {
+                const wp = waypoints[i];
+                const norm = latLonToNorm(wp.lat, wp.lon);
+                const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
+                ctx.beginPath();
+                ctx.arc(sp.x, sp.y, 3, 0, 2 * Math.PI);
+                ctx.fillStyle = "#87ceeb";
+                ctx.fill();
+                ctx.strokeStyle = "#b0b0b0";
+                ctx.lineWidth = 1;
+                ctx.stroke();
+              }
+              ctx.restore();
             }
           }
-          ctx.stroke();
-          
-          // Draw waypoint dots - light blue fill, light gray border
-          for (const wp of waypoints) {
-            const norm = latLonToNorm(wp.lat, wp.lon);
-            const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
-            ctx.beginPath();
-            ctx.arc(sp.x, sp.y, 3, 0, 2 * Math.PI);
-            ctx.fillStyle = "#87ceeb"; // Light blue
-            ctx.fill();
-            ctx.strokeStyle = "#b0b0b0"; // Light gray border
-            ctx.lineWidth = 1;
-            ctx.stroke();
-          }
-          ctx.restore();
         }
       }
     }
