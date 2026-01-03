@@ -159,18 +159,6 @@ class VehiclePhysics {
   }
 
   /**
-   * Calculate dynamic lookahead based on current velocity
-   * Faster = see further ahead, slower = shorter lookahead
-   */
-  getDynamicLookahead() {
-    // At cruise speed (25 m/s), lookahead is ~3 seconds ahead = 75m
-    // At min speed (8 m/s), lookahead is ~3 seconds = 24m
-    // Base is 80m, scale by velocity ratio
-    const speedRatio = clamp(Math.abs(this.v) / VehiclePhysics.CRUISE_SPEED, 0.3, 1);
-    return VehiclePhysics.TRAIL_LOOKAHEAD_BASE * speedRatio;
-  }
-
-  /**
    * Main physics step - advance the vehicle by wall-clock dt
    * 
    * @param {number} nowPerfMs - Current performance.now() timestamp
@@ -202,15 +190,14 @@ class VehiclePhysics {
       return { 
         d: this.d, 
         v: this.v, 
-        lookahead: this.getDynamicLookahead(),
-        visibleEnd: targetD + VehiclePhysics.TRAIL_LOOKAHEAD_BASE,
+        visibleEnd: targetD,
         isScrub: true 
       };
     }
     
-    // The "visible road" = targetD + dynamic lookahead
-    const lookahead = this.getDynamicLookahead();
-    const visibleEnd = Math.min(targetD + lookahead, totalDist);
+    // The "visible road" ends at targetD (no lookahead)
+    // Vehicle must track playback time exactly - never run ahead
+    const visibleEnd = Math.min(targetD, totalDist);
     
     // Look ahead for curves
     const maxCurvAhead = VehiclePhysics.getMaxCurvatureAhead(
@@ -247,7 +234,7 @@ class VehiclePhysics {
     // Cannot go backwards or past end
     this.d = clamp(this.d, 0, totalDist);
     
-    return { d: this.d, v: this.v, lookahead, visibleEnd, isScrub: false };
+    return { d: this.d, v: this.v, visibleEnd, isScrub: false };
   }
 
   /**
@@ -450,17 +437,17 @@ describe('VehiclePhysics', () => {
       
       // Give it some velocity
       phys.v = 20;
-      phys.d = 70; // Close to visible end (~80m)
+      phys.d = 70; // Close to visible end (targetD = 0, visibleEnd = 0)
       
-      // Step multiple times
+      // Step multiple times with targetD=0 (visibleEnd=0)
       let nowMs = 100;
       for (let i = 0; i < 20; i++) {
         phys.step(nowMs, 0, geometry, 0);
         nowMs += 100;
       }
       
-      // Should have stopped before exceeding visible end
-      const visibleEnd = 0 + phys.getDynamicLookahead();
+      // Should have stopped at visibleEnd (which equals targetD = 0)
+      // Since targetD=0 and visibleEnd=targetD, vehicle can't move forward
       assert.ok(phys.d <= geometry.totalDist, 
         `Position ${phys.d} should not exceed total ${geometry.totalDist}`);
     });
@@ -530,30 +517,6 @@ describe('VehiclePhysics', () => {
       );
       assert.ok(targetSpeedWithCurve < VehiclePhysics.CRUISE_SPEED, 
         `Expected lower target speed due to curve: ${targetSpeedWithCurve} should be < ${VehiclePhysics.CRUISE_SPEED}`);
-    });
-  });
-  
-  describe('getDynamicLookahead', () => {
-    it('returns shorter lookahead at low speed', () => {
-      const phys1 = new VehiclePhysics();
-      const phys2 = new VehiclePhysics();
-      
-      phys1.v = VehiclePhysics.CURVE_SPEED; // 8 m/s
-      phys2.v = VehiclePhysics.CRUISE_SPEED; // 25 m/s
-      
-      const lookahead1 = phys1.getDynamicLookahead();
-      const lookahead2 = phys2.getDynamicLookahead();
-      
-      assert.ok(lookahead1 < lookahead2, 
-        `Slow lookahead ${lookahead1} should be < fast lookahead ${lookahead2}`);
-    });
-    
-    it('has minimum lookahead floor', () => {
-      const phys = new VehiclePhysics();
-      phys.v = 0;
-      
-      const lookahead = phys.getDynamicLookahead();
-      assert.ok(lookahead > 0, 'Lookahead should be positive even at 0 velocity');
     });
   });
   
@@ -683,7 +646,268 @@ describe('VehiclePhysics', () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTROL SCALAR TESTS
+// Verify the mathematical model: σ(ε, ω) where ε = position error, ω = playback speed
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Control Scalar Calculator
+ * Matches the implementation in app.js _playbackSampleForMobile
+ */
+class ControlScalar {
+  static LOOKAHEAD_BASE = 80;  // meters (normalization reference)
+  static CONTROL_GAIN = 1.5;   // responsiveness to position error
+  static MAX_BOOST = 2.0;      // maximum catch-up multiplier
+  
+  /**
+   * Calculate normalized position error
+   * ε = (targetD - vehicleD) / lookaheadBase
+   * 
+   * @param {number} targetD - Where playback time maps to on path (meters)
+   * @param {number} vehicleD - Current vehicle position (meters)
+   * @returns {number} Normalized error: positive = behind, negative = ahead
+   */
+  static getPositionError(targetD, vehicleD) {
+    return (targetD - vehicleD) / ControlScalar.LOOKAHEAD_BASE;
+  }
+  
+  /**
+   * Calculate the response function
+   * response(ε) = max(0, 1 + tanh(ε * gain) * boost_factor)
+   * 
+   * This is the core S-curve that maps position error to speed multiplier
+   */
+  static getResponse(positionError) {
+    const gain = ControlScalar.CONTROL_GAIN;
+    const maxBoost = ControlScalar.MAX_BOOST;
+    
+    const tanhResponse = Math.tanh(positionError * gain);
+    // When behind (positive ε): boost up to maxBoost
+    // When ahead (negative ε): reduce down to 0
+    const response = Math.max(0, 1 + tanhResponse * (tanhResponse > 0 ? maxBoost : 1));
+    return response;
+  }
+  
+  /**
+   * Calculate the full control scalar σ(ε, ω)
+   * 
+   * @param {number} positionError - Normalized position error ε
+   * @param {number} playbackSpeed - Playback speed multiplier ω
+   * @returns {number} Control scalar to multiply physics parameters
+   */
+  static calculate(positionError, playbackSpeed) {
+    const response = ControlScalar.getResponse(positionError);
+    // sqrt(ω) for sub-linear scaling with playback speed
+    return Math.sqrt(Math.max(1, playbackSpeed)) * response;
+  }
+}
+
+describe('ControlScalar', () => {
+  
+  describe('getPositionError', () => {
+    it('returns 0 when vehicle is at target', () => {
+      const error = ControlScalar.getPositionError(100, 100);
+      assert.strictEqual(error, 0);
+    });
+    
+    it('returns positive when vehicle is behind target', () => {
+      // Target at 160m, vehicle at 80m → 80m behind
+      const error = ControlScalar.getPositionError(160, 80);
+      assert.strictEqual(error, 1); // (160-80)/80 = 1
+    });
+    
+    it('returns negative when vehicle is ahead of target', () => {
+      // Target at 80m, vehicle at 160m → 80m ahead
+      const error = ControlScalar.getPositionError(80, 160);
+      assert.strictEqual(error, -1); // (80-160)/80 = -1
+    });
+    
+    it('scales correctly with lookahead base', () => {
+      // 40m behind → ε = 0.5
+      const error = ControlScalar.getPositionError(120, 80);
+      assert.strictEqual(error, 0.5);
+    });
+  });
+  
+  describe('getResponse', () => {
+    it('returns ~1 when synchronized (ε = 0)', () => {
+      const response = ControlScalar.getResponse(0);
+      assert.ok(Math.abs(response - 1) < 0.001, 
+        `Expected response ≈ 1, got ${response}`);
+    });
+    
+    it('returns > 1 when behind (positive ε)', () => {
+      const response = ControlScalar.getResponse(1);
+      assert.ok(response > 1, 
+        `Expected response > 1 when behind, got ${response}`);
+    });
+    
+    it('returns < 1 when ahead (negative ε)', () => {
+      const response = ControlScalar.getResponse(-1);
+      assert.ok(response < 1, 
+        `Expected response < 1 when ahead, got ${response}`);
+    });
+    
+    it('approaches 0 when way ahead (very negative ε)', () => {
+      const response = ControlScalar.getResponse(-3);
+      assert.ok(response < 0.1, 
+        `Expected response ≈ 0 when way ahead, got ${response}`);
+    });
+    
+    it('saturates at (1 + maxBoost) when way behind (very positive ε)', () => {
+      const response = ControlScalar.getResponse(3);
+      const expectedMax = 1 + ControlScalar.MAX_BOOST; // 3.0
+      assert.ok(response > expectedMax * 0.9, 
+        `Expected response ≈ ${expectedMax} when way behind, got ${response}`);
+    });
+    
+    it('never goes negative', () => {
+      for (let e = -10; e <= 10; e += 0.5) {
+        const response = ControlScalar.getResponse(e);
+        assert.ok(response >= 0, 
+          `Response should never be negative, got ${response} at ε=${e}`);
+      }
+    });
+    
+    it('is monotonically increasing with ε', () => {
+      let prevResponse = -Infinity;
+      for (let e = -5; e <= 5; e += 0.1) {
+        const response = ControlScalar.getResponse(e);
+        assert.ok(response >= prevResponse, 
+          `Response should increase with ε, got ${response} < ${prevResponse} at ε=${e}`);
+        prevResponse = response;
+      }
+    });
+  });
+  
+  describe('calculate (full control scalar)', () => {
+    it('returns 1 when synchronized at 1x playback', () => {
+      const sigma = ControlScalar.calculate(0, 1);
+      assert.ok(Math.abs(sigma - 1) < 0.001, 
+        `Expected σ ≈ 1, got ${sigma}`);
+    });
+    
+    it('scales with sqrt(playbackSpeed)', () => {
+      const sigma1x = ControlScalar.calculate(0, 1);
+      const sigma4x = ControlScalar.calculate(0, 4);
+      const sigma16x = ControlScalar.calculate(0, 16);
+      
+      // At 4x playback: sqrt(4) = 2
+      assert.ok(Math.abs(sigma4x / sigma1x - 2) < 0.01, 
+        `Expected σ(4x) / σ(1x) ≈ 2, got ${sigma4x / sigma1x}`);
+      
+      // At 16x playback: sqrt(16) = 4
+      assert.ok(Math.abs(sigma16x / sigma1x - 4) < 0.01, 
+        `Expected σ(16x) / σ(1x) ≈ 4, got ${sigma16x / sigma1x}`);
+    });
+    
+    it('combines position error and playback speed', () => {
+      // Behind at high playback speed → big boost
+      const sigmaBehindFast = ControlScalar.calculate(1, 4);
+      
+      // Ahead at low playback speed → minimal
+      const sigmaAheadSlow = ControlScalar.calculate(-1, 1);
+      
+      assert.ok(sigmaBehindFast > sigmaAheadSlow * 5, 
+        `Behind+fast (${sigmaBehindFast}) should be >> ahead+slow (${sigmaAheadSlow})`);
+    });
+    
+    it('is continuous (no discontinuities)', () => {
+      const epsilon = 0.01;
+      for (let e = -3; e <= 3; e += 0.1) {
+        const s1 = ControlScalar.calculate(e, 1);
+        const s2 = ControlScalar.calculate(e + epsilon, 1);
+        const diff = Math.abs(s2 - s1);
+        
+        assert.ok(diff < 0.1, 
+          `Discontinuity at ε=${e}: diff=${diff}`);
+      }
+    });
+  });
+  
+  describe('simulation: vehicle catching up', () => {
+    it('vehicle accelerates when behind, decelerates when ahead', () => {
+      // Simulate a vehicle that starts behind, catches up, then waits
+      const history = [];
+      
+      let vehicleD = 0;
+      let vehicleV = 0;
+      const cruiseSpeed = 25;
+      const accelRate = 4;
+      const brakeRate = 6;
+      const dtS = 0.1;
+      
+      // Target moves at constant 10 m/s
+      for (let t = 0; t < 100; t++) {
+        const targetD = t * 10 * dtS; // 10 m/s
+        const error = ControlScalar.getPositionError(targetD, vehicleD);
+        const sigma = ControlScalar.calculate(error, 1);
+        
+        const effectiveCruise = cruiseSpeed * sigma;
+        const effectiveAccel = accelRate * sigma;
+        const effectiveBrake = brakeRate * Math.max(1, sigma);
+        
+        // Simple physics
+        const targetSpeed = Math.min(effectiveCruise, 100);
+        if (vehicleV < targetSpeed) {
+          vehicleV = Math.min(targetSpeed, vehicleV + effectiveAccel * dtS);
+        } else {
+          vehicleV = Math.max(targetSpeed, vehicleV - effectiveBrake * dtS);
+        }
+        vehicleV = clamp(vehicleV, 0, cruiseSpeed * 3);
+        
+        vehicleD += vehicleV * dtS;
+        
+        history.push({ t, targetD, vehicleD, error, sigma, vehicleV });
+      }
+      
+      // Vehicle should have caught up (error should trend toward 0)
+      const firstError = history[0].error;
+      const lastError = history[history.length - 1].error;
+      
+      assert.ok(Math.abs(lastError) < Math.abs(firstError) + 0.5, 
+        `Vehicle should catch up: first error ${firstError}, last error ${lastError}`);
+    });
+    
+    it('vehicle waits when ahead of target', () => {
+      // Start vehicle ahead of target
+      let vehicleD = 200;
+      let vehicleV = 20;
+      const cruiseSpeed = 25;
+      const brakeRate = 6;
+      const dtS = 0.1;
+      
+      // Target at 0, not moving
+      const targetD = 0;
+      
+      // Run for 50 steps
+      for (let t = 0; t < 50; t++) {
+        const error = ControlScalar.getPositionError(targetD, vehicleD);
+        const sigma = ControlScalar.calculate(error, 1);
+        
+        // When ahead, sigma should be very small
+        if (t > 5) {
+          assert.ok(sigma < 0.5, 
+            `When ahead, σ should be small, got ${sigma} at t=${t}`);
+        }
+        
+        const effectiveCruise = cruiseSpeed * sigma;
+        const effectiveBrake = brakeRate * Math.max(1, sigma);
+        
+        // Apply braking
+        vehicleV = Math.max(0, vehicleV - effectiveBrake * dtS);
+        vehicleD += vehicleV * dtS;
+      }
+      
+      // Vehicle should have nearly stopped
+      assert.ok(vehicleV < 1, 
+        `Vehicle should have stopped when ahead, but v=${vehicleV}`);
+    });
+  });
+});
+
 // Export for use in browser
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { VehiclePhysics };
+  module.exports = { VehiclePhysics, ControlScalar };
 }

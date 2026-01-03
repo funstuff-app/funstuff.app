@@ -3554,25 +3554,65 @@ class MapView {
       : 0.016;
     phys.lastPerfMs = nowPerfMs;
     
-    // === OVERCLOCK: Scale vehicle speed based on playback speed ===
-    // When user ramps up playback, vehicles haul ass to keep up
-    // Still decoupled (autonomous agents) but responsive to the tempo
-    const playbackSpeedMult = this._playbackSpeed || 1.0;
-    // Use sqrt for a more natural feel: 4x playback = 2x vehicle speed, 16x = 4x
-    const overclock = Math.sqrt(Math.max(1, playbackSpeedMult));
-    const overclockCruise = vp.cruiseSpeed * overclock;
-    const overclockCurve = vp.curveSpeed * overclock;
-    const overclockAccel = vp.accelRate * overclock;
-    const overclockBrake = vp.brakeRate * overclock;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CONTROL SCALAR: A unified control function σ(ε, ω) where:
+    //   ε = normalized position error (vehicle position relative to target)
+    //   ω = playback speed multiplier (user's tempo setting)
+    //
+    // The control scalar modulates ALL vehicle physics as a single "throttle":
+    //   σ → 0: vehicle stops/crawls (ahead of target, waiting)
+    //   σ → 1: vehicle at natural pace (synchronized with playback)
+    //   σ → boost: vehicle accelerates (behind target, catching up)
+    //
+    // This is essentially a proportional controller with soft saturation,
+    // allowing granular pathfinding without complex heuristics.
+    // ═══════════════════════════════════════════════════════════════════════════
     
-    // Dynamic lookahead based on current velocity: faster = see further ahead
-    // This creates natural feedback: slow down → shorter lookahead → slower trail reveal
-    // Also scale lookahead with overclock so fast vehicles see further ahead
-    const speedRatio = clamp(Math.abs(phys.v) / overclockCruise, 0.3, 1);
-    const dynamicLookahead = MapView.TRAIL_LOOKAHEAD_BASE * speedRatio * overclock;
+    const playbackSpeed = this._playbackSpeed || 1.0;
     
-    // The "visible road" = targetD + dynamic lookahead (clamped to path)
-    const visibleEnd = Math.min(targetD + dynamicLookahead, totalDist);
+    // Normalized position error: ε = (targetD - vehicleD) / referenceDistance
+    // Positive = behind target (need to catch up)
+    // Negative = ahead of target (need to wait)
+    // We normalize by the base lookahead to get a dimensionless error in [-∞, +∞]
+    const positionError = (targetD - phys.d) / MapView.TRAIL_LOOKAHEAD_BASE;
+    
+    // Control scalar function using soft-plus / sigmoid blend:
+    // σ(ε, ω) = ω · response(ε)
+    //
+    // response(ε) uses a piecewise smooth function:
+    //   ε < -1: response → 0 (way ahead, stop)
+    //   ε = 0:  response → 1 (synchronized)
+    //   ε > +1: response → 1 + boost (behind, catch up)
+    //
+    // We use: response(ε) = max(0, 1 + tanh(ε · gain))
+    // This gives smooth S-curve behavior with natural saturation.
+    
+    const controlGain = 1.5;  // How aggressively to respond to position error
+    const maxBoost = 2.0;     // Maximum catch-up multiplier when far behind
+    
+    // Smooth response function: tanh provides natural saturation at extremes
+    // Shifted so response(0) = 1, response(-∞) → 0, response(+∞) → 1 + maxBoost
+    const tanhResponse = Math.tanh(positionError * controlGain);
+    const response = Math.max(0, 1 + tanhResponse * (tanhResponse > 0 ? maxBoost : 1));
+    
+    // Final control scalar: combines playback speed with position-based response
+    // Use sqrt(playbackSpeed) for sub-linear scaling (feels more natural)
+    const controlScalar = Math.sqrt(Math.max(1, playbackSpeed)) * response;
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Apply control scalar to all physics parameters
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    const effectiveCruise = vp.cruiseSpeed * controlScalar;
+    const effectiveCurve = vp.curveSpeed * controlScalar;
+    const effectiveAccel = vp.accelRate * controlScalar;
+    const effectiveBrake = vp.brakeRate * Math.max(1, controlScalar); // Braking never reduced
+    
+    // The "visible road" ends at targetD (the playback-time position).
+    // Vehicle must NEVER exceed this - it tracks playback time exactly.
+    // The control scalar allows catching up when behind, but never running ahead.
+    // (Removed dynamic lookahead which caused vehicles to outrun the revealed trail.)
+    const visibleEnd = Math.min(targetD, totalDist);
     
     // Initialize or handle scrub: snap to target, reset velocity
     if (phys.totalDist !== totalDist || isScrub) {
@@ -3581,13 +3621,13 @@ class MapView {
       phys.v = 0; // Start from rest after scrub
     }
     
-    // === AUTONOMOUS AGENT PHYSICS ===
-    // The vehicle is a FREE AGENT that follows the visible road
-    // It accelerates on straights, brakes for curves, and stops at end of visible road
+    // ═══════════════════════════════════════════════════════════════════════════
+    // AUTONOMOUS AGENT PHYSICS (modulated by control scalar)
+    // ═══════════════════════════════════════════════════════════════════════════
     
-    // Look ahead for curves (scale lookahead with overclock for faster reaction)
+    // Look ahead for curves (scale with control scalar for faster reaction when boosting)
     let maxCurvAhead = 0;
-    const curveLookaheadEnd = Math.min(phys.d + MapView.CURVATURE_LOOKAHEAD * overclock, totalDist);
+    const curveLookaheadEnd = Math.min(phys.d + MapView.CURVATURE_LOOKAHEAD * Math.max(1, controlScalar), totalDist);
     for (let i = 0; i < curvature.length; i++) {
       const d = cumDist[i];
       if (d >= phys.d && d <= curveLookaheadEnd) {
@@ -3598,7 +3638,7 @@ class MapView {
     // Calculate target speed based on:
     // 1. Distance to end of visible road (brake to stop)
     // 2. Curvature ahead (slow for curves)
-    // 3. Cruise speed on straights (all scaled by overclock)
+    // 3. Effective cruise speed (modulated by control scalar)
     const distToVisibleEnd = visibleEnd - phys.d;
     
     let targetSpeed;
@@ -3607,31 +3647,31 @@ class MapView {
       targetSpeed = 0;
     } else if (distToVisibleEnd < MapView.STOP_BUFFER) {
       // Very close to visible end - slow crawl proportional to distance
-      targetSpeed = Math.min(2 * overclock, distToVisibleEnd * 0.5);
+      targetSpeed = Math.min(2 * Math.max(1, controlScalar), distToVisibleEnd * 0.5);
     } else {
       // Distance-limited speed: v² = 2as → v = sqrt(2 * brakeRate * distance)
       // Use a safety factor of 0.8 to ensure we don't overshoot
-      const brakeSpeed = Math.sqrt(2 * overclockBrake * Math.max(0, distToVisibleEnd - MapView.STOP_BUFFER)) * 0.8;
+      const brakeSpeed = Math.sqrt(2 * effectiveBrake * Math.max(0, distToVisibleEnd - MapView.STOP_BUFFER)) * 0.8;
       
-      // Curvature-limited speed: interpolate between cruise and curve speed (both overclocked)
+      // Curvature-limited speed: interpolate between cruise and curve speed
       const curvFactor = MapView.CURVATURE_THRESHOLD / (MapView.CURVATURE_THRESHOLD + maxCurvAhead);
-      const curveSpeed = overclockCurve + (overclockCruise - overclockCurve) * curvFactor;
+      const curveSpeed = effectiveCurve + (effectiveCruise - effectiveCurve) * curvFactor;
       
       // Take minimum of all limits
-      targetSpeed = Math.min(overclockCruise, brakeSpeed, curveSpeed);
+      targetSpeed = Math.min(effectiveCruise, brakeSpeed, curveSpeed);
     }
     
-    // Apply acceleration or braking (both overclocked for snappier response)
+    // Apply acceleration or braking (both scaled by control scalar)
     if (phys.v < targetSpeed) {
       // Accelerate
-      phys.v = Math.min(targetSpeed, phys.v + overclockAccel * dtS);
+      phys.v = Math.min(targetSpeed, phys.v + effectiveAccel * dtS);
     } else if (phys.v > targetSpeed) {
-      // Brake (stronger than acceleration for safety)
-      phys.v = Math.max(targetSpeed, phys.v - overclockBrake * dtS);
+      // Brake (never reduced below base rate for safety)
+      phys.v = Math.max(targetSpeed, phys.v - effectiveBrake * dtS);
     }
     
     // Safety clamps
-    phys.v = clamp(phys.v, 0, overclockCruise);
+    phys.v = clamp(phys.v, 0, effectiveCruise);
     
     // Update position - but don't exceed visible end
     const proposedD = phys.d + phys.v * dtS;
@@ -3730,18 +3770,16 @@ class MapView {
     const pRaw = pts[Math.min(idx + 1, pts.length - 1)];
     const reading = primaryReadingKeyedFromPoint(pRaw);
 
-    // Store reveal distance for trail drawing
-    // Trail reveals up to VISIBLE END (targetD + dynamic lookahead)
-    // Vehicle is a free agent that follows the revealed path
+    // Store debug info for trail drawing
     if (!this._vehicleRevealDist) this._vehicleRevealDist = new Map();
     this._vehicleRevealDist.set(id, {
-      d: targetD,                // Playback-time position (for reference)
-      lookahead: dynamicLookahead, // Dynamic lookahead based on vehicle speed
-      visibleEnd,                // Where the visible road ends
+      d: targetD,                // Playback-time position
+      visibleEnd,                // Where vehicle stops (= targetD, no lookahead)
       vehicleD: phys.d,          // Actual vehicle position (for debug)
       vehicleV: phys.v,          // Actual vehicle velocity (for debug)
-      totalDist,
-      cumDist  // Include cumDist for trail distance lookup
+      controlScalar,             // Control scalar σ(ε, ω) for debug
+      positionError,             // Normalized position error ε
+      totalDist
     });
 
     return { lat, lon, angle: nextA, flipX: (side === "L"), speedMps, opacity, reading, beforeFirst: t < tMin };
@@ -4079,9 +4117,8 @@ class MapView {
       const isLive = !this.playbackMode || !!this._playbackLiveFollow;
       const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
       
-      // Get vehicle's current reveal info (distance-based)
-      const revealInfo = this._vehicleRevealDist?.get(id);
-      const useDistanceReveal = !isLive && revealInfo && revealInfo.cumDist;
+      // Trail reveal is purely time-based: show points up to playback time
+      // (Distance-based reveal was removed because cumDist indices didn't match trail indices)
 
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
       const hasServerTrail = serverTrail.length >= 2;
@@ -4096,13 +4133,6 @@ class MapView {
 
       const getSp = (toScreen || this.worldToScreen.bind(this));
       
-      // Calculate reveal distance: the "visible road" the vehicle can see
-      // This is targetD + dynamic lookahead, pre-computed as visibleEnd
-      const revealDist = useDistanceReveal 
-        ? revealInfo.visibleEnd 
-        : Infinity;
-      const cachedCumDist = useDistanceReveal ? revealInfo.cumDist : null;
-
       let lastInterp = null;
       for (let i = 0; i < trail.length; i++) {
         const p = trail[i];
@@ -4115,29 +4145,8 @@ class MapView {
 
         const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
         
-        // Distance-based reveal: check if this point is beyond the reveal distance
-        if (useDistanceReveal && cachedCumDist && i < cachedCumDist.length) {
-          const pointDist = cachedCumDist[i];
-          if (pointDist > revealDist) {
-            // Smooth interpolation to exact reveal point
-            const prev = trail[i - 1];
-            if (prev && i > 0 && isFinite(Number(prev.lat)) && isFinite(Number(prev.lon))) {
-              const prevDist = cachedCumDist[i - 1];
-              const segLen = pointDist - prevDist;
-              if (segLen > 0.01) {
-                const u = clamp((revealDist - prevDist) / segLen, 0, 1);
-                const iLat = Number(prev.lat) + (lat - Number(prev.lat)) * u;
-                const iLon = Number(prev.lon) + (lon - Number(prev.lon)) * u;
-                const wpt = latLonToWorld(iLat, iLon, this.zoom);
-                const sp = getSp(wpt.x, wpt.y);
-                const pr = primaryReadingFromPoint(p);
-                const base = safeHex(pr?.color || m.color);
-                lastInterp = { sp, col: base };
-              }
-            }
-            break;
-          }
-        } else if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
+        // Time-based reveal: stop drawing when point time exceeds playback time
+        if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
           // Fallback to time-based reveal if no distance info
           const prev = trail[i - 1];
           const tPrev = (prev && typeof prev.t === "string") ? parseUtcMs(prev.t) : null;
@@ -4475,9 +4484,8 @@ class MapView {
       // Reveal logic handles time-based visibility, and the server handles jitter.
       // Idle trails remain visible as dimmed historical data.
       
-      // Get vehicle's current reveal info (distance-based)
-      const revealInfo = this._vehicleRevealDist?.get(id);
-      const useDistanceReveal = !isLive && revealInfo && revealInfo.cumDist;
+      // Trail reveal is purely time-based: show points up to playback time
+      // (Distance-based reveal was removed because cumDist indices didn't match trail indices)
       
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
       const hasServerTrail = serverTrail.length >= 2;
@@ -4495,13 +4503,6 @@ class MapView {
       // Optimization: calculate world size once per trail
       const ws = worldSizeForZoom(this.zoom);
       
-      // Calculate reveal distance: the "visible road" the vehicle can see
-      // This is targetD + dynamic lookahead, pre-computed as visibleEnd
-      const revealDist = useDistanceReveal 
-        ? revealInfo.visibleEnd 
-        : Infinity;
-      const cachedCumDist = useDistanceReveal ? revealInfo.cumDist : null;
-
       let lastInterp = null;
       for (let i = 0; i < trail.length; i++) {
         const p = trail[i];
@@ -4527,32 +4528,8 @@ class MapView {
           try { p._tMs = tMs; } catch {}
         }
         
-        // Distance-based reveal: check if this point is beyond the reveal distance
-        if (useDistanceReveal && cachedCumDist && i < cachedCumDist.length) {
-          const pointDist = cachedCumDist[i];
-          if (pointDist > revealDist) {
-            // Smooth interpolation to exact reveal point
-            const prev = trail[i - 1];
-            if (prev && i > 0) {
-              const prevDist = cachedCumDist[i - 1];
-              const segLen = pointDist - prevDist;
-              if (segLen > 0.01) {
-                const uDist = clamp((revealDist - prevDist) / segLen, 0, 1);
-                let pu = prev._u, pv = prev._v;
-                if (pu === undefined) { const n = latLonToNorm(Number(prev.lat), Number(prev.lon)); pu = n.u; pv = n.v; }
-                
-                const i_u = pu + (u - pu) * uDist;
-                const i_v = pv + (v - pv) * uDist;
-                
-                const sp = getSp(i_u * ws, i_v * ws);
-                const pr = primaryReadingFromPoint(p);
-                const base = safeHex(pr?.color || m.color);
-                lastInterp = { sp, col: base };
-              }
-            }
-            break;
-          }
-        } else if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
+        // Time-based reveal: stop drawing when point time exceeds playback time
+        if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
           // Fallback to time-based reveal if no distance info
           const prev = trail[i - 1];
           let tPrev = prev?._tMs;
