@@ -4141,11 +4141,9 @@ class MapView {
       const isLive = !this.playbackMode;
       const pbTimeMs = this.getPlaybackTimeMs();
       
-      // Get vehicle's actual time position (hides leading trail unless debug)
-      const revealInfo = this._vehicleRevealDist?.get(id);
-      const vehicleTMs = revealInfo?.vehicleTMs;
-      // Use vehicle time (hides leading trail) unless debug is on or vehicle time unavailable
-      const revealTimeMs = (this._pbDebugPath || vehicleTMs == null) ? pbTimeMs : vehicleTMs;
+      // Trail ALWAYS clips to playback time (pbTimeMs).
+      // Debug mode only affects visual styling, not clipping.
+      const revealTimeMs = pbTimeMs;
       
       // Trail reveal is purely time-based: show points up to reveal time
       // (Distance-based reveal was removed because cumDist indices didn't match trail indices)
@@ -4164,7 +4162,7 @@ class MapView {
       const getSp = (toScreen || this.worldToScreen.bind(this));
       
       // For interpolating trail end at vehicle's exact time position
-      const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs) && !this._pbDebugPath;
+      const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs);
       let prevTMs = null;
       let prevLat = null, prevLon = null;
       let prevColor = null;
@@ -4395,7 +4393,11 @@ class MapView {
     const h = this._cssH || 1;
     const dpr = this._dpr || (window.devicePixelRatio || 1);
 
-    if (this.traceMode) {
+    // In playback mode, trails must be redrawn each frame (time-clipped).
+    // Static overlay caching is only valid for trace mode without playback.
+    const useStaticOverlay = this.traceMode && !this.playbackMode;
+
+    if (useStaticOverlay) {
       this._ensureTracePoints(state);
       this._ensureOverlayStatic(state);
       const pw = this.overlayCanvas.width;
@@ -4422,12 +4424,12 @@ class MapView {
     const worldToScreenFast = (wx, wy) => ({ x: wx - centerW.x + w / 2, y: wy - centerW.y + h / 2 });
 
     // Fixed markers - same interaction model as mobile
-    // In trace mode, fixed markers are part of the cached static overlay.
+    // In trace mode (without playback), fixed markers are part of the cached static overlay.
     // In playback underlay mode, fixed markers are already present.
     // Get playback time for fixed sensors with history
     const fixedPbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
     
-    if (!this.traceMode && !canUseUnderlay && this.showFixed) {
+    if (!useStaticOverlay && !canUseUnderlay && this.showFixed) {
       for (const f of fixed) {
         const lat = Number(f.lat), lon = Number(f.lon);
         if (!isFinite(lat) || !isFinite(lon)) continue;
@@ -4516,27 +4518,15 @@ class MapView {
     // LIVE mode uses playback time at the live edge.
     const isLive = !this.playbackMode;
     const pbTimeMs = this.getPlaybackTimeMs();
-    
-    // Pre-compute vehicle positions for all mobiles BEFORE drawing trails.
-    // This populates _vehicleRevealDist with vehicleTMs so trails can clip correctly.
-    // Without this, trail clipping uses stale vehicle positions from previous frame.
-    const nowMsPrecompute = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
-    if (this.playbackMode) {
-      for (const m of mobiles) {
-        this._mobilePoseForRender(m, nowMsPrecompute);
-      }
-    }
 
     const drawTrailFor = (m, alphaMul, toScreen) => {
       const id = m && m.id != null ? String(m.id) : "";
       const key = keyFor("mobile", m && m.id != null ? m.id : "");
       const isSel = (this.selectedId === key);
       
-      // Get vehicle's actual time position (hides leading trail unless debug)
-      const revealInfo = this._vehicleRevealDist?.get(id);
-      const vehicleTMs = revealInfo?.vehicleTMs;
-      // Use vehicle time (hides leading trail) unless debug is on or vehicle time unavailable
-      const revealTimeMs = (this._pbDebugPath || vehicleTMs == null) ? pbTimeMs : vehicleTMs;
+      // Trail ALWAYS clips to playback time (pbTimeMs).
+      // Debug mode only affects visual styling, not clipping.
+      const revealTimeMs = pbTimeMs;
 
       // We no longer hide trails globally based on the latest ghosted state.
       // Reveal logic handles time-based visibility, and the server handles jitter.
@@ -4562,7 +4552,7 @@ class MapView {
       const ws = worldSizeForZoom(this.zoom);
       
       // For interpolating trail end at vehicle's exact time position
-      const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs) && !this._pbDebugPath;
+      const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs);
       let prevTMs = null;
       let prevU = null, prevV = null;
       let prevColor = null;
@@ -4806,9 +4796,9 @@ class MapView {
       return t.length >= 2;
     };
 
-    // In trace mode, trails are part of the cached static overlay.
+    // In trace mode (without playback), trails are part of the cached static overlay.
     // In playback underlay mode, trails are already present.
-    if (!this.traceMode && !canUseUnderlay) {
+    if (!useStaticOverlay && !canUseUnderlay) {
       // Note: we intentionally do not render trails for mobiles missing from the payload.
 
       // Draw order: oldest trails first, newest trails last.
@@ -6834,7 +6824,6 @@ function main() {
   const pbMenuBtn = document.getElementById("pbMenuBtn");
   const pbMenu = document.getElementById("pbMenu");
   const pbDaysSubmenu = document.getElementById("pbDaysSubmenu");
-  const pbDebugCheck = document.getElementById("pbDebugCheck");
   
   // Menu close delay for better UX
   let _menuHideTimer = null;
@@ -6953,16 +6942,6 @@ function main() {
     }
   }
   
-  function updateDebugCheckState() {
-    if (!pbDebugCheck) return;
-    const isDebug = pbDebugEl && pbDebugEl.checked;
-    if (isDebug) {
-      pbDebugCheck.classList.add("checked");
-    } else {
-      pbDebugCheck.classList.remove("checked");
-    }
-  }
-  
   function handleMenuAction(action) {
     switch (action) {
       case "save":
@@ -6971,13 +6950,6 @@ function main() {
       case "load":
         showLoadModal();
         break;
-      case "debug":
-        if (pbDebugEl) {
-          pbDebugEl.checked = !pbDebugEl.checked;
-          pbDebugEl.dispatchEvent(new Event("change"));
-        }
-        updateDebugCheckState();
-        return; // Don't close menu for toggles
     }
     closePlaybackMenu();
   }

@@ -316,6 +316,21 @@ aside, section { min-height: 0; }
 }
 .pbSpeed select:hover { border-color: rgba(255,255,255,0.16); }
 
+/* Debug toggle in playback bar */
+.pbDebugLabel {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  opacity: 0.5;
+  font-size: 16px;
+}
+.pbDebugLabel:has(input:checked) {
+  opacity: 1;
+}
+.pbDebugLabel input {
+  display: none;
+}
+
 /* Playback menu (dropup) */
 .pbMenuWrap {
   position: relative;
