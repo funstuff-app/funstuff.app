@@ -3785,14 +3785,9 @@ class MapView {
     this._traceAngleById.set(id, nextA);
     this._traceAngleLastMsById.set(id, nowPerfMs);
 
-    // Historical reading: use the starting point's reading for the current segment.
-    // The vehicle is between pts[idx] and pts[idx+1]. The visible trail behind the
-    // vehicle ends at the vehicle's position. The segment color comes from the
-    // destination point (trail[i] colors segment i-1→i). So when entering segment
-    // idx→idx+1, most of the visible trail is the previous segment (ending at idx).
-    // Use pts[idx] so the reading matches the most recently completed segment.
-    const pRaw = pts[idx];
-    const reading = primaryReadingKeyedFromPoint(pRaw);
+    // Marker reading: use the segment at the PHYSICS position (phys.d), not time position.
+    // idx and nextPoint are from _samplePathAtDistance(phys.d) - they match where the marker is drawn.
+    const reading = primaryReadingKeyedFromPoint(nextPoint);
 
     // Store debug info for trail drawing
     if (!this._vehicleRevealDist) this._vehicleRevealDist = new Map();
@@ -4141,9 +4136,13 @@ class MapView {
       const isLive = !this.playbackMode;
       const pbTimeMs = this.getPlaybackTimeMs();
       
-      // Trail ALWAYS clips to playback time (pbTimeMs).
-      // Debug mode only affects visual styling, not clipping.
-      const revealTimeMs = pbTimeMs;
+      // Debug ON: show trail ahead of vehicle (use pbTimeMs - reveals path before vehicle arrives)
+      // Debug OFF: clip trail exactly at vehicle position (use vehicleTMs)
+      const vehicleInfo = this._vehicleRevealDist?.get(id);
+      const vehicleTMs = vehicleInfo?.vehicleTMs;
+      const revealTimeMs = this._pbDebugPath
+        ? pbTimeMs  // Debug: show trail ahead
+        : ((vehicleTMs != null && isFinite(vehicleTMs)) ? vehicleTMs : pbTimeMs);
       
       // Trail reveal is purely time-based: show points up to reveal time
       // (Distance-based reveal was removed because cumDist indices didn't match trail indices)
@@ -4184,7 +4183,7 @@ class MapView {
 
         const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
         const pr = primaryReadingFromPoint(p);
-        const base = safeHex(pr?.color || m.color);
+        const base = safeHex(pr?.color);
 
         // Check if this point is beyond the vehicle's time - interpolate and stop
         if (shouldClipTrail && tMs != null && isFinite(tMs) && tMs > revealTimeMs) {
@@ -4196,7 +4195,8 @@ class MapView {
             const interpLon = prevLon + t * (lon - prevLon);
             const wpt = latLonToWorld(interpLat, interpLon, this.zoom);
             pts.push(getSp(wpt.x, wpt.y));
-            cols.push(prevColor || base);
+            // Use destination point's color (base) for the segment, not origin's color
+            cols.push(base);
             times.push(revealTimeMs);
           }
           trailClipped = true;
@@ -4524,9 +4524,13 @@ class MapView {
       const key = keyFor("mobile", m && m.id != null ? m.id : "");
       const isSel = (this.selectedId === key);
       
-      // Trail ALWAYS clips to playback time (pbTimeMs).
-      // Debug mode only affects visual styling, not clipping.
-      const revealTimeMs = pbTimeMs;
+      // Debug ON: show trail ahead of vehicle (use pbTimeMs - reveals path before vehicle arrives)
+      // Debug OFF: clip trail exactly at vehicle position (use vehicleTMs)
+      const vehicleInfo = this._vehicleRevealDist?.get(id);
+      const vehicleTMs = vehicleInfo?.vehicleTMs;
+      const revealTimeMs = this._pbDebugPath
+        ? pbTimeMs  // Debug: show trail ahead
+        : ((vehicleTMs != null && isFinite(vehicleTMs)) ? vehicleTMs : pbTimeMs);
 
       // We no longer hide trails globally based on the latest ghosted state.
       // Reveal logic handles time-based visibility, and the server handles jitter.
@@ -4588,7 +4592,7 @@ class MapView {
         }
 
         const pr = primaryReadingFromPoint(p);
-        const base = safeHex(pr?.color || m.color);
+        const base = safeHex(pr?.color);
 
         // Check if this point is beyond the vehicle's time - interpolate and stop
         if (shouldClipTrail && tMs != null && isFinite(tMs) && tMs > revealTimeMs) {
@@ -4599,7 +4603,8 @@ class MapView {
             const interpU = prevU + t * (u - prevU);
             const interpV = prevV + t * (v - prevV);
             pts.push(getSp(interpU * ws, interpV * ws));
-            cols.push(prevColor || base);
+            // Use destination point's color (base) for the segment, not origin's color
+            cols.push(base);
             times.push(revealTimeMs);
           }
           trailClipped = true;

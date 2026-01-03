@@ -93,6 +93,18 @@ The server handles many requests per second. Key optimizations:
 2. Test with `node --check dashboard/app.js`
 3. Run JS tests: `cd dashboard/tests && node --test`
 
+### Hot-Reload Static Files (No Server Restart)
+
+The server reads static files on each request (no in-memory cache). After editing dashboard files, you can update them in-place without restarting:
+
+```bash
+# Build and copy just the static files
+python -m PyInstaller --noconfirm mobileair.spec 2>&1 | tail -3 && \
+sudo cp dist/mobileair/_internal/dashboard/* /opt/mobileair/_internal/dashboard/
+```
+
+This overwrites the deployed static files. The running server serves new files immediately on the next request.
+
 ## Debugging Tips
 
 ### Check Raw API Data
