@@ -260,3 +260,107 @@ cd /Users/johusha/Stuff/mobileair && python -m PyInstaller --noconfirm mobileair
 - **Install location**: `/opt/mobileair/`
 - **Binary size**: ~34 MB
 - **Startup time**: ~1.6s warm, ~2.5s cold
+
+---
+
+## POST-MORTEM: LIVE Mode Playback Bug (January 2026)
+
+### The Bug
+In LIVE mode, trails were not rendering on first load, and the playhead was stuck at stale times instead of playing through the buffered data.
+
+### Root Cause Analysis
+The dashboard has TWO playback modes that share code but have DIFFERENT semantics:
+
+| Mode | `playbackMode` | `_playbackLiveFollow` | Intended Behavior |
+|------|----------------|----------------------|-------------------|
+| **DVR** | `true` | `false` | User controls playhead, scrub anywhere |
+| **LIVE** | `false` | `true` | Auto-play from buffer start, chase live edge |
+
+The bug was caused by **over 20 locations** in `app.js` that checked `this.playbackMode` to decide whether to use playback time. In LIVE mode, `playbackMode === false`, so these checks fell through to wall-clock time or null, causing:
+
+1. **Trails not rendering**: `refNowMs` fell back to `_dataNowMs()` (wall clock), making all trail points appear "expired" (age > 45 min decay window)
+2. **Playhead stuck at stale time**: `_ensurePlaybackPoints` only initialized playhead on cache miss, but cached stale `maxMs` from first fetch
+3. **Playback loop not running**: Early `if (!map.playbackMode) return;` killed the loop in LIVE mode
+
+### The Correct Mental Model
+
+**LIVE mode IS a playback mode** - it just auto-advances the playhead and snaps to new data. Both DVR and LIVE modes should:
+- Use `getPlaybackTimeMs()` for time-based calculations
+- Run the playback loop
+- Initialize playhead from data bounds
+
+The ONLY difference:
+- **DVR**: Playhead controlled by user, `_playbackLiveFollow = false`
+- **LIVE**: Playhead auto-advances, snaps to `maxMs` when new data arrives, `_playbackLiveFollow = true`
+
+### Locations That Were Wrong (and why)
+
+| Location | Bad Check | What Happened |
+|----------|-----------|---------------|
+| `pbTimeMs` in `drawTrailFor` (×2) | `this.playbackMode ? getPlaybackTimeMs() : null` | Trail clipping used null, showed nothing |
+| `refNowMs` fallback (×2) | Fell back to `_dataNowMs()` | Wall clock expired all trails |
+| `playbackLoop` early return | `if (!map.playbackMode) return` | Loop never ran in LIVE mode |
+| `_ensurePlaybackPoints` wrapper | `if (map.playbackMode)` | Never built playback data in LIVE mode |
+
+### The Fix Pattern
+
+**DO NOT** check `this.playbackMode` to decide whether to use playback time.
+
+**DO** use `getPlaybackTimeMs()` unconditionally for any time-based rendering:
+
+```javascript
+// BAD - breaks LIVE mode
+const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+
+// GOOD - works in both modes  
+const pbTimeMs = this.getPlaybackTimeMs();
+```
+
+**DO** check `_playbackLiveFollow` when you need mode-specific behavior:
+
+```javascript
+// When new data arrives, snap playhead in LIVE mode only
+if (this._playbackLiveFollow) {
+  this._playbackNowMs = this._playbackMaxMs;
+}
+```
+
+### Playhead Initialization Rules
+
+1. **First load (LIVE)**: Set `_playbackNowMs = _playbackMaxMs` (start at live edge)
+2. **First load (DVR)**: Set `_playbackNowMs = _playbackMaxMs` (start at end)
+3. **New data arrives (LIVE)**: Snap `_playbackNowMs = _playbackMaxMs`
+4. **New data arrives (DVR)**: Do NOT move playhead (user controls it)
+
+### Trail Decay Reference Time (`refNowMs`)
+
+The trail decay calculation uses `refNowMs` to determine point age. The fallback chain MUST be:
+
+```javascript
+const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) 
+  : (isFinite(visMaxT) ? visMaxT 
+  : (boundsMaxMs != null ? boundsMaxMs 
+  : this._dataNowMs()));
+```
+
+**NEVER** fall back to wall clock (`_dataNowMs()`) if ANY data-based time is available. Wall clock is hours ahead of historical data.
+
+### Testing Checklist for Playback Changes
+
+Before deploying playback changes:
+
+1. [ ] `node --check dashboard/app.js` passes
+2. [ ] Fresh browser (incognito) shows trails on first load in LIVE mode
+3. [ ] Playhead time matches header time on first load
+4. [ ] Trails are visible immediately, not after waiting
+5. [ ] DVR mode still works (click DVR toggle, scrub works)
+6. [ ] No console errors about undefined variables
+
+### Never Do These Things
+
+1. **Never use `git checkout` on app.js** during a debugging session - it reverts ALL fixes
+2. **Never remove variable declarations** without checking ALL usages first
+3. **Never assume `playbackMode === false` means "not playing"** - LIVE mode plays with `playbackMode === false`
+4. **Never fall back to wall clock time** for trail rendering - data timestamps are hours behind
+
+---

@@ -3290,11 +3290,6 @@ class MapView {
       this._playbackMaxMs = isFinite(maxMs) ? maxMs : null;
     }
 
-    // Initialize playhead to maxMs only if it's null (first load)
-    // Do NOT keep resetting it when new data arrives - playback loop handles advancement
-    if (this._playbackNowMs == null && this._playbackMaxMs != null) {
-      this._playbackNowMs = this._playbackMaxMs;
-    }
     // Track maxMs for other uses
     this._playbackLastMaxMs = this._playbackMaxMs;
   }
@@ -4137,10 +4132,10 @@ class MapView {
       // Idle trails remain visible as dimmed historical data.
 
       // DVR revealing-path logic:
-      // In playback mode, reveal trail up to playback time.
-      // LIVE mode still clips to playback time - it's just at the live edge.
-      const isLive = !this.playbackMode;  // Only skip clipping when DVR is completely OFF
-      const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+      // Reveal trail up to playback time (works in both DVR and LIVE modes).
+      // LIVE mode uses playback time at the live edge.
+      const isLive = !this.playbackMode;
+      const pbTimeMs = this.getPlaybackTimeMs();
       
       // Get vehicle's actual time position (hides leading trail unless debug)
       const revealInfo = this._vehicleRevealDist?.get(id);
@@ -4175,25 +4170,6 @@ class MapView {
         }
 
         const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
-        
-        // Time-based reveal: stop drawing when point time exceeds reveal time
-        // (revealTimeMs = vehicle time unless debug is on, then playback time)
-        if (!isLive && revealTimeMs != null && tMs != null && tMs > revealTimeMs) {
-          // Interpolate to exact reveal point
-          const prev = trail[i - 1];
-          const tPrev = (prev && typeof prev.t === "string") ? parseUtcMs(prev.t) : null;
-          if (prev && tPrev != null && isFinite(Number(prev.lat)) && isFinite(Number(prev.lon))) {
-            const u = clamp((revealTimeMs - tPrev) / (tMs - tPrev), 0, 1);
-            const iLat = Number(prev.lat) + (lat - Number(prev.lat)) * u;
-            const iLon = Number(prev.lon) + (lon - Number(prev.lon)) * u;
-            const wpt = latLonToWorld(iLat, iLon, this.zoom);
-            const sp = getSp(wpt.x, wpt.y);
-            const pr = primaryReadingFromPoint(p);
-            const base = safeHex(pr?.color || m.color);
-            lastInterp = { sp, col: base };
-          }
-          break;
-        }
 
         const wpt = latLonToWorld(lat, lon, this.zoom);
         pts.push(getSp(wpt.x, wpt.y));
@@ -4252,11 +4228,15 @@ class MapView {
       const FADE_TIME_MS = 45 * 60 * 1000; // 45 minutes -> fully expired
       const FADE_TAIL_FRAC = 0.50; // fade over the last 20% of FADE_TIME_MS
       const FADE_START_FRAC = 1.0 - FADE_TAIL_FRAC; // e.g. 0.80
-      // Reference time: ALWAYS use playback time when playback is active (DVR mode OR LIVE mode)
-      // This ensures trail decay works correctly during LIVE buffered playback.
+      // Reference time: use playback time, trail's max time, or playback bounds (NOT wall clock)
       const livePlaybackTimeMs = this.getPlaybackTimeMs();
       const hasPlaybackTime = livePlaybackTimeMs != null && isFinite(livePlaybackTimeMs);
-      const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) : this._dataNowMs();
+      const pbBounds = this.getPlaybackBounds();
+      const boundsMaxMs = (pbBounds.maxMs != null && isFinite(pbBounds.maxMs)) ? pbBounds.maxMs : null;
+      const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) 
+        : (isFinite(visMaxT) ? visMaxT 
+        : (boundsMaxMs != null ? boundsMaxMs 
+        : this._dataNowMs()));
 
       for (let i = 1; i < pts.length; i++) {
         if (!pts[i - 1] || !pts[i]) continue;
@@ -4498,11 +4478,10 @@ class MapView {
     const hasSelectedMobile = (sel && sel.type === "mobile" && sel.id);
     const selectedId = hasSelectedMobile ? sel.id : null;
 
-    // DVR revealing-path logic:
-    // When in playback mode, reveal trail up to playback time.
-    // LIVE mode still clips to playback time - it's just that playback time is at the live edge.
-    const isLive = !this.playbackMode;  // Only skip clipping when DVR is completely OFF
-    const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    // Reveal trail up to playback time (works in both DVR and LIVE modes).
+    // LIVE mode uses playback time at the live edge.
+    const isLive = !this.playbackMode;
+    const pbTimeMs = this.getPlaybackTimeMs();
 
     const drawTrailFor = (m, alphaMul, toScreen) => {
       const id = m && m.id != null ? String(m.id) : "";
@@ -4562,33 +4541,6 @@ class MapView {
           tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
           try { p._tMs = tMs; } catch {}
         }
-        
-        // Time-based reveal: stop drawing when point time exceeds reveal time
-        // (revealTimeMs = vehicle time unless debug is on, then playback time)
-        if (!isLive && revealTimeMs != null && tMs != null && tMs > revealTimeMs) {
-          // Interpolate to exact reveal point
-          const prev = trail[i - 1];
-          let tPrev = prev?._tMs;
-          if (tPrev === undefined) {
-            tPrev = (prev && typeof prev.t === "string") ? parseUtcMs(prev.t) : null;
-            try { if (prev) prev._tMs = tPrev; } catch {}
-          }
-          if (prev && tPrev != null) {
-            const uTime = clamp((revealTimeMs - tPrev) / (tMs - tPrev), 0, 1);
-            let pu = prev._u, pv = prev._v;
-            if (pu === undefined) { const n = latLonToNorm(Number(prev.lat), Number(prev.lon)); pu = n.u; pv = n.v; }
-            
-            // Linear interpolate in projected space
-            const i_u = pu + (u - pu) * uTime;
-            const i_v = pv + (v - pv) * uTime;
-            
-            const sp = getSp(i_u * ws, i_v * ws);
-            const pr = primaryReadingFromPoint(p);
-            const base = safeHex(pr?.color || m.color);
-            lastInterp = { sp, col: base };
-          }
-          break;
-        }
 
         pts.push(getSp(u * ws, v * ws));
         const pr = primaryReadingFromPoint(p);
@@ -4643,11 +4595,15 @@ class MapView {
       const FADE_TIME_MS = 45 * 60 * 1000; // 45 minutes -> fully expired
       const FADE_TAIL_FRAC = 0.20;
       const FADE_START_FRAC = 1.0 - FADE_TAIL_FRAC;
-      // Reference time: ALWAYS use playback time when playback is active (DVR mode OR LIVE mode)
-      // This ensures trail decay works correctly during LIVE buffered playback.
+      // Reference time: use playback time, trail's max time, or playback bounds (NOT wall clock)
       const livePlaybackTimeMs = this.getPlaybackTimeMs();
       const hasPlaybackTime = livePlaybackTimeMs != null && isFinite(livePlaybackTimeMs);
-      const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) : this._dataNowMs();
+      const pbBounds = this.getPlaybackBounds();
+      const boundsMaxMs = (pbBounds.maxMs != null && isFinite(pbBounds.maxMs)) ? pbBounds.maxMs : null;
+      const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) 
+        : (isFinite(visMaxT) ? visMaxT 
+        : (boundsMaxMs != null ? boundsMaxMs 
+        : this._dataNowMs()));
 
       // Calculate pixels per meter at the trail's location (approximate using first point).
       // This is needed to convert the pruned world distance into a screen-space dash offset.
@@ -5892,7 +5848,8 @@ function main() {
 
   const playbackLoop = () => {
     _pbRAF = null;
-    if (!map.playbackMode) return;
+    // Allow loop to run in DVR mode OR LIVE mode (both need playback time updates)
+    if (!map.playbackMode && !map._playbackLiveFollow) return;
     
     try {
     const now = performance.now();
@@ -6320,12 +6277,8 @@ function main() {
     if (pbBarEl) pbBarEl.classList.toggle("hidden", !traceEl.checked);
     if (traceEl.checked) {
       map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
-      const b = map.getPlaybackBounds();
-      // Always start at end-of-data when entering DVR (LIVE follow-tail).
-      if (isFinite(b.maxMs)) {
-        map.setPlaybackTimeMs(b.maxMs);
-        map._playbackLastMaxMs = Number(b.maxMs);
-      }
+      // Don't set playhead here - let the playback loop handle initialization
+      // when current data arrives. This avoids stale 5:00 PM timestamps.
       map.setPlaybackPlaying(false);
       updatePlaybackUi();
       _pbLastPerf = 0;
@@ -6341,11 +6294,7 @@ function main() {
       if (pbBarEl) pbBarEl.classList.toggle("hidden", !traceEl.checked);
       if (traceEl.checked) {
         map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
-        const b = map.getPlaybackBounds();
-        if (isFinite(b.maxMs)) {
-          map.setPlaybackTimeMs(b.maxMs);
-          map._playbackLastMaxMs = Number(b.maxMs);
-        }
+        // Don't set playhead here - let the playback loop handle it
         map.setPlaybackPlaying(false);
         updatePlaybackUi();
         _pbLastPerf = 0;
@@ -7178,23 +7127,13 @@ function main() {
         }
       }
 
-      // IMPORTANT: If DVR/trace is enabled, compute playback points + any playhead pinning
-      // BEFORE drawing. Otherwise the UI/map can look "pegged to the start" until a RAF
-      // redraw happens (which we now avoid when idle to save CPU).
-      if (map.playbackMode) {
-        const before = map.getPlaybackBounds();
-        map._ensurePlaybackPoints(st);
-        const after = map.getPlaybackBounds();
-        const nextMax = (after.maxMs != null && isFinite(Number(after.maxMs))) ? Number(after.maxMs) : null;
-
-        // LIVE follow mode now handles buffered playback in playbackLoop().
-        // Only initialize playhead position on first load, don't pin on every tick.
-        if (map.getPlaybackTimeMs() == null && nextMax != null) {
-          // One-time initialization when entering DVR: start near the end with buffer.
-          // The playbackLoop will adjust based on the dynamic buffer.
-          map.setPlaybackTimeMs(nextMax);
-        }
-        // If user is not at end, do not auto-jump or auto-play.
+      // Compute playback points + playhead initialization BEFORE drawing.
+      // Must run in BOTH DVR and LIVE modes.
+      map._ensurePlaybackPoints(st);
+      const bounds = map.getPlaybackBounds();
+      const nextMax = (bounds.maxMs != null && isFinite(Number(bounds.maxMs))) ? Number(bounds.maxMs) : null;
+      if (map.getPlaybackTimeMs() == null && nextMax != null) {
+        map.setPlaybackTimeMs(nextMax);
       }
 
       // Avoid forcing an extra overlay redraw every poll.
