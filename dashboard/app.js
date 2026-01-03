@@ -616,6 +616,7 @@ class MapView {
     this._playbackMaxMs = null;
     this._playbackPtsById = new Map(); // id -> [{lat,lon,tMs}, ...]
     this._playbackPtsKey = "";
+    this._physicsStateById = new Map(); // id -> {u, v, segIdx, lastPerfMs}
     // LIVE follow-tail: when true, keep playhead pinned to end-of-data (maxMs).
     // This is the default "LIVE" experience (no rewinds).
     this._playbackLiveFollow = true;
@@ -3277,6 +3278,240 @@ class MapView {
     if (this._playbackNowMs == null && this._playbackMaxMs != null) this._playbackNowMs = this._playbackMaxMs;
   }
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // AUTONOMOUS AGENT PHYSICS: Vehicles behave like self-driving agents that see
+  // the revealed trail ahead and drive naturally - accelerating on straights,
+  // braking for curves, and stopping at the end of visible road.
+  // 
+  // Key principles:
+  // 1. Trail reveals at targetD + dynamic lookahead (the "visible road")
+  // 2. Vehicle is FREE AGENT that follows visible road, not locked to playback time
+  // 3. Physics match wall-clock time, but position decouples during scrubbing
+  // 4. GPS data points act as checkpoints for ground truth
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  // Physics constants (matching unit tests in vehicle_physics.test.cjs)
+  static CRUISE_SPEED = 25;           // m/s on straights (~55 mph)
+  static CURVE_SPEED = 8;             // m/s in tight curves (~18 mph)
+  static ACCEL_RATE = 4;              // m/s² acceleration
+  static BRAKE_RATE = 6;              // m/s² braking (stronger than accel)
+  static CURVATURE_LOOKAHEAD = 60;    // meters to scan ahead for curves
+  static TRAIL_LOOKAHEAD_BASE = 80;   // base meters ahead of targetD for trail reveal
+  static CURVATURE_THRESHOLD = 0.01;  // rad/m where we start slowing
+  static STOP_BUFFER = 10;            // meters before visible end to start stopping
+  static PHYSICS_VARIATION = 0.15;    // ±15% variation in physics params per vehicle
+  
+  // Deterministic hash for vehicle ID -> [0, 1)
+  _hashId(id) {
+    let h = 0;
+    for (let i = 0; i < id.length; i++) {
+      h = ((h << 5) - h + id.charCodeAt(i)) | 0;
+    }
+    return ((h & 0x7fffffff) % 10000) / 10000;
+  }
+  
+  // Get per-vehicle physics parameters (deterministic variation from ID)
+  _getVehiclePhysics(id) {
+    if (!this._vehiclePhysicsCache) this._vehiclePhysicsCache = new Map();
+    let vp = this._vehiclePhysicsCache.get(id);
+    if (vp) return vp;
+    
+    const h1 = this._hashId(id);
+    const h2 = this._hashId(id + "_2");
+    const h3 = this._hashId(id + "_3");
+    const vary = MapView.PHYSICS_VARIATION;
+    
+    // Each vehicle gets slightly different cruise/curve speeds and acceleration
+    vp = {
+      cruiseSpeed: MapView.CRUISE_SPEED * (1 + (h1 - 0.5) * 2 * vary),
+      curveSpeed: MapView.CURVE_SPEED * (1 + (h2 - 0.5) * 2 * vary),
+      accelRate: MapView.ACCEL_RATE * (1 + (h3 - 0.5) * 2 * vary),
+      brakeRate: MapView.BRAKE_RATE * (1 + (this._hashId(id + "_4") - 0.5) * 2 * vary),
+    };
+    
+    this._vehiclePhysicsCache.set(id, vp);
+    return vp;
+  }
+  
+  // Per-vehicle physics state: { d: current distance along path (meters),
+  //                              v: velocity (m/s along path), lastPerfMs }
+  
+  _getPhysicsState(id) {
+    if (!this._physicsStateById) this._physicsStateById = new Map();
+    let st = this._physicsStateById.get(id);
+    if (!st) {
+      st = { d: 0, v: 0, lastPerfMs: null, totalDist: 0 };
+      this._physicsStateById.set(id, st);
+    }
+    return st;
+  }
+  
+  _resetPhysicsState(id) {
+    if (this._physicsStateById) this._physicsStateById.delete(id);
+  }
+  
+  // Build cumulative distance array for a path (cached per vehicle)
+  // Also computes per-point curvature for speed modulation
+  _getPathDistances(id, pts) {
+    if (!this._pathDistCache) this._pathDistCache = new Map();
+    let cached = this._pathDistCache.get(id);
+    if (cached && cached.ptsLen === pts.length) return cached;
+    
+    const n = pts.length;
+    
+    // Build cumulative distance array: cumDist[i] = distance from pts[0] to pts[i]
+    const cumDist = new Array(n);
+    cumDist[0] = 0;
+    for (let i = 1; i < n; i++) {
+      const segDist = haversineMeters(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
+      cumDist[i] = cumDist[i-1] + segDist;
+    }
+    const totalDist = cumDist[n - 1] || 1;
+    
+    // Compute curvature at each point using angle change between adjacent segments
+    // Curvature[i] is angle change (radians) per meter at point i
+    const curvature = new Array(n).fill(0);
+    if (n >= 3) {
+      for (let i = 1; i < n - 1; i++) {
+        // Vectors for adjacent segments
+        const dx1 = pts[i].lon - pts[i-1].lon;
+        const dy1 = pts[i].lat - pts[i-1].lat;
+        const dx2 = pts[i+1].lon - pts[i].lon;
+        const dy2 = pts[i+1].lat - pts[i].lat;
+        
+        // Angles of segments
+        const a1 = Math.atan2(dy1, dx1);
+        const a2 = Math.atan2(dy2, dx2);
+        
+        // Angle change (absolute, wrapped to [0, π])
+        let angleDiff = Math.abs(a2 - a1);
+        if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+        
+        // Distance over which this turn occurs
+        const dist = (cumDist[i] - cumDist[i-1] + cumDist[i+1] - cumDist[i]) / 2;
+        
+        // Curvature = angle change per meter
+        curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
+      }
+    }
+    
+    cached = { cumDist, totalDist, curvature, ptsLen: n };
+    this._pathDistCache.set(id, cached);
+    return cached;
+  }
+  
+  // Catmull-Rom spline interpolation for smooth curves
+  // Returns position and tangent at parameter t ∈ [0,1] between pts[p1] and pts[p2]
+  _catmullRom(pts, p0Idx, p1Idx, p2Idx, p3Idx, t) {
+    const p0 = pts[p0Idx];
+    const p1 = pts[p1Idx];
+    const p2 = pts[p2Idx];
+    const p3 = pts[p3Idx];
+    
+    const t2 = t * t;
+    const t3 = t2 * t;
+    
+    // Catmull-Rom basis functions
+    const lat = 0.5 * (
+      (-p0.lat + 3*p1.lat - 3*p2.lat + p3.lat) * t3 +
+      (2*p0.lat - 5*p1.lat + 4*p2.lat - p3.lat) * t2 +
+      (-p0.lat + p2.lat) * t +
+      2*p1.lat
+    );
+    const lon = 0.5 * (
+      (-p0.lon + 3*p1.lon - 3*p2.lon + p3.lon) * t3 +
+      (2*p0.lon - 5*p1.lon + 4*p2.lon - p3.lon) * t2 +
+      (-p0.lon + p2.lon) * t +
+      2*p1.lon
+    );
+    
+    // Tangent (derivative of position)
+    const dLat = 0.5 * (
+      3*(-p0.lat + 3*p1.lat - 3*p2.lat + p3.lat) * t2 +
+      2*(2*p0.lat - 5*p1.lat + 4*p2.lat - p3.lat) * t +
+      (-p0.lat + p2.lat)
+    );
+    const dLon = 0.5 * (
+      3*(-p0.lon + 3*p1.lon - 3*p2.lon + p3.lon) * t2 +
+      2*(2*p0.lon - 5*p1.lon + 4*p2.lon - p3.lon) * t +
+      (-p0.lon + p2.lon)
+    );
+    
+    return { lat, lon, dLat, dLon };
+  }
+  
+  // Sample position on path given distance along it using LINEAR interpolation
+  // Catmull-Rom was causing loops at sharp corners - linear is more predictable
+  // Returns position, tangent direction, and local curvature
+  _samplePathAtDistance(pts, cumDist, curvature, d) {
+    const n = pts.length;
+    if (n < 2) return { lat: pts[0].lat, lon: pts[0].lon, idx: 0, u: 0, heading: 0, curv: 0 };
+    
+    // Binary search for segment containing distance d
+    let lo = 0, hi = n - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (cumDist[mid] <= d) lo = mid;
+      else hi = mid - 1;
+    }
+    const idx = Math.min(lo, n - 2);
+    
+    const segStart = cumDist[idx];
+    const segEnd = cumDist[idx + 1];
+    const segLen = Math.max(0.001, segEnd - segStart);
+    const u = clamp((d - segStart) / segLen, 0, 1);
+    
+    // Linear interpolation - no overshooting at corners
+    const p0 = pts[idx];
+    const p1 = pts[idx + 1];
+    const lat = p0.lat + (p1.lat - p0.lat) * u;
+    const lon = p0.lon + (p1.lon - p0.lon) * u;
+    
+    // Heading from segment direction
+    const heading = Math.atan2(p1.lat - p0.lat, p1.lon - p0.lon);
+    
+    // Interpolate curvature between the two segment endpoints
+    const curv = (curvature[idx] || 0) * (1 - u) + (curvature[idx + 1] || 0) * u;
+    
+    return { 
+      lat, 
+      lon, 
+      idx, 
+      u, 
+      heading,
+      curv,
+      p0, 
+      p1 
+    };
+  }
+  
+  // Get target distance based on playback time
+  _getTargetDistance(pts, cumDist, totalDist, t) {
+    const tMin = pts[0].tMs;
+    const tMax = pts[pts.length - 1].tMs;
+    
+    if (t <= tMin) return 0;
+    if (t >= tMax) return totalDist;
+    
+    // Binary search for segment containing time t
+    let lo = 1, hi = pts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (pts[mid].tMs >= t) hi = mid;
+      else lo = mid + 1;
+    }
+    
+    const p0 = pts[lo - 1];
+    const p1 = pts[lo];
+    const dtMs = Math.max(1, p1.tMs - p0.tMs);
+    const u = clamp((t - p0.tMs) / dtMs, 0, 1);
+    
+    // Interpolate distance
+    const d0 = cumDist[lo - 1];
+    const d1 = cumDist[lo];
+    return d0 + (d1 - d0) * u;
+  }
+
   _playbackSampleForMobile(m, nowPerfMs) {
     const id = m && m.id != null ? String(m.id) : "";
     if (!id) return null;
@@ -3296,36 +3531,135 @@ class MapView {
       return { lat: p.lat, lon: p.lon, m: p.m, readings: p.readings, beforeFirst: t < tMin, afterLast: t > tMax };
     }
 
-    let idxHi = 1;
-    if (t <= tMin) idxHi = 1;
-    else if (t >= tMax) idxHi = pts.length - 1;
-    else {
-      let lo = 1;
-      let hi = pts.length - 1;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (pts[mid].tMs >= t) hi = mid;
-        else lo = mid + 1;
-      }
-      idxHi = lo;
+    // Get path geometry (cached) - includes curvature
+    const { cumDist, totalDist, curvature } = this._getPathDistances(id, pts);
+    
+    // Target distance along path based on playback time
+    // This is where the "ghost" would be - the trail reveals up to targetD + lookahead
+    const targetD = this._getTargetDistance(pts, cumDist, totalDist, t);
+    
+    // Physics state and per-vehicle parameters
+    const phys = this._getPhysicsState(id);
+    const vp = this._getVehiclePhysics(id);
+    
+    // Detect scrubbing: if playback time jumped significantly, snap to new position
+    const lastPlaybackT = phys.lastPlaybackT || t;
+    const playbackDt = t - lastPlaybackT;
+    const isScrub = Math.abs(playbackDt) > 2000; // >2 second jump = scrub
+    phys.lastPlaybackT = t;
+    
+    // Wall-clock dt for physics integration
+    const dtS = (phys.lastPerfMs != null && isFinite(phys.lastPerfMs)) 
+      ? Math.min(0.1, Math.max(0, (nowPerfMs - phys.lastPerfMs) / 1000))
+      : 0.016;
+    phys.lastPerfMs = nowPerfMs;
+    
+    // === OVERCLOCK: Scale vehicle speed based on playback speed ===
+    // When user ramps up playback, vehicles haul ass to keep up
+    // Still decoupled (autonomous agents) but responsive to the tempo
+    const playbackSpeedMult = this._playbackSpeed || 1.0;
+    // Use sqrt for a more natural feel: 4x playback = 2x vehicle speed, 16x = 4x
+    const overclock = Math.sqrt(Math.max(1, playbackSpeedMult));
+    const overclockCruise = vp.cruiseSpeed * overclock;
+    const overclockCurve = vp.curveSpeed * overclock;
+    const overclockAccel = vp.accelRate * overclock;
+    const overclockBrake = vp.brakeRate * overclock;
+    
+    // Dynamic lookahead based on current velocity: faster = see further ahead
+    // This creates natural feedback: slow down → shorter lookahead → slower trail reveal
+    // Also scale lookahead with overclock so fast vehicles see further ahead
+    const speedRatio = clamp(Math.abs(phys.v) / overclockCruise, 0.3, 1);
+    const dynamicLookahead = MapView.TRAIL_LOOKAHEAD_BASE * speedRatio * overclock;
+    
+    // The "visible road" = targetD + dynamic lookahead (clamped to path)
+    const visibleEnd = Math.min(targetD + dynamicLookahead, totalDist);
+    
+    // Initialize or handle scrub: snap to target, reset velocity
+    if (phys.totalDist !== totalDist || isScrub) {
+      phys.totalDist = totalDist;
+      phys.d = targetD;
+      phys.v = 0; // Start from rest after scrub
     }
-
-    const nextPoint = pts[idxHi];
-    const prevPoint = pts[Math.max(0, idxHi - 1)];
+    
+    // === AUTONOMOUS AGENT PHYSICS ===
+    // The vehicle is a FREE AGENT that follows the visible road
+    // It accelerates on straights, brakes for curves, and stops at end of visible road
+    
+    // Look ahead for curves (scale lookahead with overclock for faster reaction)
+    let maxCurvAhead = 0;
+    const curveLookaheadEnd = Math.min(phys.d + MapView.CURVATURE_LOOKAHEAD * overclock, totalDist);
+    for (let i = 0; i < curvature.length; i++) {
+      const d = cumDist[i];
+      if (d >= phys.d && d <= curveLookaheadEnd) {
+        if (curvature[i] > maxCurvAhead) maxCurvAhead = curvature[i];
+      }
+    }
+    
+    // Calculate target speed based on:
+    // 1. Distance to end of visible road (brake to stop)
+    // 2. Curvature ahead (slow for curves)
+    // 3. Cruise speed on straights (all scaled by overclock)
+    const distToVisibleEnd = visibleEnd - phys.d;
+    
+    let targetSpeed;
+    if (distToVisibleEnd <= 0) {
+      // Already at or past visible end - full stop
+      targetSpeed = 0;
+    } else if (distToVisibleEnd < MapView.STOP_BUFFER) {
+      // Very close to visible end - slow crawl proportional to distance
+      targetSpeed = Math.min(2 * overclock, distToVisibleEnd * 0.5);
+    } else {
+      // Distance-limited speed: v² = 2as → v = sqrt(2 * brakeRate * distance)
+      // Use a safety factor of 0.8 to ensure we don't overshoot
+      const brakeSpeed = Math.sqrt(2 * overclockBrake * Math.max(0, distToVisibleEnd - MapView.STOP_BUFFER)) * 0.8;
+      
+      // Curvature-limited speed: interpolate between cruise and curve speed (both overclocked)
+      const curvFactor = MapView.CURVATURE_THRESHOLD / (MapView.CURVATURE_THRESHOLD + maxCurvAhead);
+      const curveSpeed = overclockCurve + (overclockCruise - overclockCurve) * curvFactor;
+      
+      // Take minimum of all limits
+      targetSpeed = Math.min(overclockCruise, brakeSpeed, curveSpeed);
+    }
+    
+    // Apply acceleration or braking (both overclocked for snappier response)
+    if (phys.v < targetSpeed) {
+      // Accelerate
+      phys.v = Math.min(targetSpeed, phys.v + overclockAccel * dtS);
+    } else if (phys.v > targetSpeed) {
+      // Brake (stronger than acceleration for safety)
+      phys.v = Math.max(targetSpeed, phys.v - overclockBrake * dtS);
+    }
+    
+    // Safety clamps
+    phys.v = clamp(phys.v, 0, overclockCruise);
+    
+    // Update position - but don't exceed visible end
+    const proposedD = phys.d + phys.v * dtS;
+    if (proposedD >= visibleEnd) {
+      // Would overshoot - clamp to visible end and stop
+      phys.d = visibleEnd;
+      phys.v = 0;
+    } else {
+      phys.d = proposedD;
+    }
+    
+    // Cannot go backwards or past total path end
+    phys.d = clamp(phys.d, 0, totalDist);
+    
+    // Sample actual position on path (linear interpolation)
+    const sample = this._samplePathAtDistance(pts, cumDist, curvature, phys.d);
+    const { lat, lon, idx, u, heading, p0, p1 } = sample;
+    
+    // Get segment info for readings and visibility
+    const nextPoint = p1 || pts[Math.min(idx + 1, pts.length - 1)];
+    const prevPoint = p0 || pts[idx];
     const dtMs = Math.max(1, (nextPoint.tMs - prevPoint.tMs));
-    const u = clamp((t - prevPoint.tMs) / dtMs, 0, 1);
-    const lat = prevPoint.lat + (nextPoint.lat - prevPoint.lat) * u;
-    const lon = prevPoint.lon + (nextPoint.lon - prevPoint.lon) * u;
-    const distM = haversineMeters(prevPoint.lat, prevPoint.lon, nextPoint.lat, nextPoint.lon);
-    let speedMps = clamp(distM / Math.max(0.001, dtMs / 1000), 0, Number(this._traceRealMaxSpeedMps) || 20.0);
-    // If we're at (or beyond) the end of data, the marker is not traversing a segment anymore.
-    // Don't report the last segment's speed as current motion.
+    
+    // Use actual physics velocity for display, not recorded velocity
+    let speedMps = phys.v;
     if (t >= tMax - 1) speedMps = 0;
 
-    // Determine transient visibility:
-    // - Dim idle (non-moving) markers unless Debug/Selected.
-    // Note: ghosted status is irrelevant here - it's current live state, not historical.
-    // During playback, we use the trail's `m` flag to determine if it was moving at that time.
+    // Determine transient visibility
     let opacity = 1.0;
     const dimOpacity = 0.25;
     const movingFlag = !!(nextPoint && (nextPoint.m === 1 || nextPoint.m === "1" || nextPoint.m === true));
@@ -3336,23 +3670,30 @@ class MapView {
       opacity = dimOpacity;
     }
 
-    // Additional gap check (dim markers in large data gaps)
     if (dtMs > 305000 && t > prevPoint.tMs + 5000 && t < nextPoint.tMs - 5000 && !this._pbDebugPath && !isSel) {
       opacity = dimOpacity;
     }
 
-    // Heading + flip side + smoothed render angle (reuse caches).
-    const w0 = latLonToWorld(prevPoint.lat, prevPoint.lon, this.zoom);
-    const w1 = latLonToWorld(nextPoint.lat, nextPoint.lon, this.zoom);
-    let dx = (w1.x - w0.x);
-    let dy = (w1.y - w0.y);
-    if (Math.abs(dx) < 0.0001 && Math.abs(dy) < 0.0001) {
+    // Use smooth spline heading (already in lat/lon space, convert to screen space)
+    // The spline gives us dLat/dLon, but screen Y is inverted, so we need atan2(-dLat, dLon)
+    // Actually heading is already atan2(dLat, dLon) from _samplePathAtDistance
+    // We need to convert to screen heading which accounts for Mercator projection
+    const currWorld = latLonToWorld(lat, lon, this.zoom);
+    const epsilon = 0.0001;
+    const aheadWorld = latLonToWorld(
+      lat + Math.sin(heading) * epsilon, 
+      lon + Math.cos(heading) * epsilon, 
+      this.zoom
+    );
+    let dx = aheadWorld.x - currWorld.x;
+    let dy = aheadWorld.y - currWorld.y;
+    if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) {
       dx = 1e-3;
       dy = 0;
     }
-    const heading = Math.atan2(dy, dx);
+    const screenHeading = Math.atan2(dy, dx);
 
-    const absH = Math.abs(heading);
+    const absH = Math.abs(screenHeading);
     const dead = 0.22;
     const switchToLeft = (Math.PI / 2) + dead;
     const switchToRight = (Math.PI / 2) - dead;
@@ -3362,8 +3703,8 @@ class MapView {
     else if (side === "L" && absH < switchToRight) side = "R";
     this._traceLastSideById.set(id, side);
 
-    let renderAngle = heading;
-    if (side === "L") renderAngle = Math.PI - heading;
+    let renderAngle = screenHeading;
+    if (side === "L") renderAngle = Math.PI - screenHeading;
     if (renderAngle > Math.PI) renderAngle -= Math.PI * 2;
     if (renderAngle < -Math.PI) renderAngle += Math.PI * 2;
 
@@ -3375,20 +3716,33 @@ class MapView {
     };
     const prevA = this._traceAngleById.get(id);
     const lastMs = this._traceAngleLastMsById.get(id);
-    const dtS = (lastMs != null && isFinite(lastMs)) ? Math.max(0, (nowPerfMs - lastMs) / 1000) : 0;
-    const tauS = 0.35;
-    const alpha = dtS > 0 ? (1 - Math.exp(-dtS / tauS)) : 1;
+    const dtAngleS = (lastMs != null && isFinite(lastMs)) ? Math.max(0, (nowPerfMs - lastMs) / 1000) : 0;
+    const tauS = 0.25; // Slightly faster angle response for responsiveness
+    const alpha = dtAngleS > 0 ? (1 - Math.exp(-dtAngleS / tauS)) : 1;
     const nextA = (prevA == null)
       ? renderAngle
       : wrapAngle(prevA + wrapAngle(renderAngle - prevA) * alpha);
     this._traceAngleById.set(id, nextA);
     this._traceAngleLastMsById.set(id, nowPerfMs);
 
-    // Historical reading: always use the destination point's reading for the current segment
-    // (idxHi) so the label matches the trail segment color (which is also based on the dest point).
-    // Previously we snapped to nearest (idxPick), causing a mismatch for the first 50% of the segment.
-    const pRaw = pts[idxHi];
+    // Historical reading: use the destination point's reading for the current segment
+    // so the label matches the trail segment color.
+    const pRaw = pts[Math.min(idx + 1, pts.length - 1)];
     const reading = primaryReadingKeyedFromPoint(pRaw);
+
+    // Store reveal distance for trail drawing
+    // Trail reveals up to VISIBLE END (targetD + dynamic lookahead)
+    // Vehicle is a free agent that follows the revealed path
+    if (!this._vehicleRevealDist) this._vehicleRevealDist = new Map();
+    this._vehicleRevealDist.set(id, {
+      d: targetD,                // Playback-time position (for reference)
+      lookahead: dynamicLookahead, // Dynamic lookahead based on vehicle speed
+      visibleEnd,                // Where the visible road ends
+      vehicleD: phys.d,          // Actual vehicle position (for debug)
+      vehicleV: phys.v,          // Actual vehicle velocity (for debug)
+      totalDist,
+      cumDist  // Include cumDist for trail distance lookup
+    });
 
     return { lat, lon, angle: nextA, flipX: (side === "L"), speedMps, opacity, reading, beforeFirst: t < tMin };
   }
@@ -3719,10 +4073,15 @@ class MapView {
       // Idle trails remain visible as dimmed historical data.
 
       // DVR revealing-path logic:
-      // When in playback mode, only show points up to the current playhead.
+      // In playback mode, reveal trail up to vehicle position + lookahead distance.
+      // This gives vehicles a constant "runway" to react to, regardless of speed.
       // If we are LIVE (at the end), show the full path.
       const isLive = !this.playbackMode || !!this._playbackLiveFollow;
       const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+      
+      // Get vehicle's current reveal info (distance-based)
+      const revealInfo = this._vehicleRevealDist?.get(id);
+      const useDistanceReveal = !isLive && revealInfo && revealInfo.cumDist;
 
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
       const hasServerTrail = serverTrail.length >= 2;
@@ -3736,6 +4095,13 @@ class MapView {
       const times = [];
 
       const getSp = (toScreen || this.worldToScreen.bind(this));
+      
+      // Calculate reveal distance: the "visible road" the vehicle can see
+      // This is targetD + dynamic lookahead, pre-computed as visibleEnd
+      const revealDist = useDistanceReveal 
+        ? revealInfo.visibleEnd 
+        : Infinity;
+      const cachedCumDist = useDistanceReveal ? revealInfo.cumDist : null;
 
       let lastInterp = null;
       for (let i = 0; i < trail.length; i++) {
@@ -3748,8 +4114,31 @@ class MapView {
         }
 
         const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
-        if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
-          // Smooth reveal interpolation:
+        
+        // Distance-based reveal: check if this point is beyond the reveal distance
+        if (useDistanceReveal && cachedCumDist && i < cachedCumDist.length) {
+          const pointDist = cachedCumDist[i];
+          if (pointDist > revealDist) {
+            // Smooth interpolation to exact reveal point
+            const prev = trail[i - 1];
+            if (prev && i > 0 && isFinite(Number(prev.lat)) && isFinite(Number(prev.lon))) {
+              const prevDist = cachedCumDist[i - 1];
+              const segLen = pointDist - prevDist;
+              if (segLen > 0.01) {
+                const u = clamp((revealDist - prevDist) / segLen, 0, 1);
+                const iLat = Number(prev.lat) + (lat - Number(prev.lat)) * u;
+                const iLon = Number(prev.lon) + (lon - Number(prev.lon)) * u;
+                const wpt = latLonToWorld(iLat, iLon, this.zoom);
+                const sp = getSp(wpt.x, wpt.y);
+                const pr = primaryReadingFromPoint(p);
+                const base = safeHex(pr?.color || m.color);
+                lastInterp = { sp, col: base };
+              }
+            }
+            break;
+          }
+        } else if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
+          // Fallback to time-based reveal if no distance info
           const prev = trail[i - 1];
           const tPrev = (prev && typeof prev.t === "string") ? parseUtcMs(prev.t) : null;
           if (prev && tPrev != null && isFinite(Number(prev.lat)) && isFinite(Number(prev.lon))) {
@@ -3760,7 +4149,6 @@ class MapView {
             const sp = getSp(wpt.x, wpt.y);
             const pr = primaryReadingFromPoint(p);
             const base = safeHex(pr?.color || m.color);
-            // No binary fading here; color is baked per segment below
             lastInterp = { sp, col: base };
           }
           break;
@@ -4086,6 +4474,11 @@ class MapView {
       // We no longer hide trails globally based on the latest ghosted state.
       // Reveal logic handles time-based visibility, and the server handles jitter.
       // Idle trails remain visible as dimmed historical data.
+      
+      // Get vehicle's current reveal info (distance-based)
+      const revealInfo = this._vehicleRevealDist?.get(id);
+      const useDistanceReveal = !isLive && revealInfo && revealInfo.cumDist;
+      
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
       const hasServerTrail = serverTrail.length >= 2;
       // When in historical mode, always use server trail (not live-accumulated persisted trail)
@@ -4101,6 +4494,13 @@ class MapView {
 
       // Optimization: calculate world size once per trail
       const ws = worldSizeForZoom(this.zoom);
+      
+      // Calculate reveal distance: the "visible road" the vehicle can see
+      // This is targetD + dynamic lookahead, pre-computed as visibleEnd
+      const revealDist = useDistanceReveal 
+        ? revealInfo.visibleEnd 
+        : Infinity;
+      const cachedCumDist = useDistanceReveal ? revealInfo.cumDist : null;
 
       let lastInterp = null;
       for (let i = 0; i < trail.length; i++) {
@@ -4126,8 +4526,34 @@ class MapView {
           tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
           try { p._tMs = tMs; } catch {}
         }
-        if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
-          // Smooth reveal interpolation:
+        
+        // Distance-based reveal: check if this point is beyond the reveal distance
+        if (useDistanceReveal && cachedCumDist && i < cachedCumDist.length) {
+          const pointDist = cachedCumDist[i];
+          if (pointDist > revealDist) {
+            // Smooth interpolation to exact reveal point
+            const prev = trail[i - 1];
+            if (prev && i > 0) {
+              const prevDist = cachedCumDist[i - 1];
+              const segLen = pointDist - prevDist;
+              if (segLen > 0.01) {
+                const uDist = clamp((revealDist - prevDist) / segLen, 0, 1);
+                let pu = prev._u, pv = prev._v;
+                if (pu === undefined) { const n = latLonToNorm(Number(prev.lat), Number(prev.lon)); pu = n.u; pv = n.v; }
+                
+                const i_u = pu + (u - pu) * uDist;
+                const i_v = pv + (v - pv) * uDist;
+                
+                const sp = getSp(i_u * ws, i_v * ws);
+                const pr = primaryReadingFromPoint(p);
+                const base = safeHex(pr?.color || m.color);
+                lastInterp = { sp, col: base };
+              }
+            }
+            break;
+          }
+        } else if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
+          // Fallback to time-based reveal if no distance info
           const prev = trail[i - 1];
           let tPrev = prev?._tMs;
           if (tPrev === undefined) {

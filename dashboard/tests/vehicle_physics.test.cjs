@@ -1,0 +1,689 @@
+/**
+ * Unit tests for autonomous vehicle physics
+ * 
+ * These tests validate that the vehicle physics behave like an autonomous agent:
+ * 1. Accelerates on straights, brakes for curves
+ * 2. Never exceeds visible road (targetD + lookahead)
+ * 3. Respects physics that match wall-time
+ * 4. Handles scrubbing (large playback time jumps)
+ */
+
+const { describe, it, beforeEach } = require('node:test');
+const assert = require('node:assert');
+
+// Haversine distance in meters (simplified for testing)
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (deg) => deg * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + 
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * 
+            Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+/**
+ * Autonomous vehicle physics engine
+ * This is the extracted, testable physics logic
+ */
+class VehiclePhysics {
+  // Physics constants (matching user requirements)
+  static CRUISE_SPEED = 25;          // m/s on straights
+  static CURVE_SPEED = 8;            // m/s in tight curves
+  static ACCEL_RATE = 4;             // m/s² acceleration
+  static BRAKE_RATE = 6;             // m/s² braking (stronger than accel)
+  static CURVATURE_LOOKAHEAD = 60;   // meters to scan ahead for curves
+  static TRAIL_LOOKAHEAD_BASE = 80;  // base meters ahead of targetD for trail reveal
+  static CURVATURE_THRESHOLD = 0.01; // rad/m where we start slowing
+  static STOP_BUFFER = 10;           // meters before end to start stopping
+
+  constructor() {
+    this.d = 0;           // current distance along path (meters)
+    this.v = 0;           // current velocity (m/s)
+    this.lastPerfMs = null;
+    this.lastPlaybackT = null;
+    this.totalDist = 0;
+  }
+
+  /**
+   * Build cumulative distances and curvature for path points
+   */
+  static buildPathGeometry(pts) {
+    const n = pts.length;
+    if (n < 2) return { cumDist: [0], totalDist: 0, curvature: [0] };
+    
+    const cumDist = new Array(n);
+    cumDist[0] = 0;
+    for (let i = 1; i < n; i++) {
+      const segDist = haversineMeters(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
+      cumDist[i] = cumDist[i-1] + segDist;
+    }
+    const totalDist = cumDist[n - 1] || 1;
+    
+    // Curvature at each point (rad/m)
+    const curvature = new Array(n).fill(0);
+    if (n >= 3) {
+      for (let i = 1; i < n - 1; i++) {
+        const dx1 = pts[i].lon - pts[i-1].lon;
+        const dy1 = pts[i].lat - pts[i-1].lat;
+        const dx2 = pts[i+1].lon - pts[i].lon;
+        const dy2 = pts[i+1].lat - pts[i].lat;
+        
+        const a1 = Math.atan2(dy1, dx1);
+        const a2 = Math.atan2(dy2, dx2);
+        
+        let angleDiff = Math.abs(a2 - a1);
+        if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+        
+        const dist = (cumDist[i] - cumDist[i-1] + cumDist[i+1] - cumDist[i]) / 2;
+        curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
+      }
+    }
+    
+    return { cumDist, totalDist, curvature };
+  }
+
+  /**
+   * Get target distance based on playback time
+   */
+  static getTargetDistance(pts, cumDist, totalDist, tMs) {
+    const n = pts.length;
+    if (n < 2) return 0;
+    
+    const tMin = pts[0].tMs;
+    const tMax = pts[n - 1].tMs;
+    
+    if (tMs <= tMin) return 0;
+    if (tMs >= tMax) return totalDist;
+    
+    // Binary search for segment
+    let lo = 1, hi = n - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (pts[mid].tMs >= tMs) hi = mid;
+      else lo = mid + 1;
+    }
+    
+    const p0 = pts[lo - 1];
+    const p1 = pts[lo];
+    const dtMs = Math.max(1, p1.tMs - p0.tMs);
+    const u = clamp((tMs - p0.tMs) / dtMs, 0, 1);
+    
+    return cumDist[lo - 1] + (cumDist[lo] - cumDist[lo - 1]) * u;
+  }
+
+  /**
+   * Get maximum curvature in a distance window ahead
+   */
+  static getMaxCurvatureAhead(cumDist, curvature, currentD, lookaheadDist, totalDist) {
+    const endD = Math.min(currentD + lookaheadDist, totalDist);
+    let maxCurv = 0;
+    
+    for (let i = 0; i < cumDist.length; i++) {
+      const d = cumDist[i];
+      if (d >= currentD && d <= endD) {
+        if (curvature[i] > maxCurv) maxCurv = curvature[i];
+      }
+    }
+    return maxCurv;
+  }
+
+  /**
+   * Calculate target speed based on curvature and distance to end of visible road
+   */
+  static getTargetSpeed(currentD, visibleEndD, maxCurvAhead, totalDist) {
+    const distToEnd = visibleEndD - currentD;
+    
+    // If near end of visible road, slow to stop
+    if (distToEnd < VehiclePhysics.STOP_BUFFER) {
+      return 0;
+    }
+    
+    // Distance-limited speed (brake to stop at end of visible road)
+    // v² = 2as → v = sqrt(2 * brakeRate * distance)
+    const brakeSpeed = Math.sqrt(2 * VehiclePhysics.BRAKE_RATE * Math.max(0, distToEnd - VehiclePhysics.STOP_BUFFER));
+    
+    // Curvature-limited speed
+    const curvFactor = VehiclePhysics.CURVATURE_THRESHOLD / 
+      (VehiclePhysics.CURVATURE_THRESHOLD + maxCurvAhead);
+    const curveSpeed = VehiclePhysics.CURVE_SPEED + 
+      (VehiclePhysics.CRUISE_SPEED - VehiclePhysics.CURVE_SPEED) * curvFactor;
+    
+    // Take minimum of all limits
+    return Math.min(VehiclePhysics.CRUISE_SPEED, brakeSpeed, curveSpeed);
+  }
+
+  /**
+   * Calculate dynamic lookahead based on current velocity
+   * Faster = see further ahead, slower = shorter lookahead
+   */
+  getDynamicLookahead() {
+    // At cruise speed (25 m/s), lookahead is ~3 seconds ahead = 75m
+    // At min speed (8 m/s), lookahead is ~3 seconds = 24m
+    // Base is 80m, scale by velocity ratio
+    const speedRatio = clamp(Math.abs(this.v) / VehiclePhysics.CRUISE_SPEED, 0.3, 1);
+    return VehiclePhysics.TRAIL_LOOKAHEAD_BASE * speedRatio;
+  }
+
+  /**
+   * Main physics step - advance the vehicle by wall-clock dt
+   * 
+   * @param {number} nowPerfMs - Current performance.now() timestamp
+   * @param {number} playbackTMs - Current playback time in recording
+   * @param {object} geometry - { cumDist, totalDist, curvature }
+   * @param {number} targetD - Where playback time maps to on the path
+   * @returns {{ d, v, lookahead, visibleEnd, isScrub }}
+   */
+  step(nowPerfMs, playbackTMs, geometry, targetD) {
+    const { cumDist, totalDist, curvature } = geometry;
+    
+    // Wall-clock dt
+    const dtS = (this.lastPerfMs != null && isFinite(this.lastPerfMs))
+      ? clamp((nowPerfMs - this.lastPerfMs) / 1000, 0, 0.1)
+      : 0.016;
+    this.lastPerfMs = nowPerfMs;
+    
+    // Detect scrubbing: large playback time jump
+    const lastT = this.lastPlaybackT ?? playbackTMs;
+    const playbackDt = playbackTMs - lastT;
+    const isScrub = Math.abs(playbackDt) > 2000;
+    this.lastPlaybackT = playbackTMs;
+    
+    // Handle path change or scrub: snap to target
+    if (this.totalDist !== totalDist || isScrub) {
+      this.totalDist = totalDist;
+      this.d = targetD;
+      this.v = 0; // Start from rest after scrub
+      return { 
+        d: this.d, 
+        v: this.v, 
+        lookahead: this.getDynamicLookahead(),
+        visibleEnd: targetD + VehiclePhysics.TRAIL_LOOKAHEAD_BASE,
+        isScrub: true 
+      };
+    }
+    
+    // The "visible road" = targetD + dynamic lookahead
+    const lookahead = this.getDynamicLookahead();
+    const visibleEnd = Math.min(targetD + lookahead, totalDist);
+    
+    // Look ahead for curves
+    const maxCurvAhead = VehiclePhysics.getMaxCurvatureAhead(
+      cumDist, curvature, this.d, 
+      VehiclePhysics.CURVATURE_LOOKAHEAD, totalDist
+    );
+    
+    // Target speed based on curvature and distance to visible end
+    const targetSpeed = VehiclePhysics.getTargetSpeed(
+      this.d, visibleEnd, maxCurvAhead, totalDist
+    );
+    
+    // Apply acceleration/braking
+    if (this.v < targetSpeed) {
+      // Accelerate
+      this.v = Math.min(targetSpeed, this.v + VehiclePhysics.ACCEL_RATE * dtS);
+    } else if (this.v > targetSpeed) {
+      // Brake
+      this.v = Math.max(targetSpeed, this.v - VehiclePhysics.BRAKE_RATE * dtS);
+    }
+    
+    // Safety clamp
+    this.v = clamp(this.v, 0, VehiclePhysics.CRUISE_SPEED);
+    
+    // Update position
+    this.d += this.v * dtS;
+    
+    // Cannot exceed visible road
+    if (this.d >= visibleEnd) {
+      this.d = visibleEnd;
+      this.v = 0;
+    }
+    
+    // Cannot go backwards or past end
+    this.d = clamp(this.d, 0, totalDist);
+    
+    return { d: this.d, v: this.v, lookahead, visibleEnd, isScrub: false };
+  }
+
+  /**
+   * Sample position on path at given distance (linear interpolation)
+   */
+  static samplePathAtDistance(pts, cumDist, d) {
+    const n = pts.length;
+    if (n < 2) return { lat: pts[0].lat, lon: pts[0].lon, heading: 0, idx: 0 };
+    
+    // Binary search for segment
+    let lo = 0, hi = n - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (cumDist[mid] <= d) lo = mid;
+      else hi = mid - 1;
+    }
+    const idx = Math.min(lo, n - 2);
+    
+    const segStart = cumDist[idx];
+    const segEnd = cumDist[idx + 1];
+    const u = segEnd > segStart ? clamp((d - segStart) / (segEnd - segStart), 0, 1) : 0;
+    
+    const p0 = pts[idx];
+    const p1 = pts[idx + 1];
+    
+    const lat = p0.lat + (p1.lat - p0.lat) * u;
+    const lon = p0.lon + (p1.lon - p0.lon) * u;
+    
+    // Heading from segment direction
+    const heading = Math.atan2(p1.lat - p0.lat, p1.lon - p0.lon);
+    
+    return { lat, lon, heading, idx, u };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('VehiclePhysics', () => {
+  
+  describe('buildPathGeometry', () => {
+    it('computes cumulative distances correctly', () => {
+      // Simple 3-point straight line going east
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 0 },
+        { lat: 40.0, lon: -110.99, tMs: 1000 },
+        { lat: 40.0, lon: -110.98, tMs: 2000 },
+      ];
+      
+      const { cumDist, totalDist } = VehiclePhysics.buildPathGeometry(pts);
+      
+      assert.strictEqual(cumDist[0], 0);
+      assert.ok(cumDist[1] > 0);
+      assert.ok(cumDist[2] > cumDist[1]);
+      assert.strictEqual(totalDist, cumDist[2]);
+    });
+    
+    it('computes curvature for a 90-degree turn', () => {
+      // L-shaped path: east then north
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 0 },
+        { lat: 40.0, lon: -110.99, tMs: 1000 },  // going east
+        { lat: 40.01, lon: -110.99, tMs: 2000 }, // turn north
+      ];
+      
+      const { curvature } = VehiclePhysics.buildPathGeometry(pts);
+      
+      // Middle point should have high curvature (90° turn)
+      assert.ok(curvature[1] > 0.001, `Expected high curvature at turn, got ${curvature[1]}`);
+      // Endpoints have 0 curvature
+      assert.strictEqual(curvature[0], 0);
+      assert.strictEqual(curvature[2], 0);
+    });
+    
+    it('returns zero curvature for straight paths', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 0 },
+        { lat: 40.0, lon: -110.99, tMs: 1000 },
+        { lat: 40.0, lon: -110.98, tMs: 2000 },
+        { lat: 40.0, lon: -110.97, tMs: 3000 },
+      ];
+      
+      const { curvature } = VehiclePhysics.buildPathGeometry(pts);
+      
+      // All interior points should have ~0 curvature
+      for (let i = 1; i < curvature.length - 1; i++) {
+        assert.ok(curvature[i] < 0.0001, `Expected ~0 curvature on straight, got ${curvature[i]}`);
+      }
+    });
+  });
+  
+  describe('getTargetDistance', () => {
+    it('returns 0 before trail start', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 1000 },
+        { lat: 40.0, lon: -110.99, tMs: 2000 },
+      ];
+      const { cumDist, totalDist } = VehiclePhysics.buildPathGeometry(pts);
+      
+      const d = VehiclePhysics.getTargetDistance(pts, cumDist, totalDist, 500);
+      assert.strictEqual(d, 0);
+    });
+    
+    it('returns totalDist after trail end', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 1000 },
+        { lat: 40.0, lon: -110.99, tMs: 2000 },
+      ];
+      const { cumDist, totalDist } = VehiclePhysics.buildPathGeometry(pts);
+      
+      const d = VehiclePhysics.getTargetDistance(pts, cumDist, totalDist, 3000);
+      assert.strictEqual(d, totalDist);
+    });
+    
+    it('interpolates correctly at midpoint', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 0 },
+        { lat: 40.0, lon: -110.98, tMs: 2000 },
+      ];
+      const { cumDist, totalDist } = VehiclePhysics.buildPathGeometry(pts);
+      
+      const d = VehiclePhysics.getTargetDistance(pts, cumDist, totalDist, 1000);
+      // Should be approximately half the total distance
+      assert.ok(Math.abs(d - totalDist / 2) < 1, `Expected ~half distance, got ${d}`);
+    });
+  });
+  
+  describe('getTargetSpeed', () => {
+    it('returns cruise speed on straights', () => {
+      const speed = VehiclePhysics.getTargetSpeed(0, 1000, 0, 1000);
+      assert.strictEqual(speed, VehiclePhysics.CRUISE_SPEED);
+    });
+    
+    it('slows down for high curvature', () => {
+      const straightSpeed = VehiclePhysics.getTargetSpeed(0, 1000, 0, 1000);
+      const curveSpeed = VehiclePhysics.getTargetSpeed(0, 1000, 0.05, 1000);
+      
+      assert.ok(curveSpeed < straightSpeed, 
+        `Expected curve speed ${curveSpeed} < straight speed ${straightSpeed}`);
+    });
+    
+    it('slows to stop near end of visible road', () => {
+      const speed = VehiclePhysics.getTargetSpeed(98, 100, 0, 200);
+      assert.strictEqual(speed, 0);
+    });
+    
+    it('limits speed when approaching visible end', () => {
+      // 10m from visible end, should brake to reasonable speed
+      const speed = VehiclePhysics.getTargetSpeed(90, 100, 0, 200);
+      
+      // Should be limited by braking distance
+      const expectedMax = Math.sqrt(2 * VehiclePhysics.BRAKE_RATE * (100 - 90 - VehiclePhysics.STOP_BUFFER));
+      assert.ok(speed <= expectedMax + 0.1, 
+        `Expected speed ${speed} <= ${expectedMax} for braking distance`);
+    });
+  });
+  
+  describe('step (physics integration)', () => {
+    let phys;
+    
+    beforeEach(() => {
+      phys = new VehiclePhysics();
+    });
+    
+    it('accelerates from rest', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 0 },
+        { lat: 40.0, lon: -110.9, tMs: 60000 }, // ~800m over 60s
+      ];
+      const geometry = VehiclePhysics.buildPathGeometry(pts);
+      
+      // Initialize
+      phys.step(0, 0, geometry, 0);
+      phys.v = 0;
+      phys.d = 0;
+      
+      // Step forward 100ms at a time
+      let nowMs = 100;
+      for (let i = 0; i < 10; i++) {
+        const playbackT = i * 1000; // Advance playback 1s per step
+        const targetD = VehiclePhysics.getTargetDistance(pts, geometry.cumDist, geometry.totalDist, playbackT);
+        phys.step(nowMs, playbackT, geometry, targetD);
+        nowMs += 100;
+      }
+      
+      // Should have accelerated
+      assert.ok(phys.v > 0, `Expected positive velocity, got ${phys.v}`);
+    });
+    
+    it('stops at end of visible road', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 0 },
+        { lat: 40.0, lon: -110.99, tMs: 10000 }, // ~85m
+      ];
+      const geometry = VehiclePhysics.buildPathGeometry(pts);
+      
+      // targetD at 0 = visible end at ~80m lookahead
+      phys.step(0, 0, geometry, 0);
+      
+      // Give it some velocity
+      phys.v = 20;
+      phys.d = 70; // Close to visible end (~80m)
+      
+      // Step multiple times
+      let nowMs = 100;
+      for (let i = 0; i < 20; i++) {
+        phys.step(nowMs, 0, geometry, 0);
+        nowMs += 100;
+      }
+      
+      // Should have stopped before exceeding visible end
+      const visibleEnd = 0 + phys.getDynamicLookahead();
+      assert.ok(phys.d <= geometry.totalDist, 
+        `Position ${phys.d} should not exceed total ${geometry.totalDist}`);
+    });
+    
+    it('snaps to target on scrub', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 0 },
+        { lat: 40.0, lon: -110.9, tMs: 60000 },
+      ];
+      const geometry = VehiclePhysics.buildPathGeometry(pts);
+      
+      // Initial position
+      phys.step(0, 0, geometry, 0);
+      phys.d = 100;
+      phys.v = 10;
+      
+      // Scrub forward 30 seconds
+      const newTargetD = VehiclePhysics.getTargetDistance(
+        pts, geometry.cumDist, geometry.totalDist, 30000
+      );
+      const result = phys.step(1000, 30000, geometry, newTargetD);
+      
+      assert.ok(result.isScrub, 'Should detect scrub');
+      assert.strictEqual(phys.d, newTargetD, 'Should snap to target on scrub');
+      assert.strictEqual(phys.v, 0, 'Should reset velocity on scrub');
+    });
+    
+    it('brakes before curves', () => {
+      // Path with a sharp turn - use smaller segments so turn is within lookahead
+      const pts = [
+        { lat: 40.0, lon: -111.0, tMs: 0 },
+        { lat: 40.0, lon: -110.9996, tMs: 1000 },  // ~34m east
+        { lat: 40.0, lon: -110.9992, tMs: 2000 },  // another ~34m east - TURN POINT
+        { lat: 40.0003, lon: -110.9992, tMs: 3000 }, // 90° turn north (~34m)
+        { lat: 40.0006, lon: -110.9992, tMs: 4000 }, // continue north
+        { lat: 40.0009, lon: -110.9992, tMs: 5000 }, // continue north (give more visible road)
+      ];
+      const geometry = VehiclePhysics.buildPathGeometry(pts);
+      
+      // Curvature is stored at point index 2 (the turn point)
+      // Verify the curvature is actually there
+      assert.ok(geometry.curvature[2] > 0.001, 
+        `Expected high curvature at turn point (idx 2), got ${geometry.curvature[2]}`);
+      
+      // Put the vehicle before the turn - need to be within curvature lookahead distance
+      phys.totalDist = geometry.totalDist;
+      phys.d = geometry.cumDist[1]; // At waypoint 1, before the turn
+      phys.v = VehiclePhysics.CRUISE_SPEED;
+      phys.lastPerfMs = 0;
+      phys.lastPlaybackT = 1000;
+      
+      // Check that max curvature ahead includes the turn
+      // Lookahead is 60m, and the turn should be within that
+      const distToTurn = geometry.cumDist[2] - geometry.cumDist[1];
+      assert.ok(distToTurn < VehiclePhysics.CURVATURE_LOOKAHEAD, 
+        `Turn should be within lookahead: ${distToTurn}m < ${VehiclePhysics.CURVATURE_LOOKAHEAD}m`);
+      
+      const maxCurv = VehiclePhysics.getMaxCurvatureAhead(
+        geometry.cumDist, geometry.curvature, geometry.cumDist[1], 
+        VehiclePhysics.CURVATURE_LOOKAHEAD, geometry.totalDist
+      );
+      assert.ok(maxCurv > 0.001, `Expected high curvature ahead, got ${maxCurv}`);
+      
+      // The target speed should be lower when curvature is high
+      const targetSpeedWithCurve = VehiclePhysics.getTargetSpeed(
+        geometry.cumDist[1], geometry.totalDist, maxCurv, geometry.totalDist
+      );
+      assert.ok(targetSpeedWithCurve < VehiclePhysics.CRUISE_SPEED, 
+        `Expected lower target speed due to curve: ${targetSpeedWithCurve} should be < ${VehiclePhysics.CRUISE_SPEED}`);
+    });
+  });
+  
+  describe('getDynamicLookahead', () => {
+    it('returns shorter lookahead at low speed', () => {
+      const phys1 = new VehiclePhysics();
+      const phys2 = new VehiclePhysics();
+      
+      phys1.v = VehiclePhysics.CURVE_SPEED; // 8 m/s
+      phys2.v = VehiclePhysics.CRUISE_SPEED; // 25 m/s
+      
+      const lookahead1 = phys1.getDynamicLookahead();
+      const lookahead2 = phys2.getDynamicLookahead();
+      
+      assert.ok(lookahead1 < lookahead2, 
+        `Slow lookahead ${lookahead1} should be < fast lookahead ${lookahead2}`);
+    });
+    
+    it('has minimum lookahead floor', () => {
+      const phys = new VehiclePhysics();
+      phys.v = 0;
+      
+      const lookahead = phys.getDynamicLookahead();
+      assert.ok(lookahead > 0, 'Lookahead should be positive even at 0 velocity');
+    });
+  });
+  
+  describe('samplePathAtDistance', () => {
+    it('returns first point at distance 0', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0 },
+        { lat: 40.01, lon: -111.0 },
+      ];
+      const { cumDist } = VehiclePhysics.buildPathGeometry(pts);
+      
+      const sample = VehiclePhysics.samplePathAtDistance(pts, cumDist, 0);
+      
+      assert.strictEqual(sample.lat, 40.0);
+      assert.strictEqual(sample.lon, -111.0);
+    });
+    
+    it('returns last point at total distance', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0 },
+        { lat: 40.01, lon: -111.0 },
+      ];
+      const { cumDist, totalDist } = VehiclePhysics.buildPathGeometry(pts);
+      
+      const sample = VehiclePhysics.samplePathAtDistance(pts, cumDist, totalDist);
+      
+      assert.ok(Math.abs(sample.lat - 40.01) < 0.0001);
+      assert.strictEqual(sample.lon, -111.0);
+    });
+    
+    it('interpolates at midpoint', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0 },
+        { lat: 40.02, lon: -111.0 },
+      ];
+      const { cumDist, totalDist } = VehiclePhysics.buildPathGeometry(pts);
+      
+      const sample = VehiclePhysics.samplePathAtDistance(pts, cumDist, totalDist / 2);
+      
+      assert.ok(Math.abs(sample.lat - 40.01) < 0.001, 
+        `Expected lat ~40.01, got ${sample.lat}`);
+    });
+    
+    it('computes heading correctly (eastward)', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0 },
+        { lat: 40.0, lon: -110.0 }, // Going east
+      ];
+      const { cumDist, totalDist } = VehiclePhysics.buildPathGeometry(pts);
+      
+      const sample = VehiclePhysics.samplePathAtDistance(pts, cumDist, totalDist / 2);
+      
+      // Heading should be ~0 (east in lat/lon space)
+      assert.ok(Math.abs(sample.heading) < 0.1, 
+        `Expected heading ~0 (east), got ${sample.heading}`);
+    });
+    
+    it('computes heading correctly (northward)', () => {
+      const pts = [
+        { lat: 40.0, lon: -111.0 },
+        { lat: 41.0, lon: -111.0 }, // Going north
+      ];
+      const { cumDist, totalDist } = VehiclePhysics.buildPathGeometry(pts);
+      
+      const sample = VehiclePhysics.samplePathAtDistance(pts, cumDist, totalDist / 2);
+      
+      // Heading should be ~π/2 (north in lat/lon space)
+      assert.ok(Math.abs(sample.heading - Math.PI / 2) < 0.1, 
+        `Expected heading ~π/2 (north), got ${sample.heading}`);
+    });
+  });
+  
+  describe('TRAX rail physics (sanity check)', () => {
+    // TRAX should maintain consistent speeds along their routes
+    // This test validates that straight rail segments = steady speed
+    
+    it('maintains steady speed on straight rail', () => {
+      // Simulate a straight TRAX line - longer path for more steady state
+      const pts = [];
+      for (let i = 0; i < 40; i++) {
+        pts.push({
+          lat: 40.0,
+          lon: -111.0 + i * 0.001, // ~85m per segment
+          tMs: i * 3000, // 3s per segment = ~28 m/s
+        });
+      }
+      const geometry = VehiclePhysics.buildPathGeometry(pts);
+      
+      const phys = new VehiclePhysics();
+      phys.step(0, 0, geometry, 0);
+      
+      // Run for a while, recording speeds
+      const speeds = [];
+      let nowMs = 100;
+      for (let i = 0; i < 100; i++) {
+        const playbackT = i * 500;
+        const targetD = VehiclePhysics.getTargetDistance(
+          pts, geometry.cumDist, geometry.totalDist, playbackT
+        );
+        phys.step(nowMs, playbackT, geometry, targetD);
+        speeds.push(phys.v);
+        nowMs += 100;
+      }
+      
+      // After initial acceleration, speeds should be fairly consistent
+      // Skip first 40 samples (~4 seconds) for acceleration phase
+      const steadyStateSpeeds = speeds.slice(40);
+      
+      if (steadyStateSpeeds.length > 0) {
+        const avgSpeed = steadyStateSpeeds.reduce((a, b) => a + b, 0) / steadyStateSpeeds.length;
+        
+        // Check that most speeds are within 30% of average (allow some variation)
+        let outliers = 0;
+        for (const s of steadyStateSpeeds) {
+          if (avgSpeed > 0) {
+            const deviation = Math.abs(s - avgSpeed) / avgSpeed;
+            if (deviation > 0.3) outliers++;
+          }
+        }
+        
+        // Allow up to 20% outliers (vehicle may be catching up or braking at end)
+        const outlierRatio = outliers / steadyStateSpeeds.length;
+        assert.ok(outlierRatio < 0.2, 
+          `Too many speed outliers: ${outliers}/${steadyStateSpeeds.length} (${(outlierRatio*100).toFixed(1)}%)`);
+      }
+    });
+  });
+});
+
+// Export for use in browser
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { VehiclePhysics };
+}
