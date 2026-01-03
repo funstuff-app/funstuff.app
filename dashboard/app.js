@@ -3785,9 +3785,13 @@ class MapView {
     this._traceAngleById.set(id, nextA);
     this._traceAngleLastMsById.set(id, nowPerfMs);
 
-    // Historical reading: use the destination point's reading for the current segment
-    // so the label matches the trail segment color.
-    const pRaw = pts[Math.min(idx + 1, pts.length - 1)];
+    // Historical reading: use the starting point's reading for the current segment.
+    // The vehicle is between pts[idx] and pts[idx+1]. The visible trail behind the
+    // vehicle ends at the vehicle's position. The segment color comes from the
+    // destination point (trail[i] colors segment i-1→i). So when entering segment
+    // idx→idx+1, most of the visible trail is the previous segment (ending at idx).
+    // Use pts[idx] so the reading matches the most recently completed segment.
+    const pRaw = pts[idx];
     const reading = primaryReadingKeyedFromPoint(pRaw);
 
     // Store debug info for trail drawing
@@ -4159,30 +4163,57 @@ class MapView {
 
       const getSp = (toScreen || this.worldToScreen.bind(this));
       
-      let lastInterp = null;
+      // For interpolating trail end at vehicle's exact time position
+      const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs) && !this._pbDebugPath;
+      let prevTMs = null;
+      let prevLat = null, prevLon = null;
+      let prevColor = null;
+      let trailClipped = false;
+      
       for (let i = 0; i < trail.length; i++) {
         const p = trail[i];
         const lat = Number(p.lat), lon = Number(p.lon);
         if (p.lat == null || p.lon == null || !isFinite(lat) || !isFinite(lon)) {
           pts.push(null);
           cols.push(null);
+          times.push(null);
+          prevTMs = null;
+          prevLat = null;
+          prevLon = null;
+          prevColor = null;
           continue;
         }
 
         const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
+        const pr = primaryReadingFromPoint(p);
+        const base = safeHex(pr?.color || m.color);
+
+        // Check if this point is beyond the vehicle's time - interpolate and stop
+        if (shouldClipTrail && tMs != null && isFinite(tMs) && tMs > revealTimeMs) {
+          // Interpolate to exact revealTimeMs if we have a valid previous point
+          if (prevTMs != null && isFinite(prevTMs) && prevTMs <= revealTimeMs && prevLat != null && prevLon != null) {
+            const dt = tMs - prevTMs;
+            const t = dt > 0 ? (revealTimeMs - prevTMs) / dt : 0;
+            const interpLat = prevLat + t * (lat - prevLat);
+            const interpLon = prevLon + t * (lon - prevLon);
+            const wpt = latLonToWorld(interpLat, interpLon, this.zoom);
+            pts.push(getSp(wpt.x, wpt.y));
+            cols.push(prevColor || base);
+            times.push(revealTimeMs);
+          }
+          trailClipped = true;
+          break; // Stop collecting points
+        }
 
         const wpt = latLonToWorld(lat, lon, this.zoom);
         pts.push(getSp(wpt.x, wpt.y));
-        const pr = primaryReadingFromPoint(p);
-        const base = safeHex(pr?.color || m.color);
-        // No binary fading here; color is baked per segment below
         cols.push(base);
         times.push(tMs);
-      }
-      if (lastInterp) {
-        pts.push(lastInterp.sp);
-        cols.push(lastInterp.col);
-        times.push(pbTimeMs);
+        
+        prevTMs = tMs;
+        prevLat = lat;
+        prevLon = lon;
+        prevColor = base;
       }
 
       if (pts.length < 2) return false;
@@ -4271,6 +4302,9 @@ class MapView {
           ctx.restore();
           continue;
         }
+
+        // Hide leading trail: skip points ahead of the vehicle's time position (unless debug)
+        // (Trail is already clipped during collection, but this handles edge cases)
 
         const ageMs = Math.max(0, Number(refNowMs) - Number(t1));
         const fTime = clamp(ageMs / Math.max(1, FADE_TIME_MS), 0, 1);
@@ -4482,6 +4516,16 @@ class MapView {
     // LIVE mode uses playback time at the live edge.
     const isLive = !this.playbackMode;
     const pbTimeMs = this.getPlaybackTimeMs();
+    
+    // Pre-compute vehicle positions for all mobiles BEFORE drawing trails.
+    // This populates _vehicleRevealDist with vehicleTMs so trails can clip correctly.
+    // Without this, trail clipping uses stale vehicle positions from previous frame.
+    const nowMsPrecompute = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
+    if (this.playbackMode) {
+      for (const m of mobiles) {
+        this._mobilePoseForRender(m, nowMsPrecompute);
+      }
+    }
 
     const drawTrailFor = (m, alphaMul, toScreen) => {
       const id = m && m.id != null ? String(m.id) : "";
@@ -4517,7 +4561,13 @@ class MapView {
       // Optimization: calculate world size once per trail
       const ws = worldSizeForZoom(this.zoom);
       
-      let lastInterp = null;
+      // For interpolating trail end at vehicle's exact time position
+      const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs) && !this._pbDebugPath;
+      let prevTMs = null;
+      let prevU = null, prevV = null;
+      let prevColor = null;
+      let trailClipped = false;
+      
       for (let i = 0; i < trail.length; i++) {
         const p = trail[i];
         
@@ -4528,6 +4578,11 @@ class MapView {
           if (p.lat == null || p.lon == null || !isFinite(lat) || !isFinite(lon)) {
             pts.push(null);
             cols.push(null);
+            times.push(null);
+            prevTMs = null;
+            prevU = null;
+            prevV = null;
+            prevColor = null;
             continue;
           }
           const norm = latLonToNorm(lat, lon);
@@ -4542,18 +4597,33 @@ class MapView {
           try { p._tMs = tMs; } catch {}
         }
 
-        pts.push(getSp(u * ws, v * ws));
         const pr = primaryReadingFromPoint(p);
         const base = safeHex(pr?.color || m.color);
-        // We no longer dim points globally here. 
-        // Dimming is now handled per-segment in the drawing loop below.
+
+        // Check if this point is beyond the vehicle's time - interpolate and stop
+        if (shouldClipTrail && tMs != null && isFinite(tMs) && tMs > revealTimeMs) {
+          // Interpolate to exact revealTimeMs if we have a valid previous point
+          if (prevTMs != null && isFinite(prevTMs) && prevTMs <= revealTimeMs && prevU != null && prevV != null) {
+            const dt = tMs - prevTMs;
+            const t = dt > 0 ? (revealTimeMs - prevTMs) / dt : 0;
+            const interpU = prevU + t * (u - prevU);
+            const interpV = prevV + t * (v - prevV);
+            pts.push(getSp(interpU * ws, interpV * ws));
+            cols.push(prevColor || base);
+            times.push(revealTimeMs);
+          }
+          trailClipped = true;
+          break; // Stop collecting points
+        }
+
+        pts.push(getSp(u * ws, v * ws));
         cols.push(base);
         times.push(tMs);
-      }
-      if (lastInterp) {
-        pts.push(lastInterp.sp);
-        cols.push(lastInterp.col);
-        times.push(pbTimeMs);
+        
+        prevTMs = tMs;
+        prevU = u;
+        prevV = v;
+        prevColor = base;
       }
 
       if (pts.length < 2) return false;
@@ -4688,6 +4758,9 @@ class MapView {
           flushBatch();
           continue;
         }
+
+        // Hide leading trail: skip points ahead of the vehicle's time position (unless debug)
+        // (Trail is already clipped during collection, but this handles edge cases)
 
         const ageMs = refNowMs - t1;
         
