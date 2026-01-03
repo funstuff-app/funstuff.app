@@ -4014,6 +4014,100 @@ class MapView {
     return `${revKey}|${persistKey}|w:${w}|h:${h}|z:${z.toFixed(4)}|c:${clat.toFixed(6)},${clon.toFixed(6)}|sel:${sel}|fixed:${fixed}`;
   }
 
+  /**
+   * Collect trail data for rendering. Shared by both _ensureOverlayStatic and drawOverlay.
+   * Returns { pts, cols, times, trail, isGhost } or null if trail is invalid.
+   */
+  _collectTrailData(m, toScreen) {
+    const id = m && m.id != null ? String(m.id) : "";
+    
+    // Get reveal time (for clipping trail at vehicle position)
+    const pbTimeMs = this.getPlaybackTimeMs();
+    const vehicleInfo = this._vehicleRevealDist?.get(id);
+    const vehicleTMs = vehicleInfo?.vehicleTMs;
+    const revealTimeMs = this._pbDebugPath
+      ? pbTimeMs  // Debug: show trail ahead
+      : ((vehicleTMs != null && isFinite(vehicleTMs)) ? vehicleTMs : pbTimeMs);
+    
+    // Get trail source
+    const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
+    const hasServerTrail = serverTrail.length >= 2;
+    const persistedTrail = (id && !this._historicalMode) ? (this._persistedTrailById.get(id)?.trail || []) : [];
+    const trail = (persistedTrail.length >= 2) ? persistedTrail : (hasServerTrail ? serverTrail : []);
+    if (!Array.isArray(trail) || trail.length < 2) return null;
+    
+    const isGhost = !!m.ghosted;
+    const pts = [];
+    const cols = [];
+    const times = [];
+    
+    const getSp = toScreen || this.worldToScreen.bind(this);
+    const ws = worldSizeForZoom(this.zoom);
+    
+    const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs);
+    let prevTMs = null;
+    let prevU = null, prevV = null;
+    
+    for (let i = 0; i < trail.length; i++) {
+      const p = trail[i];
+      
+      // Get normalized world coordinates (cached on point)
+      let u = p._u, v = p._v;
+      if (u === undefined) {
+        const lat = Number(p.lat), lon = Number(p.lon);
+        if (p.lat == null || p.lon == null || !isFinite(lat) || !isFinite(lon)) {
+          pts.push(null);
+          cols.push(null);
+          times.push(null);
+          prevTMs = null;
+          prevU = null;
+          prevV = null;
+          continue;
+        }
+        const norm = latLonToNorm(lat, lon);
+        u = norm.u; v = norm.v;
+        p._u = u; p._v = v;
+      }
+      
+      // Get timestamp (cached on point)
+      let tMs = p?._tMs;
+      if (tMs === undefined) {
+        tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
+        try { p._tMs = tMs; } catch {}
+      }
+      
+      // Get color from point's recorded readings ONLY (immutable historical data)
+      const pr = primaryReadingFromPoint(p);
+      const base = safeHex(pr?.color);
+      
+      // Clip trail at vehicle's time position
+      if (shouldClipTrail && tMs != null && isFinite(tMs) && tMs > revealTimeMs) {
+        if (prevTMs != null && isFinite(prevTMs) && prevTMs <= revealTimeMs && prevU != null && prevV != null) {
+          const dt = tMs - prevTMs;
+          const t = dt > 0 ? (revealTimeMs - prevTMs) / dt : 0;
+          const interpU = prevU + t * (u - prevU);
+          const interpV = prevV + t * (v - prevV);
+          pts.push(getSp(interpU * ws, interpV * ws));
+          // Use destination point's color for the clipped segment
+          cols.push(base);
+          times.push(revealTimeMs);
+        }
+        break; // Stop collecting
+      }
+      
+      pts.push(getSp(u * ws, v * ws));
+      cols.push(base);
+      times.push(tMs);
+      
+      prevTMs = tMs;
+      prevU = u;
+      prevV = v;
+    }
+    
+    if (pts.length < 2) return null;
+    return { pts, cols, times, trail, isGhost };
+  }
+
   _ensureOverlayStatic(state) {
     const dpr = this._dpr || (window.devicePixelRatio || 1);
     const cssW = this._cssW || 1;
@@ -4123,99 +4217,13 @@ class MapView {
 
     const drawTrailFor = (m, alphaMul, toScreen) => {
       const id = m && m.id != null ? String(m.id) : "";
-      const key = keyFor("mobile", m && m.id != null ? m.id : "");
-      const isSelUi = (this.selectedId === key);
-
-      // We no longer hide trails globally based on the latest ghosted state.
-      // Reveal logic handles time-based visibility, and the server handles jitter.
-      // Idle trails remain visible as dimmed historical data.
-
-      // DVR revealing-path logic:
-      // Reveal trail up to playback time (works in both DVR and LIVE modes).
-      // LIVE mode uses playback time at the live edge.
       const isLive = !this.playbackMode;
-      const pbTimeMs = this.getPlaybackTimeMs();
       
-      // Debug ON: show trail ahead of vehicle (use pbTimeMs - reveals path before vehicle arrives)
-      // Debug OFF: clip trail exactly at vehicle position (use vehicleTMs)
-      const vehicleInfo = this._vehicleRevealDist?.get(id);
-      const vehicleTMs = vehicleInfo?.vehicleTMs;
-      const revealTimeMs = this._pbDebugPath
-        ? pbTimeMs  // Debug: show trail ahead
-        : ((vehicleTMs != null && isFinite(vehicleTMs)) ? vehicleTMs : pbTimeMs);
+      // Use shared trail collection logic
+      const data = this._collectTrailData(m, toScreen);
+      if (!data) return false;
+      const { pts, cols, times, trail, isGhost } = data;
       
-      // Trail reveal is purely time-based: show points up to reveal time
-      // (Distance-based reveal was removed because cumDist indices didn't match trail indices)
-
-      const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
-      const hasServerTrail = serverTrail.length >= 2;
-      // When in historical mode, always use server trail (not live-accumulated persisted trail)
-      const persistedTrail = (id && !this._historicalMode) ? (this._persistedTrailById.get(id)?.trail || []) : [];
-      const trail = (persistedTrail.length >= 2) ? persistedTrail : (hasServerTrail ? serverTrail : []);
-      if (!Array.isArray(trail) || trail.length < 2) return false;
-      const isGhost = !!m.ghosted;
-      const pts = [];
-      const cols = [];
-      const times = [];
-
-      const getSp = (toScreen || this.worldToScreen.bind(this));
-      
-      // For interpolating trail end at vehicle's exact time position
-      const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs);
-      let prevTMs = null;
-      let prevLat = null, prevLon = null;
-      let prevColor = null;
-      let trailClipped = false;
-      
-      for (let i = 0; i < trail.length; i++) {
-        const p = trail[i];
-        const lat = Number(p.lat), lon = Number(p.lon);
-        if (p.lat == null || p.lon == null || !isFinite(lat) || !isFinite(lon)) {
-          pts.push(null);
-          cols.push(null);
-          times.push(null);
-          prevTMs = null;
-          prevLat = null;
-          prevLon = null;
-          prevColor = null;
-          continue;
-        }
-
-        const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
-        const pr = primaryReadingFromPoint(p);
-        const base = safeHex(pr?.color);
-
-        // Check if this point is beyond the vehicle's time - interpolate and stop
-        if (shouldClipTrail && tMs != null && isFinite(tMs) && tMs > revealTimeMs) {
-          // Interpolate to exact revealTimeMs if we have a valid previous point
-          if (prevTMs != null && isFinite(prevTMs) && prevTMs <= revealTimeMs && prevLat != null && prevLon != null) {
-            const dt = tMs - prevTMs;
-            const t = dt > 0 ? (revealTimeMs - prevTMs) / dt : 0;
-            const interpLat = prevLat + t * (lat - prevLat);
-            const interpLon = prevLon + t * (lon - prevLon);
-            const wpt = latLonToWorld(interpLat, interpLon, this.zoom);
-            pts.push(getSp(wpt.x, wpt.y));
-            // Use destination point's color (base) for the segment, not origin's color
-            cols.push(base);
-            times.push(revealTimeMs);
-          }
-          trailClipped = true;
-          break; // Stop collecting points
-        }
-
-        const wpt = latLonToWorld(lat, lon, this.zoom);
-        pts.push(getSp(wpt.x, wpt.y));
-        cols.push(base);
-        times.push(tMs);
-        
-        prevTMs = tMs;
-        prevLat = lat;
-        prevLon = lon;
-        prevColor = base;
-      }
-
-      if (pts.length < 2) return false;
-      // selection handled above for early return; keep local isSel for styling
       const isSel2 = (selectedId && m.id === selectedId);
 
       // Tail fade should be based on the *visible* (drawn) trail only.
@@ -4521,107 +4529,12 @@ class MapView {
 
     const drawTrailFor = (m, alphaMul, toScreen) => {
       const id = m && m.id != null ? String(m.id) : "";
-      const key = keyFor("mobile", m && m.id != null ? m.id : "");
-      const isSel = (this.selectedId === key);
       
-      // Debug ON: show trail ahead of vehicle (use pbTimeMs - reveals path before vehicle arrives)
-      // Debug OFF: clip trail exactly at vehicle position (use vehicleTMs)
-      const vehicleInfo = this._vehicleRevealDist?.get(id);
-      const vehicleTMs = vehicleInfo?.vehicleTMs;
-      const revealTimeMs = this._pbDebugPath
-        ? pbTimeMs  // Debug: show trail ahead
-        : ((vehicleTMs != null && isFinite(vehicleTMs)) ? vehicleTMs : pbTimeMs);
-
-      // We no longer hide trails globally based on the latest ghosted state.
-      // Reveal logic handles time-based visibility, and the server handles jitter.
-      // Idle trails remain visible as dimmed historical data.
+      // Use shared trail collection logic
+      const data = this._collectTrailData(m, toScreen);
+      if (!data) return false;
+      const { pts, cols, times, trail, isGhost } = data;
       
-      // Trail reveal is purely time-based: show points up to playback time
-      // (Distance-based reveal was removed because cumDist indices didn't match trail indices)
-      
-      const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
-      const hasServerTrail = serverTrail.length >= 2;
-      // When in historical mode, always use server trail (not live-accumulated persisted trail)
-      const persistedTrail = (id && !this._historicalMode) ? (this._persistedTrailById.get(id)?.trail || []) : [];
-      const trail = (persistedTrail.length >= 2) ? persistedTrail : (hasServerTrail ? serverTrail : []);
-      if (!Array.isArray(trail) || trail.length < 2) return false;
-      const isGhost = !!m.ghosted;
-      const pts = [];
-      const cols = [];
-      const times = [];
-
-      const getSp = (toScreen || this.worldToScreen.bind(this));
-
-      // Optimization: calculate world size once per trail
-      const ws = worldSizeForZoom(this.zoom);
-      
-      // For interpolating trail end at vehicle's exact time position
-      const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs);
-      let prevTMs = null;
-      let prevU = null, prevV = null;
-      let prevColor = null;
-      let trailClipped = false;
-      
-      for (let i = 0; i < trail.length; i++) {
-        const p = trail[i];
-        
-        // OPTIMIZATION: Cache normalized world coordinates to avoid expensive trig per frame.
-        let u = p._u, v = p._v;
-        if (u === undefined) {
-          const lat = Number(p.lat), lon = Number(p.lon);
-          if (p.lat == null || p.lon == null || !isFinite(lat) || !isFinite(lon)) {
-            pts.push(null);
-            cols.push(null);
-            times.push(null);
-            prevTMs = null;
-            prevU = null;
-            prevV = null;
-            prevColor = null;
-            continue;
-          }
-          const norm = latLonToNorm(lat, lon);
-          u = norm.u; v = norm.v;
-          p._u = u; p._v = v;
-        }
-
-        // Cache parsed timestamp on the point to avoid per-frame parsing work.
-        let tMs = p?._tMs;
-        if (tMs === undefined) {
-          tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
-          try { p._tMs = tMs; } catch {}
-        }
-
-        const pr = primaryReadingFromPoint(p);
-        const base = safeHex(pr?.color);
-
-        // Check if this point is beyond the vehicle's time - interpolate and stop
-        if (shouldClipTrail && tMs != null && isFinite(tMs) && tMs > revealTimeMs) {
-          // Interpolate to exact revealTimeMs if we have a valid previous point
-          if (prevTMs != null && isFinite(prevTMs) && prevTMs <= revealTimeMs && prevU != null && prevV != null) {
-            const dt = tMs - prevTMs;
-            const t = dt > 0 ? (revealTimeMs - prevTMs) / dt : 0;
-            const interpU = prevU + t * (u - prevU);
-            const interpV = prevV + t * (v - prevV);
-            pts.push(getSp(interpU * ws, interpV * ws));
-            // Use destination point's color (base) for the segment, not origin's color
-            cols.push(base);
-            times.push(revealTimeMs);
-          }
-          trailClipped = true;
-          break; // Stop collecting points
-        }
-
-        pts.push(getSp(u * ws, v * ws));
-        cols.push(base);
-        times.push(tMs);
-        
-        prevTMs = tMs;
-        prevU = u;
-        prevV = v;
-        prevColor = base;
-      }
-
-      if (pts.length < 2) return false;
       const isSelTrail = (selectedId && m.id === selectedId);
 
       // Tail fade should be based on the *visible* (drawn) trail only.
