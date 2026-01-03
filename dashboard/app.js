@@ -3365,6 +3365,124 @@ class MapView {
   _resetPhysicsState(id) {
     if (this._physicsStateById) this._physicsStateById.delete(id);
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SMOOTH PATH GENERATION: Convert raw GPS points into smoothed waypoints
+  // that remove GPS jitter while preserving actual road geometry.
+  // 
+  // CONSERVATIVE smoothing: only removes small-angle GPS noise, preserves
+  // straight lines and real corners. Salt Lake is a grid city - 90° turns are real.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Get or compute smoothed waypoint path for a vehicle
+  // Returns { waypoints, cumDist, totalDist, curvature, origIdxMap }
+  _getSmoothPath(id, pts) {
+    if (!this._smoothPathCache) this._smoothPathCache = new Map();
+    const cached = this._smoothPathCache.get(id);
+    if (cached && cached.ptsLen === pts.length && cached.ptsKey === this._playbackPtsKey) {
+      return cached;
+    }
+
+    const n = pts.length;
+    if (n < 2) {
+      const single = { 
+        waypoints: pts.slice(), 
+        cumDist: [0], 
+        totalDist: 0, 
+        curvature: [0], 
+        origIdxMap: [0],
+        ptsLen: n,
+        ptsKey: this._playbackPtsKey
+      };
+      this._smoothPathCache.set(id, single);
+      return single;
+    }
+
+    // Step 1: CONSERVATIVE jitter removal using moving average
+    // Only smooth positions, don't change path topology
+    // This preserves straight lines and sharp corners
+    const WINDOW_SIZE = 3; // Small window = subtle smoothing
+    const JITTER_THRESHOLD_M = 8; // Only smooth if deviation < 8 meters (GPS noise range)
+    
+    const waypoints = pts.map((p, i) => {
+      // Compute local average position
+      let sumLat = 0, sumLon = 0, count = 0;
+      for (let j = Math.max(0, i - 1); j <= Math.min(n - 1, i + 1); j++) {
+        sumLat += pts[j].lat;
+        sumLon += pts[j].lon;
+        count++;
+      }
+      const avgLat = sumLat / count;
+      const avgLon = sumLon / count;
+      
+      // Only apply smoothing if the deviation is small (GPS jitter)
+      const deviationM = haversineMeters(p.lat, p.lon, avgLat, avgLon);
+      
+      let smoothLat, smoothLon;
+      if (deviationM < JITTER_THRESHOLD_M && i > 0 && i < n - 1) {
+        // Blend toward average (subtle: 30% smooth, 70% original)
+        const blend = 0.3;
+        smoothLat = p.lat + blend * (avgLat - p.lat);
+        smoothLon = p.lon + blend * (avgLon - p.lon);
+      } else {
+        // Keep original (this is a real corner or endpoint)
+        smoothLat = p.lat;
+        smoothLon = p.lon;
+      }
+      
+      return {
+        lat: smoothLat,
+        lon: smoothLon,
+        origIdx: i,
+        tMs: p.tMs,
+        m: p.m,
+        readings: p.readings
+      };
+    });
+
+    // Step 2: Build distance table for waypoints
+    const wn = waypoints.length;
+    const cumDist = new Array(wn);
+    cumDist[0] = 0;
+    for (let i = 1; i < wn; i++) {
+      const segDist = haversineMeters(waypoints[i-1].lat, waypoints[i-1].lon, waypoints[i].lat, waypoints[i].lon);
+      cumDist[i] = cumDist[i-1] + segDist;
+    }
+    const totalDist = cumDist[wn - 1] || 1;
+
+    // Step 3: Compute curvature at each waypoint
+    const curvature = new Array(wn).fill(0);
+    if (wn >= 3) {
+      for (let i = 1; i < wn - 1; i++) {
+        const dx1 = waypoints[i].lon - waypoints[i-1].lon;
+        const dy1 = waypoints[i].lat - waypoints[i-1].lat;
+        const dx2 = waypoints[i+1].lon - waypoints[i].lon;
+        const dy2 = waypoints[i+1].lat - waypoints[i].lat;
+        
+        const a1 = Math.atan2(dy1, dx1);
+        const a2 = Math.atan2(dy2, dx2);
+        let angleDiff = Math.abs(a2 - a1);
+        if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+        
+        const dist = (cumDist[i] - cumDist[i-1] + cumDist[i+1] - cumDist[i]) / 2;
+        curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
+      }
+    }
+
+    const origIdxMap = waypoints.map(w => w.origIdx);
+
+    const result = { 
+      waypoints, 
+      cumDist, 
+      totalDist, 
+      curvature, 
+      origIdxMap,
+      ptsLen: n,
+      ptsKey: this._playbackPtsKey
+    };
+    this._smoothPathCache.set(id, result);
+    return result;
+  }
   
   // Build cumulative distance array for a path (cached per vehicle)
   // Also computes per-point curvature for speed modulation
@@ -3547,11 +3665,15 @@ class MapView {
       return { lat: p.lat, lon: p.lon, m: p.m, readings: p.readings, beforeFirst: t < tMin, afterLast: t > tMax };
     }
 
-    // Get path geometry (cached) - includes curvature
+    // Get raw path geometry for physics (distance, curvature from original GPS points)
     const { cumDist, totalDist, curvature } = this._getPathDistances(id, pts);
     
-    // Target distance along path based on playback time
-    // This is where the "ghost" would be - the trail reveals up to targetD + lookahead
+    // Get smoothed waypoints for attraction bias (separate from path following)
+    const smoothPath = this._getSmoothPath(id, pts);
+    const smoothWaypoints = smoothPath.waypoints;
+    const smoothCumDist = smoothPath.cumDist;
+    
+    // Target distance along raw path based on playback time
     const targetD = this._getTargetDistance(pts, cumDist, totalDist, t);
     
     // Physics state and per-vehicle parameters
@@ -3702,11 +3824,52 @@ class MapView {
     // Cannot go backwards or past total path end
     phys.d = clamp(phys.d, 0, totalDist);
     
-    // Sample actual position on path (linear interpolation)
-    const sample = this._samplePathAtDistance(pts, cumDist, curvature, phys.d);
-    const { lat, lon, idx, u, heading, p0, p1 } = sample;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // WAYPOINT STEERING: Vehicle has 2D position that steers toward waypoints
+    // instead of being locked to a rail. The physics distance (phys.d) determines
+    // which waypoint to target, but the actual position uses steering dynamics.
+    // ═══════════════════════════════════════════════════════════════════════════
     
-    // Get segment info for readings and visibility
+    // Sample raw path position (where GPS says we should be)
+    const rawSample = this._samplePathAtDistance(pts, cumDist, curvature, phys.d);
+    
+    // Sample smooth waypoint position (jitter-free target)
+    const smoothTotalDist = smoothPath.totalDist;
+    const smoothD = (phys.d / totalDist) * smoothTotalDist;
+    const waypointSample = this._samplePathAtDistance(
+      smoothWaypoints, smoothCumDist, smoothPath.curvature, smoothD
+    );
+    
+    // Initialize 2D physics state if needed
+    if (phys.lat == null || phys.lon == null || isScrub) {
+      // Start at waypoint position
+      phys.lat = waypointSample.lat;
+      phys.lon = waypointSample.lon;
+      phys.heading = waypointSample.heading;
+    }
+    
+    // Steering toward waypoint position with damping
+    // This creates smooth movement that tracks waypoints without rail-locking
+    const STEER_RATE = 3.0; // How fast to steer toward waypoint (higher = snappier)
+    const steerFactor = 1 - Math.exp(-STEER_RATE * dtS);
+    
+    // Blend current position toward waypoint
+    phys.lat += steerFactor * (waypointSample.lat - phys.lat);
+    phys.lon += steerFactor * (waypointSample.lon - phys.lon);
+    
+    // Smooth heading toward waypoint heading
+    let headingDiff = waypointSample.heading - phys.heading;
+    // Wrap to [-π, π]
+    while (headingDiff > Math.PI) headingDiff -= 2 * Math.PI;
+    while (headingDiff < -Math.PI) headingDiff += 2 * Math.PI;
+    phys.heading += steerFactor * headingDiff;
+    
+    const lat = phys.lat;
+    const lon = phys.lon;
+    const heading = phys.heading;
+    const { idx, u, p0, p1 } = rawSample;
+    
+    // Get segment info for readings and visibility (from raw path)
     const nextPoint = p1 || pts[Math.min(idx + 1, pts.length - 1)];
     const prevPoint = p0 || pts[idx];
     const dtMs = Math.max(1, (nextPoint.tMs - prevPoint.tMs));
@@ -4029,7 +4192,7 @@ class MapView {
       ? pbTimeMs  // Debug: show trail ahead
       : ((vehicleTMs != null && isFinite(vehicleTMs)) ? vehicleTMs : pbTimeMs);
     
-    // Get trail source
+    // Get trail source - always use raw trail for rendering
     const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
     const hasServerTrail = serverTrail.length >= 2;
     const persistedTrail = (id && !this._historicalMode) ? (this._persistedTrailById.get(id)?.trail || []) : [];
@@ -4392,6 +4555,7 @@ class MapView {
       const m = mobiles.find(x => x.id === selectedId);
       if (m) drawTrailFor(m, 1.0, worldToScreenFast);
     }
+    
   }
 
   drawOverlay(state, opts = {}) {
@@ -4751,9 +4915,58 @@ class MapView {
         const m = mobiles.find(x => x.id === selectedId);
         if (m) drawTrailFor(m, 1.0, worldToScreenFast);
       }
+      
+      // ═══════════════════════════════════════════════════════════════════════════
+      // DEBUG: Draw smoothed waypoints overlay when debug flag is enabled
+      // Shows the waypoint path that vehicles steer toward
+      // ═══════════════════════════════════════════════════════════════════════════
+      if (this._pbDebugPath) {
+        const ws = worldSizeForZoom(this.zoom);
+        for (const m of mobiles) {
+          const id = m && m.id != null ? String(m.id) : "";
+          const playbackPts = this._playbackPtsById.get(id);
+          if (!playbackPts || playbackPts.length < 2) continue;
+          
+          const smoothPath = this._getSmoothPath(id, playbackPts);
+          const waypoints = smoothPath.waypoints;
+          
+          // Draw waypoint path - light gray, 75% opacity
+          ctx.save();
+          ctx.strokeStyle = "#b0b0b0"; // Light gray
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 0.75;
+          ctx.beginPath();
+          
+          let started = false;
+          for (const wp of waypoints) {
+            const norm = latLonToNorm(wp.lat, wp.lon);
+            const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
+            if (!started) {
+              ctx.moveTo(sp.x, sp.y);
+              started = true;
+            } else {
+              ctx.lineTo(sp.x, sp.y);
+            }
+          }
+          ctx.stroke();
+          
+          // Draw waypoint dots - light blue fill, light gray border
+          for (const wp of waypoints) {
+            const norm = latLonToNorm(wp.lat, wp.lon);
+            const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
+            ctx.beginPath();
+            ctx.arc(sp.x, sp.y, 3, 0, 2 * Math.PI);
+            ctx.fillStyle = "#87ceeb"; // Light blue
+            ctx.fill();
+            ctx.strokeStyle = "#b0b0b0"; // Light gray border
+            ctx.lineWidth = 1;
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
     }
-
-
 
     // Emoji markers
     const nowMs = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
