@@ -1134,9 +1134,11 @@ def _pick_primary_key(readings: dict[str, dict[str, Any]]) -> str | None:
 
 def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_event: threading.Event) -> None:
     revision = 0
+    print(f"[FetchLoop] Starting with interval={interval_s}s", flush=True)
     while not stop_event.is_set():
         attempt_ts = time.time()
         try:
+            print(f"[FetchLoop] Fetching data...", flush=True)
             mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=stdlib_get)
             fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=stdlib_get)
 
@@ -1152,11 +1154,13 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             meta = st.setdefault("meta", {})
             meta.update({"last_fetch_attempt_ts": attempt_ts, "last_fetch_ok_ts": attempt_ts, "server_revision": revision})
             update_app_state_with_new_data(app_state, st)
+            print(f"[FetchLoop] Revision {revision} updated", flush=True)
             
             # Periodically save history
             if revision % 10 == 0:
                 save_fixed_history(app_state)
         except Exception as e:
+            print(f"[FetchLoop] Error: {type(e).__name__}: {e}", flush=True)
             with app_state.lock:
                 st = app_state.state if isinstance(app_state.state, dict) else {"ts": time.time(), "mobile": [], "fixed": [], "meta": {}}
                 meta = st.setdefault("meta", {})
