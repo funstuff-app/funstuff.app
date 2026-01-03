@@ -217,6 +217,8 @@ def parse_hourly_record(line: str) -> dict:
         date, time, datetime, site_id, site_name, gmt_offset, 
         parameter, unit, value, agency
     """
+    from datetime import timezone, timedelta as td
+    
     fields = line.strip().split("|")
     if len(fields) < 9:
         return {}
@@ -226,8 +228,13 @@ def parse_hourly_record(line: str) -> dict:
         date_str = fields[0]
         time_str = fields[1]
         
-        # Handle 2-digit year
+        # Handle 2-digit year - parse as naive first
         dt = datetime.strptime(f"{date_str} {time_str}", "%m/%d/%y %H:%M")
+        
+        # Convert to UTC using the GMT offset field (e.g., -7 for Utah local)
+        gmt_offset = float(fields[4]) if fields[4] else 0
+        local_tz = timezone(td(hours=gmt_offset))
+        dt = dt.replace(tzinfo=local_tz).astimezone(timezone.utc)
         
         value = None
         try:

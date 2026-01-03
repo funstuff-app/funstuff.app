@@ -1243,11 +1243,13 @@ class MapView {
           if (isFinite(bounds.minMs) && isFinite(bounds.maxMs)) {
             const clamped = clamp(tMs, bounds.minMs, bounds.maxMs);
             this.setPlaybackTimeMs(clamped);
-            // Follow live only when dragging near the absolute end.
-            this._playbackLiveFollow = (clamped >= (bounds.maxMs - 1500));
+            // User interaction exits LIVE mode (they're manually controlling)
+            this._playbackLiveFollow = false;
+            if (typeof this._resetLiveTracking === "function") this._resetLiveTracking();
           } else {
             this.setPlaybackTimeMs(tMs);
             this._playbackLiveFollow = false;
+            if (typeof this._resetLiveTracking === "function") this._resetLiveTracking();
           }
         }
         this.drawOverlay(this.lastState);
@@ -1657,6 +1659,10 @@ class MapView {
     } else {
       // Entering DVR starts in LIVE follow-tail at the end-of-data.
       this._playbackLiveFollow = true;
+      // Immediately jump to the live edge
+      if (this._playbackMaxMs != null) {
+        this._playbackNowMs = this._playbackMaxMs;
+      }
     }
     this._invalidateOverlayStatic();
     this.drawOverlay(this.lastState);
@@ -1872,10 +1878,13 @@ class MapView {
       if (isFinite(bounds.minMs) && isFinite(bounds.maxMs)) {
         const clamped = clamp(tMs, bounds.minMs, bounds.maxMs);
         this.setPlaybackTimeMs(clamped);
-        this._playbackLiveFollow = (clamped >= (bounds.maxMs - 1500));
+        // User interaction exits LIVE mode (they're manually controlling)
+        this._playbackLiveFollow = false;
+        if (typeof this._resetLiveTracking === "function") this._resetLiveTracking();
       } else {
         this.setPlaybackTimeMs(tMs);
         this._playbackLiveFollow = false;
+        if (typeof this._resetLiveTracking === "function") this._resetLiveTracking();
       }
       return true;
     }
@@ -3234,48 +3243,60 @@ class MapView {
 
   _ensurePlaybackPoints(state) {
     const key = this._playbackPointsKeyForState(state);
-    if (this._playbackPtsKey === key) return;
-    this._playbackPtsKey = key;
+    const cacheHit = (this._playbackPtsKey === key);
+    
+    if (cacheHit && !this._playbackLiveFollow) {
+      // Cache hit and not in LIVE mode - skip entirely
+      return;
+    }
+    
+    // Rebuild playback points if cache miss
+    if (!cacheHit) {
+      this._playbackPtsKey = key;
+      
+      const nextPtsById = new Map();
+      let minMs = Infinity;
+      let maxMs = -Infinity;
 
-    const nextPtsById = new Map();
-    let minMs = Infinity;
-    let maxMs = -Infinity;
+      const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
+      for (const m of mobiles) {
+        const id = m && m.id != null ? String(m.id) : "";
+        if (!id) continue;
 
-    const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
-    for (const m of mobiles) {
-      const id = m && m.id != null ? String(m.id) : "";
-      if (!id) continue;
+        const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
+        const persisted = this._historicalMode ? [] : (this._persistedTrailById.get(id)?.trail || []);
+        const src = (persisted.length >= 2) ? persisted : serverTrail;
+        if (!Array.isArray(src) || src.length < 2) continue;
 
-      const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
-      // When viewing historical data, always use server trail (not live-accumulated persisted trail)
-      const persisted = this._historicalMode ? [] : (this._persistedTrailById.get(id)?.trail || []);
-      const src = (persisted.length >= 2) ? persisted : serverTrail;
-      if (!Array.isArray(src) || src.length < 2) continue;
-
-      const pts = [];
-      for (const p of src) {
-        const lat = Number(p?.lat);
-        const lon = Number(p?.lon);
-        if (!isFinite(lat) || !isFinite(lon)) continue;
-        const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
-        if (tMs == null || !isFinite(tMs)) continue;
-        pts.push({ lat, lon, tMs, m: p.m, readings: p.readings });
-        minMs = Math.min(minMs, tMs);
-        maxMs = Math.max(maxMs, tMs);
+        const pts = [];
+        for (const p of src) {
+          const lat = Number(p?.lat);
+          const lon = Number(p?.lon);
+          if (!isFinite(lat) || !isFinite(lon)) continue;
+          const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
+          if (tMs == null || !isFinite(tMs)) continue;
+          pts.push({ lat, lon, tMs, m: p.m, readings: p.readings });
+          minMs = Math.min(minMs, tMs);
+          maxMs = Math.max(maxMs, tMs);
+        }
+        if (pts.length >= 1) {
+          pts.sort((a, b) => a.tMs - b.tMs);
+          nextPtsById.set(id, pts);
+        }
       }
-      // Allow single-point trails so marker is visible at that position
-      if (pts.length >= 1) {
-        pts.sort((a, b) => a.tMs - b.tMs);
-        nextPtsById.set(id, pts);
-      }
+
+      this._playbackPtsById = nextPtsById;
+      this._playbackMinMs = isFinite(minMs) ? minMs : null;
+      this._playbackMaxMs = isFinite(maxMs) ? maxMs : null;
     }
 
-    this._playbackPtsById = nextPtsById;
-    this._playbackMinMs = isFinite(minMs) ? minMs : null;
-    this._playbackMaxMs = isFinite(maxMs) ? maxMs : null;
-
-    // Default playhead to latest if unset.
-    if (this._playbackNowMs == null && this._playbackMaxMs != null) this._playbackNowMs = this._playbackMaxMs;
+    // Initialize playhead to maxMs only if it's null (first load)
+    // Do NOT keep resetting it when new data arrives - playback loop handles advancement
+    if (this._playbackNowMs == null && this._playbackMaxMs != null) {
+      this._playbackNowMs = this._playbackMaxMs;
+    }
+    // Track maxMs for other uses
+    this._playbackLastMaxMs = this._playbackMaxMs;
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -3695,6 +3716,10 @@ class MapView {
     const prevPoint = p0 || pts[idx];
     const dtMs = Math.max(1, (nextPoint.tMs - prevPoint.tMs));
     
+    // Calculate vehicle's actual time position (for trail reveal)
+    // Interpolate time based on position within segment
+    const vehicleTMs = prevPoint.tMs + (nextPoint.tMs - prevPoint.tMs) * u;
+    
     // Use actual physics velocity for display, not recorded velocity
     let speedMps = phys.v;
     if (t >= tMax - 1) speedMps = 0;
@@ -3777,6 +3802,7 @@ class MapView {
       visibleEnd,                // Where vehicle stops (= targetD, no lookahead)
       vehicleD: phys.d,          // Actual vehicle position (for debug)
       vehicleV: phys.v,          // Actual vehicle velocity (for debug)
+      vehicleTMs,                // Actual vehicle time (for trail reveal)
       controlScalar,             // Control scalar σ(ε, ω) for debug
       positionError,             // Normalized position error ε
       totalDist
@@ -4111,13 +4137,18 @@ class MapView {
       // Idle trails remain visible as dimmed historical data.
 
       // DVR revealing-path logic:
-      // In playback mode, reveal trail up to vehicle position + lookahead distance.
-      // This gives vehicles a constant "runway" to react to, regardless of speed.
-      // If we are LIVE (at the end), show the full path.
-      const isLive = !this.playbackMode || !!this._playbackLiveFollow;
+      // In playback mode, reveal trail up to playback time.
+      // LIVE mode still clips to playback time - it's just at the live edge.
+      const isLive = !this.playbackMode;  // Only skip clipping when DVR is completely OFF
       const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
       
-      // Trail reveal is purely time-based: show points up to playback time
+      // Get vehicle's actual time position (hides leading trail unless debug)
+      const revealInfo = this._vehicleRevealDist?.get(id);
+      const vehicleTMs = revealInfo?.vehicleTMs;
+      // Use vehicle time (hides leading trail) unless debug is on or vehicle time unavailable
+      const revealTimeMs = (this._pbDebugPath || vehicleTMs == null) ? pbTimeMs : vehicleTMs;
+      
+      // Trail reveal is purely time-based: show points up to reveal time
       // (Distance-based reveal was removed because cumDist indices didn't match trail indices)
 
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
@@ -4145,13 +4176,14 @@ class MapView {
 
         const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
         
-        // Time-based reveal: stop drawing when point time exceeds playback time
-        if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
-          // Fallback to time-based reveal if no distance info
+        // Time-based reveal: stop drawing when point time exceeds reveal time
+        // (revealTimeMs = vehicle time unless debug is on, then playback time)
+        if (!isLive && revealTimeMs != null && tMs != null && tMs > revealTimeMs) {
+          // Interpolate to exact reveal point
           const prev = trail[i - 1];
           const tPrev = (prev && typeof prev.t === "string") ? parseUtcMs(prev.t) : null;
           if (prev && tPrev != null && isFinite(Number(prev.lat)) && isFinite(Number(prev.lon))) {
-            const u = clamp((pbTimeMs - tPrev) / (tMs - tPrev), 0, 1);
+            const u = clamp((revealTimeMs - tPrev) / (tMs - tPrev), 0, 1);
             const iLat = Number(prev.lat) + (lat - Number(prev.lat)) * u;
             const iLon = Number(prev.lon) + (lon - Number(prev.lon)) * u;
             const wpt = latLonToWorld(iLat, iLon, this.zoom);
@@ -4220,14 +4252,11 @@ class MapView {
       const FADE_TIME_MS = 45 * 60 * 1000; // 45 minutes -> fully expired
       const FADE_TAIL_FRAC = 0.50; // fade over the last 20% of FADE_TIME_MS
       const FADE_START_FRAC = 1.0 - FADE_TAIL_FRAC; // e.g. 0.80
-      // Reference time:
-      // - In playback mode (including when "LIVE"/follow-tail at the end), fade follows the playhead time.
-      //   This prevents the entire historical path from suddenly fading out when playback reaches the end
-      //   and we transition into follow-tail.
-      // - Outside playback mode, fade follows wall-clock time.
-      const refNowMs = (this.playbackMode && pbTimeMs != null && isFinite(pbTimeMs))
-        ? Number(pbTimeMs)
-        : this._dataNowMs();
+      // Reference time: ALWAYS use playback time when playback is active (DVR mode OR LIVE mode)
+      // This ensures trail decay works correctly during LIVE buffered playback.
+      const livePlaybackTimeMs = this.getPlaybackTimeMs();
+      const hasPlaybackTime = livePlaybackTimeMs != null && isFinite(livePlaybackTimeMs);
+      const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) : this._dataNowMs();
 
       for (let i = 1; i < pts.length; i++) {
         if (!pts[i - 1] || !pts[i]) continue;
@@ -4470,15 +4499,21 @@ class MapView {
     const selectedId = hasSelectedMobile ? sel.id : null;
 
     // DVR revealing-path logic:
-    // When in playback mode, only show points up to the current playhead.
-    // If we are LIVE (at the end), show the full path.
-    const isLive = !this.playbackMode || !!this._playbackLiveFollow;
+    // When in playback mode, reveal trail up to playback time.
+    // LIVE mode still clips to playback time - it's just that playback time is at the live edge.
+    const isLive = !this.playbackMode;  // Only skip clipping when DVR is completely OFF
     const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
 
     const drawTrailFor = (m, alphaMul, toScreen) => {
       const id = m && m.id != null ? String(m.id) : "";
       const key = keyFor("mobile", m && m.id != null ? m.id : "");
       const isSel = (this.selectedId === key);
+      
+      // Get vehicle's actual time position (hides leading trail unless debug)
+      const revealInfo = this._vehicleRevealDist?.get(id);
+      const vehicleTMs = revealInfo?.vehicleTMs;
+      // Use vehicle time (hides leading trail) unless debug is on or vehicle time unavailable
+      const revealTimeMs = (this._pbDebugPath || vehicleTMs == null) ? pbTimeMs : vehicleTMs;
 
       // We no longer hide trails globally based on the latest ghosted state.
       // Reveal logic handles time-based visibility, and the server handles jitter.
@@ -4528,9 +4563,10 @@ class MapView {
           try { p._tMs = tMs; } catch {}
         }
         
-        // Time-based reveal: stop drawing when point time exceeds playback time
-        if (!isLive && pbTimeMs != null && tMs != null && tMs > pbTimeMs) {
-          // Fallback to time-based reveal if no distance info
+        // Time-based reveal: stop drawing when point time exceeds reveal time
+        // (revealTimeMs = vehicle time unless debug is on, then playback time)
+        if (!isLive && revealTimeMs != null && tMs != null && tMs > revealTimeMs) {
+          // Interpolate to exact reveal point
           const prev = trail[i - 1];
           let tPrev = prev?._tMs;
           if (tPrev === undefined) {
@@ -4538,7 +4574,7 @@ class MapView {
             try { if (prev) prev._tMs = tPrev; } catch {}
           }
           if (prev && tPrev != null) {
-            const uTime = clamp((pbTimeMs - tPrev) / (tMs - tPrev), 0, 1);
+            const uTime = clamp((revealTimeMs - tPrev) / (tMs - tPrev), 0, 1);
             let pu = prev._u, pv = prev._v;
             if (pu === undefined) { const n = latLonToNorm(Number(prev.lat), Number(prev.lon)); pu = n.u; pv = n.v; }
             
@@ -4607,11 +4643,11 @@ class MapView {
       const FADE_TIME_MS = 45 * 60 * 1000; // 45 minutes -> fully expired
       const FADE_TAIL_FRAC = 0.20;
       const FADE_START_FRAC = 1.0 - FADE_TAIL_FRAC;
-      // In playback mode (even when following "LIVE" at end), key fading to the playhead time so we
-      // don't fade the entire trail just because wall-clock time has advanced past the history window.
-      const refNowMs = (this.playbackMode && pbTimeMs != null && isFinite(pbTimeMs))
-        ? Number(pbTimeMs)
-        : this._dataNowMs();
+      // Reference time: ALWAYS use playback time when playback is active (DVR mode OR LIVE mode)
+      // This ensures trail decay works correctly during LIVE buffered playback.
+      const livePlaybackTimeMs = this.getPlaybackTimeMs();
+      const hasPlaybackTime = livePlaybackTimeMs != null && isFinite(livePlaybackTimeMs);
+      const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) : this._dataNowMs();
 
       // Calculate pixels per meter at the trail's location (approximate using first point).
       // This is needed to convert the pruned world distance into a screen-space dash offset.
@@ -5765,6 +5801,29 @@ function main() {
   let _pbLastKnownMinMs = null;
   let _pbLastKnownMaxMs = null;
   
+  // ─────────────────────────────────────────────────────────────────────────────
+  // LIVE BUFFER: Track wall-clock time since app started to know how much data we have.
+  // Buffer = time since first data arrival. Playback replays this accumulated buffer.
+  // ─────────────────────────────────────────────────────────────────────────────
+  let _pbLiveStartWallMs = null;        // wall-clock time (perf.now) when LIVE mode started
+  let _pbLiveStartDataMs = null;        // data time (maxMs) when LIVE mode started
+  const _pbLiveStallThreshold = 3;      // stalls before auto-rewind in LIVE mode
+  let _pbLiveTargetMs = null;           // where playback should aim in LIVE mode
+  let _pbLiveStallCount = 0;            // how many times we've hit end waiting for data
+  
+  // Helper to reset LIVE tracking (call when exiting LIVE mode)
+  // Exposed on map object so class methods can call it
+  function _resetLiveTracking() {
+    _pbLiveStartWallMs = null;
+    _pbLiveStartDataMs = null;
+    _pbLiveStallCount = 0;
+  }
+  map._resetLiveTracking = _resetLiveTracking;
+  
+  // LIVE camera follow: smooth pan/zoom to fit moving vehicles
+  const _pbLiveFollowDurationMs = 2000; // animation duration for camera follow (slow, smooth)
+  const _pbLiveFollowPadding = 0.15;    // extra padding around bounds (15%)
+  
   // Physics constants
   const _pbPlaybackSpeed = 1.0;       // target velocity when playing forward
   const _pbRewindSpeed = -100.0;      // target velocity when rewinding (negative = backward, FAST)
@@ -5804,9 +5863,8 @@ function main() {
       pbScrubEl.step = "100"; // 100ms steps for smoother scrubbing
       pbScrubEl.disabled = false;
       if (!_pbScrubbing) {
-        // If we are following live, force the slider to the absolute end.
-        const useMax = map._playbackLiveFollow || map.isPlaybackAtEnd(200);
-        pbScrubEl.value = useMax ? String(durMs) : String(clamp(tRelMs, 0, durMs));
+        // Show actual playhead position (don't force to end in LIVE mode)
+        pbScrubEl.value = String(clamp(tRelMs, 0, durMs));
       }
     } else if (pbScrubEl) {
       pbScrubEl.disabled = true;
@@ -5816,9 +5874,9 @@ function main() {
     }
 
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
-    // If we don't have any bounds yet, we still consider ourselves "LIVE" at the end.
     const atEnd = !hasBounds || map.isPlaybackAtEnd(200);
-    const followingLive = atEnd && map._playbackLiveFollow;
+    // LIVE mode is based on the flag, not position - we're replaying the buffer
+    const followingLive = map._playbackLiveFollow;
 
     if (pbPlayEl) {
       if (followingLive) {
@@ -5835,6 +5893,8 @@ function main() {
   const playbackLoop = () => {
     _pbRAF = null;
     if (!map.playbackMode) return;
+    
+    try {
     const now = performance.now();
     const dt = (_pbLastPerf > 0) ? (now - _pbLastPerf) : 0;
     _pbLastPerf = now;
@@ -5843,6 +5903,12 @@ function main() {
     let tMs = map.getPlaybackTimeMs();
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
     const durMs = hasBounds ? (b.maxMs - b.minMs) : 1;
+    
+    // LIVE mode: if playhead is uninitialized, start at maxMs
+    if (map._playbackLiveFollow && hasBounds && (tMs == null || !isFinite(tMs))) {
+      tMs = b.maxMs;
+      map.setPlaybackTimeMs(tMs);
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // DETECT DATA CHANGES (new data arrived, or data trimmed)
@@ -5852,18 +5918,155 @@ function main() {
     if (hasBounds) {
       if (_pbLastKnownMaxMs != null && b.maxMs > _pbLastKnownMaxMs + 100) {
         newDataArrived = true;
+        // Reset stall counter when fresh data arrives
+        _pbLiveStallCount = 0;
       }
       _pbLastKnownMinMs = b.minMs;
       _pbLastKnownMaxMs = b.maxMs;
       
-      // If playhead is now outside bounds (data trimmed), clamp it
-      if (tMs < b.minMs) {
-        tMs = b.minMs;
-        map.setPlaybackTimeMs(tMs);
+      // If playhead is now outside bounds (data trimmed or server restarted), handle it
+      if (tMs != null && isFinite(tMs)) {
+        if (tMs < b.minMs) {
+          // In LIVE mode, jump to live edge; otherwise clamp to minMs
+          if (map._playbackLiveFollow) {
+            tMs = b.maxMs;
+          } else {
+            tMs = b.minMs;
+          }
+          map.setPlaybackTimeMs(tMs);
+        }
+        if (tMs > b.maxMs) {
+          tMs = b.maxMs;
+          map.setPlaybackTimeMs(tMs);
+        }
       }
-      if (tMs > b.maxMs) {
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // LIVE BUFFER CALCULATION
+    // Buffer = wall-clock time since LIVE started (how much data we've accumulated).
+    // Playback consumes this buffer at playbackSpeed rate.
+    // ─────────────────────────────────────────────────────────────────────────
+    let liveBufferMs = 0;
+    
+    if (hasBounds && map._playbackLiveFollow) {
+      // Initialize playhead to maxMs if it's not set yet (first data arrival in LIVE mode)
+      if (tMs == null || !isFinite(tMs)) {
         tMs = b.maxMs;
         map.setPlaybackTimeMs(tMs);
+      }
+      
+      // Initialize LIVE tracking on first entry
+      if (_pbLiveStartWallMs == null) {
+        _pbLiveStartWallMs = now;
+        _pbLiveStartDataMs = b.maxMs;
+      }
+      
+      // Buffer = wall-clock time since we started LIVE mode
+      // This is how much new data has accumulated since we began
+      const wallElapsed = now - _pbLiveStartWallMs;
+      liveBufferMs = wallElapsed;
+      
+      // Target = newest data minus the buffer (stay behind the live edge)
+      // The buffer grows in real-time, so we always have runway
+      _pbLiveTargetMs = b.maxMs - liveBufferMs;
+      
+      // Clamp: if rewind outpaces buffer accumulation, just use minMs
+      if (_pbLiveTargetMs < b.minMs) {
+        _pbLiveTargetMs = b.minMs;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // LIVE CAMERA FOLLOW: Smooth pan/zoom to fit all MOVING vehicles
+    // Only recalculate and animate when fresh data arrives
+    // ─────────────────────────────────────────────────────────────────────────
+    const state = map.lastState;
+    if (newDataArrived && map._playbackLiveFollow && state) {
+      const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
+      let minLat = Infinity, maxLat = -Infinity;
+      let minLon = Infinity, maxLon = -Infinity;
+      let movingCount = 0;
+      
+      for (const m of mobiles) {
+        // Skip ghosted/idle vehicles
+        if (!m || m.ghosted) continue;
+        
+        // Check if vehicle has any moving points (m === 1) - indicates activity
+        const trail = Array.isArray(m.trail) ? m.trail : [];
+        if (trail.length === 0) continue;
+        
+        // Use the most recent trail point as current position
+        const lastPt = trail[trail.length - 1];
+        if (!lastPt) continue;
+        
+        // Only include if the most recent point is "moving" (m flag set)
+        const isMoving = (lastPt.m === 1 || lastPt.m === "1" || lastPt.m === true);
+        if (!isMoving) continue;
+        
+        const lat = Number(lastPt.lat);
+        const lon = Number(lastPt.lon);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+        
+        minLat = Math.min(minLat, lat);
+        maxLat = Math.max(maxLat, lat);
+        minLon = Math.min(minLon, lon);
+        maxLon = Math.max(maxLon, lon);
+        movingCount++;
+      }
+      
+      // Only pan/zoom if we have at least one moving vehicle
+      if (movingCount > 0 && isFinite(minLat) && isFinite(maxLat)) {
+        // Add padding
+        const latRange = maxLat - minLat;
+        const lonRange = maxLon - minLon;
+        const latPad = Math.max(latRange * _pbLiveFollowPadding, 0.01); // minimum ~1km
+        const lonPad = Math.max(lonRange * _pbLiveFollowPadding, 0.01);
+        
+        minLat -= latPad;
+        maxLat += latPad;
+        minLon -= lonPad;
+        maxLon += lonPad;
+        
+        // Compute target zoom and center (similar to fitBoundsLatLon but with custom animation)
+        const w0 = 256;
+        const xMin0 = lonToX(minLon, w0);
+        const xMax0 = lonToX(maxLon, w0);
+        const yMin0 = latToY(maxLat, w0);
+        const yMax0 = latToY(minLat, w0);
+        const dx0 = Math.max(1e-6, Math.abs(xMax0 - xMin0));
+        const dy0 = Math.max(1e-6, Math.abs(yMax0 - yMin0));
+        
+        const rect = map.overlayCanvas.getBoundingClientRect();
+        const w = rect.width;
+        const h = rect.height;
+        const pad = map._getOverlayPaddingPx ? map._getOverlayPaddingPx() : { left: 0, right: 0, top: 0, bottom: 0 };
+        const availW = Math.max(40, w - pad.left - pad.right);
+        const availH = Math.max(40, h - pad.top - pad.bottom);
+        
+        const scale = Math.min(availW / dx0, availH / dy0);
+        let targetZoom = Math.log2(scale);
+        targetZoom -= 0.18; // breathing room
+        targetZoom = clamp(targetZoom, map._zoomMin || 1, map._zoomMax || 20);
+        
+        // Center of bbox
+        const cx0 = (xMin0 + xMax0) / 2;
+        const cy0 = (yMin0 + yMax0) / 2;
+        const centerLL = worldToLatLon(cx0, cy0, 0);
+        
+        // Adjust for panel offset
+        const targetScreenX = pad.left + availW / 2;
+        const targetScreenY = pad.top + availH / 2;
+        const cWorld = latLonToWorld(centerLL.lat, centerLL.lon, targetZoom);
+        const centerWorldX = cWorld.x - (targetScreenX - w / 2);
+        const centerWorldY = cWorld.y - (targetScreenY - h / 2);
+        const finalCenter = worldToLatLon(centerWorldX, clamp(centerWorldY, 0, cWorld.ws - 1), targetZoom);
+        
+        // Smoothly animate to new bounds (slow animation for gentle following)
+        map._animateTo(
+          { centerLat: finalCenter.lat, centerLon: finalCenter.lon, zoom: targetZoom },
+          { durationMs: _pbLiveFollowDurationMs }
+        );
       }
     }
 
@@ -5955,10 +6158,16 @@ function main() {
           // Cruise phase: full speed
           _pbVelocity = cruiseSpeed;
         }
-      } else if (map._playbackLiveFollow && atEnd) {
-        // LIVE mode at end: stay put, but resume when new data arrives
-        _pbVelocity = 0;
-        if (newDataArrived) {
+      } else if (map._playbackLiveFollow) {
+        // ─────────────────────────────────────────────────────────────────────
+        // LIVE MODE: Play forward until we hit maxMs, then stall waiting for
+        // new data. When new data arrives, resume playing.
+        // ─────────────────────────────────────────────────────────────────────
+        if (atEnd) {
+          // At live edge, waiting for new data - just hold position
+          _pbVelocity = 0;
+        } else {
+          // Have data ahead - play toward live edge at user-selected speed
           _pbVelocity = _pbPlaybackSpeed * speedMult;
         }
       } else if (map.getPlaybackPlaying()) {
@@ -6076,12 +6285,18 @@ function main() {
     const hasMotion = Math.abs(_pbVelocity) > _pbVelocityThreshold;
     const hasWheelMomentum = Math.abs(_pbWheelAccum) > 0.1;
     const waitingToRewind = _pbAtEndSincePerf != null;
-    const liveWaitingForData = map._playbackLiveFollow && map.isPlaybackAtEnd(10);
+    const inLiveMode = map._playbackLiveFollow;  // LIVE mode always keeps loop running
     
-    if (map.getPlaybackPlaying() || markerInertiaActive || hasMotion || hasWheelMomentum || waitingToRewind || liveWaitingForData) {
+    if (map.getPlaybackPlaying() || markerInertiaActive || hasMotion || hasWheelMomentum || waitingToRewind || inLiveMode) {
       _pbRAF = requestAnimationFrame(playbackLoop);
     } else {
       _pbLastPerf = 0;
+    }
+    
+    } catch (e) {
+      // Don't let errors kill the playback loop
+      console.error("playbackLoop error:", e);
+      _pbRAF = requestAnimationFrame(playbackLoop);
     }
   };
 
@@ -6155,24 +6370,28 @@ function main() {
 
       const atEnd = map.isPlaybackAtEnd(100);
       
-      // If in LIVE follow mode (lit button), clicking initiates rewind
-      if (map._playbackLiveFollow && atEnd) {
-        map._playbackLiveFollow = false;
-        _pbAtEndSincePerf = null;
-        _pbWheelAccum = 0;
-        _pbIsRewinding = true;
-        _pbVelocity = _pbRewindSpeed;
-        map.setPlaybackPlaying(true);
-        _pbLastPerf = 0;
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
+      // If in LIVE mode, clicking toggles pause/play but stays in LIVE mode
+      if (map._playbackLiveFollow) {
+        if (map.getPlaybackPlaying()) {
+          // Pause LIVE playback (but stay in LIVE mode)
+          map.setPlaybackPlaying(false);
+          _pbVelocity = 0;
+          _pbWheelAccum = 0;
+          updatePlaybackUi();
+        } else {
+          // Resume LIVE playback
+          _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+          map.setPlaybackPlaying(true);
+          _pbLastPerf = 0;
+          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          updatePlaybackUi();
+        }
         return;
       }
 
-      // If currently playing (not live-follow), pause
+      // If currently playing (not LIVE mode), pause
       if (map.getPlaybackPlaying()) {
         map.setPlaybackPlaying(false);
-        map._playbackLiveFollow = false;
         _pbVelocity = 0;
         _pbWheelAccum = 0;
         _pbAtEndSincePerf = null;
@@ -6181,9 +6400,8 @@ function main() {
         return;
       }
 
-      // If at the end (paused), initiate immediate rewind
+      // If at the end (paused, not LIVE), initiate immediate rewind
       if (atEnd) {
-        map._playbackLiveFollow = false;
         _pbAtEndSincePerf = null;
         _pbWheelAccum = 0;
         _pbIsRewinding = true;
@@ -6195,12 +6413,11 @@ function main() {
         return;
       }
 
-      // Normal play from current position
+      // Normal play from current position (not LIVE, not at end)
       _pbAtEndSincePerf = null;
       _pbWheelAccum = 0;
       _pbIsRewinding = false;
       _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-      map._playbackLiveFollow = false;
       map.setPlaybackPlaying(true);
       _pbLastPerf = 0;
       // Always restart the loop
@@ -6817,6 +7034,7 @@ function main() {
       _pbLastScrubTime = performance.now();
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false; // exit live mode when user grabs slider
+      _resetLiveTracking();
       updatePlaybackUi();
     });
     pbScrubEl.addEventListener("pointerup", () => {
@@ -6969,12 +7187,11 @@ function main() {
         const after = map.getPlaybackBounds();
         const nextMax = (after.maxMs != null && isFinite(Number(after.maxMs))) ? Number(after.maxMs) : null;
 
-        // LIVE follow-tail: always pin playhead to the end-of-data.
-        // This avoids any "rewind" behavior on load or when new data arrives.
-        if (!map._pbDrag && map._playbackLiveFollow && nextMax != null) {
-          map.setPlaybackTimeMs(nextMax);
-        } else if (map.getPlaybackTimeMs() == null && nextMax != null) {
-          // One-time initialization when entering DVR: start at the end-of-data.
+        // LIVE follow mode now handles buffered playback in playbackLoop().
+        // Only initialize playhead position on first load, don't pin on every tick.
+        if (map.getPlaybackTimeMs() == null && nextMax != null) {
+          // One-time initialization when entering DVR: start near the end with buffer.
+          // The playbackLoop will adjust based on the dynamic buffer.
           map.setPlaybackTimeMs(nextMax);
         }
         // If user is not at end, do not auto-jump or auto-play.
