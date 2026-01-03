@@ -78,6 +78,10 @@
                 <option value="20">20×</option>
               </select>
             </label>
+            <label class="pbDebugLabel" title="Show full path ahead">
+              <input type="checkbox" id="pbDebugPath" />
+              <span>🐛</span>
+            </label>
             <!-- Menu button with dropup -->
             <div class="pbMenuWrap">
               <button id="pbMenuBtn" type="button" class="pbMenuBtn" title="More options">⋮</button>
@@ -97,15 +101,8 @@
                   <span class="pbMenuArrow">›</span>
                   <div class="pbSubmenu" id="pbDaysSubmenu"></div>
                 </div>
-                <div class="pbMenuDivider"></div>
-                <div class="pbMenuItem pbMenuToggle" data-action="debug">
-                  <span class="pbMenuIcon">🐛</span>
-                  <span class="pbMenuLabel">Debug Mode</span>
-                  <span class="pbMenuCheck" id="pbDebugCheck"></span>
-                </div>
               </div>
             </div>
-            <input type="checkbox" id="pbDebugPath" class="hidden" />
           </div>
 
           <!-- Sidebar panel (integrated, overlays map) -->
