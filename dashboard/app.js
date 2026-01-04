@@ -4792,8 +4792,8 @@ class MapView {
       // Fade is strictly time-based decay:
       // - total decay window: 45 minutes
       // - fade begins only in the last 20% of that window (tail)
-      const FADE_TIME_MS = 45 * 60 * 1000; // 45 minutes -> fully expired
-      const FADE_TAIL_FRAC = 0.50; // fade over the last 20% of FADE_TIME_MS
+      const FADE_TIME_MS = 20 * 60 * 1000; // 20 minutes -> fully expired
+      const FADE_TAIL_FRAC = 0.20; // fade over the last 20% of FADE_TIME_MS
       const FADE_START_FRAC = 1.0 - FADE_TAIL_FRAC; // e.g. 0.80
       // Reference time: use playback time, trail's max time, or playback bounds (NOT wall clock)
       const livePlaybackTimeMs = this.getPlaybackTimeMs();
