@@ -6614,6 +6614,9 @@ function main() {
   // Track data bounds to detect new data / trimmed data
   let _pbLastKnownMinMs = null;
   let _pbLastKnownMaxMs = null;
+
+  // Server can bump this to force LIVE camera follow even if data timestamps are unchanged.
+  let _pbLastForceRefreshSeq = null;
   
   // ─────────────────────────────────────────────────────────────────────────────
   // LIVE BUFFER: Track wall-clock time since app started to know how much data we have.
@@ -6755,6 +6758,22 @@ function main() {
           map.setPlaybackTimeMs(tMs);
         }
       }
+    }
+
+    // Forced refresh: treat as a new-data event even if bounds didn't move.
+    // This is used by the terminal TUI to request a camera fit/zoom in the web UI.
+    try {
+      const state = map.lastState;
+      const seq = state?.meta?.force_refresh_seq;
+      if (typeof seq === "number" && isFinite(seq)) {
+        if (_pbLastForceRefreshSeq != null && seq !== _pbLastForceRefreshSeq) {
+          newDataArrived = true;
+          _pbLiveStallCount = 0;
+        }
+        _pbLastForceRefreshSeq = seq;
+      }
+    } catch {
+      // ignore
     }
     
     // ─────────────────────────────────────────────────────────────────────────
