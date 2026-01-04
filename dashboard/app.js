@@ -638,6 +638,9 @@ class MapView {
     // and scrub the global playhead from it. Only the last-interacted marker uses this.
     this._pbInertia2d = null; // { id, t0Ms, lastMs, posClient:{x,y}, vel:{x,y} }
     this._pbDebugPath = false;
+    // Vehicle actual path buffer: records the dynamically computed positions (phys.lat/lon)
+    // This is the ACTUAL path the vehicle takes, which differs based on speed/steering
+    this._vehicleActualPathById = new Map(); // id -> [{lat, lon, d}]
 
     // Selection orchestration (polished camera + trace sync).
     this._selectOrchRAF = null;
@@ -3380,153 +3383,255 @@ class MapView {
   // ═══════════════════════════════════════════════════════════════════════════
   
   static WAYPOINT_CHUNK_SIZE = 50;      // Points per computed chunk
-  static WAYPOINT_BEHIND = 15;          // Points behind vehicle to keep
-  static WAYPOINT_AHEAD_BASE = 5;       // Base points ahead at 1x speed
-  static WAYPOINT_AHEAD_PER_SPEED = 3;  // Additional points per speed multiplier
+  static WAYPOINT_BEHIND = 5;           // Points behind vehicle to keep
+  static WAYPOINT_AHEAD_BASE = 20;      // Base points ahead at 1x speed
+  static WAYPOINT_AHEAD_PER_SPEED = 5;  // Additional points per speed multiplier
   static JITTER_THRESHOLD_M = 8;        // Only smooth deviations < 8 meters
   static JITTER_BLEND = 0.3;            // Blend factor for jitter smoothing
 
-  // Get sliding window of smoothed waypoints around vehicle position
-  // Returns { waypoints, startIdx, endIdx, cumDist, curvature }
-  // vehicleIdx: current position index in raw pts
-  // playbackSpeed: current speed multiplier (affects look-ahead)
-  _getWaypointWindow(id, pts, vehicleIdx, playbackSpeed) {
-    if (!this._waypointWindowCache) this._waypointWindowCache = new Map();
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PROGRESSIVE SPLINE PATH
+  // 
+  // The vehicle's path is computed PROGRESSIVELY as it advances. When the
+  // vehicle passes a GPS waypoint, we compute the spline segment from that
+  // waypoint to the next using the CURRENT tension (based on current speed).
+  // 
+  // Key insight: Once a spline segment is computed, it's LOCKED. When speed
+  // changes, only FUTURE segments (not yet reached) use the new tension.
+  // This prevents the vehicle from "snapping" when speed changes.
+  //
+  // Structure:
+  //   _vehiclePathById: Map<id, { 
+  //     computedPts: [{lat, lon, rawIdx, tMs, m, readings}],  // progressive spline
+  //     cumDist: [],           // cumulative distances for computedPts
+  //     lastRawIdx: number,    // last raw GPS index we've computed past
+  //   }>
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Get or create the progressive path for a vehicle
+  _getVehiclePath(id, pts) {
+    if (!this._vehiclePathById) this._vehiclePathById = new Map();
     
+    let path = this._vehiclePathById.get(id);
+    const ptsKey = this._playbackPtsKey;
+    
+    // Reset if pts changed (different recording loaded)
+    if (path && path.ptsKey !== ptsKey) {
+      path = null;
+    }
+    
+    if (!path) {
+      // Initialize with first GPS point
+      const p0 = pts[0];
+      path = {
+        computedPts: [{
+          lat: p0.lat,
+          lon: p0.lon,
+          rawIdx: 0,
+          tMs: p0.tMs,
+          m: p0.m,
+          readings: p0.readings
+        }],
+        cumDist: [0],
+        lastRawIdx: 0,
+        ptsKey
+      };
+      this._vehiclePathById.set(id, path);
+    }
+    
+    return path;
+  }
+
+  // Extend the progressive path up to (and past) targetRawIdx
+  // Uses current playback speed to determine spline tension for NEW segments only
+  // CRITICAL: If tension changed, invalidate segments AHEAD of vehicle and recompute
+  _extendVehiclePath(id, pts, targetRawIdx, playbackSpeed, vehicleRawIdx) {
+    const path = this._getVehiclePath(id, pts);
     const n = pts.length;
-    if (n < 2) return null;
     
-    // Calculate window bounds based on speed
-    const aheadCount = MapView.WAYPOINT_AHEAD_BASE + 
-                       Math.floor(MapView.WAYPOINT_AHEAD_PER_SPEED * Math.max(1, playbackSpeed));
-    const behindCount = MapView.WAYPOINT_BEHIND;
+    // Spline tension from current speed
+    // HIGH tension = TIGHT curves (follows GPS closely) - for LOW speed
+    // LOW tension = SMOOTH curves (wider arcs) - for HIGH speed
+    // At 1x: tension = 0.85 (tight, follows GPS)
+    // At 20x: tension ~ 0.33 (smooth, wide arcs)
+    const tension = Math.max(0.2, 0.85 - 0.12 * Math.log2(Math.max(1, playbackSpeed)));
+    const tensionKey = Math.round(tension * 100);
     
-    const startIdx = Math.max(0, vehicleIdx - behindCount);
-    const endIdx = Math.min(n - 1, vehicleIdx + aheadCount);
-    
-    // Check cache for this window
-    const cached = this._waypointWindowCache.get(id);
-    if (cached && 
-        cached.ptsLen === n && 
-        cached.startIdx <= startIdx && 
-        cached.endIdx >= endIdx &&
-        cached.ptsKey === this._playbackPtsKey) {
-      // Cached window contains our needed range
-      return cached;
-    }
-    
-    // Compute new window (extend if we have partial overlap)
-    let computeStart = startIdx;
-    let computeEnd = endIdx;
-    let prevWaypoints = null;
-    
-    if (cached && cached.ptsLen === n && cached.ptsKey === this._playbackPtsKey) {
-      // Reuse overlapping portion
-      prevWaypoints = cached.waypoints;
-      if (cached.startIdx <= startIdx && cached.endIdx >= startIdx) {
-        // Overlap at start - only compute new end portion
-        computeStart = cached.endIdx + 1;
-      } else if (cached.startIdx <= endIdx && cached.endIdx >= endIdx) {
-        // Overlap at end - only compute new start portion
-        computeEnd = cached.startIdx - 1;
-      }
-    }
-    
-    // Compute waypoints for the window
-    const windowPts = [];
-    for (let i = startIdx; i <= endIdx; i++) {
-      const p = pts[i];
+    // If tension changed and we have segments ahead of vehicle, invalidate them
+    if (path.lastTensionKey !== undefined && path.lastTensionKey !== tensionKey) {
+      // Find where vehicle is in computed path
+      const vehRawIdx = vehicleRawIdx || 0;
       
-      // Check if we can reuse from previous cache
-      if (prevWaypoints) {
-        const prevIdx = i - (cached?.startIdx || 0);
-        if (prevIdx >= 0 && prevIdx < prevWaypoints.length && 
-            prevWaypoints[prevIdx]?.origIdx === i) {
-          windowPts.push(prevWaypoints[prevIdx]);
-          continue;
+      // Truncate: keep only points up to current vehicle position
+      // Find the last computed point that's AT or BEFORE vehicle
+      let keepUpToIdx = 0;
+      for (let i = 0; i < path.computedPts.length; i++) {
+        if (path.computedPts[i].rawIdx <= vehRawIdx) {
+          keepUpToIdx = i;
+        } else {
+          break;
         }
       }
       
-      // Compute smoothed position using local average
-      let sumLat = 0, sumLon = 0, count = 0;
-      for (let j = Math.max(0, i - 1); j <= Math.min(n - 1, i + 1); j++) {
-        sumLat += pts[j].lat;
-        sumLon += pts[j].lon;
-        count++;
+      // Truncate arrays
+      if (keepUpToIdx < path.computedPts.length - 1) {
+        path.computedPts = path.computedPts.slice(0, keepUpToIdx + 1);
+        path.cumDist = path.cumDist.slice(0, keepUpToIdx + 1);
+        path.lastRawIdx = Math.floor(path.computedPts[keepUpToIdx].rawIdx);
       }
-      const avgLat = sumLat / count;
-      const avgLon = sumLon / count;
-      
-      const deviationM = haversineMeters(p.lat, p.lon, avgLat, avgLon);
-      
-      let smoothLat, smoothLon;
-      if (deviationM < MapView.JITTER_THRESHOLD_M && i > 0 && i < n - 1) {
-        // Apply speed-dependent smoothing - faster = more smoothing (look further ahead)
-        const speedBlend = MapView.JITTER_BLEND * (1 + 0.1 * Math.max(0, playbackSpeed - 1));
-        const blend = Math.min(0.5, speedBlend); // Cap at 50%
-        smoothLat = p.lat + blend * (avgLat - p.lat);
-        smoothLon = p.lon + blend * (avgLon - p.lon);
-      } else {
-        smoothLat = p.lat;
-        smoothLon = p.lon;
-      }
-      
-      windowPts.push({
-        lat: smoothLat,
-        lon: smoothLon,
-        origIdx: i,
-        tMs: p.tMs,
-        m: p.m,
-        readings: p.readings
-      });
+    }
+    path.lastTensionKey = tensionKey;
+    
+    // Already computed past this index?
+    if (path.lastRawIdx >= targetRawIdx) {
+      return path;
     }
     
-    // Build cumulative distance for window
-    const wn = windowPts.length;
-    const cumDist = new Array(wn);
-    cumDist[0] = 0;
-    for (let i = 1; i < wn; i++) {
-      const segDist = haversineMeters(
-        windowPts[i-1].lat, windowPts[i-1].lon,
-        windowPts[i].lat, windowPts[i].lon
-      );
-      cumDist[i] = cumDist[i-1] + segDist;
+    const s = (1 - tension) / 2;
+    
+    // Catmull-Rom interpolation
+    const catmullRom = (p0, p1, p2, p3, t) => {
+      const t2 = t * t;
+      const t3 = t2 * t;
+      const h1 = -s * t3 + 2 * s * t2 - s * t;
+      const h2 = (2 - s) * t3 + (s - 3) * t2 + 1;
+      const h3 = (s - 2) * t3 + (3 - 2 * s) * t2 + s * t;
+      const h4 = s * t3 - s * t2;
+      return {
+        lat: h1 * p0.lat + h2 * p1.lat + h3 * p2.lat + h4 * p3.lat,
+        lon: h1 * p0.lon + h2 * p1.lon + h3 * p2.lon + h4 * p3.lon
+      };
+    };
+    
+    const SAMPLES_PER_SEGMENT = 4;
+    
+    // Extend from lastRawIdx to targetRawIdx
+    for (let i = path.lastRawIdx; i < targetRawIdx && i < n - 1; i++) {
+      const p0 = pts[Math.max(0, i - 1)];
+      const p1 = pts[i];
+      const p2 = pts[Math.min(n - 1, i + 1)];
+      const p3 = pts[Math.min(n - 1, i + 2)];
+      
+      // Add interpolated points for segment i → i+1
+      for (let si = 1; si <= SAMPLES_PER_SEGMENT; si++) {
+        const t = si / (SAMPLES_PER_SEGMENT + 1);
+        const interp = catmullRom(p0, p1, p2, p3, t);
+        
+        const newPt = {
+          lat: interp.lat,
+          lon: interp.lon,
+          rawIdx: i + t,
+          tMs: p1.tMs + t * (p2.tMs - p1.tMs),
+          m: p2.m,
+          readings: p2.readings
+        };
+        
+        // Compute distance from last point
+        const lastPt = path.computedPts[path.computedPts.length - 1];
+        const segDist = haversineMeters(lastPt.lat, lastPt.lon, newPt.lat, newPt.lon);
+        
+        path.computedPts.push(newPt);
+        path.cumDist.push(path.cumDist[path.cumDist.length - 1] + segDist);
+      }
+      
+      // Add the endpoint (GPS point i+1)
+      const endPt = {
+        lat: p2.lat,
+        lon: p2.lon,
+        rawIdx: i + 1,
+        tMs: p2.tMs,
+        m: p2.m,
+        readings: p2.readings
+      };
+      
+      const lastPt = path.computedPts[path.computedPts.length - 1];
+      const segDist = haversineMeters(lastPt.lat, lastPt.lon, endPt.lat, endPt.lon);
+      
+      path.computedPts.push(endPt);
+      path.cumDist.push(path.cumDist[path.cumDist.length - 1] + segDist);
+      
+      path.lastRawIdx = i + 1;
     }
-    const totalDist = cumDist[wn - 1] || 1;
+    
+    return path;
+  }
+
+  // Get sliding window of waypoints around vehicle position from PROGRESSIVE path
+  // Returns { waypoints, startIdx, endIdx, cumDist, curvature }
+  _getWaypointWindow(id, pts, vehicleIdx, playbackSpeed) {
+    const n = pts.length;
+    if (n < 2) return null;
+    
+    // Extend progressive path to cover ahead of vehicle
+    const aheadCount = MapView.WAYPOINT_AHEAD_BASE + 
+                       Math.floor(MapView.WAYPOINT_AHEAD_PER_SPEED * Math.max(1, playbackSpeed));
+    const targetRawIdx = Math.min(n - 1, vehicleIdx + aheadCount);
+    
+    // Pass vehicleIdx so _extendVehiclePath can invalidate segments ahead when tension changes
+    const path = this._extendVehiclePath(id, pts, targetRawIdx, playbackSpeed, vehicleIdx);
+    
+    // Find window in computed path
+    const behindCount = MapView.WAYPOINT_BEHIND;
+    const cpts = path.computedPts;
+    const ccum = path.cumDist;
+    
+    // Find index in computed path corresponding to vehicleIdx
+    let vehicleComputedIdx = 0;
+    for (let i = 0; i < cpts.length; i++) {
+      if (cpts[i].rawIdx >= vehicleIdx) {
+        vehicleComputedIdx = i;
+        break;
+      }
+      vehicleComputedIdx = i;
+    }
+    
+    // Window bounds in computed path (5 samples per GPS segment)
+    const SAMPLES_PER_SEG = 5; // 4 interpolated + 1 endpoint
+    const startComputedIdx = Math.max(0, vehicleComputedIdx - behindCount * SAMPLES_PER_SEG);
+    const endComputedIdx = Math.min(cpts.length - 1, vehicleComputedIdx + aheadCount * SAMPLES_PER_SEG);
+    
+    // Extract window
+    const windowPts = cpts.slice(startComputedIdx, endComputedIdx + 1);
+    const windowCumDist = [];
+    const baseDist = ccum[startComputedIdx];
+    for (let i = startComputedIdx; i <= endComputedIdx; i++) {
+      windowCumDist.push(ccum[i] - baseDist);
+    }
+    const totalDist = windowCumDist[windowCumDist.length - 1] || 1;
     
     // Compute curvature for window
+    const wn = windowPts.length;
     const curvature = new Array(wn).fill(0);
     if (wn >= 3) {
       for (let i = 1; i < wn - 1; i++) {
-        const wp = windowPts;
-        const dx1 = wp[i].lon - wp[i-1].lon;
-        const dy1 = wp[i].lat - wp[i-1].lat;
-        const dx2 = wp[i+1].lon - wp[i].lon;
-        const dy2 = wp[i+1].lat - wp[i-1].lat;
+        const dx1 = windowPts[i].lon - windowPts[i-1].lon;
+        const dy1 = windowPts[i].lat - windowPts[i-1].lat;
+        const dx2 = windowPts[i+1].lon - windowPts[i].lon;
+        const dy2 = windowPts[i+1].lat - windowPts[i].lat;
         
         const a1 = Math.atan2(dy1, dx1);
         const a2 = Math.atan2(dy2, dx2);
         let angleDiff = Math.abs(a2 - a1);
         if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
         
-        const dist = (cumDist[i] - cumDist[i-1] + cumDist[i+1] - cumDist[i]) / 2;
+        const dist = (windowCumDist[i] - windowCumDist[i-1] + windowCumDist[i+1] - windowCumDist[i]) / 2;
         curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
       }
     }
     
-    const result = {
+    return {
       waypoints: windowPts,
-      startIdx,
-      endIdx,
-      cumDist,
+      startIdx: startComputedIdx,
+      endIdx: endComputedIdx,
+      cumDist: windowCumDist,
       totalDist,
       curvature,
-      ptsLen: n,
-      ptsKey: this._playbackPtsKey
+      // For mapping raw distance to window distance
+      startRawIdx: cpts[startComputedIdx]?.rawIdx || 0,
+      endRawIdx: cpts[endComputedIdx]?.rawIdx || n - 1,
+      fullCumDist: ccum,
+      fullStartIdx: startComputedIdx
     };
-    
-    this._waypointWindowCache.set(id, result);
-    return result;
   }
 
   // Legacy: Get full smooth path (for compatibility with debug display)
@@ -4005,41 +4110,72 @@ class MapView {
     // Sample raw path position (where GPS says we should be)
     const rawSample = this._samplePathAtDistance(pts, cumDist, curvature, phys.d);
     
-    // Sample smooth waypoint position from sliding window
-    // The window covers [startIdx, endIdx] of the raw path
-    // We need to find the corresponding position within the window
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PROGRESSIVE SPLINE SAMPLING
+    // 
+    // The waypoint window now comes from a PROGRESSIVE spline path where:
+    // - Past segments are LOCKED (computed with tension at time of traversal)
+    // - Future segments use CURRENT tension (based on current speed)
+    // 
+    // The vehicle samples its position from this progressive path, which is
+    // indexed by cumulative distance. We map phys.d (raw GPS distance) to the
+    // progressive path's cumulative distance.
+    // ═══════════════════════════════════════════════════════════════════════════
+    
     let waypointSample;
     if (waypointWindow && smoothWaypoints.length >= 2) {
-      // Find waypoint in window closest to vehicle's raw position
-      const winStartRawIdx = waypointWindow.startIdx;
-      const winEndRawIdx = waypointWindow.endIdx;
+      // The progressive path has its own cumulative distances
+      // Map phys.d (distance on raw GPS) to progressive path distance
+      //
+      // Strategy: Find the computed path point corresponding to our raw distance
+      // by interpolating based on rawIdx values in the computed points
       
-      // Map vehicle's raw index to window index
-      const rawIdx = Math.max(0, Math.min(pts.length - 1, vehicleIdx));
-      const winIdx = clamp(rawIdx - winStartRawIdx, 0, smoothWaypoints.length - 1);
-      
-      // Use fractional index based on phys.d position within window
-      // Find where phys.d falls in the window's cumDist
-      let wD = 0;
-      for (let i = 0; i < smoothWaypoints.length - 1; i++) {
-        const origIdx = smoothWaypoints[i].origIdx;
-        if (origIdx != null && cumDist[origIdx] != null && cumDist[origIdx] >= phys.d) {
-          // Found the segment - interpolate position
-          const prevOrigIdx = smoothWaypoints[Math.max(0, i - 1)].origIdx || 0;
-          const segStart = cumDist[prevOrigIdx] || 0;
-          const segEnd = cumDist[origIdx] || 0;
-          const segLen = segEnd - segStart;
-          wD = smoothCumDist[Math.max(0, i - 1)] + 
-               (segLen > 0 ? (phys.d - segStart) / segLen * (smoothCumDist[i] - smoothCumDist[Math.max(0, i - 1)]) : 0);
-          break;
+      // Get the full progressive path for this vehicle
+      const path = this._vehiclePathById?.get(id);
+      if (path && path.computedPts.length >= 2) {
+        const cpts = path.computedPts;
+        const ccum = path.cumDist;
+        
+        // Find where phys.d falls in raw GPS cumDist
+        let rawIdx = 0;
+        let rawFrac = 0;
+        for (let i = 0; i < cumDist.length - 1; i++) {
+          if (cumDist[i + 1] >= phys.d) {
+            rawIdx = i;
+            const segLen = cumDist[i + 1] - cumDist[i];
+            rawFrac = segLen > 0 ? (phys.d - cumDist[i]) / segLen : 0;
+            break;
+          }
+          rawIdx = i;
         }
-        wD = smoothCumDist[i];
+        const rawIdxFrac = rawIdx + rawFrac;
+        
+        // Find corresponding position in computed path
+        let compIdx = 0;
+        for (let i = 0; i < cpts.length - 1; i++) {
+          if (cpts[i + 1].rawIdx >= rawIdxFrac) {
+            compIdx = i;
+            break;
+          }
+          compIdx = i;
+        }
+        
+        // Interpolate between computed points
+        const cp0 = cpts[compIdx];
+        const cp1 = cpts[Math.min(cpts.length - 1, compIdx + 1)];
+        const rawIdxSpan = cp1.rawIdx - cp0.rawIdx;
+        const t = rawIdxSpan > 0 ? clamp((rawIdxFrac - cp0.rawIdx) / rawIdxSpan, 0, 1) : 0;
+        
+        waypointSample = {
+          lat: cp0.lat + t * (cp1.lat - cp0.lat),
+          lon: cp0.lon + t * (cp1.lon - cp0.lon),
+          heading: Math.atan2(cp1.lat - cp0.lat, cp1.lon - cp0.lon),
+          m: cp1.m,
+          readings: cp1.readings
+        };
+      } else {
+        waypointSample = rawSample;
       }
-      wD = clamp(wD, 0, waypointWindow.totalDist);
-      
-      waypointSample = this._samplePathAtDistance(
-        smoothWaypoints, smoothCumDist, waypointWindow.curvature, wD
-      );
     } else {
       // Fallback: use raw sample
       waypointSample = rawSample;
@@ -4047,27 +4183,56 @@ class MapView {
     
     // Initialize 2D physics state if needed (use needsSnap from earlier)
     if (phys.lat == null || phys.lon == null || needsSnap) {
-      // Start at waypoint position
-      phys.lat = waypointSample.lat;
-      phys.lon = waypointSample.lon;
-      phys.heading = waypointSample.heading;
+      // Start at raw GPS position (not spline, to avoid teleport on speed change)
+      phys.lat = rawSample.lat;
+      phys.lon = rawSample.lon;
+      phys.heading = rawSample.heading;
     }
     
-    // Steering toward waypoint position with damping
-    // This creates smooth movement that tracks waypoints without rail-locking
+    // Steering toward RAW GPS position with damping
+    // This ensures vehicle never teleports when speed changes (spline recomputes).
+    // Physics provides natural smoothing through steering inertia.
     const STEER_RATE = 3.0; // How fast to steer toward waypoint (higher = snappier)
     const steerFactor = 1 - Math.exp(-STEER_RATE * dtS);
     
-    // Blend current position toward waypoint
-    phys.lat += steerFactor * (waypointSample.lat - phys.lat);
-    phys.lon += steerFactor * (waypointSample.lon - phys.lon);
+    // Blend current position toward raw GPS sample
+    phys.lat += steerFactor * (rawSample.lat - phys.lat);
+    phys.lon += steerFactor * (rawSample.lon - phys.lon);
     
-    // Smooth heading toward waypoint heading
-    let headingDiff = waypointSample.heading - phys.heading;
+    // Smooth heading toward raw GPS heading
+    let headingDiff = rawSample.heading - phys.heading;
     // Wrap to [-π, π]
     while (headingDiff > Math.PI) headingDiff -= 2 * Math.PI;
     while (headingDiff < -Math.PI) headingDiff += 2 * Math.PI;
     phys.heading += steerFactor * headingDiff;
+    
+    // Record actual vehicle path for debug visualization
+    // This captures the dynamically computed steering path, not the waypoints
+    if (this._pbDebugPath) {
+      if (!this._vehicleActualPathById) this._vehicleActualPathById = new Map();
+      let actualPath = this._vehicleActualPathById.get(id);
+      if (!actualPath || needsSnap) {
+        actualPath = [];
+        this._vehicleActualPathById.set(id, actualPath);
+      }
+      // Record position at regular distance intervals to avoid excessive points
+      const lastPt = actualPath.length > 0 ? actualPath[actualPath.length - 1] : null;
+      const recordInterval = 2; // meters between recorded points
+      if (!lastPt || Math.abs(phys.d - lastPt.d) >= recordInterval) {
+        actualPath.push({ lat: phys.lat, lon: phys.lon, d: phys.d });
+        // Limit buffer size - keep window around current position
+        const maxBehind = 50; // points behind vehicle
+        const maxAhead = 10; // points ahead (from scrub-back)
+        while (actualPath.length > maxBehind + maxAhead) {
+          // Remove oldest point if it's behind current position
+          if (actualPath[0].d < phys.d - maxBehind * recordInterval) {
+            actualPath.shift();
+          } else {
+            break;
+          }
+        }
+      }
+    }
     
     const lat = phys.lat;
     const lon = phys.lon;
@@ -5120,70 +5285,123 @@ class MapView {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // DEBUG: Draw smoothed waypoints overlay when debug flag is enabled
-    // Only shows for the currently selected marker, windowed around vehicle position
+    // DEBUG: Draw the STEERING PATH - predicted trajectory based on current physics
+    // This shows where the vehicle WILL go based on current heading and steering.
+    // Like a racing game steering trainer - shows the predicted path ahead.
+    //
+    // The path is computed by simulating the vehicle forward from current position,
+    // steering toward lookahead points on the raw GPS path.
     // ═══════════════════════════════════════════════════════════════════════════
     if (this._pbDebugPath && this.playbackMode) {
       const sel = parseKey(this.selectedId);
       const selId = (sel && sel.type === "mobile" && sel.id) ? sel.id : null;
       if (selId) {
-        const DEBUG_WAYPOINTS_BEHIND = 15;
-        const DEBUG_WAYPOINTS_AHEAD = 5;
-        
         const ws = worldSizeForZoom(this.zoom);
+        const mid = String(selId);
+        
         const mobs = Array.isArray(state.mobile) ? state.mobile : [];
         const mm = mobs.find(x => x.id === selId);
         if (mm) {
-          const mid = String(mm.id);
           const playbackPts = this._playbackPtsById.get(mid);
           if (playbackPts && playbackPts.length >= 2) {
-            const smoothPath = this._getSmoothPath(mid, playbackPts);
-            const waypoints = smoothPath?.waypoints;
+            const phys = this._getPhysicsState(mid);
+            const { cumDist, totalDist, curvature } = this._getPathDistances(mid, playbackPts);
+            const physD = (phys.d != null && isFinite(phys.d)) ? phys.d : 0;
+            const playbackSpeed = this._playbackSpeed || 1.0;
             
-            if (waypoints && waypoints.length >= 2) {
-              const phys = this._getPhysicsState(mid);
-              const { cumDist, totalDist } = this._getPathDistances(mid, playbackPts);
-              const physD = (phys.d != null && isFinite(phys.d)) ? phys.d : 0;
-              const smoothD = totalDist > 0 ? (physD / totalDist) * smoothPath.totalDist : 0;
-              
-              let vehicleIdx = 0;
-              for (let i = 0; i < smoothPath.cumDist.length; i++) {
-                if (smoothPath.cumDist[i] <= smoothD) vehicleIdx = i;
-                else break;
-              }
+            // Simulate vehicle forward to generate predicted steering path
+            const LOOKAHEAD_BASE = 20;
+            const LOOKAHEAD_PER_SPEED = 8;
+            const lookaheadD = LOOKAHEAD_BASE + LOOKAHEAD_PER_SPEED * Math.sqrt(Math.max(1, playbackSpeed));
             
-              const startIdx = Math.max(0, vehicleIdx - DEBUG_WAYPOINTS_BEHIND);
-              const endIdx = Math.min(waypoints.length - 1, vehicleIdx + DEBUG_WAYPOINTS_AHEAD);
+            const STEER_RATE_BASE = 4.0;
+            const steerRate = STEER_RATE_BASE / Math.sqrt(Math.max(1, playbackSpeed));
+            
+            const metersPerDegLat = 111320;
+            const metersPerDegLon = 111320 * Math.cos((phys.lat || 40.7) * Math.PI / 180);
+            
+            // Start from current vehicle state
+            let simLat = phys.lat || 0;
+            let simLon = phys.lon || 0;
+            let simHeading = phys.heading || 0;
+            let simD = physD;
+            const simV = phys.v || 15; // Use current velocity or default
+            
+            // Generate predicted path points
+            const steeringPath = [{ lat: simLat, lon: simLon }];
+            const SIM_STEPS = 30;
+            const SIM_DT = 0.1; // 100ms per step
+            
+            for (let step = 0; step < SIM_STEPS && simD < totalDist; step++) {
+              // Calculate lookahead target
+              const targetD = Math.min(simD + lookaheadD, totalDist);
+              const lookaheadSample = this._samplePathAtDistance(playbackPts, cumDist, curvature, targetD);
               
+              // Calculate heading to lookahead
+              const dLat = lookaheadSample.lat - simLat;
+              const dLon = lookaheadSample.lon - simLon;
+              const targetHeading = Math.atan2(dLat, dLon);
+              
+              // Steer toward target
+              let headingDiff = targetHeading - simHeading;
+              while (headingDiff > Math.PI) headingDiff -= 2 * Math.PI;
+              while (headingDiff < -Math.PI) headingDiff += 2 * Math.PI;
+              
+              const steerFactor = 1 - Math.exp(-steerRate * SIM_DT);
+              simHeading += steerFactor * headingDiff;
+              
+              // Move forward
+              const moveDistM = simV * SIM_DT * playbackSpeed;
+              simLat += (moveDistM * Math.sin(simHeading)) / metersPerDegLat;
+              simLon += (moveDistM * Math.cos(simHeading)) / metersPerDegLon;
+              simD += moveDistM;
+              
+              steeringPath.push({ lat: simLat, lon: simLon });
+            }
+            
+            if (steeringPath.length >= 2) {
               ctx.save();
-              ctx.strokeStyle = "#b0b0b0";
-              ctx.lineWidth = 1.5;
+              
+              // Draw the steering path (cyan, gradually fading)
+              ctx.strokeStyle = "#00ffff";
+              ctx.lineWidth = 3;
               ctx.setLineDash([]);
-              ctx.globalAlpha = 0.75;
               ctx.beginPath();
               
-              let started = false;
-              for (let i = startIdx; i <= endIdx; i++) {
-                const wp = waypoints[i];
-                const norm = latLonToNorm(wp.lat, wp.lon);
+              for (let i = 0; i < steeringPath.length; i++) {
+                const pt = steeringPath[i];
+                const norm = latLonToNorm(pt.lat, pt.lon);
                 const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
-                if (!started) { ctx.moveTo(sp.x, sp.y); started = true; }
-                else { ctx.lineTo(sp.x, sp.y); }
+                if (i === 0) ctx.moveTo(sp.x, sp.y);
+                else ctx.lineTo(sp.x, sp.y);
               }
+              
+              // Fade from opaque to transparent
+              const gradient = ctx.createLinearGradient(
+                worldToScreenFast(latLonToNorm(steeringPath[0].lat, steeringPath[0].lon).u * ws, 
+                                  latLonToNorm(steeringPath[0].lat, steeringPath[0].lon).v * ws).x,
+                worldToScreenFast(latLonToNorm(steeringPath[0].lat, steeringPath[0].lon).u * ws, 
+                                  latLonToNorm(steeringPath[0].lat, steeringPath[0].lon).v * ws).y,
+                worldToScreenFast(latLonToNorm(steeringPath[steeringPath.length-1].lat, steeringPath[steeringPath.length-1].lon).u * ws, 
+                                  latLonToNorm(steeringPath[steeringPath.length-1].lat, steeringPath[steeringPath.length-1].lon).v * ws).x,
+                worldToScreenFast(latLonToNorm(steeringPath[steeringPath.length-1].lat, steeringPath[steeringPath.length-1].lon).u * ws, 
+                                  latLonToNorm(steeringPath[steeringPath.length-1].lat, steeringPath[steeringPath.length-1].lon).v * ws).y
+              );
+              ctx.globalAlpha = 0.8;
               ctx.stroke();
               
-              for (let i = startIdx; i <= endIdx; i++) {
-                const wp = waypoints[i];
-                const norm = latLonToNorm(wp.lat, wp.lon);
+              // Draw waypoint dots at intervals
+              for (let i = 0; i < steeringPath.length; i += 3) {
+                const pt = steeringPath[i];
+                const norm = latLonToNorm(pt.lat, pt.lon);
                 const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
+                const alpha = 1 - (i / steeringPath.length) * 0.7;
                 ctx.beginPath();
                 ctx.arc(sp.x, sp.y, 3, 0, 2 * Math.PI);
-                ctx.fillStyle = "#87ceeb";
+                ctx.fillStyle = `rgba(0, 255, 255, ${alpha})`;
                 ctx.fill();
-                ctx.strokeStyle = "#b0b0b0";
-                ctx.lineWidth = 1;
-                ctx.stroke();
               }
+              
               ctx.restore();
             }
           }
