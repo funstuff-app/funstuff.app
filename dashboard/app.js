@@ -6801,37 +6801,43 @@ function main() {
       const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
       let minLat = Infinity, maxLat = -Infinity;
       let minLon = Infinity, maxLon = -Infinity;
-      let movingCount = 0;
+      let visibleVehicleCount = 0;
+      let visiblePointCount = 0;
       
       for (const m of mobiles) {
         // Skip ghosted/idle vehicles
         if (!m || m.ghosted) continue;
         
-        // Check if vehicle has any moving points (m === 1) - indicates activity
         const trail = Array.isArray(m.trail) ? m.trail : [];
         if (trail.length === 0) continue;
-        
-        // Use the most recent trail point as current position
-        const lastPt = trail[trail.length - 1];
-        if (!lastPt) continue;
-        
-        // Only include if the most recent point is "moving" (m flag set)
-        const isMoving = (lastPt.m === 1 || lastPt.m === "1" || lastPt.m === true);
-        if (!isMoving) continue;
-        
-        const lat = Number(lastPt.lat);
-        const lon = Number(lastPt.lon);
-        if (!isFinite(lat) || !isFinite(lon)) continue;
-        
-        minLat = Math.min(minLat, lat);
-        maxLat = Math.max(maxLat, lat);
-        minLon = Math.min(minLon, lon);
-        maxLon = Math.max(maxLon, lon);
-        movingCount++;
+
+        // Bounds must include *all visible path segments*, not just the newest point.
+        // We mirror trail visibility rules: in non-debug mode, only moving points (m=1)
+        // contribute to the visible path.
+        let includedAnyForVehicle = false;
+        for (const p of trail) {
+          if (!p) continue;
+          const isMoving = !!(p && (p.m === 1 || p.m === "1" || p.m === true));
+          const isVisiblePt = !!map._pbDebugPath || isMoving;
+          if (!isVisiblePt) continue;
+
+          const lat = Number(p.lat);
+          const lon = Number(p.lon);
+          if (!isFinite(lat) || !isFinite(lon)) continue;
+
+          minLat = Math.min(minLat, lat);
+          maxLat = Math.max(maxLat, lat);
+          minLon = Math.min(minLon, lon);
+          maxLon = Math.max(maxLon, lon);
+          visiblePointCount++;
+          includedAnyForVehicle = true;
+        }
+
+        if (includedAnyForVehicle) visibleVehicleCount++;
       }
       
       // Only pan/zoom if we have at least one moving vehicle
-      if (movingCount > 0 && isFinite(minLat) && isFinite(maxLat)) {
+      if (visibleVehicleCount > 0 && visiblePointCount > 0 && isFinite(minLat) && isFinite(maxLat)) {
         // Add padding
         const latRange = maxLat - minLat;
         const lonRange = maxLon - minLon;
