@@ -4269,8 +4269,22 @@ class MapView {
     // Interpolate time based on position within segment
     const vehicleTMs = prevPoint.tMs + (nextPoint.tMs - prevPoint.tMs) * u;
     
-    // Use actual physics velocity for display, not recorded velocity
-    let speedMps = phys.v;
+    // Calculate true GPS speed for the current segment (real-world speed)
+    // We use the raw segment (idx) that the vehicle is currently traversing
+    let trueSpeedMps = 0;
+    if (idx < pts.length - 1) {
+      const pStart = pts[idx];
+      const pEnd = pts[idx + 1];
+      const distM = cumDist[idx + 1] - cumDist[idx];
+      const timeS = (pEnd.tMs - pStart.tMs) / 1000;
+      if (timeS > 0.1) {
+        trueSpeedMps = distM / timeS;
+      }
+    }
+
+    // Use true GPS speed for display, not the playback-scaled physics velocity
+    // let speedMps = phys.v;
+    let speedMps = trueSpeedMps;
     if (t >= tMax - 1) speedMps = 0;
 
     // Determine transient visibility
