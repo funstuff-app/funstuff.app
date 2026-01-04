@@ -5419,6 +5419,17 @@ class MapView {
             let simD = physD;
             let simV = phys.v || 15;
             
+            // ═══════════════════════════════════════════════════════════════════
+            // EMERGENT PHYSICS: No precalculation. Just react to visible trail.
+            // 
+            // curveDebt = distance lost from slowing for curves
+            // - Paid back by accelerating on straightaways
+            // - Stops: just wait (no debt - we're honoring the GPS data)
+            // ═══════════════════════════════════════════════════════════════════
+            
+            let curveDebt = 0;
+            const CRUISE_SPEED = 15; // Base cruise speed in m/s
+            
             const steeringPath = [{ lat: simLat, lon: simLon }];
             const SIM_STEPS = 30;
             const SIM_DT = 0.1;
@@ -5432,8 +5443,7 @@ class MapView {
               
               // Sample from PRECOMPUTED SMOOTH CURVE
               const lookaheadSample = sampleCurveAtD(targetD);
-              
-              // Also get the curve point at our CURRENT distance (for lateral correction)
+                            // Also get the curve point at our CURRENT distance (for lateral correction)
               const currentCurvePt = sampleCurveAtD(simD);
               
               // Calculate lateral offset from curve
@@ -5467,24 +5477,44 @@ class MapView {
               while (headingDiff < -Math.PI) headingDiff += 2 * Math.PI;
               const headingError = Math.abs(headingDiff);
               
-              // BRAKING: The key insight - if heading error is large, we MUST slow down
-              // Heading error > 0.3 rad (~17°) means we're not aligned with the curve
-              // curvature 0.0001 = gentle, 0.001 = moderate, 0.005+ = sharp
-              const curveFactor = 0.0003 / (0.0003 + maxCurvAhead); // More sensitive
-              
-              // Heading error is the PRIMARY brake signal - if we're pointed wrong, slow down!
-              // At 0.5 rad (~30°) error, reduce to 40% speed
-              // At 1.0 rad (~57°) error, reduce to 10% speed
+              // Curvature and heading factors for curve detection
+              const curveFactor = 0.0003 / (0.0003 + maxCurvAhead);
               const headingFactor = Math.max(0.1, 1.0 - headingError * 1.8);
-              
-              // Lateral offset also triggers braking
               const lateralFactor = Math.max(0.3, 1.0 - lateralOffset / (50 * sqrtSpeed));
               
-              const targetSimV = 15 * curveFactor * headingFactor * lateralFactor;
+              // ═══════════════════════════════════════════════════════════════════
+              // EMERGENT SPEED: No precalculation. Just physics.
+              // ═══════════════════════════════════════════════════════════════════
               
-              const blendRate = simV > targetSimV ? 0.5 : 0.2;
+              const onCurve = curveFactor < 0.7 || headingFactor < 0.7 || lateralFactor < 0.7;
+              
+              // Distance to where we can go
+              const distanceToEnd = visibleTargetD - simD;
+              
+              let targetSimV;
+              // If we're close to the end, slow down / stop
+              if (distanceToEnd < 10) {
+                // At or near the end - stop
+                targetSimV = Math.max(0, distanceToEnd * 0.5);
+              } else if (onCurve) {
+                // On curve - slow for physics
+                targetSimV = CRUISE_SPEED * curveFactor * headingFactor * lateralFactor;
+                // Accumulate curve debt (we're going slower than cruise)
+                const expectedDist = CRUISE_SPEED * SIM_DT * playbackSpeed;
+                const actualDist = targetSimV * SIM_DT * playbackSpeed;
+                curveDebt += (expectedDist - actualDist);
+              } else {
+                // Straightaway - cruise + pay back curve debt
+                const debtPayback = Math.min(curveDebt, CRUISE_SPEED * 0.5 * SIM_DT * playbackSpeed);
+                curveDebt -= debtPayback;
+                const boostRatio = 1.0 + (debtPayback / (CRUISE_SPEED * SIM_DT * playbackSpeed));
+                targetSimV = CRUISE_SPEED * boostRatio;
+              }
+              
+              // Smooth velocity
+              const blendRate = simV > targetSimV ? 0.6 : 0.4;
               simV = simV + blendRate * (targetSimV - simV);
-              simV = Math.max(2, simV);
+              simV = Math.max(0, Math.min(40, simV));
               
               // Steer toward target - steerRate already scaled by 1/sqrt(speed)
               const speedFactor = Math.max(0.5, 15 / Math.max(5, simV));
