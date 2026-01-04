@@ -6,6 +6,7 @@ import math
 import hashlib
 import time
 import sys
+import signal
 import subprocess
 import urllib.request
 import urllib.error
@@ -411,7 +412,7 @@ class AirQualityApp(App):
     """
 
     BINDINGS = [
-        ("r", "refresh_data", "Refresh Data"),
+        ("r", "force_refresh_data", "Refresh Data"),
         ("q", "quit", "Quit"),
         ("n", "rename_sensor", "Name Sensor"),
         ("m", "open_map", "Open Map"),
@@ -426,6 +427,43 @@ class AirQualityApp(App):
     forced_active_sensors = set()
     pinned_sensors = set()
     fixed_history = {}
+    _refresh_token = 0
+
+    def __init__(self, *, dashboard_handle=None, **kwargs):
+        super().__init__(**kwargs)
+        self.dashboard_handle = dashboard_handle
+
+    def _request_web_force_refresh(self) -> None:
+        """Force the served web dashboard to treat the next poll as "new data".
+
+        No new HTTP endpoints: this uses in-process access when bundled
+        (threaded server), and SIGUSR1 when the dashboard runs as a subprocess.
+        """
+        h = getattr(self, "dashboard_handle", None)
+        if h is None:
+            return
+
+        # Bundled mode: in-process server via start_server_in_thread() returns (stop_event, httpd)
+        if isinstance(h, tuple) and len(h) >= 2:
+            httpd = h[1]
+            app_state = getattr(httpd, "app_state", None)
+            if app_state is None:
+                return
+            try:
+                from dashboard_server import bump_force_refresh_seq
+                bump_force_refresh_seq(app_state)
+            except Exception:
+                return
+            return
+
+        # Normal mode: dashboard server is a subprocess; signal it.
+        pid = getattr(h, "pid", None)
+        if isinstance(pid, int) and pid > 0:
+            try:
+                if hasattr(signal, "SIGUSR1"):
+                    os.kill(pid, signal.SIGUSR1)
+            except Exception:
+                pass
 
     def compose(self) -> ComposeResult:
         # Theme is automatically handled by Textual for known themes like 'gruvbox',
@@ -480,6 +518,19 @@ class AirQualityApp(App):
         self.action_refresh_data()
         # Poll every 1 minute (60 seconds)
         self.set_interval(60, self.action_refresh_data)
+
+    def _bump_refresh_token(self) -> int:
+        self._refresh_token += 1
+        return self._refresh_token
+
+    def _with_refresh_meta(self, data: dict, *, forced_refresh: bool, refreshed_at: datetime) -> dict:
+        out = dict(data or {})
+        meta = dict(out.get("meta") or {})
+        meta["forced_refresh"] = bool(forced_refresh)
+        meta["refreshed_at_ts"] = refreshed_at.timestamp()
+        meta["refresh_token"] = self._bump_refresh_token()
+        out["meta"] = meta
+        return out
         
     def setup_data_dir(self):
         self.data_dir = os.path.expanduser("~/.mobileair")
@@ -644,25 +695,50 @@ class AirQualityApp(App):
 
     @work(thread=True)
     def action_refresh_data(self) -> None:
-        self.call_from_thread(self.update_status, f"Fetching data at {datetime.now().strftime('%H:%M:%S')}...")
-        
+        self._refresh_data_common(forced_refresh=False)
+
+    @work(thread=True)
+    def action_force_refresh_data(self) -> None:
+        self._request_web_force_refresh()
+        self._refresh_data_common(forced_refresh=True)
+
+    def _refresh_data_common(self, *, forced_refresh: bool) -> None:
+        now = datetime.now()
+        self.call_from_thread(self.update_status, f"Fetching data at {now.strftime('%H:%M:%S')}...")
+
         mobile_data = self.fetch_data(MOBILE_URL)
         fixed_data = self.fetch_data(FIXED_URL)
-        
+
         # Also fetch wind data
         self.fetch_wind_data()
-        
-        if mobile_data or fixed_data:
+
+        # Always drive the same "data refreshed" UI update routine.
+        # If we couldn't fetch anything, reuse the existing state (don't mutate history).
+        fetched_any = mobile_data is not None or fixed_data is not None
+        if fetched_any:
             combined_data = {
-                "mobile": mobile_data if mobile_data else {},
-                "fixed": fixed_data if fixed_data else {}
+                "mobile": mobile_data or {},
+                "fixed": fixed_data or {},
             }
-            self.call_from_thread(self.update_data_state, combined_data, update_history=True)
-            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            self.call_from_thread(self.update_status, f"Last updated: {now_str}")
-            self.call_from_thread(self.update_last_updated, datetime.now().strftime('%H:%M:%S'))
+            update_history = True
+            status_msg = f"Last updated: {now.strftime('%Y-%m-%d %H:%M:%S')}"
         else:
-            self.call_from_thread(self.update_status, "Failed to fetch data.")
+            combined_data = self.current_data or {"mobile": {}, "fixed": {}}
+            update_history = True if forced_refresh else False
+            status_msg = f"Refreshed (no new fetch): {now.strftime('%Y-%m-%d %H:%M:%S')}"
+
+        combined_data = self._with_refresh_meta(
+            combined_data,
+            forced_refresh=forced_refresh,
+            refreshed_at=now,
+        )
+
+        if forced_refresh:
+            status_msg = f"Forced refresh: {status_msg}"
+
+        self.call_from_thread(self.update_data_state, combined_data, update_history=update_history)
+        self.call_from_thread(self.update_status, status_msg)
+        self.call_from_thread(self.update_last_updated, now.strftime('%H:%M:%S'))
 
     def fetch_wind_data(self) -> None:
         """Fetch wind data from dashboard server or directly from AirNow."""
@@ -1022,6 +1098,29 @@ class AirQualityApp(App):
         self.current_data = data
         self.update_list(data, update_history)
         self.update_widgets()
+
+        # Client-side contract: forced refresh must behave like a "new data" event.
+        # In particular, it must not rely on selection-change events to refresh details.
+        try:
+            meta = data.get("meta") if isinstance(data, dict) else None
+            forced = bool(meta.get("forced_refresh")) if isinstance(meta, dict) else False
+        except Exception:
+            forced = False
+
+        if forced:
+            try:
+                list_view = self.query_one(ListView)
+                if list_view.index is not None and list_view.index < len(list_view.children):
+                    item = list_view.children[list_view.index]
+                    if isinstance(item, SensorItem):
+                        self.update_details_view(item)
+            except Exception:
+                pass
+
+            try:
+                self.refresh()
+            except Exception:
+                pass
 
     def _apply_ghost_classes(self, list_view: ListView):
         current_idx = list_view.index
@@ -1768,7 +1867,7 @@ if __name__ == "__main__":
     else:
         dashboard_handle = _start_dashboard_server_process()
         try:
-            app = AirQualityApp()
+            app = AirQualityApp(dashboard_handle=dashboard_handle)
             app.run()
         finally:
             # Clean up dashboard server

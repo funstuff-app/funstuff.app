@@ -18,6 +18,7 @@ import re
 import ssl
 import socket
 import sys
+import signal
 import threading
 import time
 from dataclasses import dataclass, field
@@ -304,11 +305,58 @@ class AppState:
     fixed_history_path: Path | None = None
     fixed_history_dirty: bool = False
 
+    # Bumped on-demand (e.g., from the TUI) to force the web client to treat the
+    # next /api/state poll as a "new data" event even if timestamps/trails are unchanged.
+    force_refresh_seq: int = 0
+
     def __post_init__(self) -> None:
         try:
             self.cached_json_bytes = json.dumps(self.state).encode("utf-8")
         except Exception:
             self.cached_json_bytes = b"{}"
+
+
+def bump_force_refresh_seq(app_state: AppState) -> int:
+    """Bump the server-side force-refresh sequence.
+
+    This is consumed by the web dashboard client to treat the next poll as a
+    "new data" event (e.g., re-run LIVE camera fit/zoom) even if timestamps
+    and trails are unchanged.
+
+    Important: This function is safe to call from a signal handler; it does not
+    acquire locks or serialize JSON. The next /api/state request will sync
+    cached JSON bytes under the normal lock.
+    """
+    try:
+        app_state.force_refresh_seq = int(getattr(app_state, "force_refresh_seq", 0) or 0) + 1
+    except Exception:
+        try:
+            app_state.force_refresh_seq = 1
+        except Exception:
+            pass
+    return int(getattr(app_state, "force_refresh_seq", 0) or 0)
+
+
+def _ensure_force_refresh_seq_cached(app_state: AppState) -> None:
+    """Ensure cached JSON reflects app_state.force_refresh_seq.
+
+    Must be called under app_state.lock.
+    """
+    st = app_state.state if isinstance(app_state.state, dict) else {"ts": time.time(), "mobile": [], "fixed": [], "meta": {}}
+    meta = st.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        st["meta"] = meta
+
+    seq = int(getattr(app_state, "force_refresh_seq", 0) or 0)
+    if int(meta.get("force_refresh_seq") or 0) != seq:
+        meta["force_refresh_seq"] = seq
+        st["meta"] = meta
+        app_state.state = st
+        try:
+            app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
+        except Exception:
+            pass
 
 
 def load_fixed_history(app_state: AppState, data_dir: Path) -> None:
@@ -1153,6 +1201,8 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             revision += 1
             meta = st.setdefault("meta", {})
             meta.update({"last_fetch_attempt_ts": attempt_ts, "last_fetch_ok_ts": attempt_ts, "server_revision": revision})
+            # Preserve the force-refresh sequence across rebuild_state() calls.
+            meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
             update_app_state_with_new_data(app_state, st)
             print(f"[FetchLoop] Revision {revision} updated", flush=True)
             
@@ -1165,7 +1215,12 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
                 st = app_state.state if isinstance(app_state.state, dict) else {"ts": time.time(), "mobile": [], "fixed": [], "meta": {}}
                 meta = st.setdefault("meta", {})
                 meta["last_fetch_error"] = f"{type(e).__name__}: {e}"
+                meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
                 app_state.state = st
+                try:
+                    app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
+                except Exception:
+                    pass
         stop_event.wait(interval_s)
 
 
@@ -1557,6 +1612,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 return self._send(200, (static_dir / "tui.js").read_bytes(), "text/javascript")
             if self.path.startswith("/api/state"):
                 with app_state.lock:
+                    _ensure_force_refresh_seq_cached(app_state)
                     return self._send(200, app_state.cached_json_bytes, "application/json")
             if self.path.startswith("/api/tui"):
                 return self._handle_tui_state()
@@ -1748,6 +1804,14 @@ def main() -> int:
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir))
     # Timeout for individual requests - helps with Safari/iOS connection issues
     httpd.timeout = 30
+
+    # Allow a local controller process (e.g., the TUI) to request a force-refresh
+    # without any new HTTP endpoint: `kill -USR1 <pid>`.
+    try:
+        if hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, lambda *_: bump_force_refresh_seq(app_state))
+    except Exception:
+        pass
     if args.https:
         cert_path = Path(args.cert) if args.cert else (data_dir / "dev-cert.pem")
         key_path = Path(args.key) if args.key else (data_dir / "dev-key.pem")
@@ -1791,10 +1855,10 @@ def main() -> int:
     return 0
 
 
-def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: float = 60.0) -> tuple[threading.Event, threading.Thread]:
+def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: float = 60.0) -> tuple[threading.Event, ThreadingHTTPServer]:
     """Start the dashboard server in a background thread.
     
-    Returns (stop_event, server_thread) so the caller can stop it later.
+    Returns (stop_event, httpd) so the caller can stop it later.
     Used when running as a bundled executable where subprocess isn't available.
     """
     data_dir = default_data_dir()
@@ -1824,6 +1888,12 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
     httpd = ThreadingHTTPServer((host, port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir))
     # Timeout for individual requests - helps with Safari/iOS connection issues
     httpd.timeout = 30
+
+    # Expose app_state for in-process callers without any new endpoint.
+    try:
+        setattr(httpd, "app_state", app_state)
+    except Exception:
+        pass
     
     def serve():
         try:
