@@ -37,7 +37,7 @@ class VehiclePhysics {
   static CURVE_SPEED = 8;            // m/s in tight curves
   static ACCEL_RATE = 4;             // m/s² acceleration
   static BRAKE_RATE = 6;             // m/s² braking (stronger than accel)
-  static CURVATURE_LOOKAHEAD = 60;   // meters to scan ahead for curves
+  static CURVATURE_LOOKAHEAD = 100;  // meters to scan ahead for curves
   static TRAIL_LOOKAHEAD_BASE = 80;  // base meters ahead of targetD for trail reveal
   static CURVATURE_THRESHOLD = 0.01; // rad/m where we start slowing
   static STOP_BUFFER = 10;           // meters before end to start stopping
@@ -118,44 +118,49 @@ class VehiclePhysics {
   }
 
   /**
-   * Get maximum curvature in a distance window ahead
+   * Calculate safe target speed based on curves ahead and visible end
    */
-  static getMaxCurvatureAhead(cumDist, curvature, currentD, lookaheadDist, totalDist) {
-    const endD = Math.min(currentD + lookaheadDist, totalDist);
-    let maxCurv = 0;
+  static getSafeTargetSpeed(currentD, visibleEndD, cumDist, curvature, totalDist) {
+    const distToEnd = visibleEndD - currentD;
+    
+    // 1. Distance to end of visible road (brake to stop)
+    if (distToEnd <= 0) return 0;
+    if (distToEnd < VehiclePhysics.STOP_BUFFER) {
+      return Math.min(2, distToEnd * 0.5);
+    }
+    
+    // Distance-limited speed: v² = 2as → v = sqrt(2 * brakeRate * distance)
+    const brakeSpeed = Math.sqrt(2 * VehiclePhysics.BRAKE_RATE * Math.max(0, distToEnd - VehiclePhysics.STOP_BUFFER)) * 0.8;
+    
+    // 2. Safe speed for curves ahead
+    // Scan ahead and find the most restrictive speed limit
+    const lookaheadEnd = Math.min(currentD + VehiclePhysics.CURVATURE_LOOKAHEAD, totalDist);
+    let safeCurveSpeed = VehiclePhysics.CRUISE_SPEED;
     
     for (let i = 0; i < cumDist.length; i++) {
       const d = cumDist[i];
-      if (d >= currentD && d <= endD) {
-        if (curvature[i] > maxCurv) maxCurv = curvature[i];
+      if (d < currentD) continue;
+      if (d > lookaheadEnd) break;
+      
+      const curv = curvature[i];
+      if (curv <= 0.001) continue;
+      
+      // Allowed speed at the curve
+      const curvFactor = VehiclePhysics.CURVATURE_THRESHOLD / (VehiclePhysics.CURVATURE_THRESHOLD + curv);
+      const allowedSpeedAtCurve = VehiclePhysics.CURVE_SPEED + 
+        (VehiclePhysics.CRUISE_SPEED - VehiclePhysics.CURVE_SPEED) * curvFactor;
+      
+      // Max speed allowed NOW to safely brake to that speed
+      const distToCurve = d - currentD;
+      const maxApproachSpeed = Math.sqrt(allowedSpeedAtCurve * allowedSpeedAtCurve + 2 * VehiclePhysics.BRAKE_RATE * distToCurve);
+      
+      if (maxApproachSpeed < safeCurveSpeed) {
+        safeCurveSpeed = maxApproachSpeed;
       }
     }
-    return maxCurv;
-  }
-
-  /**
-   * Calculate target speed based on curvature and distance to end of visible road
-   */
-  static getTargetSpeed(currentD, visibleEndD, maxCurvAhead, totalDist) {
-    const distToEnd = visibleEndD - currentD;
-    
-    // If near end of visible road, slow to stop
-    if (distToEnd < VehiclePhysics.STOP_BUFFER) {
-      return 0;
-    }
-    
-    // Distance-limited speed (brake to stop at end of visible road)
-    // v² = 2as → v = sqrt(2 * brakeRate * distance)
-    const brakeSpeed = Math.sqrt(2 * VehiclePhysics.BRAKE_RATE * Math.max(0, distToEnd - VehiclePhysics.STOP_BUFFER));
-    
-    // Curvature-limited speed
-    const curvFactor = VehiclePhysics.CURVATURE_THRESHOLD / 
-      (VehiclePhysics.CURVATURE_THRESHOLD + maxCurvAhead);
-    const curveSpeed = VehiclePhysics.CURVE_SPEED + 
-      (VehiclePhysics.CRUISE_SPEED - VehiclePhysics.CURVE_SPEED) * curvFactor;
     
     // Take minimum of all limits
-    return Math.min(VehiclePhysics.CRUISE_SPEED, brakeSpeed, curveSpeed);
+    return Math.min(VehiclePhysics.CRUISE_SPEED, brakeSpeed, safeCurveSpeed);
   }
 
   /**
@@ -199,15 +204,9 @@ class VehiclePhysics {
     // Vehicle must track playback time exactly - never run ahead
     const visibleEnd = Math.min(targetD, totalDist);
     
-    // Look ahead for curves
-    const maxCurvAhead = VehiclePhysics.getMaxCurvatureAhead(
-      cumDist, curvature, this.d, 
-      VehiclePhysics.CURVATURE_LOOKAHEAD, totalDist
-    );
-    
     // Target speed based on curvature and distance to visible end
-    const targetSpeed = VehiclePhysics.getTargetSpeed(
-      this.d, visibleEnd, maxCurvAhead, totalDist
+    const targetSpeed = VehiclePhysics.getSafeTargetSpeed(
+      this.d, visibleEnd, cumDist, curvature, totalDist
     );
     
     // Apply acceleration/braking
@@ -363,28 +362,42 @@ describe('VehiclePhysics', () => {
     });
   });
   
-  describe('getTargetSpeed', () => {
+  describe('getSafeTargetSpeed', () => {
     it('returns cruise speed on straights', () => {
-      const speed = VehiclePhysics.getTargetSpeed(0, 1000, 0, 1000);
+      const cumDist = [0, 100, 200, 300];
+      const curvature = [0, 0, 0, 0];
+      const totalDist = 300;
+      const speed = VehiclePhysics.getSafeTargetSpeed(0, 300, cumDist, curvature, totalDist);
       assert.strictEqual(speed, VehiclePhysics.CRUISE_SPEED);
     });
     
-    it('slows down for high curvature', () => {
-      const straightSpeed = VehiclePhysics.getTargetSpeed(0, 1000, 0, 1000);
-      const curveSpeed = VehiclePhysics.getTargetSpeed(0, 1000, 0.05, 1000);
+    it('slows down for high curvature ahead', () => {
+      const cumDist = [0, 20, 40];
+      const curvature = [0, 0.1, 0]; // High curvature at 20m
+      const totalDist = 40;
+      
+      const straightSpeed = VehiclePhysics.CRUISE_SPEED;
+      const curveSpeed = VehiclePhysics.getSafeTargetSpeed(0, 40, cumDist, curvature, totalDist);
       
       assert.ok(curveSpeed < straightSpeed, 
         `Expected curve speed ${curveSpeed} < straight speed ${straightSpeed}`);
     });
     
     it('slows to stop near end of visible road', () => {
-      const speed = VehiclePhysics.getTargetSpeed(98, 100, 0, 200);
-      assert.strictEqual(speed, 0);
+      const cumDist = [0, 100];
+      const curvature = [0, 0];
+      const totalDist = 100;
+      const speed = VehiclePhysics.getSafeTargetSpeed(98, 100, cumDist, curvature, totalDist);
+      // Should be crawling, not stopped, but very slow
+      assert.ok(speed > 0 && speed < 2, `Expected crawl speed, got ${speed}`);
     });
     
     it('limits speed when approaching visible end', () => {
+      const cumDist = [0, 100];
+      const curvature = [0, 0];
+      const totalDist = 100;
       // 10m from visible end, should brake to reasonable speed
-      const speed = VehiclePhysics.getTargetSpeed(90, 100, 0, 200);
+      const speed = VehiclePhysics.getSafeTargetSpeed(90, 100, cumDist, curvature, totalDist);
       
       // Should be limited by braking distance
       const expectedMax = Math.sqrt(2 * VehiclePhysics.BRAKE_RATE * (100 - 90 - VehiclePhysics.STOP_BUFFER));
@@ -505,18 +518,15 @@ describe('VehiclePhysics', () => {
       assert.ok(distToTurn < VehiclePhysics.CURVATURE_LOOKAHEAD, 
         `Turn should be within lookahead: ${distToTurn}m < ${VehiclePhysics.CURVATURE_LOOKAHEAD}m`);
       
-      const maxCurv = VehiclePhysics.getMaxCurvatureAhead(
-        geometry.cumDist, geometry.curvature, geometry.cumDist[1], 
-        VehiclePhysics.CURVATURE_LOOKAHEAD, geometry.totalDist
-      );
-      assert.ok(maxCurv > 0.001, `Expected high curvature ahead, got ${maxCurv}`);
+      // Step physics
+      // Target is far ahead so visible road isn't the limit
+      const targetD = geometry.totalDist;
+      const result = phys.step(100, 1100, geometry, targetD);
       
-      // The target speed should be lower when curvature is high
-      const targetSpeedWithCurve = VehiclePhysics.getTargetSpeed(
-        geometry.cumDist[1], geometry.totalDist, maxCurv, geometry.totalDist
-      );
-      assert.ok(targetSpeedWithCurve < VehiclePhysics.CRUISE_SPEED, 
-        `Expected lower target speed due to curve: ${targetSpeedWithCurve} should be < ${VehiclePhysics.CRUISE_SPEED}`);
+      // Should be braking (v < CRUISE_SPEED) because of the turn ahead
+      // In 0.1s step with brake rate 6, speed drops by ~0.6
+      assert.ok(result.v < VehiclePhysics.CRUISE_SPEED - 0.5, 
+        `Should brake for turn. v=${result.v}, cruise=${VehiclePhysics.CRUISE_SPEED}`);
     });
   });
   

@@ -3317,7 +3317,7 @@ class MapView {
   static CURVE_SPEED = 8;             // m/s in tight curves (~18 mph)
   static ACCEL_RATE = 4;              // m/s² acceleration
   static BRAKE_RATE = 6;              // m/s² braking (stronger than accel)
-  static CURVATURE_LOOKAHEAD = 60;    // meters to scan ahead for curves
+  static CURVATURE_LOOKAHEAD = 100;   // meters to scan ahead for curves
   static TRAIL_LOOKAHEAD_BASE = 80;   // base meters ahead of targetD for trail reveal
   static CURVATURE_THRESHOLD = 0.01;  // rad/m where we start slowing
   static STOP_BUFFER = 10;            // meters before visible end to start stopping
@@ -4016,7 +4016,9 @@ class MapView {
     // ═══════════════════════════════════════════════════════════════════════════
     
     const effectiveCruise = vp.cruiseSpeed * controlScalar;
-    const effectiveCurve = vp.curveSpeed * controlScalar;
+    // Scale curve speed sub-linearly so we slow down relatively more when fast-forwarding
+    // This ensures turns look like turns even at 20x speed
+    const effectiveCurve = vp.curveSpeed * Math.pow(controlScalar, 0.75);
     const effectiveAccel = vp.accelRate * controlScalar;
     const effectiveBrake = vp.brakeRate * Math.max(1, controlScalar); // Braking never reduced
     
@@ -4040,19 +4042,42 @@ class MapView {
     // AUTONOMOUS AGENT PHYSICS (modulated by control scalar)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    // Look ahead for curves (scale with control scalar for faster reaction when boosting)
-    let maxCurvAhead = 0;
-    const curveLookaheadEnd = Math.min(phys.d + MapView.CURVATURE_LOOKAHEAD * Math.max(1, controlScalar), totalDist);
-    for (let i = 0; i < curvature.length; i++) {
+    // Look ahead for curves and calculate safe approach speed
+    // Instead of just finding max curvature, we find the most restrictive speed limit
+    // based on distance to each curve.
+    // v_safe = sqrt(v_curve^2 + 2 * a_brake * distance)
+    
+    const lookaheadDist = MapView.CURVATURE_LOOKAHEAD * Math.max(1, controlScalar);
+    const curveLookaheadEnd = Math.min(phys.d + lookaheadDist, totalDist);
+    
+    // Start scanning from the vehicle's current segment
+    let safeSpeed = effectiveCruise;
+    
+    for (let i = vehicleIdx; i < curvature.length; i++) {
       const d = cumDist[i];
-      if (d >= phys.d && d <= curveLookaheadEnd) {
-        if (curvature[i] > maxCurvAhead) maxCurvAhead = curvature[i];
+      if (d < phys.d) continue; // Skip points behind us
+      if (d > curveLookaheadEnd) break; // Stop at lookahead horizon
+      
+      const curv = curvature[i];
+      if (curv <= 0.001) continue; // Skip straights
+      
+      // Calculate speed limit for this specific curve point
+      const curvFactor = MapView.CURVATURE_THRESHOLD / (MapView.CURVATURE_THRESHOLD + curv);
+      const allowedSpeedAtCurve = effectiveCurve + (effectiveCruise - effectiveCurve) * curvFactor;
+      
+      // Calculate max speed allowed NOW to safely brake to that speed by distance d
+      // v_now = sqrt(v_target^2 + 2 * a * d)
+      const distToCurve = d - phys.d;
+      const maxApproachSpeed = Math.sqrt(allowedSpeedAtCurve * allowedSpeedAtCurve + 2 * effectiveBrake * distToCurve);
+      
+      if (maxApproachSpeed < safeSpeed) {
+        safeSpeed = maxApproachSpeed;
       }
     }
     
     // Calculate target speed based on:
     // 1. Distance to end of visible road (brake to stop)
-    // 2. Curvature ahead (slow for curves)
+    // 2. Safe speed for curves ahead (calculated above)
     // 3. Effective cruise speed (modulated by control scalar)
     const distToVisibleEnd = visibleEnd - phys.d;
     
@@ -4068,12 +4093,8 @@ class MapView {
       // Use a safety factor of 0.8 to ensure we don't overshoot
       const brakeSpeed = Math.sqrt(2 * effectiveBrake * Math.max(0, distToVisibleEnd - MapView.STOP_BUFFER)) * 0.8;
       
-      // Curvature-limited speed: interpolate between cruise and curve speed
-      const curvFactor = MapView.CURVATURE_THRESHOLD / (MapView.CURVATURE_THRESHOLD + maxCurvAhead);
-      const curveSpeed = effectiveCurve + (effectiveCruise - effectiveCurve) * curvFactor;
-      
       // Take minimum of all limits
-      targetSpeed = Math.min(effectiveCruise, brakeSpeed, curveSpeed);
+      targetSpeed = Math.min(effectiveCruise, brakeSpeed, safeSpeed);
     }
     
     // Apply acceleration or braking (both scaled by control scalar)
