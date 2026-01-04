@@ -5309,45 +5309,186 @@ class MapView {
             const physD = (phys.d != null && isFinite(phys.d)) ? phys.d : 0;
             const playbackSpeed = this._playbackSpeed || 1.0;
             
-            // Simulate vehicle forward to generate predicted steering path
-            const LOOKAHEAD_BASE = 20;
-            const LOOKAHEAD_PER_SPEED = 8;
-            const lookaheadD = LOOKAHEAD_BASE + LOOKAHEAD_PER_SPEED * Math.sqrt(Math.max(1, playbackSpeed));
+            // Calculate visible end - same as vehicle physics uses
+            const tMin = playbackPts[0].tMs;
+            const tMax = playbackPts[playbackPts.length - 1].tMs;
+            const playT = this._currentPlaybackTimeMs || tMax;
+            const visibleTargetD = this._getTargetDistance(playbackPts, cumDist, totalDist, playT);
             
-            const STEER_RATE_BASE = 4.0;
-            const steerRate = STEER_RATE_BASE / Math.sqrt(Math.max(1, playbackSpeed));
+            // ═══════════════════════════════════════════════════════════════════
+            // PRECOMPUTE SMOOTH CURVE using Catmull-Rom spline interpolation
+            // This creates the path the vehicle WOULD take based on GPS waypoints
+            // ═══════════════════════════════════════════════════════════════════
+            
+            // Find which GPS points are ahead of vehicle (within visible range)
+            const startIdx = cumDist.findIndex(d => d >= physD);
+            const endIdx = cumDist.findIndex(d => d >= visibleTargetD);
+            const visibleStartIdx = Math.max(0, (startIdx === -1 ? 0 : startIdx) - 1);
+            const visibleEndIdx = endIdx === -1 ? playbackPts.length - 1 : Math.min(playbackPts.length - 1, endIdx + 1);
+            
+            // Generate smooth curve waypoints using Catmull-Rom spline
+            const smoothCurve = [];
+            const SAMPLES_PER_SEGMENT = 8; // More samples = smoother curve
+            
+            for (let i = visibleStartIdx; i < visibleEndIdx; i++) {
+              const p0 = playbackPts[Math.max(0, i - 1)];
+              const p1 = playbackPts[i];
+              const p2 = playbackPts[Math.min(playbackPts.length - 1, i + 1)];
+              const p3 = playbackPts[Math.min(playbackPts.length - 1, i + 2)];
+              
+              // Catmull-Rom interpolation with tension 0.5 (standard)
+              const tension = 0.5;
+              const s = (1 - tension) / 2;
+              
+              for (let j = 0; j <= SAMPLES_PER_SEGMENT; j++) {
+                const t = j / SAMPLES_PER_SEGMENT;
+                const t2 = t * t;
+                const t3 = t2 * t;
+                
+                const h1 = -s * t3 + 2 * s * t2 - s * t;
+                const h2 = (2 - s) * t3 + (s - 3) * t2 + 1;
+                const h3 = (s - 2) * t3 + (3 - 2 * s) * t2 + s * t;
+                const h4 = s * t3 - s * t2;
+                
+                const lat = h1 * p0.lat + h2 * p1.lat + h3 * p2.lat + h4 * p3.lat;
+                const lon = h1 * p0.lon + h2 * p1.lon + h3 * p2.lon + h4 * p3.lon;
+                
+                // Calculate distance along curve for this point
+                const segDist = cumDist[i] + (cumDist[Math.min(i + 1, cumDist.length - 1)] - cumDist[i]) * t;
+                
+                // Only include points within visible range and ahead of vehicle
+                if (segDist >= physD && segDist <= visibleTargetD) {
+                  smoothCurve.push({ lat, lon, d: segDist });
+                }
+              }
+            }
+            
+            // Remove duplicate points (from overlapping segments)
+            const deduped = [];
+            for (let i = 0; i < smoothCurve.length; i++) {
+              if (i === 0 || 
+                  Math.abs(smoothCurve[i].lat - deduped[deduped.length - 1].lat) > 1e-7 ||
+                  Math.abs(smoothCurve[i].lon - deduped[deduped.length - 1].lon) > 1e-7) {
+                deduped.push(smoothCurve[i]);
+              }
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STEERING SIMULATION: Vehicle steers toward precomputed curve
+            // All parameters SCALE WITH PLAYBACK SPEED to maintain realistic physics
+            // ═══════════════════════════════════════════════════════════════════
+            
+            const sqrtSpeed = Math.sqrt(Math.max(1, playbackSpeed));
+            
+            // Lookahead INCREASES with speed - need to see curves earlier at high speed
+            const LOOKAHEAD_BASE = 30;      // meters at 1x
+            const LOOKAHEAD_PER_SQRT = 20;  // additional meters per sqrt(speed)
+            const lookaheadD_base = LOOKAHEAD_BASE + LOOKAHEAD_PER_SQRT * sqrtSpeed;
+            
+            // Steering rate DECREASES with speed - more inertia at high speed
+            const STEER_RATE_BASE = 6.0;
+            const steerRate = STEER_RATE_BASE / sqrtSpeed;
+            
+            // Lateral pull-back DECREASES with speed - can't correct as sharply
+            const PULLBACK_BASE = 1.0;
+            const pullbackScale = PULLBACK_BASE / sqrtSpeed;
             
             const metersPerDegLat = 111320;
             const metersPerDegLon = 111320 * Math.cos((phys.lat || 40.7) * Math.PI / 180);
             
-            // Start from current vehicle state
+            // Sample the precomputed curve at a given distance
+            const sampleCurveAtD = (targetD) => {
+              if (deduped.length < 2) return deduped[0] || { lat: phys.lat, lon: phys.lon };
+              for (let i = 0; i < deduped.length - 1; i++) {
+                if (deduped[i + 1].d >= targetD) {
+                  const u = (deduped[i + 1].d - deduped[i].d) > 0.1 
+                    ? (targetD - deduped[i].d) / (deduped[i + 1].d - deduped[i].d)
+                    : 0;
+                  return {
+                    lat: deduped[i].lat + u * (deduped[i + 1].lat - deduped[i].lat),
+                    lon: deduped[i].lon + u * (deduped[i + 1].lon - deduped[i].lon)
+                  };
+                }
+              }
+              return deduped[deduped.length - 1];
+            };
+            
             let simLat = phys.lat || 0;
             let simLon = phys.lon || 0;
             let simHeading = phys.heading || 0;
             let simD = physD;
-            const simV = phys.v || 15; // Use current velocity or default
+            let simV = phys.v || 15;
             
-            // Generate predicted path points
             const steeringPath = [{ lat: simLat, lon: simLon }];
             const SIM_STEPS = 30;
-            const SIM_DT = 0.1; // 100ms per step
+            const SIM_DT = 0.1;
             
-            for (let step = 0; step < SIM_STEPS && simD < totalDist; step++) {
-              // Calculate lookahead target
-              const targetD = Math.min(simD + lookaheadD, totalDist);
-              const lookaheadSample = this._samplePathAtDistance(playbackPts, cumDist, curvature, targetD);
+            for (let step = 0; step < SIM_STEPS && simD < visibleTargetD; step++) {
+              // Lookahead scales with speed, clamped to visible trail
+              const lookaheadD = Math.min(lookaheadD_base, visibleTargetD - simD);
+              if (lookaheadD <= 0) break;
               
-              // Calculate heading to lookahead
-              const dLat = lookaheadSample.lat - simLat;
-              const dLon = lookaheadSample.lon - simLon;
+              const targetD = Math.min(simD + lookaheadD, visibleTargetD);
+              
+              // Sample from PRECOMPUTED SMOOTH CURVE
+              const lookaheadSample = sampleCurveAtD(targetD);
+              
+              // Also get the curve point at our CURRENT distance (for lateral correction)
+              const currentCurvePt = sampleCurveAtD(simD);
+              
+              // Calculate lateral offset from curve
+              const latOffsetM = (simLat - currentCurvePt.lat) * metersPerDegLat;
+              const lonOffsetM = (simLon - currentCurvePt.lon) * metersPerDegLon;
+              const lateralOffset = Math.sqrt(latOffsetM * latOffsetM + lonOffsetM * lonOffsetM);
+              
+              // Look ahead for curves within braking distance (scales with speed)
+              const brakeLookahead = Math.min(simV * playbackSpeed * 2, visibleTargetD - simD);
+              let maxCurvAhead = 0;
+              for (let i = 0; i < curvature.length; i++) {
+                const d = cumDist[i];
+                if (d >= simD && d <= simD + brakeLookahead) {
+                  if (curvature[i] > maxCurvAhead) maxCurvAhead = curvature[i];
+                }
+              }
+              
+              // Steer toward a BLEND of lookahead point and current curve point
+              // Pull-back scales inversely with speed - less aggressive correction at high speed
+              const rawPullBack = Math.min(1, lateralOffset / 50);
+              const pullBack = rawPullBack * pullbackScale; // Scale by 1/sqrt(speed)
+              const blendLat = lookaheadSample.lat * (1 - pullBack) + currentCurvePt.lat * pullBack;
+              const blendLon = lookaheadSample.lon * (1 - pullBack) + currentCurvePt.lon * pullBack;
+              
+              const dLat = blendLat - simLat;
+              const dLon = blendLon - simLon;
               const targetHeading = Math.atan2(dLat, dLon);
               
-              // Steer toward target
               let headingDiff = targetHeading - simHeading;
               while (headingDiff > Math.PI) headingDiff -= 2 * Math.PI;
               while (headingDiff < -Math.PI) headingDiff += 2 * Math.PI;
+              const headingError = Math.abs(headingDiff);
               
-              const steerFactor = 1 - Math.exp(-steerRate * SIM_DT);
+              // BRAKING: The key insight - if heading error is large, we MUST slow down
+              // Heading error > 0.3 rad (~17°) means we're not aligned with the curve
+              // curvature 0.0001 = gentle, 0.001 = moderate, 0.005+ = sharp
+              const curveFactor = 0.0003 / (0.0003 + maxCurvAhead); // More sensitive
+              
+              // Heading error is the PRIMARY brake signal - if we're pointed wrong, slow down!
+              // At 0.5 rad (~30°) error, reduce to 40% speed
+              // At 1.0 rad (~57°) error, reduce to 10% speed
+              const headingFactor = Math.max(0.1, 1.0 - headingError * 1.8);
+              
+              // Lateral offset also triggers braking
+              const lateralFactor = Math.max(0.3, 1.0 - lateralOffset / (50 * sqrtSpeed));
+              
+              const targetSimV = 15 * curveFactor * headingFactor * lateralFactor;
+              
+              const blendRate = simV > targetSimV ? 0.5 : 0.2;
+              simV = simV + blendRate * (targetSimV - simV);
+              simV = Math.max(2, simV);
+              
+              // Steer toward target - steerRate already scaled by 1/sqrt(speed)
+              const speedFactor = Math.max(0.5, 15 / Math.max(5, simV));
+              const steerFactor = 1 - Math.exp(-steerRate * speedFactor * SIM_DT);
               simHeading += steerFactor * headingDiff;
               
               // Move forward
@@ -5359,13 +5500,55 @@ class MapView {
               steeringPath.push({ lat: simLat, lon: simLon });
             }
             
+            // Draw the precomputed smooth curve (the "road" based on GPS data)
+            if (deduped.length >= 2) {
+              ctx.save();
+              
+              // Draw smooth curve line (cyan)
+              ctx.strokeStyle = "#00ffff";
+              ctx.lineWidth = 3;
+              ctx.globalAlpha = 0.7;
+              ctx.setLineDash([]);
+              ctx.beginPath();
+              
+              for (let i = 0; i < deduped.length; i++) {
+                const pt = deduped[i];
+                const norm = latLonToNorm(pt.lat, pt.lon);
+                const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
+                if (i === 0) ctx.moveTo(sp.x, sp.y);
+                else ctx.lineTo(sp.x, sp.y);
+              }
+              ctx.stroke();
+              
+              // Draw waypoint markers along the curve (every ~50m)
+              ctx.fillStyle = "#00ffff";
+              let lastMarkerD = -Infinity;
+              const MARKER_SPACING = 50; // meters between markers
+              for (let i = 0; i < deduped.length; i++) {
+                const pt = deduped[i];
+                if (pt.d - lastMarkerD >= MARKER_SPACING) {
+                  const norm = latLonToNorm(pt.lat, pt.lon);
+                  const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
+                  ctx.beginPath();
+                  ctx.arc(sp.x, sp.y, 4, 0, 2 * Math.PI);
+                  ctx.globalAlpha = 0.9 - (pt.d - physD) / (visibleTargetD - physD + 1) * 0.6;
+                  ctx.fill();
+                  lastMarkerD = pt.d;
+                }
+              }
+              
+              ctx.restore();
+            }
+            
+            // Draw the steering simulation path (where vehicle will actually go)
             if (steeringPath.length >= 2) {
               ctx.save();
               
-              // Draw the steering path (cyan, gradually fading)
-              ctx.strokeStyle = "#00ffff";
-              ctx.lineWidth = 3;
-              ctx.setLineDash([]);
+              // Draw steering path as dashed line
+              ctx.strokeStyle = "#ff00ff"; // Magenta to distinguish from curve
+              ctx.lineWidth = 2;
+              ctx.globalAlpha = 0.5;
+              ctx.setLineDash([5, 5]);
               ctx.beginPath();
               
               for (let i = 0; i < steeringPath.length; i++) {
@@ -5375,32 +5558,7 @@ class MapView {
                 if (i === 0) ctx.moveTo(sp.x, sp.y);
                 else ctx.lineTo(sp.x, sp.y);
               }
-              
-              // Fade from opaque to transparent
-              const gradient = ctx.createLinearGradient(
-                worldToScreenFast(latLonToNorm(steeringPath[0].lat, steeringPath[0].lon).u * ws, 
-                                  latLonToNorm(steeringPath[0].lat, steeringPath[0].lon).v * ws).x,
-                worldToScreenFast(latLonToNorm(steeringPath[0].lat, steeringPath[0].lon).u * ws, 
-                                  latLonToNorm(steeringPath[0].lat, steeringPath[0].lon).v * ws).y,
-                worldToScreenFast(latLonToNorm(steeringPath[steeringPath.length-1].lat, steeringPath[steeringPath.length-1].lon).u * ws, 
-                                  latLonToNorm(steeringPath[steeringPath.length-1].lat, steeringPath[steeringPath.length-1].lon).v * ws).x,
-                worldToScreenFast(latLonToNorm(steeringPath[steeringPath.length-1].lat, steeringPath[steeringPath.length-1].lon).u * ws, 
-                                  latLonToNorm(steeringPath[steeringPath.length-1].lat, steeringPath[steeringPath.length-1].lon).v * ws).y
-              );
-              ctx.globalAlpha = 0.8;
               ctx.stroke();
-              
-              // Draw waypoint dots at intervals
-              for (let i = 0; i < steeringPath.length; i += 3) {
-                const pt = steeringPath[i];
-                const norm = latLonToNorm(pt.lat, pt.lon);
-                const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
-                const alpha = 1 - (i / steeringPath.length) * 0.7;
-                ctx.beginPath();
-                ctx.arc(sp.x, sp.y, 3, 0, 2 * Math.PI);
-                ctx.fillStyle = `rgba(0, 255, 255, ${alpha})`;
-                ctx.fill();
-              }
               
               ctx.restore();
             }
