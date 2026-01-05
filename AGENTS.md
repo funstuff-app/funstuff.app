@@ -1,7 +1,3 @@
-# AI Agent Instructions for MobileAir
-
-This document helps AI coding assistants understand and work with the MobileAir codebase effectively.
-
 ## Project Structure
 
 ```
@@ -93,19 +89,17 @@ The server handles many requests per second. Key optimizations:
 2. Test with `node --check dashboard/app.js`
 3. Run JS tests: `cd dashboard/tests && node --test`
 
-### Hot-Reload Static Files (No Server Restart)
-
-The server reads static files on each request (no in-memory cache). After editing dashboard files, you can update them in-place without restarting:
-
-```bash
-# Build and copy just the static files
-python -m PyInstaller --noconfirm mobileair.spec 2>&1 | tail -3 && \
-sudo cp dist/mobileair/_internal/dashboard/* /opt/mobileair/_internal/dashboard/
-```
-
-This overwrites the deployed static files. The running server serves new files immediately on the next request.
-
 ## Debugging Tips
+
+### Default Debug Protocol (Observe → Act → Explain)
+
+When a failure is **ambiguous** (or you are not highly confident in the cause), do a quick check before interpreting the error text.
+
+- **Observe (lightweight):** run **1–2** cheapest checks that disambiguate the cause (e.g., `pwd`, `ls`, verify a file exists, confirm server reachable, inspect actual payload/log line).
+- **Act:** take exactly one corrective step based on what you observed.
+- **Explain:** summarize using the observed facts.
+
+For straightforward errors with an obvious fix, apply the fix and retry immediately (no ritual probing).
 
 ### Check Raw API Data
 ```python
@@ -238,12 +232,46 @@ The TUI can be packaged as a standalone macOS executable using PyInstaller.
 ### Build Command
 ```bash
 cd /Users/johusha/Stuff/mobileair
-python -m PyInstaller --noconfirm mobileair.spec
+rm -rf build/mobileair dist/mobileair
+python -m PyInstaller --noconfirm --clean mobileair.spec
+```
+
+If you ever see a PyInstaller runtime error like `ArchiveReadError: Python magic pattern mismatch`, it usually means the executable and embedded archive got out of sync (stale/partial rebuild). The clean rebuild above fixes it.
+
+### Verify Bundled Dashboard Assets
+If you add a new file under `dashboard/`, you must also add it to `mobileair.spec` `datas=[...]`.
+
+Sanity check that the built app includes all dashboard assets (especially any newly-added JS):
+```bash
+ls -la dist/mobileair/_internal/dashboard
 ```
 
 ### Deploy Command
 ```bash
-sudo rm -rf /opt/mobileair && sudo mv dist/mobileair /opt/mobileair
+sudo mkdir -p /opt/mobileair && sudo rsync -a --delete dist/mobileair/ /opt/mobileair/
+```
+
+### Quick Verify / Debug
+
+Smoke-test the built binary before deploying:
+
+```bash
+./dist/mobileair/mobileair --help
+```
+
+Confirm the deployed binary matches what you built:
+
+```bash
+shasum -a 256 dist/mobileair/mobileair
+sudo shasum -a 256 /opt/mobileair/mobileair
+```
+
+Confirm what `mobileair` you are running:
+
+```bash
+command -v mobileair
+which -a mobileair
+ls -la /usr/local/bin/mobileair
 ```
 
 ### Run the Binary
@@ -265,7 +293,13 @@ You can also specify host and port:
 
 ### Build + Deploy One-Liner
 ```bash
-cd /Users/johusha/Stuff/mobileair && python -m PyInstaller --noconfirm mobileair.spec 2>&1 | tail -3 && sudo rm -rf /opt/mobileair && sudo mv dist/mobileair /opt/mobileair && echo "Done"
+cd /Users/johusha/Stuff/mobileair && rm -rf build/mobileair dist/mobileair && python -m PyInstaller --noconfirm --clean mobileair.spec 2>&1 | tail -3 && sudo mkdir -p /opt/mobileair && sudo rsync -a --delete dist/mobileair/ /opt/mobileair/ && echo "Done"
+```
+
+### Dashboard JS Tests
+Node’s test runner expects files/globs (not a directory path). Run:
+```bash
+node --test dashboard/tests/*.cjs
 ```
 
 ### Key Details

@@ -309,6 +309,12 @@ class AppState:
     # next /api/state poll as a "new data" event even if timestamps/trails are unchanged.
     force_refresh_seq: int = 0
 
+    # Server-authoritative "since last update" window for mobile trail timestamps.
+    # Values are epoch milliseconds (UTC).
+    last_mobile_max_ms: int | None = None
+    trail_update_start_ms: int | None = None
+    trail_update_end_ms: int | None = None
+
     def __post_init__(self) -> None:
         try:
             self.cached_json_bytes = json.dumps(self.state).encode("utf-8")
@@ -338,7 +344,7 @@ def bump_force_refresh_seq(app_state: AppState) -> int:
 
 
 def _ensure_force_refresh_seq_cached(app_state: AppState) -> None:
-    """Ensure cached JSON reflects app_state.force_refresh_seq.
+    """Ensure cached JSON reflects app_state.force_refresh_seq (and related meta).
 
     Must be called under app_state.lock.
     """
@@ -349,8 +355,22 @@ def _ensure_force_refresh_seq_cached(app_state: AppState) -> None:
         st["meta"] = meta
 
     seq = int(getattr(app_state, "force_refresh_seq", 0) or 0)
+    dirty = False
     if int(meta.get("force_refresh_seq") or 0) != seq:
         meta["force_refresh_seq"] = seq
+        dirty = True
+
+    # Always include server-authoritative trail update window when known.
+    s_ms = getattr(app_state, "trail_update_start_ms", None)
+    e_ms = getattr(app_state, "trail_update_end_ms", None)
+    if s_ms is not None and int(meta.get("trail_update_start_ms") or 0) != int(s_ms):
+        meta["trail_update_start_ms"] = int(s_ms)
+        dirty = True
+    if e_ms is not None and int(meta.get("trail_update_end_ms") or 0) != int(e_ms):
+        meta["trail_update_end_ms"] = int(e_ms)
+        dirty = True
+
+    if dirty:
         st["meta"] = meta
         app_state.state = st
         try:
@@ -745,6 +765,27 @@ def _first_last_ts(trail: list[dict[str, Any]]) -> tuple[float | None, float | N
 
     return get_ms(trail[0]), get_ms(trail[-1])
 
+
+def _max_mobile_trail_ms(mobiles: Any) -> int | None:
+    """Return the newest breadcrumb timestamp across all mobiles as epoch milliseconds."""
+    if not isinstance(mobiles, list):
+        return None
+    best_s: float | None = None
+    for m in mobiles:
+        if not isinstance(m, dict):
+            continue
+        trail = m.get("trail")
+        if not isinstance(trail, list) or not trail:
+            continue
+        _, last_s = _first_last_ts(trail)
+        if last_s is None:
+            continue
+        if best_s is None or last_s > best_s:
+            best_s = last_s
+    if best_s is None:
+        return None
+    return int(best_s * 1000)
+
 def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now: float | None = None) -> None:
     if now is None:
         now = time.time()
@@ -853,6 +894,27 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                 pm["_sticky_ghosted"] = True
             combined_mobile.append(pm)
         st["mobile"] = combined_mobile
+
+        # Compute and publish the server-authoritative "since last update" window.
+        # This is consumed by the dashboard camera-follow to fit only the newly
+        # revealed trail segment.
+        new_max_ms = _max_mobile_trail_ms(st.get("mobile"))
+        if new_max_ms is not None:
+            prev_max_ms = app_state.last_mobile_max_ms
+            if prev_max_ms is None:
+                # First observation: define a minimal window at the end.
+                app_state.trail_update_start_ms = new_max_ms - 1
+                app_state.trail_update_end_ms = new_max_ms
+            elif new_max_ms > prev_max_ms:
+                app_state.trail_update_start_ms = prev_max_ms
+                app_state.trail_update_end_ms = new_max_ms
+            # Always keep last_mobile_max_ms in sync.
+            app_state.last_mobile_max_ms = new_max_ms
+
+            if app_state.trail_update_start_ms is not None:
+                meta["trail_update_start_ms"] = int(app_state.trail_update_start_ms)
+            if app_state.trail_update_end_ms is not None:
+                meta["trail_update_end_ms"] = int(app_state.trail_update_end_ms)
 
         # Merge AirNow readings into fixed sensors
         if app_state.airnow_readings:
