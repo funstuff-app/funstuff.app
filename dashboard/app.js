@@ -3448,6 +3448,12 @@ class MapView {
   static JITTER_THRESHOLD_M = 8;        // Only smooth deviations < 8 meters
   static JITTER_BLEND = 0.3;            // Blend factor for jitter smoothing
   static MIN_TRAIL_LENGTH_M = 50;      // Ignore tiny trails (GPS jitter)
+  static MIN_CAMERA_FIT_SEGMENT_POINTS = 3;
+  static MIN_CAMERA_FIT_SEGMENT_LENGTH_M = 120;
+  static MIN_CAMERA_FIT_SEGMENT_DISPLACEMENT_M = 60;
+  static MIN_CAMERA_FIT_SEGMENT_STRAIGHTNESS = 0.2;
+  static MIN_CAMERA_FIT_SEGMENT_LENGTH_M_2PT = 500;
+  static MIN_CAMERA_FIT_SEGMENT_DISPLACEMENT_M_2PT = 500;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PROGRESSIVE SPLINE PATH
@@ -6798,6 +6804,12 @@ function main() {
         return logic.collectBoundsForMobilesNewSegment(mobiles, windowStartMs, windowEndMs, {
           includeDebugPath: !!map._pbDebugPath,
           minTrailLengthM: MapView.MIN_TRAIL_LENGTH_M,
+          minVisibleSegmentPoints: MapView.MIN_CAMERA_FIT_SEGMENT_POINTS,
+          minVisibleSegmentLengthM: MapView.MIN_CAMERA_FIT_SEGMENT_LENGTH_M,
+          minVisibleSegmentDisplacementM: MapView.MIN_CAMERA_FIT_SEGMENT_DISPLACEMENT_M,
+          minVisibleSegmentStraightness: MapView.MIN_CAMERA_FIT_SEGMENT_STRAIGHTNESS,
+          minVisibleSegmentLengthM2: MapView.MIN_CAMERA_FIT_SEGMENT_LENGTH_M_2PT,
+          minVisibleSegmentDisplacementM2: MapView.MIN_CAMERA_FIT_SEGMENT_DISPLACEMENT_M_2PT,
         });
       }
     } catch {
@@ -6862,6 +6874,28 @@ function main() {
       return out;
     };
 
+    const _segmentStatsMeters = (pts) => {
+      if (!Array.isArray(pts) || pts.length < 2) return { totalM: 0, displacementM: 0, straightness: 0 };
+      let totalM = 0;
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1];
+        const b = pts[i];
+        const d = haversineMeters(Number(a?.lat), Number(a?.lon), Number(b?.lat), Number(b?.lon));
+        if (isFinite(d)) totalM += d;
+      }
+      const first = pts[0];
+      const last = pts[pts.length - 1];
+      const displacementM = haversineMeters(
+        Number(first?.lat),
+        Number(first?.lon),
+        Number(last?.lat),
+        Number(last?.lon)
+      );
+      const disp = isFinite(displacementM) ? displacementM : 0;
+      const straightness = totalM > 0 ? disp / totalM : 0;
+      return { totalM, displacementM: disp, straightness };
+    };
+
     for (const m of mobiles) {
       if (!m || m.ghosted) continue;
 
@@ -6916,6 +6950,23 @@ function main() {
         const recent = _collectRecentVisibleSegment(trail);
         if (recent.length > 0) {
           candidate.push(...recent);
+        }
+      }
+
+      // Guard against false-positive tiny "moving" slivers from GPS noise.
+      if (!map._pbDebugPath) {
+        const st = _segmentStatsMeters(candidate);
+
+        const allowTwoPoint =
+          candidate.length === 2 &&
+          st.totalM >= MapView.MIN_CAMERA_FIT_SEGMENT_LENGTH_M_2PT &&
+          st.displacementM >= MapView.MIN_CAMERA_FIT_SEGMENT_DISPLACEMENT_M_2PT;
+
+        if (!allowTwoPoint) {
+          if (candidate.length < MapView.MIN_CAMERA_FIT_SEGMENT_POINTS) continue;
+          if (st.totalM < MapView.MIN_CAMERA_FIT_SEGMENT_LENGTH_M) continue;
+          if (st.displacementM < MapView.MIN_CAMERA_FIT_SEGMENT_DISPLACEMENT_M) continue;
+          if (st.straightness < MapView.MIN_CAMERA_FIT_SEGMENT_STRAIGHTNESS) continue;
         }
       }
 

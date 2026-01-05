@@ -10,6 +10,12 @@
   const DEFAULT_MIN_TRAIL_LENGTH_M = 50;
   const DEFAULT_MAX_SEGMENT_POINTS = 600;
   const DEFAULT_SIG_EPS_DEG = 1e-4; // ~11m lat; good enough for debouncing
+  const DEFAULT_MIN_VISIBLE_SEGMENT_POINTS = 3;
+  const DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M = 120;
+  const DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M = 60;
+  const DEFAULT_MIN_VISIBLE_SEGMENT_STRAIGHTNESS = 0.2;
+  const DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M_TWO_POINTS = 500;
+  const DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M_TWO_POINTS = 500;
 
   const _isFinite = (x) => typeof x === "number" && isFinite(x);
 
@@ -35,6 +41,30 @@
   };
 
   const isMovingPoint = (p) => !!(p && (p.m === 1 || p.m === "1" || p.m === true));
+
+  function segmentStatsMeters(pts) {
+    if (!Array.isArray(pts) || pts.length < 2) {
+      return { totalM: 0, displacementM: 0, straightness: 0 };
+    }
+    let totalM = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1];
+      const b = pts[i];
+      const d = haversineMeters(Number(a?.lat), Number(a?.lon), Number(b?.lat), Number(b?.lon));
+      if (_isFinite(d)) totalM += d;
+    }
+    const first = pts[0];
+    const last = pts[pts.length - 1];
+    const displacementM = haversineMeters(
+      Number(first?.lat),
+      Number(first?.lon),
+      Number(last?.lat),
+      Number(last?.lon)
+    );
+    const disp = _isFinite(displacementM) ? displacementM : 0;
+    const straightness = totalM > 0 ? disp / totalM : 0;
+    return { totalM, displacementM: disp, straightness };
+  }
 
   function trailMeetsMinLength(trail, minMeters = DEFAULT_MIN_TRAIL_LENGTH_M) {
     if (!Array.isArray(trail) || trail.length < 2) return false;
@@ -138,6 +168,12 @@
     includeDebugPath = false,
     minTrailLengthM = DEFAULT_MIN_TRAIL_LENGTH_M,
     maxSegmentPoints = DEFAULT_MAX_SEGMENT_POINTS,
+    minVisibleSegmentPoints = DEFAULT_MIN_VISIBLE_SEGMENT_POINTS,
+    minVisibleSegmentLengthM = DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M,
+    minVisibleSegmentDisplacementM = DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M,
+    minVisibleSegmentStraightness = DEFAULT_MIN_VISIBLE_SEGMENT_STRAIGHTNESS,
+    minVisibleSegmentLengthM2 = DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M_TWO_POINTS,
+    minVisibleSegmentDisplacementM2 = DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M_TWO_POINTS,
   } = {}) {
     let minLat = Infinity;
     let maxLat = -Infinity;
@@ -167,6 +203,26 @@
       });
 
       if (pts.length === 0) continue;
+
+      // Guard against false-positive "moving" slivers (e.g., a couple of m=1 points from GPS noise).
+      // This prevents the camera from zooming way out to include a remote, tiny artifact.
+      if (!includeDebugPath) {
+        const st = segmentStatsMeters(pts);
+
+        // 2-point segments can happen when we intentionally bound a recent segment.
+        // Allow only if it represents a meaningful displacement (prevents tiny slivers).
+        const allowTwoPoint =
+          pts.length === 2 &&
+          st.totalM >= minVisibleSegmentLengthM2 &&
+          st.displacementM >= minVisibleSegmentDisplacementM2;
+
+        if (!allowTwoPoint) {
+          if (pts.length < minVisibleSegmentPoints) continue;
+          if (st.totalM < minVisibleSegmentLengthM) continue;
+          if (st.displacementM < minVisibleSegmentDisplacementM) continue;
+          if (st.straightness < minVisibleSegmentStraightness) continue;
+        }
+      }
 
       // If the segment is entirely before windowStartMs, it can still be relevant;
       // the server meta window is authoritative, and we cap work via maxSegmentPoints.
@@ -200,6 +256,7 @@
   return {
     parseUtcMs,
     haversineMeters,
+    segmentStatsMeters,
     trailMeetsMinLength,
     collectMostRecentVisibleSegment,
     collectBoundsForMobilesNewSegment,
@@ -207,5 +264,11 @@
     DEFAULT_MIN_TRAIL_LENGTH_M,
     DEFAULT_MAX_SEGMENT_POINTS,
     DEFAULT_SIG_EPS_DEG,
+    DEFAULT_MIN_VISIBLE_SEGMENT_POINTS,
+    DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M,
+    DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M,
+    DEFAULT_MIN_VISIBLE_SEGMENT_STRAIGHTNESS,
+    DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M_TWO_POINTS,
+    DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M_TWO_POINTS,
   };
 });

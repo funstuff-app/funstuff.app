@@ -248,7 +248,7 @@ ls -la dist/mobileair/_internal/dashboard
 
 ### Deploy Command
 ```bash
-sudo mkdir -p /opt/mobileair && sudo rsync -a --delete dist/mobileair/ /opt/mobileair/
+./deploy_local_safe.sh
 ```
 
 ### Quick Verify / Debug
@@ -263,7 +263,7 @@ Confirm the deployed binary matches what you built:
 
 ```bash
 shasum -a 256 dist/mobileair/mobileair
-sudo shasum -a 256 /opt/mobileair/mobileair
+shasum -a 256 ~/.local/mobileair/mobileair
 ```
 
 Confirm what `mobileair` you are running:
@@ -276,24 +276,24 @@ ls -la /usr/local/bin/mobileair
 
 ### Run the Binary
 ```bash
-/opt/mobileair/mobileair
+    ~/.local/mobileair/mobileair
 ```
 
 ### Headless Mode (Server Only)
 To run the dashboard server without the TUI (useful for logging/debugging):
 ```bash
-/opt/mobileair/mobileair --headless
+~/.local/mobileair/mobileair --headless
 ```
 This prints all stdout/stderr to the terminal instead of redirecting to a log file.
 
 You can also specify host and port:
 ```bash
-/opt/mobileair/mobileair --headless --host 0.0.0.0 --port 8766
+~/.local/mobileair/mobileair --headless --host 0.0.0.0 --port 8766
 ```
 
 ### Build + Deploy One-Liner
 ```bash
-cd /Users/johusha/Stuff/mobileair && rm -rf build/mobileair dist/mobileair && python -m PyInstaller --noconfirm --clean mobileair.spec 2>&1 | tail -3 && sudo mkdir -p /opt/mobileair && sudo rsync -a --delete dist/mobileair/ /opt/mobileair/ && echo "Done"
+cd /Users/johusha/Stuff/mobileair && rm -rf build/mobileair dist/mobileair && python -m PyInstaller --noconfirm --clean mobileair.spec 2>&1 | tail -3 && ./deploy_local_safe.sh && echo "Done"
 ```
 
 ### Dashboard JS Tests
@@ -305,6 +305,6 @@ node --test dashboard/tests/*.cjs
 ### Key Details
 - **Spec file**: `mobileair.spec` - PyInstaller configuration
 - **Output**: `dist/mobileair/` directory containing the executable and dependencies
-- **Install location**: `/opt/mobileair/`
+- **Install location**: `~/.local/mobileair/`
 - **Binary size**: ~34 MB
 - **Startup time**: ~1.6s warm, ~2.5s cold

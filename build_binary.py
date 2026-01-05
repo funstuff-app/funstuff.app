@@ -74,9 +74,8 @@ def main():
         print(f"Size:   {size_mb:.1f} MB")
         print("\nRun with:")
         print(f"  {binary_path}")
-        print("\nTo install, copy the entire folder:")
-        print(f"  sudo cp -r {dist_dir} /opt/mobileair")
-        print(f"  sudo ln -sf /opt/mobileair/mobileair /usr/local/bin/mobileair")
+        print("\nTo install (user-local, no /opt required):")
+        print("  ./deploy_local_safe.sh")
     else:
         print("\n❌ Binary not found at expected location")
         sys.exit(1)

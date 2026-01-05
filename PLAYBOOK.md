@@ -50,7 +50,7 @@ If you must change the JSON contract, update both:
 - If you touched the dashboard static files, ensure PyInstaller bundles them.
 
 6) Deploy safely
-- Never delete `/opt/mobileair` as part of normal deploy.
+- Never delete the deploy target directory as part of normal deploy.
 
 ## Tests
 
@@ -95,16 +95,16 @@ ls -la dist/mobileair/_internal/dashboard
 
 ## Deploy (Non-Destructive)
 
-Do not delete `/opt/mobileair`.
+Do not delete the deploy target directory.
 
 ```bash
-sudo mkdir -p /opt/mobileair && sudo rsync -a --delete dist/mobileair/ /opt/mobileair/
+./deploy_local_safe.sh
 ```
 
 Verify deployed assets:
 
 ```bash
-ls -la /opt/mobileair/_internal/dashboard
+ls -la ~/.local/mobileair/_internal/dashboard
 ```
 
 ## Verify / Troubleshoot Build & Deploy
@@ -119,7 +119,7 @@ Confirm the deployed binary matches the built artifact (useful when diagnosing â
 
 ```bash
 shasum -a 256 dist/mobileair/mobileair
-sudo shasum -a 256 /opt/mobileair/mobileair
+shasum -a 256 ~/.local/mobileair/mobileair
 ```
 
 Confirm what `mobileair` you are actually running (common when `/usr/local/bin/mobileair` is a symlink):
@@ -135,4 +135,4 @@ ls -la /usr/local/bin/mobileair
 - Confirm tests pass (`run_tests.py`).
 - Confirm the UI you changed no longer regresses (manual smoke test).
 - Confirm packaging includes new static assets (if any).
-- Confirm deploy did not delete `/opt/mobileair`.
+- Confirm deploy did not delete the deploy target directory.

@@ -79,3 +79,28 @@ test("vehicles with no window-moving points contribute only a short recent segme
   assert.equal(bb.visibleVehicleCount, 1);
   assert.ok(bb.visiblePointCount >= 2);
 });
+
+test("ignores short out-and-back moving sliver (GPS noise) even if m=1", () => {
+  const t0 = Date.UTC(2026, 0, 1, 0, 0, 0);
+  // Artificial sliver: jump out and back, producing path length but low displacement.
+  const trail = [
+    { lat: 40.0, lon: -111.0, t: iso(t0 + 0), m: 1 },
+    { lat: 40.001, lon: -111.0, t: iso(t0 + 10_000), m: 1 },
+    { lat: 40.0, lon: -111.0, t: iso(t0 + 20_000), m: 1 },
+  ];
+
+  const mobiles = [{ id: "S", ghosted: false, trail }];
+  const bb = logic.collectBoundsForMobilesNewSegment(mobiles, t0 + 5_000, t0 + 25_000, {
+    includeDebugPath: false,
+    // Keep overall trail eligibility permissive...
+    minTrailLengthM: 50,
+    // ...but require enough displacement/straightness to count as a real segment.
+    minVisibleSegmentPoints: 3,
+    minVisibleSegmentLengthM: 100,
+    minVisibleSegmentDisplacementM: 80,
+    minVisibleSegmentStraightness: 0.3,
+  });
+
+  assert.equal(bb.visibleVehicleCount, 0);
+  assert.equal(bb.visiblePointCount, 0);
+});
