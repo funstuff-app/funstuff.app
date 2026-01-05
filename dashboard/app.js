@@ -4791,47 +4791,45 @@ class MapView {
         ctx.textBaseline = "middle";
         ctx.fillText(emoji, sp.x, sp.y);
 
-        if (this.showFixedLabels) {
-          // label pill (2 lines): ID line (white) + reading value line (colored)
-          // Use web-safe font stack that works reliably on iOS Safari
-          ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
-          const line1 = label;
-          const line2Key = pr.key ? String(pr.key) : "";
-          const line2Val = formatTagValue(pr.value);
-          // Ensure we have actual text widths (iOS Safari can return 0 for some fonts)
-          const m1 = ctx.measureText(line1);
-          const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
-          const m2b = ctx.measureText(line2Val);
-          const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
-          const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
-          const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
-          const padX = 8;
-          const bw = Math.max(m1w, (m2aw + m2bw)) + padX * 2;
-          const bh = (line2Key || line2Val) ? 30 : 18;
-          const bx = sp.x - bw / 2;
-          const by = sp.y + 18;
-          ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
-          ctx.strokeStyle = safeHex((pr && pr.color) || color);
-          ctx.lineWidth = 1.8;
-          roundRect(ctx, bx, by, bw, bh, 9);
-          ctx.fill();
-          ctx.stroke();
-          ctx.fillStyle = "#e8eef7";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          const padY = 4;
-          const lineH = (bh - padY * 2) / ((line2Key || line2Val) ? 2 : 1);
-          const y1 = by + padY + lineH * 0.5;
-          const y2 = by + padY + lineH * 1.5;
-          ctx.fillText(line1, sp.x, y1);
-          if (line2Key || line2Val) {
-            // draw key in muted, value in pollutant color - use safe widths
-            const x0 = sp.x - (m2aw + m2bw) / 2;
-            ctx.fillStyle = "rgba(232,238,247,0.70)";
-            ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
-            ctx.fillStyle = pr.color || "#ffffff";
-            ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
-          }
+        // label pill (2 lines): ID line (white) + reading value line (colored)
+        // Use web-safe font stack that works reliably on iOS Safari
+        ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+        const line1 = label;
+        const line2Key = pr.key ? String(pr.key) : "";
+        const line2Val = formatTagValue(pr.value);
+        // Ensure we have actual text widths (iOS Safari can return 0 for some fonts)
+        const m1 = ctx.measureText(line1);
+        const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
+        const m2b = ctx.measureText(line2Val);
+        const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
+        const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
+        const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
+        const padX = 8;
+        const bw = Math.max(m1w, (m2aw + m2bw)) + padX * 2;
+        const bh = (line2Key || line2Val) ? 30 : 18;
+        const bx = sp.x - bw / 2;
+        const by = sp.y + 18;
+        ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
+        ctx.strokeStyle = safeHex((pr && pr.color) || color);
+        ctx.lineWidth = 1.8;
+        roundRect(ctx, bx, by, bw, bh, 9);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "#e8eef7";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const padY = 4;
+        const lineH = (bh - padY * 2) / ((line2Key || line2Val) ? 2 : 1);
+        const y1 = by + padY + lineH * 0.5;
+        const y2 = by + padY + lineH * 1.5;
+        ctx.fillText(line1, sp.x, y1);
+        if (line2Key || line2Val) {
+          // draw key in muted, value in pollutant color - use safe widths
+          const x0 = sp.x - (m2aw + m2bw) / 2;
+          ctx.fillStyle = "rgba(232,238,247,0.70)";
+          ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
+          ctx.fillStyle = pr.color || "#ffffff";
+          ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
         }
         ctx.restore();
     }
