@@ -97,6 +97,8 @@
     includeDebugPath = false,
     maxPoints = DEFAULT_MAX_SEGMENT_POINTS,
     minTrailLengthM = DEFAULT_MIN_TRAIL_LENGTH_M,
+    minVisibleSegmentPoints = DEFAULT_MIN_VISIBLE_SEGMENT_POINTS,
+    minVisibleSegmentLengthM = DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M,
   } = {}) {
     if (!Array.isArray(trail) || trail.length < 2) return [];
 
@@ -158,7 +160,14 @@
 
       // If there's no movement in the server update window, only include a short recent
       // segment (bounded by distance) so old trails don't dominate the bounds.
-      if (!hasWindowMoving && totalM >= minTrailLengthM) break;
+      // Important: include *enough* distance/points to satisfy the segment eligibility
+      // checks later, otherwise we can end up with a tiny 2-point sliver that gets
+      // filtered out and produces empty bounds even on a forced refresh.
+      if (!hasWindowMoving) {
+        const needM = includeDebugPath ? minTrailLengthM : Math.max(minTrailLengthM, minVisibleSegmentLengthM);
+        const needPts = includeDebugPath ? 2 : Math.max(2, minVisibleSegmentPoints);
+        if (totalM >= needM && out.length >= needPts) break;
+      }
     }
 
     return out;
@@ -200,6 +209,8 @@
         includeDebugPath,
         maxPoints: maxSegmentPoints,
         minTrailLengthM,
+        minVisibleSegmentPoints,
+        minVisibleSegmentLengthM,
       });
 
       if (pts.length === 0) continue;
