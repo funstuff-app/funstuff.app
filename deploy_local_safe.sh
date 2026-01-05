@@ -12,16 +12,21 @@ set -euo pipefail
 #   ./deploy_local_safe.sh --target "$HOME/.local/mobileair" --in-place
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$REPO_ROOT/dist/mobileair"
+SRC="$REPO_ROOT/dist/mobileair_bundle"
 TS="$(date +%Y%m%d-%H%M%S)"
 
 TARGET="${HOME}/.local/mobileair"
 IN_PLACE=0
+WRAPPER_DIR="${HOME}/.local/bin"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target)
       TARGET="${2:-}"
+      shift 2
+      ;;
+    --wrapper-dir)
+      WRAPPER_DIR="${2:-}"
       shift 2
       ;;
     --in-place)
@@ -44,22 +49,16 @@ if [[ -z "$TARGET" ]]; then
   exit 2
 fi
 
+if [[ -z "$WRAPPER_DIR" ]]; then
+  echo "ERROR: --wrapper-dir requires a directory path" >&2
+  exit 2
+fi
+
 STAGING="$TARGET.__staging"
 BACKUP="$TARGET.backup-$TS"
 
-pick_wrapper_dir() {
-  # Prefer a directory that is already on PATH on Homebrew macOS.
-  if [[ -d "/opt/homebrew/bin" && -w "/opt/homebrew/bin" ]]; then
-    echo "/opt/homebrew/bin"
-    return
-  fi
-  # Fallback to a user-local bin.
-  echo "${HOME}/.local/bin"
-}
-
 install_wrapper() {
-  local wrapperDir
-  wrapperDir="$(pick_wrapper_dir)"
+  local wrapperDir="$WRAPPER_DIR"
   mkdir -p "$wrapperDir"
   local wrapperPath="$wrapperDir/mobileair"
 
@@ -67,7 +66,7 @@ install_wrapper() {
   # expect _internal next to the executable. Use a wrapper that execs the real binary.
   cat > "$wrapperPath" <<EOF
 #!/usr/bin/env bash
-exec "${TARGET}/mobileair" "$@"
+exec "${TARGET}/mobileair" "\$@"
 EOF
   chmod +x "$wrapperPath"
 
@@ -86,10 +85,8 @@ EOF
     echo "NOTE: 'mobileair' is not currently on PATH in this shell."
   fi
 
-  if [[ "$wrapperDir" == "${HOME}/.local/bin" ]]; then
-    echo "If 'mobileair' is not found, add this to your shell PATH:"
-    echo "  export PATH=\"${HOME}/.local/bin:\$PATH\""
-  fi
+  echo "If 'mobileair' is not found, ensure this is on your PATH:"
+  echo "  export PATH=\"${wrapperDir}:\$PATH\""
 }
 
 sudo_if_needed() {

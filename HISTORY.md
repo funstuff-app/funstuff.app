@@ -91,8 +91,8 @@ Run full suite:
 
 ```bash
 cd /Users/johusha/Stuff/mobileair
-rm -rf build/mobileair dist/mobileair
-/Users/johusha/Stuff/mobileair/.venv/bin/python -m PyInstaller --noconfirm --clean mobileair.spec
+rm -rf build/mobileair_bundle dist/mobileair_bundle
+/Users/johusha/Stuff/mobileair/.venv/bin/python -m PyInstaller --noconfirm --clean --workpath build/mobileair_bundle mobileair.spec
 ```
 
 ### Quick Verify / Debug
@@ -100,13 +100,13 @@ rm -rf build/mobileair dist/mobileair
 Smoke-test the built binary before deploying:
 
 ```bash
-./dist/mobileair/mobileair --help
+./dist/mobileair_bundle/mobileair --help
 ```
 
 Confirm the deployed binary matches what you built:
 
 ```bash
-shasum -a 256 dist/mobileair/mobileair
+shasum -a 256 dist/mobileair_bundle/mobileair
 shasum -a 256 ~/.local/mobileair/mobileair
 ```
 
@@ -115,7 +115,7 @@ Confirm what `mobileair` you are running (PATH/symlink sanity):
 ```bash
 command -v mobileair
 which -a mobileair
-ls -la /usr/local/bin/mobileair
+ls -la ~/.local/bin/mobileair
 ```
 
 ### Verify bundled assets (important)
@@ -125,7 +125,7 @@ When adding any new file under `dashboard/`, it must be included in `mobileair.s
 Sanity check:
 
 ```bash
-ls -la dist/mobileair/_internal/dashboard
+ls -la dist/mobileair_bundle/_internal/dashboard
 ```
 
 ### Deploy (non-destructive)
@@ -145,9 +145,9 @@ ls -la ~/.local/mobileair/_internal/dashboard
 ## Pitfalls We Hit (and how to avoid them)
 
 - **PyInstaller didn’t bundle new dashboard file**: adding `dashboard/camera_fit_logic.js` required updating `mobileair.spec` `datas=[...]`.
-  - Fix: always verify `dist/mobileair/_internal/dashboard` before deploying.
+  - Fix: always verify `dist/mobileair_bundle/_internal/dashboard` before deploying.
 - **PyInstaller runtime error `Python magic pattern mismatch`**: caused by a stale/partial rebuild leaving the EXE and embedded archive out of sync.
-  - Fix: always do a clean build (`rm -rf build/mobileair dist/mobileair` + `PyInstaller --clean`) before deploying.
+  - Fix: always do a clean build (`rm -rf build/mobileair_bundle dist/mobileair_bundle` + `PyInstaller --clean --workpath build/mobileair_bundle`) before deploying.
 - **Node test runner path**: `node --test` expects a file/glob in our setup.
   - Use: `node --test dashboard/tests/*.cjs`
 

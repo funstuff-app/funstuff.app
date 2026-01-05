@@ -8,7 +8,7 @@ Usage:
 This will:
 1. Install PyInstaller if not present
 2. Build the native binary using the spec file
-3. Output the binary to dist/mobileair
+3. Output the binary to dist/mobileair_bundle
 """
 
 import subprocess
@@ -49,6 +49,7 @@ def main():
             sys.executable, "-m", "PyInstaller",
             "--clean",
             "--noconfirm",
+            "--workpath", "build/mobileair_bundle",
             "mobileair.spec"
         ],
         capture_output=False
@@ -58,9 +59,9 @@ def main():
         print("\n❌ Build failed!")
         sys.exit(1)
     
-    # Directory mode creates dist/mobileair/mobileair
-    binary_path = script_dir / "dist" / "mobileair" / "mobileair"
-    dist_dir = script_dir / "dist" / "mobileair"
+    # Directory mode creates dist/mobileair_bundle/mobileair
+    binary_path = script_dir / "dist" / "mobileair_bundle" / "mobileair"
+    dist_dir = script_dir / "dist" / "mobileair_bundle"
     
     if binary_path.exists():
         # Calculate total size of dist directory

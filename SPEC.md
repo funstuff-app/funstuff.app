@@ -216,7 +216,7 @@ python run_tests.py
 python -m unittest discover -s tests -p "test_*.py"
 
 # JavaScript tests (requires Node.js)
-cd dashboard/tests && node --test
+node --test dashboard/tests/*.cjs
 ```
 
 ## API Endpoints
