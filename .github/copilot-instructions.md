@@ -60,7 +60,7 @@
 You are an AI coding agent working in the MobileAir repo. Read this carefully and follow it exactly.
 
 **Non-negotiables**
-- Do NOT delete the target deploy directory during deploy. No `sudo rm -rf /opt/mobileair`. Deploy should replace/update artifacts without nuking the directory.
+- Do NOT delete the deploy target directory during deploy (e.g. `~/.local/mobileair` for local installs, `/opt/mobileair` on Raspberry Pi). No `rm -rf` on the deploy dir. Deploy should update artifacts without nuking the directory.
 - Do NOT add new UX, fallbacks, or “helpful” extra behaviors. Implement only what is explicitly requested below.
 - Do NOT lock or override user camera interaction (pan/zoom) with programmatic camera animations.
 - Do NOT add arbitrary time windows (“fallback windows”) or client heuristics for “since last update”. Server meta is authoritative.

@@ -107,7 +107,7 @@ Confirm the deployed binary matches what you built:
 
 ```bash
 shasum -a 256 dist/mobileair/mobileair
-sudo shasum -a 256 /opt/mobileair/mobileair
+shasum -a 256 ~/.local/mobileair/mobileair
 ```
 
 Confirm what `mobileair` you are running (PATH/symlink sanity):
@@ -130,16 +130,16 @@ ls -la dist/mobileair/_internal/dashboard
 
 ### Deploy (non-destructive)
 
-Do not delete `/opt/mobileair`.
+Do not delete the deploy target directory.
 
 ```bash
-sudo mkdir -p /opt/mobileair && sudo rsync -a --delete dist/mobileair/ /opt/mobileair/
+./deploy_local_safe.sh
 ```
 
 Verify deploy:
 
 ```bash
-ls -la /opt/mobileair/_internal/dashboard
+ls -la ~/.local/mobileair/_internal/dashboard
 ```
 
 ## Pitfalls We Hit (and how to avoid them)

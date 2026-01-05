@@ -144,7 +144,7 @@ Changes made this session:
 - Updated `vehicle_physics.test.cjs` to remove `getDynamicLookahead` method and tests
 - Verified all 201 Python + 43 JS tests pass
 
-The build at `/opt/mobileair` contains these changes.
+The build at `~/.local/mobileair` contains these changes.
 
 ---
 
