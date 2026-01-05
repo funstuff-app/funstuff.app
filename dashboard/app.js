@@ -482,11 +482,31 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
     const times = r.history_times;
     const values = r.history;
     const colors = r.history_colors || [];
-    
-    // Convert ISO strings to ms timestamps
-    const timesMs = times.map(t => new Date(t).getTime());
-    
-    // Find the appropriate value for this time
+
+    // Some feeds include null/invalid times (and sometimes null values) as padding.
+    // Those break monotonic ordering and make binary search return wrong indices
+    // (often yielding a null value), which makes fixed-marker labels show key-only.
+    // Build a filtered, monotonic timeline for indexing, but keep original arrays
+    // for sparklines.
+    const timesMs = [];
+    const valuesF = [];
+    const colorsF = [];
+    const n = Math.min(times.length, values.length);
+    for (let i = 0; i < n; i++) {
+      const tMs = parseUtcMs(times[i]);
+      if (!(tMs != null && isFinite(tMs))) continue;
+      const v = values[i];
+      if (v == null) continue;
+      timesMs.push(tMs);
+      valuesF.push(v);
+      colorsF.push(colors[i] || r.color || "#cccccc");
+    }
+    if (timesMs.length < 1) {
+      result[key] = r;
+      continue;
+    }
+
+    // Find the appropriate value for this time (timeline is monotonic)
     const tMin = timesMs[0];
     const tMax = timesMs[timesMs.length - 1];
     
@@ -494,7 +514,7 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
     if (playbackTimeMs <= tMin) {
       idx = 0;
     } else if (playbackTimeMs >= tMax) {
-      idx = values.length - 1;
+      idx = valuesF.length - 1;
     } else {
       // Binary search for the right interval
       let lo = 0;
@@ -508,8 +528,8 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
     }
     
     result[key] = {
-      value: values[idx],
-      color: colors[idx] || r.color || "#cccccc",
+      value: valuesF[idx],
+      color: colorsF[idx] || r.color || "#cccccc",
       // Keep original arrays for sparklines
       history: values,
       history_times: times,
