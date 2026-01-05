@@ -232,8 +232,8 @@ The TUI can be packaged as a standalone macOS executable using PyInstaller.
 ### Build Command
 ```bash
 cd /Users/johusha/Stuff/mobileair
-rm -rf build/mobileair dist/mobileair
-python -m PyInstaller --noconfirm --clean mobileair.spec
+rm -rf build/mobileair_bundle dist/mobileair_bundle
+python -m PyInstaller --noconfirm --clean --workpath build/mobileair_bundle mobileair.spec
 ```
 
 If you ever see a PyInstaller runtime error like `ArchiveReadError: Python magic pattern mismatch`, it usually means the executable and embedded archive got out of sync (stale/partial rebuild). The clean rebuild above fixes it.
@@ -243,7 +243,7 @@ If you add a new file under `dashboard/`, you must also add it to `mobileair.spe
 
 Sanity check that the built app includes all dashboard assets (especially any newly-added JS):
 ```bash
-ls -la dist/mobileair/_internal/dashboard
+ls -la dist/mobileair_bundle/_internal/dashboard
 ```
 
 ### Deploy Command
@@ -256,13 +256,13 @@ ls -la dist/mobileair/_internal/dashboard
 Smoke-test the built binary before deploying:
 
 ```bash
-./dist/mobileair/mobileair --help
+./dist/mobileair_bundle/mobileair --help
 ```
 
 Confirm the deployed binary matches what you built:
 
 ```bash
-shasum -a 256 dist/mobileair/mobileair
+shasum -a 256 dist/mobileair_bundle/mobileair
 shasum -a 256 ~/.local/mobileair/mobileair
 ```
 
@@ -271,7 +271,7 @@ Confirm what `mobileair` you are running:
 ```bash
 command -v mobileair
 which -a mobileair
-ls -la /usr/local/bin/mobileair
+ls -la ~/.local/bin/mobileair
 ```
 
 ### Run the Binary
@@ -293,7 +293,8 @@ You can also specify host and port:
 
 ### Build + Deploy One-Liner
 ```bash
-cd /Users/johusha/Stuff/mobileair && rm -rf build/mobileair dist/mobileair && python -m PyInstaller --noconfirm --clean mobileair.spec 2>&1 | tail -3 && ./deploy_local_safe.sh && echo "Done"
+cd /Users/johusha/Stuff/mobileair && rm -rf build/mobileair_bundle dist/mobileair_bundle && python -m PyInstaller --noconfirm --clean --workpath build/mobileair_bundle mobileair.spec 2>&1 | tail -3 && ./deploy_local_safe.sh && echo "Done"
+
 ```
 
 ### Dashboard JS Tests
@@ -304,7 +305,7 @@ node --test dashboard/tests/*.cjs
 
 ### Key Details
 - **Spec file**: `mobileair.spec` - PyInstaller configuration
-- **Output**: `dist/mobileair/` directory containing the executable and dependencies
+- **Output**: `dist/mobileair_bundle/` directory containing the executable and dependencies
 - **Install location**: `~/.local/mobileair/`
 - **Binary size**: ~34 MB
 - **Startup time**: ~1.6s warm, ~2.5s cold

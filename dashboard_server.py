@@ -1636,6 +1636,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 return self._send(200, (static_dir / "app.js").read_bytes(), "text/javascript")
             if self.path == "/map_nav_engine.js":
                 return self._send(200, (static_dir / "map_nav_engine.js").read_bytes(), "text/javascript")
+            if self.path == "/camera_fit_logic.js":
+                return self._send(200, (static_dir / "camera_fit_logic.js").read_bytes(), "text/javascript")
             if self.path == "/styles.css":
                 return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css")
             if self.path == "/manifest.json":

@@ -176,5 +176,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name='mobileair',
+    name='mobileair_bundle',
 )

@@ -77,7 +77,7 @@ node --test dashboard/tests/*.cjs
 
 ```bash
 cd /Users/johusha/Stuff/mobileair
-rm -rf build/mobileair dist/mobileair
+rm -rf build/mobileair build/mobileair_bundle dist/mobileair dist/mobileair_bundle
 /Users/johusha/Stuff/mobileair/.venv/bin/python -m PyInstaller --noconfirm --clean mobileair.spec
 ```
 
@@ -90,7 +90,7 @@ If you add any new file under `dashboard/` that must ship in the binary, you mus
 Sanity check the bundled assets:
 
 ```bash
-ls -la dist/mobileair/_internal/dashboard
+ls -la dist/mobileair_bundle/_internal/dashboard
 ```
 
 ## Deploy (Non-Destructive)
@@ -112,13 +112,13 @@ ls -la ~/.local/mobileair/_internal/dashboard
 Smoke-test the newly built binary before deploying:
 
 ```bash
-./dist/mobileair/mobileair --help
+./dist/mobileair_bundle/mobileair --help
 ```
 
 Confirm the deployed binary matches the built artifact (useful when diagnosing “works in dist/ but not in /opt/”):
 
 ```bash
-shasum -a 256 dist/mobileair/mobileair
+shasum -a 256 dist/mobileair_bundle/mobileair
 shasum -a 256 ~/.local/mobileair/mobileair
 ```
 
@@ -127,8 +127,10 @@ Confirm what `mobileair` you are actually running (common when `/usr/local/bin/m
 ```bash
 command -v mobileair
 which -a mobileair
-ls -la /usr/local/bin/mobileair
+ls -la ~/.local/bin/mobileair
 ```
+
+If `which -a mobileair` shows an older wrapper earlier on PATH (e.g. under `/usr/local/bin` or `/opt/homebrew/bin`), remove/rename it or adjust PATH so `~/.local/bin` wins.
 
 ## Debug/Validation Checklist (Generic)
 
