@@ -566,11 +566,21 @@ class MapView {
     this.center = { lat: 40.7608, lon: -111.8910 };
     // macOS trackpad UX: two-finger pan + pinch zoom (avoid mouse-drag schema)
     this._centerAnimRAF = null;
+
+    // Auto-camera follow must never override user interaction.
+    // Suppress live-follow/forced-fit animations during interaction + short cooldown.
+    this._autoCameraSuppressedUntilPerfMs = 0;
+    this._autoCameraCooldownMs = 1400;
+    this._lastAutoFitSig = "";
+    this._autoFitInFlightSig = "";
+    this._pendingForcedFit = null; // { bounds, durationMs }
     this.selectedId = null;
     // Marker visibility toggles
     this.showFixed = true;
     this.showMobile = true;
-    this.showLabels = true;
+    // Label visibility is per-sensor-type (mobile vs fixed)
+    this.showMobileLabels = true;
+    this.showFixedLabels = true;
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
     this._traceRAF = null;
@@ -721,6 +731,31 @@ class MapView {
     this.overlayCanvas.addEventListener("touchcancel", (e) => this.onTouchEnd(e), { passive: false });
 
     this.resize();
+  }
+
+  _cancelCameraAnimations() {
+    if (this._centerAnimRAF) cancelAnimationFrame(this._centerAnimRAF);
+    this._centerAnimRAF = null;
+  }
+
+  _suppressAutoCamera({ cooldownMs } = {}) {
+    const cd = (typeof cooldownMs === "number" && isFinite(cooldownMs)) ? cooldownMs : this._autoCameraCooldownMs;
+    const until = performance.now() + Math.max(0, cd);
+    if (!(until <= this._autoCameraSuppressedUntilPerfMs)) {
+      this._autoCameraSuppressedUntilPerfMs = until;
+    }
+  }
+
+  _noteUserInteraction() {
+    // User input wins: cancel in-flight camera animations and suppress new auto-fits.
+    this._cancelCameraAnimations();
+    this._suppressAutoCamera();
+  }
+
+  _canRunAutoCamera() {
+    const now = performance.now();
+    if (this._touchActive || this._mouseDragging || this._pinchZooming) return false;
+    return now >= (this._autoCameraSuppressedUntilPerfMs || 0);
   }
 
   _dataNowMs() {
@@ -915,6 +950,7 @@ class MapView {
     // Safari-only; prevent page zoom and handle pinch natively.
     e.preventDefault();
     e.stopPropagation();
+    this._noteUserInteraction();
     this._stopPinchInertia();
     this._pinchZooming = true;
     const { sx, sy } = this._eventToLocalXY(e);
@@ -935,6 +971,7 @@ class MapView {
     if (!this._gesture) return;
     e.preventDefault();
     e.stopPropagation();
+    this._noteUserInteraction();
     this._pinchZooming = true;
     const { sx, sy } = this._eventToLocalXY(e);
     // Update anchor screen point as the gesture midpoint moves.
@@ -969,6 +1006,8 @@ class MapView {
     
     // Mark touch as active to skip expensive operations during interaction
     this._touchActive = true;
+
+    this._noteUserInteraction();
     
     // Cancel any in-progress pinch inertia
     this._stopPinchInertia();
@@ -1055,6 +1094,8 @@ class MapView {
   onTouchMove(e) {
     if (!this._touchState) return;
     e.preventDefault();
+
+    this._noteUserInteraction();
 
     const touches = e.touches;
     if (touches.length === 0) return;
@@ -1207,6 +1248,7 @@ class MapView {
     }
     */
 
+    this._noteUserInteraction();
     this._mouseDragging = true;
     this._mouseDragMoved = false;
     this._mouseDragStart = { x: e.clientX, y: e.clientY };
@@ -1263,6 +1305,7 @@ class MapView {
       return;
     }
     if (!this._mouseDragging || !this._mouseDragStart || !this._mouseDragCenterStart) return;
+    this._noteUserInteraction();
     const dx = e.clientX - this._mouseDragStart.x;
     const dy = e.clientY - this._mouseDragStart.y;
     if (Math.abs(dx) + Math.abs(dy) > 3) this._mouseDragMoved = true;
@@ -2314,6 +2357,8 @@ class MapView {
     // - pinch-to-zoom -> wheel with ctrlKey=true (zoom)
     e.preventDefault();
 
+    this._noteUserInteraction();
+
     // IMPORTANT: user request: no mouse-wheel zoom and no “ctrl held to zoom”.
     // In browsers on macOS, *trackpad pinch* typically arrives as wheel events with ctrlKey=true
     // and deltaMode=0 (pixel scrolling). We treat ONLY that combination as pinch-zoom.
@@ -3282,11 +3327,25 @@ class MapView {
           const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
           if (tMs == null || !isFinite(tMs)) continue;
           pts.push({ lat, lon, tMs, m: p.m, readings: p.readings });
-          minMs = Math.min(minMs, tMs);
-          maxMs = Math.max(maxMs, tMs);
         }
         if (pts.length >= 1) {
           pts.sort((a, b) => a.tMs - b.tMs);
+
+          // Ignore trails that are effectively just GPS jitter.
+          let totalM = 0;
+          for (let i = 1; i < pts.length; i++) {
+            const a = pts[i - 1];
+            const b = pts[i];
+            const d = haversineMeters(a.lat, a.lon, b.lat, b.lon);
+            if (isFinite(d)) totalM += d;
+            if (totalM >= MapView.MIN_TRAIL_LENGTH_M) break;
+          }
+          if (totalM < MapView.MIN_TRAIL_LENGTH_M) {
+            continue;
+          }
+
+          minMs = Math.min(minMs, pts[0].tMs);
+          maxMs = Math.max(maxMs, pts[pts.length - 1].tMs);
           nextPtsById.set(id, pts);
         }
       }
@@ -3388,6 +3447,7 @@ class MapView {
   static WAYPOINT_AHEAD_PER_SPEED = 5;  // Additional points per speed multiplier
   static JITTER_THRESHOLD_M = 8;        // Only smooth deviations < 8 meters
   static JITTER_BLEND = 0.3;            // Blend factor for jitter smoothing
+  static MIN_TRAIL_LENGTH_M = 50;      // Ignore tiny trails (GPS jitter)
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PROGRESSIVE SPLINE PATH
@@ -4731,45 +4791,47 @@ class MapView {
         ctx.textBaseline = "middle";
         ctx.fillText(emoji, sp.x, sp.y);
 
-        // label pill (2 lines): ID line (white) + reading value line (colored)
-        // Use web-safe font stack that works reliably on iOS Safari
-        ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
-        const line1 = label;
-        const line2Key = pr.key ? String(pr.key) : "";
-        const line2Val = formatTagValue(pr.value);
-        // Ensure we have actual text widths (iOS Safari can return 0 for some fonts)
-        const m1 = ctx.measureText(line1);
-        const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
-        const m2b = ctx.measureText(line2Val);
-        const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
-        const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
-        const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
-        const padX = 8;
-        const bw = Math.max(m1w, (m2aw + m2bw)) + padX * 2;
-        const bh = (line2Key || line2Val) ? 30 : 18;
-        const bx = sp.x - bw / 2;
-        const by = sp.y + 18;
-        ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
-        ctx.strokeStyle = safeHex((pr && pr.color) || color);
-        ctx.lineWidth = 1.8;
-        roundRect(ctx, bx, by, bw, bh, 9);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = "#e8eef7";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        const padY = 4;
-        const lineH = (bh - padY * 2) / ((line2Key || line2Val) ? 2 : 1);
-        const y1 = by + padY + lineH * 0.5;
-        const y2 = by + padY + lineH * 1.5;
-        ctx.fillText(line1, sp.x, y1);
-        if (line2Key || line2Val) {
-          // draw key in muted, value in pollutant color - use safe widths
-          const x0 = sp.x - (m2aw + m2bw) / 2;
-          ctx.fillStyle = "rgba(232,238,247,0.70)";
-          ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
-          ctx.fillStyle = pr.color || "#ffffff";
-          ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
+        if (this.showFixedLabels) {
+          // label pill (2 lines): ID line (white) + reading value line (colored)
+          // Use web-safe font stack that works reliably on iOS Safari
+          ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+          const line1 = label;
+          const line2Key = pr.key ? String(pr.key) : "";
+          const line2Val = formatTagValue(pr.value);
+          // Ensure we have actual text widths (iOS Safari can return 0 for some fonts)
+          const m1 = ctx.measureText(line1);
+          const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
+          const m2b = ctx.measureText(line2Val);
+          const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
+          const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
+          const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
+          const padX = 8;
+          const bw = Math.max(m1w, (m2aw + m2bw)) + padX * 2;
+          const bh = (line2Key || line2Val) ? 30 : 18;
+          const bx = sp.x - bw / 2;
+          const by = sp.y + 18;
+          ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
+          ctx.strokeStyle = safeHex((pr && pr.color) || color);
+          ctx.lineWidth = 1.8;
+          roundRect(ctx, bx, by, bw, bh, 9);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#e8eef7";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          const padY = 4;
+          const lineH = (bh - padY * 2) / ((line2Key || line2Val) ? 2 : 1);
+          const y1 = by + padY + lineH * 0.5;
+          const y2 = by + padY + lineH * 1.5;
+          ctx.fillText(line1, sp.x, y1);
+          if (line2Key || line2Val) {
+            // draw key in muted, value in pollutant color - use safe widths
+            const x0 = sp.x - (m2aw + m2bw) / 2;
+            ctx.fillStyle = "rgba(232,238,247,0.70)";
+            ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
+            ctx.fillStyle = pr.color || "#ffffff";
+            ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
+          }
         }
         ctx.restore();
     }
@@ -5748,7 +5810,7 @@ class MapView {
 
       // Trace-mode speed indicator (buses only): show reproduced playback speed.
       // TODO: also for trax.
-      if ((this.traceMode || this.playbackMode) && this.showLabels) {
+      if ((this.traceMode || this.playbackMode) && this.showMobileLabels) {
         const sid = (m && m.id != null) ? String(m.id).toUpperCase() : "";
         const isBus = (emoji === "🚍") || sid.startsWith("BUS");
         if (isBus) {
@@ -5777,7 +5839,7 @@ class MapView {
       }
 
       // tiny label pill (hideable via showLabels toggle)
-      if (this.showLabels) {
+      if (this.showMobileLabels) {
         const txt1 = label;
         const txt2Key = pr.key ? String(pr.key) : "";
         const txt2Val = formatTagValue(pr.value);
@@ -6232,7 +6294,10 @@ function main() {
   const SIDEBAR_OPEN_KEY = "mobileair.sidebarOpen";
   const SHOW_MOBILE_KEY = "mobileair.showMobile";
   const SHOW_FIXED_KEY = "mobileair.showFixed";
-  const SHOW_LABELS_KEY = "mobileair.showLabels";
+  // Labels are now per-type; keep legacy key as a migration fallback.
+  const SHOW_LABELS_LEGACY_KEY = "mobileair.showLabels";
+  const SHOW_MOBILE_LABELS_KEY = "mobileair.showMobileLabels";
+  const SHOW_FIXED_LABELS_KEY = "mobileair.showFixedLabels";
   const tabMobileEl = document.getElementById("tabMobile");
   const tabFixedEl = document.getElementById("tabPermanent");
   const tabLabelsEl = document.getElementById("tabLabels");
@@ -6248,7 +6313,13 @@ function main() {
   // Restore visibility states
   map.showMobile = localStorage.getItem(SHOW_MOBILE_KEY) !== "false";
   map.showFixed = localStorage.getItem(SHOW_FIXED_KEY) !== "false";
-  map.showLabels = localStorage.getItem(SHOW_LABELS_KEY) !== "false";
+  const legacyShowLabels = localStorage.getItem(SHOW_LABELS_LEGACY_KEY);
+  map.showMobileLabels = localStorage.getItem(SHOW_MOBILE_LABELS_KEY) != null
+    ? (localStorage.getItem(SHOW_MOBILE_LABELS_KEY) !== "false")
+    : (legacyShowLabels !== "false");
+  map.showFixedLabels = localStorage.getItem(SHOW_FIXED_LABELS_KEY) != null
+    ? (localStorage.getItem(SHOW_FIXED_LABELS_KEY) !== "false")
+    : (legacyShowLabels !== "false");
 
   function updateSidebarVisibility() {
     if (sidebarEl) sidebarEl.classList.toggle("hidden", !sidebarOpen);
@@ -6262,6 +6333,7 @@ function main() {
 
   function applySidebarTab() {
     const isMobile = (activeTab === "mobile");
+    const labelsOn = isMobile ? map.showMobileLabels : map.showFixedLabels;
     // "active" = which list is shown in sidebar
     // "disabled" = markers hidden on map (dimmed look)
     if (tabMobileEl) {
@@ -6275,15 +6347,16 @@ function main() {
       tabFixedEl.setAttribute("aria-selected", !isMobile ? "true" : "false");
     }
     if (tabLabelsEl) {
-      tabLabelsEl.classList.toggle("active", map.showLabels);
-      tabLabelsEl.classList.toggle("disabled", !map.showLabels);
+      tabLabelsEl.classList.toggle("active", labelsOn);
+      tabLabelsEl.classList.toggle("disabled", !labelsOn);
     }
     if (listMobileEl) listMobileEl.classList.toggle("hidden", !isMobile);
     if (listFixedEl) listFixedEl.classList.toggle("hidden", isMobile);
     localStorage.setItem(TAB_STORAGE_KEY, isMobile ? "mobile" : "fixed");
     localStorage.setItem(SHOW_MOBILE_KEY, map.showMobile ? "true" : "false");
     localStorage.setItem(SHOW_FIXED_KEY, map.showFixed ? "true" : "false");
-    localStorage.setItem(SHOW_LABELS_KEY, map.showLabels ? "true" : "false");
+    localStorage.setItem(SHOW_MOBILE_LABELS_KEY, map.showMobileLabels ? "true" : "false");
+    localStorage.setItem(SHOW_FIXED_LABELS_KEY, map.showFixedLabels ? "true" : "false");
   }
 
   // Hamburger menu button toggles sidebar
@@ -6338,7 +6411,11 @@ function main() {
   
   if (tabLabelsEl) {
     tabLabelsEl.addEventListener("click", () => {
-      map.showLabels = !map.showLabels;
+      if (activeTab === "mobile") {
+        map.showMobileLabels = !map.showMobileLabels;
+      } else {
+        map.showFixedLabels = !map.showFixedLabels;
+      }
       applySidebarTab();
       map._invalidateOverlayStatic();
       map.drawOverlay(map.lastState);
@@ -6404,7 +6481,6 @@ function main() {
       if (!isFinite(lat) || !isFinite(lon) || !isFinite(zoom)) return false;
       map.center = { lat, lon };
       map.zoom = clamp(zoom, map._zoomMin ?? 3, map._zoomMax ?? 18);
-      map._centeredOnce = true; // prevent "auto center on first mobile" from overriding restore
       return true;
     } catch {
       return false;
@@ -6640,6 +6716,223 @@ function main() {
   // LIVE camera follow: smooth pan/zoom to fit moving vehicles
   const _pbLiveFollowDurationMs = 2000; // animation duration for camera follow (slow, smooth)
   const _pbLiveFollowPadding = 0.15;    // extra padding around bounds (15%)
+
+  function _animateFitBoundsLatLon({ minLat, minLon, maxLat, maxLon }, { durationMs = _pbLiveFollowDurationMs } = {}) {
+    if (!isFinite(minLat) || !isFinite(maxLat) || !isFinite(minLon) || !isFinite(maxLon)) return;
+
+    // User interaction always wins: do not start/continue auto camera fits while the user
+    // is actively panning/zooming, or during the post-interaction cooldown.
+    if (map && typeof map._canRunAutoCamera === "function" && !map._canRunAutoCamera()) return;
+
+    // Add padding
+    const latRange = maxLat - minLat;
+    const lonRange = maxLon - minLon;
+    const latPad = Math.max(latRange * _pbLiveFollowPadding, 0.01); // minimum ~1km
+    const lonPad = Math.max(lonRange * _pbLiveFollowPadding, 0.01);
+
+    minLat -= latPad;
+    maxLat += latPad;
+    minLon -= lonPad;
+    maxLon += lonPad;
+
+    // Compute target zoom and center (similar to fitBoundsLatLon but with custom animation)
+    const w0 = 256;
+    const xMin0 = lonToX(minLon, w0);
+    const xMax0 = lonToX(maxLon, w0);
+    const yMin0 = latToY(maxLat, w0);
+    const yMax0 = latToY(minLat, w0);
+    const dx0 = Math.max(1e-6, Math.abs(xMax0 - xMin0));
+    const dy0 = Math.max(1e-6, Math.abs(yMax0 - yMin0));
+
+    const rect = map.overlayCanvas.getBoundingClientRect();
+    const w = rect.width;
+    const h = rect.height;
+    const pad = map._getOverlayPaddingPx ? map._getOverlayPaddingPx() : { left: 0, right: 0, top: 0, bottom: 0 };
+    const availW = Math.max(40, w - pad.left - pad.right);
+    const availH = Math.max(40, h - pad.top - pad.bottom);
+
+    const scale = Math.min(availW / dx0, availH / dy0);
+    let targetZoom = Math.log2(scale);
+    targetZoom -= 0.18; // breathing room
+    targetZoom = clamp(targetZoom, map._zoomMin || 1, map._zoomMax || 20);
+
+    // Center of bbox
+    const cx0 = (xMin0 + xMax0) / 2;
+    const cy0 = (yMin0 + yMax0) / 2;
+    const centerLL = worldToLatLon(cx0, cy0, 0);
+
+    // Adjust for panel offset
+    const targetScreenX = pad.left + availW / 2;
+    const targetScreenY = pad.top + availH / 2;
+    const cWorld = latLonToWorld(centerLL.lat, centerLL.lon, targetZoom);
+    const centerWorldX = cWorld.x - (targetScreenX - w / 2);
+    const centerWorldY = cWorld.y - (targetScreenY - h / 2);
+    const finalCenter = worldToLatLon(centerWorldX, clamp(centerWorldY, 0, cWorld.ws - 1), targetZoom);
+
+    // Debounce: only animate if it would materially change the camera.
+    try {
+      const qLatLon = (x) => (isFinite(x) ? Math.round(x * 1e5) : NaN);
+      const qZoom = (x) => (isFinite(x) ? Math.round(x * 1e3) : NaN);
+      const curr = map && map.center ? map.center : { lat: NaN, lon: NaN };
+      const currentSig = `${qLatLon(Number(curr.lat))}|${qLatLon(Number(curr.lon))}|${qZoom(Number(map?.zoom))}`;
+      const targetSig = `${qLatLon(Number(finalCenter.lat))}|${qLatLon(Number(finalCenter.lon))}|${qZoom(Number(targetZoom))}`;
+
+      if (currentSig === targetSig) return;
+      if (map && map._centerAnimRAF && map._autoFitInFlightSig === targetSig) return;
+      if (map) {
+        map._autoFitInFlightSig = targetSig;
+        map._lastAutoFitSig = targetSig;
+      }
+    } catch {
+      // ignore
+    }
+
+    map._animateTo(
+      { centerLat: finalCenter.lat, centerLon: finalCenter.lon, zoom: targetZoom },
+      { durationMs }
+    );
+  }
+
+  function _collectBoundsForMobilesNewSegment(mobiles, windowStartMs, windowEndMs) {
+    try {
+      const logic = (typeof window !== "undefined") ? window.CameraFitLogic : null;
+      if (logic && typeof logic.collectBoundsForMobilesNewSegment === "function") {
+        return logic.collectBoundsForMobilesNewSegment(mobiles, windowStartMs, windowEndMs, {
+          includeDebugPath: !!map._pbDebugPath,
+          minTrailLengthM: MapView.MIN_TRAIL_LENGTH_M,
+        });
+      }
+    } catch {
+      // fall through to legacy implementation
+    }
+
+    let minLat = Infinity, maxLat = -Infinity;
+    let minLon = Infinity, maxLon = -Infinity;
+    let visibleVehicleCount = 0;
+    let visiblePointCount = 0;
+
+    const _trailMeetsMinLength = (trail) => {
+      if (!Array.isArray(trail) || trail.length < 2) return false;
+      let totalM = 0;
+      let prev = null;
+      for (const p of trail) {
+        const lat = Number(p?.lat);
+        const lon = Number(p?.lon);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+        if (prev) {
+          const d = haversineMeters(prev.lat, prev.lon, lat, lon);
+          if (isFinite(d)) totalM += d;
+          if (totalM >= MapView.MIN_TRAIL_LENGTH_M) return true;
+        }
+        prev = { lat, lon };
+      }
+      return (totalM >= MapView.MIN_TRAIL_LENGTH_M);
+    };
+
+    // Collect a recent visible (moving) segment ending at/before windowEndMs.
+    // Used when a vehicle has no points inside the update window, but still has a
+    // visible trail we should consider for camera fit.
+    const _collectRecentVisibleSegment = (trail) => {
+      if (!Array.isArray(trail) || trail.length < 2) return [];
+      const out = [];
+      let totalM = 0;
+      let prev = null;
+      for (let i = trail.length - 1; i >= 0; i--) {
+        const p = trail[i];
+        if (!p) continue;
+        const tStr = (typeof p.t === "string") ? p.t : null;
+        const tPointMs = tStr ? parseUtcMs(tStr) : null;
+        if (windowEndMs != null && tPointMs != null && tPointMs > windowEndMs) continue;
+
+        const isMoving = !!(p && (p.m === 1 || p.m === "1" || p.m === true));
+        const isVisiblePt = !!map._pbDebugPath || isMoving;
+        if (!isVisiblePt) continue;
+
+        const lat = Number(p.lat);
+        const lon = Number(p.lon);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+
+        if (prev) {
+          const d = haversineMeters(lat, lon, prev.lat, prev.lon);
+          if (isFinite(d)) totalM += d;
+        }
+        out.push({ lat, lon });
+        prev = { lat, lon };
+
+        if (totalM >= MapView.MIN_TRAIL_LENGTH_M) break;
+      }
+      return out;
+    };
+
+    for (const m of mobiles) {
+      if (!m || m.ghosted) continue;
+
+      const trail = Array.isArray(m.trail) ? m.trail : [];
+      if (trail.length === 0) continue;
+
+      // Ignore jitter-only trails based on overall trail length.
+      // Do NOT filter on per-update segment length; real movement per poll can be short.
+      if (!_trailMeetsMinLength(trail)) continue;
+
+      const candidate = [];
+
+      for (let i = trail.length - 1; i >= 0; i--) {
+        const p = trail[i];
+        if (!p) continue;
+
+        const tStr = (p && typeof p.t === "string") ? p.t : null;
+        const tPointMs = tStr ? parseUtcMs(tStr) : null;
+        if (windowEndMs != null && tPointMs != null && tPointMs > windowEndMs) {
+          continue;
+        }
+        if (windowStartMs != null && tPointMs != null && tPointMs < windowStartMs) {
+          if (candidate.length > 0) {
+            const isMoving = !!(p && (p.m === 1 || p.m === "1" || p.m === true));
+            const isVisiblePt = !!map._pbDebugPath || isMoving;
+            if (isVisiblePt) {
+              const lat = Number(p.lat);
+              const lon = Number(p.lon);
+              if (isFinite(lat) && isFinite(lon)) {
+                candidate.push({ lat, lon });
+              }
+            }
+          }
+          break;
+        }
+
+        const isMoving = !!(p && (p.m === 1 || p.m === "1" || p.m === true));
+        const isVisiblePt = !!map._pbDebugPath || isMoving;
+        if (!isVisiblePt) continue;
+
+        const lat = Number(p.lat);
+        const lon = Number(p.lon);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+
+        candidate.push({ lat, lon });
+      }
+
+      // If this vehicle had no points inside the update window, include a recent
+      // visible (moving) segment from the past so the camera fit reflects what’s
+      // actually visible on the map.
+      if (candidate.length === 0) {
+        const recent = _collectRecentVisibleSegment(trail);
+        if (recent.length > 0) {
+          candidate.push(...recent);
+        }
+      }
+
+      for (const pt of candidate) {
+        minLat = Math.min(minLat, pt.lat);
+        maxLat = Math.max(maxLat, pt.lat);
+        minLon = Math.min(minLon, pt.lon);
+        maxLon = Math.max(maxLon, pt.lon);
+        visiblePointCount++;
+      }
+      visibleVehicleCount++;
+    }
+
+    return { minLat, minLon, maxLat, maxLon, visibleVehicleCount, visiblePointCount };
+  }
   
   // Physics constants
   const _pbPlaybackSpeed = 1.0;       // target velocity when playing forward
@@ -6721,6 +7014,7 @@ function main() {
     let tMs = map.getPlaybackTimeMs();
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
     const durMs = hasBounds ? (b.maxMs - b.minMs) : 1;
+    const prevKnownMaxMs = _pbLastKnownMaxMs;
     
     // LIVE mode: if playhead is uninitialized, start at maxMs
     if (map._playbackLiveFollow && hasBounds && (tMs == null || !isFinite(tMs))) {
@@ -6732,10 +7026,16 @@ function main() {
     // DETECT DATA CHANGES (new data arrived, or data trimmed)
     // ─────────────────────────────────────────────────────────────────────────
     let newDataArrived = false;
+    let forceCameraFit = false;
     
     if (hasBounds) {
       if (_pbLastKnownMaxMs != null && b.maxMs > _pbLastKnownMaxMs + 100) {
         newDataArrived = true;
+        // Record the update window for future forced camera fits.
+        if (typeof prevKnownMaxMs === "number" && isFinite(prevKnownMaxMs)) {
+          _pbLastDataUpdateWindowStartMs = prevKnownMaxMs;
+          _pbLastDataUpdateWindowEndMs = b.maxMs;
+        }
         // Reset stall counter when fresh data arrives
         _pbLiveStallCount = 0;
       }
@@ -6766,8 +7066,17 @@ function main() {
       const state = map.lastState;
       const seq = state?.meta?.force_refresh_seq;
       if (typeof seq === "number" && isFinite(seq)) {
-        if (_pbLastForceRefreshSeq != null && seq !== _pbLastForceRefreshSeq) {
+        if (_pbLastForceRefreshSeq == null) {
+          // If the server seq is already >0 when playback starts (e.g. TUI refresh happened first),
+          // treat it as a one-time forced camera fit.
+          if (seq > 0) {
+            newDataArrived = true;
+            forceCameraFit = true;
+            _pbLiveStallCount = 0;
+          }
+        } else if (seq !== _pbLastForceRefreshSeq) {
           newDataArrived = true;
+          forceCameraFit = true;
           _pbLiveStallCount = 0;
         }
         _pbLastForceRefreshSeq = seq;
@@ -6812,101 +7121,20 @@ function main() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // LIVE CAMERA FOLLOW: Smooth pan/zoom to fit all MOVING vehicles
-    // Only recalculate and animate when fresh data arrives
+    // LIVE CAMERA FOLLOW: Smooth pan/zoom to fit the *newly updated* visible trail.
+    // The server is authoritative for the update window (meta.trail_update_*_ms).
     // ─────────────────────────────────────────────────────────────────────────
-    const state = map.lastState;
-    if (newDataArrived && map._playbackLiveFollow && state) {
-      const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
-      let minLat = Infinity, maxLat = -Infinity;
-      let minLon = Infinity, maxLon = -Infinity;
-      let visibleVehicleCount = 0;
-      let visiblePointCount = 0;
-      
-      for (const m of mobiles) {
-        // Skip ghosted/idle vehicles
-        if (!m || m.ghosted) continue;
-        
-        const trail = Array.isArray(m.trail) ? m.trail : [];
-        if (trail.length === 0) continue;
-
-        // Bounds must include *all visible path segments*, not just the newest point.
-        // We mirror trail visibility rules: in non-debug mode, only moving points (m=1)
-        // contribute to the visible path.
-        let includedAnyForVehicle = false;
-        for (const p of trail) {
-          if (!p) continue;
-          const isMoving = !!(p && (p.m === 1 || p.m === "1" || p.m === true));
-          const isVisiblePt = !!map._pbDebugPath || isMoving;
-          if (!isVisiblePt) continue;
-
-          const lat = Number(p.lat);
-          const lon = Number(p.lon);
-          if (!isFinite(lat) || !isFinite(lon)) continue;
-
-          minLat = Math.min(minLat, lat);
-          maxLat = Math.max(maxLat, lat);
-          minLon = Math.min(minLon, lon);
-          maxLon = Math.max(maxLon, lon);
-          visiblePointCount++;
-          includedAnyForVehicle = true;
+    {
+      const state = map.lastState;
+      const meta = state?.meta;
+      const sMs = (meta && typeof meta.trail_update_start_ms === "number" && isFinite(meta.trail_update_start_ms)) ? meta.trail_update_start_ms : null;
+      const eMs = (meta && typeof meta.trail_update_end_ms === "number" && isFinite(meta.trail_update_end_ms)) ? meta.trail_update_end_ms : null;
+      if ((newDataArrived || forceCameraFit) && map._playbackLiveFollow && state && sMs != null && eMs != null) {
+        const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
+        const bb = _collectBoundsForMobilesNewSegment(mobiles, sMs, eMs);
+        if (bb && bb.visibleVehicleCount > 0 && bb.visiblePointCount > 0 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
+          _animateFitBoundsLatLon(bb, { durationMs: _pbLiveFollowDurationMs });
         }
-
-        if (includedAnyForVehicle) visibleVehicleCount++;
-      }
-      
-      // Only pan/zoom if we have at least one moving vehicle
-      if (visibleVehicleCount > 0 && visiblePointCount > 0 && isFinite(minLat) && isFinite(maxLat)) {
-        // Add padding
-        const latRange = maxLat - minLat;
-        const lonRange = maxLon - minLon;
-        const latPad = Math.max(latRange * _pbLiveFollowPadding, 0.01); // minimum ~1km
-        const lonPad = Math.max(lonRange * _pbLiveFollowPadding, 0.01);
-        
-        minLat -= latPad;
-        maxLat += latPad;
-        minLon -= lonPad;
-        maxLon += lonPad;
-        
-        // Compute target zoom and center (similar to fitBoundsLatLon but with custom animation)
-        const w0 = 256;
-        const xMin0 = lonToX(minLon, w0);
-        const xMax0 = lonToX(maxLon, w0);
-        const yMin0 = latToY(maxLat, w0);
-        const yMax0 = latToY(minLat, w0);
-        const dx0 = Math.max(1e-6, Math.abs(xMax0 - xMin0));
-        const dy0 = Math.max(1e-6, Math.abs(yMax0 - yMin0));
-        
-        const rect = map.overlayCanvas.getBoundingClientRect();
-        const w = rect.width;
-        const h = rect.height;
-        const pad = map._getOverlayPaddingPx ? map._getOverlayPaddingPx() : { left: 0, right: 0, top: 0, bottom: 0 };
-        const availW = Math.max(40, w - pad.left - pad.right);
-        const availH = Math.max(40, h - pad.top - pad.bottom);
-        
-        const scale = Math.min(availW / dx0, availH / dy0);
-        let targetZoom = Math.log2(scale);
-        targetZoom -= 0.18; // breathing room
-        targetZoom = clamp(targetZoom, map._zoomMin || 1, map._zoomMax || 20);
-        
-        // Center of bbox
-        const cx0 = (xMin0 + xMax0) / 2;
-        const cy0 = (yMin0 + yMax0) / 2;
-        const centerLL = worldToLatLon(cx0, cy0, 0);
-        
-        // Adjust for panel offset
-        const targetScreenX = pad.left + availW / 2;
-        const targetScreenY = pad.top + availH / 2;
-        const cWorld = latLonToWorld(centerLL.lat, centerLL.lon, targetZoom);
-        const centerWorldX = cWorld.x - (targetScreenX - w / 2);
-        const centerWorldY = cWorld.y - (targetScreenY - h / 2);
-        const finalCenter = worldToLatLon(centerWorldX, clamp(centerWorldY, 0, cWorld.ws - 1), targetZoom);
-        
-        // Smoothly animate to new bounds (slow animation for gentle following)
-        map._animateTo(
-          { centerLat: finalCenter.lat, centerLon: finalCenter.lon, zoom: targetZoom },
-          { durationMs: _pbLiveFollowDurationMs }
-        );
       }
     }
 
@@ -7925,6 +8153,7 @@ function main() {
 
   const POLL_MS = 2000;
   let _tickInFlight = false;
+  let _tickLastForceRefreshSeq = null;
 
   async function tick() {
     if (_tickInFlight) return;
@@ -7971,16 +8200,6 @@ function main() {
     }
 
     try {
-
-      // initial center: first mobile
-      if (!map._centeredOnce) {
-        const first = Array.isArray(st.mobile) ? st.mobile[0] : null;
-        if (first && isFinite(Number(first.lat)) && isFinite(Number(first.lon))) {
-          map.center = { lat: Number(first.lat), lon: Number(first.lon) };
-          map._centeredOnce = true;
-        }
-      }
-
       // keep selection if possible; DO NOT auto-select anything
       const mobiles = Array.isArray(st.mobile) ? st.mobile : [];
       if (selectedId) {
@@ -8000,6 +8219,49 @@ function main() {
       if (map.getPlaybackTimeMs() == null && nextMax != null) {
         map.setPlaybackTimeMs(nextMax);
       }
+
+      // Forced refresh (from the TUI): trigger a camera refit using the server-provided
+      // update window. This must work even if playback/live-follow RAF is idle.
+      try {
+        const meta = st?.meta;
+        const seqRaw = meta?.force_refresh_seq;
+        const seqNum = (typeof seqRaw === "number" && isFinite(seqRaw)) ? seqRaw : null;
+        let bumped = false;
+        if (seqNum != null) {
+          if (_tickLastForceRefreshSeq == null) {
+            // If the user pressed 'r' before our first successful poll, seq may already be >0.
+            bumped = (seqNum > 0);
+          } else {
+            bumped = (seqNum !== _tickLastForceRefreshSeq);
+          }
+          _tickLastForceRefreshSeq = seqNum;
+        }
+
+        if (bumped) {
+          const sMs = (typeof meta?.trail_update_start_ms === "number" && isFinite(meta.trail_update_start_ms)) ? meta.trail_update_start_ms : null;
+          const eMs = (typeof meta?.trail_update_end_ms === "number" && isFinite(meta.trail_update_end_ms)) ? meta.trail_update_end_ms : null;
+          if (sMs != null && eMs != null) {
+            const bb = _collectBoundsForMobilesNewSegment(mobiles, sMs, eMs);
+            if (bb && bb.visibleVehicleCount > 0 && bb.visiblePointCount > 0 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
+              // Respect user interaction: if the user is panning/zooming, defer until after cooldown.
+              if (typeof map?._canRunAutoCamera === "function" && !map._canRunAutoCamera()) {
+                map._pendingForcedFit = { bounds: bb, durationMs: _pbLiveFollowDurationMs };
+              } else {
+                _animateFitBoundsLatLon(bb, { durationMs: _pbLiveFollowDurationMs });
+              }
+            }
+          }
+        }
+      } catch {}
+
+      // If a forced refresh was requested during user interaction, apply it once we can.
+      try {
+        if (map && map._pendingForcedFit && typeof map._canRunAutoCamera === "function" && map._canRunAutoCamera()) {
+          const p = map._pendingForcedFit;
+          map._pendingForcedFit = null;
+          if (p && p.bounds) _animateFitBoundsLatLon(p.bounds, { durationMs: p.durationMs || _pbLiveFollowDurationMs });
+        }
+      } catch {}
 
       // Avoid forcing an extra overlay redraw every poll.
       // Selection is applied before draw() so the single drawOverlay pass uses the right styling.

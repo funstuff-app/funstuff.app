@@ -98,6 +98,7 @@ a = Analysis(
         # Dashboard static files (browser UI)
         ('dashboard/index.html', 'dashboard'),
         ('dashboard/app.js', 'dashboard'),
+        ('dashboard/camera_fit_logic.js', 'dashboard'),
         ('dashboard/map_nav_engine.js', 'dashboard'),
         ('dashboard/styles.css', 'dashboard'),
         ('dashboard/tui.html', 'dashboard'),
@@ -158,7 +159,7 @@ exe = EXE(
     name='mobileair',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,
+    strip=False,
     upx=False,
     console=True,
     disable_windowed_traceback=False,
@@ -173,7 +174,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=True,
+    strip=False,
     upx=False,
     name='mobileair',
 )
