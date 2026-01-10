@@ -6731,8 +6731,9 @@ function main() {
   // Velocity in "playback ms per wall ms" (1.0 = real-time forward, -15 = fast rewind)
   let _pbVelocity = 0;
   
-  // Track when we first came to rest at the end (for 1s pause before rewind)
-  let _pbAtEndSincePerf = null;   // performance.now() when we first stopped at end
+  // Track when we hit the end and are waiting for vehicles to physically reach the
+  // end of their paths (no fixed pause; rewind triggers when vehicles are done).
+  let _pbAtEndSincePerf = null;   // performance.now() when we started waiting at end
   
   // Track when ease-in phase started (for wall-time-based easing)
   let _pbEaseStartPerf = null;
@@ -6741,6 +6742,10 @@ function main() {
   
   // Flag to track active rewind (not based on velocity)
   let _pbIsRewinding = false;
+
+  // Replay loop start ("point A"): where playback started / where the user last left the playhead.
+  // Auto-rewind returns here instead of rewinding to the global min bound.
+  let _pbLoopStartMs = null;
   
   // Track data bounds to detect new data / trimmed data
   let _pbLastKnownMinMs = null;
@@ -7040,9 +7045,49 @@ function main() {
   const _pbFriction = 0.997;          // velocity decay per ms when coasting (drag inertia)
   const _pbWheelFriction = 0.985;     // velocity decay per ms for wheel scroll (stops faster)
   const _pbForceStrength = 0.008;     // how quickly velocity changes toward target (per ms)
-  const _pbEndPauseMs = 1000;         // wait 1 second at end before rewinding
   const _pbVelocityThreshold = 0.1;   // below this, considered "at rest"
   const _pbEaseInDistance = 0.02;     // start braking when within 2% of bounds (only near edges)
+
+  // When playhead hits end, wait until all vehicle physics states have reached
+  // the end of their path, then trigger rewind.
+  const _pbVehicleDoneEpsM = 1.0;
+  const _pbVehicleDoneVelEpsMps = 0.05;
+
+  function _pbAllVehiclesReachedPlaybackEnd(state) {
+    try {
+      const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
+      let considered = 0;
+      for (const m of mobiles) {
+        if (!m || m.ghosted) continue;
+        const id = (m.id != null) ? String(m.id) : "";
+        if (!id) continue;
+
+        const pts = (map && map._playbackPtsById) ? map._playbackPtsById.get(id) : null;
+        if (!pts || pts.length < 1) continue;
+
+        // Single-point paths are trivially "done".
+        if (pts.length === 1) {
+          considered++;
+          continue;
+        }
+
+        const distInfo = (typeof map?._getPathDistances === "function") ? map._getPathDistances(id, pts) : null;
+        const totalDist = distInfo && isFinite(distInfo.totalDist) ? distInfo.totalDist : 0;
+        const phys = (typeof map?._getPhysicsState === "function") ? map._getPhysicsState(id) : null;
+        const d = phys && isFinite(phys.d) ? phys.d : 0;
+        const v = phys && isFinite(phys.v) ? phys.v : 0;
+
+        considered++;
+        if (!(d >= (totalDist - _pbVehicleDoneEpsM) && v <= _pbVehicleDoneVelEpsMps)) {
+          return false;
+        }
+      }
+      // If we had no vehicles to consider, don't stall.
+      return true;
+    } catch {
+      return true;
+    }
+  }
   
   // Scroll wheel nudge (iPod-style momentum)
   let _pbWheelAccum = 0;              // accumulated wheel delta
@@ -7052,6 +7097,7 @@ function main() {
   // Drag tracking
   let _pbDidDrag = false;             // did the user actually drag (vs click)?
   let _pbIsWheelCoasting = false;     // is current coast from wheel scroll?
+  let _pbCommitLoopStartOnCoastEnd = false;
 
   const fmtTime = (ms) => {
     if (ms == null || !isFinite(ms)) return "—";
@@ -7120,6 +7166,9 @@ function main() {
     if (map._playbackLiveFollow && hasBounds && (tMs == null || !isFinite(tMs))) {
       tMs = b.maxMs;
       map.setPlaybackTimeMs(tMs);
+      // In LIVE mode, the replay loop start should track where playback starts.
+      // This matters if the user later exits LIVE and the system auto-rewinds.
+      _pbLoopStartMs = tMs;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -7208,6 +7257,8 @@ function main() {
         if (tMs == null || !isFinite(tMs) || Math.abs(nextMs - tMs) > 200) {
           tMs = nextMs;
           map.setPlaybackTimeMs(tMs);
+          // Update replay loop start to the beginning of this replay segment.
+          _pbLoopStartMs = tMs;
         }
       }
     }
@@ -7287,15 +7338,18 @@ function main() {
       }
 
       // Determine velocity based on state
-      const atStart = (tMs <= b.minMs + 1);
       const atEnd = (tMs >= b.maxMs - 1);
       const speedMult = map.getPlaybackSpeed() || 1.0;
+
+      // Resolve loop start within current bounds.
+      const loopStartMsRaw = (_pbLoopStartMs != null) ? Number(_pbLoopStartMs) : null;
+      const loopStartMs = (isFinite(loopStartMsRaw)) ? clamp(loopStartMsRaw, b.minMs, b.maxMs) : b.minMs;
       
       if (_pbIsRewinding) {
         // Tape-reel rewind: ramp up, cruise, ease into start
-        const distFromStart = tMs - b.minMs;
-        const totalDist = durMs;
-        const progress = 1 - (distFromStart / totalDist); // 0 at end, 1 at start
+        const totalDist = Math.max(1, b.maxMs - loopStartMs);
+        const distFromStart = tMs - loopStartMs;
+        const progress = 1 - (distFromStart / totalDist); // 0 at end, 1 at loop start
         
         // Base cruise speed: complete full rewind in ~4 seconds
         const cruiseSpeed = -totalDist / 4000;
@@ -7316,7 +7370,7 @@ function main() {
           const speedFactor = 0.3 + (progress / 0.15) * 0.7;
           _pbVelocity = cruiseSpeed * speedFactor;
         } else if (inEasePhase || shouldStartEase) {
-          // NEWTONIAN PHYSICS: constant acceleration to reach playbackSpeed at b.minMs
+          // NEWTONIAN PHYSICS: constant acceleration to reach playbackSpeed at loopStartMs
           if (_pbEaseStartPerf == null) {
             _pbEaseStartPerf = now;
             _pbEaseStartPos = tMs;
@@ -7329,7 +7383,7 @@ function main() {
           // Acceleration = (v_final - v₀) / t
           const v0 = _pbEaseStartVelocity;
           const vFinal = playbackSpeed;
-          const d = _pbEaseStartPos - b.minMs;
+          const d = _pbEaseStartPos - loopStartMs;
           
           const avgVel = (v0 + vFinal) / 2;
           // Avoid division by zero
@@ -7344,7 +7398,7 @@ function main() {
           }
           
           // End ease when we reach start or velocity reaches target
-          if (tMs <= b.minMs + 10 || _pbVelocity >= vFinal) {
+          if (tMs <= loopStartMs + 10 || _pbVelocity >= vFinal) {
             _pbIsRewinding = false;
             _pbEaseStartPerf = null;
             _pbVelocity = playbackSpeed;
@@ -7368,13 +7422,11 @@ function main() {
       } else if (map.getPlaybackPlaying()) {
         // Normal forward playback
         if (atEnd) {
-          // At end, not LIVE: stop and remain at the end (no auto-rewind).
+          // At end, not LIVE, not rewinding: hold playhead and let vehicle physics
+          // finish moving to the end of their paths; rewind will trigger when all
+          // vehicles are actually at the end.
+          if (_pbAtEndSincePerf == null) _pbAtEndSincePerf = now;
           _pbVelocity = 0;
-          _pbWheelAccum = 0;
-          _pbAtEndSincePerf = null;
-          _pbIsRewinding = false;
-          map.setPlaybackPlaying(false);
-          updatePlaybackUi();
         } else {
           // Normal forward - maintain playback speed
           _pbVelocity = _pbPlaybackSpeed * speedMult;
@@ -7391,12 +7443,20 @@ function main() {
         if (_pbVelocity > 0 && _pbVelocity <= playbackSpeed) {
           // Forward coasting reached playback speed - resume
           _pbIsWheelCoasting = false;
+          if (_pbCommitLoopStartOnCoastEnd) {
+            _pbLoopStartMs = tMs;
+            _pbCommitLoopStartOnCoastEnd = false;
+          }
           _pbVelocity = playbackSpeed;
           map.setPlaybackPlaying(true);
           updatePlaybackUi();
         } else if (_pbVelocity < 0 && Math.abs(_pbVelocity) < _pbVelocityThreshold) {
           // Backward coasting stopped - resume forward playback
           _pbIsWheelCoasting = false;
+          if (_pbCommitLoopStartOnCoastEnd) {
+            _pbLoopStartMs = tMs;
+            _pbCommitLoopStartOnCoastEnd = false;
+          }
           _pbVelocity = playbackSpeed;
           map.setPlaybackPlaying(true);
           updatePlaybackUi();
@@ -7414,15 +7474,16 @@ function main() {
       // Move playhead
       if (Math.abs(_pbVelocity) > 0) {
         let nextMs = tMs + _pbVelocity * dt;
-        
-        // Clamp to bounds
-        nextMs = clamp(nextMs, b.minMs, b.maxMs);
+
+        // Clamp to bounds; during auto-rewind, clamp to loopStartMs instead of the global min.
+        const rewindMinMs = (_pbIsRewinding && loopStartMs != null && isFinite(loopStartMs)) ? loopStartMs : b.minMs;
+        nextMs = clamp(nextMs, rewindMinMs, b.maxMs);
         
         // If we hit a bound, zero velocity (unless in active ease - let ease control it)
-        if (nextMs <= b.minMs && _pbVelocity < 0 && _pbEaseStartPerf == null) {
+        if (nextMs <= rewindMinMs && _pbVelocity < 0 && _pbEaseStartPerf == null) {
           _pbVelocity = 0;
           _pbIsRewinding = false; // rewind complete
-          nextMs = b.minMs;
+          nextMs = rewindMinMs;
         }
         if (nextMs >= b.maxMs && _pbVelocity > 0) {
           _pbVelocity = 0;
@@ -7457,8 +7518,28 @@ function main() {
     // ─────────────────────────────────────────────────────────────────────────
     // RENDER
     // ─────────────────────────────────────────────────────────────────────────
-    if (didAdvanceTime) {
+    const waitingForVehiclesAtEnd =
+      !_pbIsRewinding &&
+      map.getPlaybackPlaying() &&
+      !map._playbackLiveFollow &&
+      hasBounds &&
+      tMs != null &&
+      isFinite(tMs) &&
+      (tMs >= b.maxMs - 1) &&
+      (_pbAtEndSincePerf != null);
+
+    if (didAdvanceTime || waitingForVehiclesAtEnd) {
       map.drawOverlay(map.lastState, { cacheUnderlay: true });
+    }
+
+    // If we're waiting at the end (no fixed pause), start rewind exactly when
+    // the last vehicle reaches the end of its path.
+    if (waitingForVehiclesAtEnd) {
+      if (_pbAllVehiclesReachedPlaybackEnd(map.lastState)) {
+        _pbIsRewinding = true;
+        _pbVelocity = _pbRewindSpeed;
+        _pbAtEndSincePerf = null;
+      }
     }
 
     // UI updates
@@ -7584,13 +7665,14 @@ function main() {
 
       // If at the end (paused, not LIVE), initiate immediate rewind
       if (atEnd) {
-        // "Live" button at the end should enter LIVE-follow, not rewind.
+        // If we don't have a loop start yet, fall back to the global min.
+        if (_pbLoopStartMs == null || !isFinite(Number(_pbLoopStartMs))) {
+          _pbLoopStartMs = b.minMs;
+        }
         _pbAtEndSincePerf = null;
         _pbWheelAccum = 0;
-        _pbIsRewinding = false;
-        _pbVelocity = 0;
-        map._playbackLiveFollow = true;
-        if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
+        _pbIsRewinding = true;
+        _pbVelocity = _pbRewindSpeed; // immediate rewind velocity
         map.setPlaybackPlaying(true);
         _pbLastPerf = 0;
         if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
@@ -7602,6 +7684,11 @@ function main() {
       _pbAtEndSincePerf = null;
       _pbWheelAccum = 0;
       _pbIsRewinding = false;
+      // Capture replay point A if it hasn't been set via scrubbing.
+      if (_pbLoopStartMs == null || !isFinite(Number(_pbLoopStartMs))) {
+        const cur = map.getPlaybackTimeMs();
+        _pbLoopStartMs = (cur != null && isFinite(Number(cur))) ? Number(cur) : b.minMs;
+      }
       _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
       map.setPlaybackPlaying(true);
       _pbLastPerf = 0;
@@ -8176,12 +8263,18 @@ function main() {
       const relMs = Number(pbScrubEl.value);
       if (!isFinite(relMs)) return;
       const tMs = b.minMs + relMs;
-      map.setPlaybackTimeMs(clamp(tMs, b.minMs, b.maxMs));
+      const clampedT = clamp(tMs, b.minMs, b.maxMs);
+      map.setPlaybackTimeMs(clampedT);
 
       // Entering LIVE state ONLY when the slider is dragged all the way to the end.
       const maxMs = Number(pbScrubEl.max);
       // Use a more generous epsilon (1.5s) for "snapping" to live follow when dragging near the end.
       map._playbackLiveFollow = (isFinite(maxMs) && relMs >= maxMs - 1500);
+
+      // If the user leaves the playhead somewhere (non-LIVE), treat it as replay point A.
+      if (!map._playbackLiveFollow) {
+        _pbLoopStartMs = clampedT;
+      }
 
       updatePlaybackUi();
       map.drawOverlay(map.lastState);
@@ -8250,6 +8343,7 @@ function main() {
       // Exit LIVE mode on scroll
       map._playbackLiveFollow = false;
       _pbIsWheelCoasting = true;
+      _pbCommitLoopStartOnCoastEnd = true;
       // Horizontal scroll (two-finger swipe): deltaX > 0 = swipe right = backward in time
       // Scale by timeline duration for proportional movement, reduced sensitivity
       const b = map.getPlaybackBounds();
