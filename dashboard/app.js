@@ -3329,6 +3329,19 @@ class MapView {
       let minMs = Infinity;
       let maxMs = -Infinity;
 
+      // Live playback is "today only"; clamp the window start to 5:00 AM local time.
+      // Use the newest reading timestamp to determine what "today" means.
+      const liveDayStartMs = (!this._historicalMode)
+        ? (() => {
+            const bestMs = newestReadingMsFromState(state);
+            if (bestMs == null || !isFinite(bestMs)) return null;
+            const d = new Date(bestMs);
+            d.setHours(5, 0, 0, 0);
+            const ms = d.getTime();
+            return isFinite(ms) ? ms : null;
+          })()
+        : null;
+
       const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
       for (const m of mobiles) {
         const id = m && m.id != null ? String(m.id) : "";
@@ -3351,11 +3364,19 @@ class MapView {
         if (pts.length >= 1) {
           pts.sort((a, b) => a.tMs - b.tMs);
 
+          let filtered = pts;
+          if (liveDayStartMs != null && isFinite(liveDayStartMs)) {
+            filtered = pts.filter(p => p.tMs >= liveDayStartMs);
+          }
+          if (!Array.isArray(filtered) || filtered.length < 2) {
+            continue;
+          }
+
           // Ignore trails that are effectively just GPS jitter.
           let totalM = 0;
-          for (let i = 1; i < pts.length; i++) {
-            const a = pts[i - 1];
-            const b = pts[i];
+          for (let i = 1; i < filtered.length; i++) {
+            const a = filtered[i - 1];
+            const b = filtered[i];
             const d = haversineMeters(a.lat, a.lon, b.lat, b.lon);
             if (isFinite(d)) totalM += d;
             if (totalM >= MapView.MIN_TRAIL_LENGTH_M) break;
@@ -3364,13 +3385,15 @@ class MapView {
             continue;
           }
 
-          minMs = Math.min(minMs, pts[0].tMs);
-          maxMs = Math.max(maxMs, pts[pts.length - 1].tMs);
-          nextPtsById.set(id, pts);
+          minMs = Math.min(minMs, filtered[0].tMs);
+          maxMs = Math.max(maxMs, filtered[filtered.length - 1].tMs);
+          nextPtsById.set(id, filtered);
         }
       }
 
       this._playbackPtsById = nextPtsById;
+      // NOTE: liveDayStartMs is a *filter floor* (exclude overnight data), not a forced UI range.
+      // Keeping min bound at the first actual point avoids a long empty "dead zone" on fresh loads.
       this._playbackMinMs = isFinite(minMs) ? minMs : null;
       this._playbackMaxMs = isFinite(maxMs) ? maxMs : null;
     }
@@ -3392,7 +3415,7 @@ class MapView {
   // ─────────────────────────────────────────────────────────────────────────────
   
   // Physics constants (matching unit tests in vehicle_physics.test.cjs)
-  static CRUISE_SPEED = 25;           // m/s on straights (~55 mph)
+  static CRUISE_SPEED = 12;           // m/s on straights (~25 mph)
   static CURVE_SPEED = 8;             // m/s in tight curves (~18 mph)
   static ACCEL_RATE = 4;              // m/s² acceleration
   static BRAKE_RATE = 6;              // m/s² braking (stronger than accel)
@@ -4615,14 +4638,22 @@ class MapView {
 
         const driveMs = Math.max(1, tCum);
 
-        // Prevent loop "teleport": after pausing at the end, drive back to the loop start quickly.
+        // NOTE: "rewind at the end of time" logic (loop return) is intentionally disabled.
+        // This used to add a fast "return" segment after reaching the end, which makes the
+        // playback jump back toward the loop start.
+        //
+        // // Prevent loop "teleport": after pausing at the end, drive back to the loop start quickly.
+        // const loopStartPt = pts[0];
+        // const endPt = pts[pts.length - 1] || loopStartPt;
+        // const backDistM = haversineMeters(endPt.lat, endPt.lon, loopStartPt.lat, loopStartPt.lon);
+        // const returnMs = (isFinite(backDistM) && backDistM > 3)
+        //   ? clamp(1000 + (backDistM / 250) * 1000, 1000, 3000)
+        //   : 0;
+        // const totalMsWithReturn = driveMs + pauseMs + returnMs;
+
         const loopStartPt = pts[0];
-        const endPt = pts[pts.length - 1] || loopStartPt;
-        const backDistM = haversineMeters(endPt.lat, endPt.lon, loopStartPt.lat, loopStartPt.lon);
-        const returnMs = (isFinite(backDistM) && backDistM > 3)
-          ? clamp(1000 + (backDistM / 250) * 1000, 1000, 3000)
-          : 0;
-        const totalMsWithReturn = driveMs + pauseMs + returnMs;
+        const returnMs = 0;
+        const totalMsWithReturn = driveMs + pauseMs;
 
         nextRoutesById.set(id, {
           pts,
@@ -7153,6 +7184,33 @@ function main() {
     } catch {
       // ignore
     }
+
+    // When new server data arrives (or TUI forces a refresh), rewind the playhead so the
+    // newest segment gets replayed.
+    //
+    // Important: scale the rewind by the current playback speed.
+    // If the server updates every ~10 minutes and playback speed is 5x, the client will
+    // have consumed ~50 minutes of data-time between updates; we must rewind ~50 minutes
+    // of data-time to replay what happened since the last update.
+    if (hasBounds && map._playbackLiveFollow && (newDataArrived || forceCameraFit)) {
+      const meta = map.lastState?.meta;
+      const sMs = (meta && typeof meta.trail_update_start_ms === "number" && isFinite(meta.trail_update_start_ms)) ? meta.trail_update_start_ms : null;
+      const eMs = (meta && typeof meta.trail_update_end_ms === "number" && isFinite(meta.trail_update_end_ms)) ? meta.trail_update_end_ms : null;
+      const updateIntervalMs = (sMs != null && eMs != null) ? (eMs - sMs) : null;
+      const speedMult = map.getPlaybackSpeed() || 1.0;
+      if (updateIntervalMs != null && isFinite(updateIntervalMs) && updateIntervalMs > 0 && isFinite(speedMult) && speedMult > 0) {
+        const rewindMs = updateIntervalMs * speedMult;
+        const targetMs = b.maxMs - rewindMs;
+        const nextMs = clamp(targetMs, b.minMs, b.maxMs);
+        // Apply when the target is materially different.
+        // (On a forced refresh we may need to seek forward or backward depending on where
+        // the playhead currently is; the intention is to jump to the replay start.)
+        if (tMs == null || !isFinite(tMs) || Math.abs(nextMs - tMs) > 200) {
+          tMs = nextMs;
+          map.setPlaybackTimeMs(tMs);
+        }
+      }
+    }
     
     // ─────────────────────────────────────────────────────────────────────────
     // LIVE BUFFER CALCULATION
@@ -7310,18 +7368,13 @@ function main() {
       } else if (map.getPlaybackPlaying()) {
         // Normal forward playback
         if (atEnd) {
-          // At end, not LIVE, not rewinding: pause then auto-rewind
-          if (_pbAtEndSincePerf == null) {
-            _pbAtEndSincePerf = now;
-            _pbVelocity = 0; // stop at end
-          }
-          const timeAtEnd = now - _pbAtEndSincePerf;
-          if (timeAtEnd >= _pbEndPauseMs) {
-            // Time's up - start rewinding
-            _pbIsRewinding = true;
-            _pbVelocity = _pbRewindSpeed;
-            _pbAtEndSincePerf = null; // reset so we don't keep retriggering
-          }
+          // At end, not LIVE: stop and remain at the end (no auto-rewind).
+          _pbVelocity = 0;
+          _pbWheelAccum = 0;
+          _pbAtEndSincePerf = null;
+          _pbIsRewinding = false;
+          map.setPlaybackPlaying(false);
+          updatePlaybackUi();
         } else {
           // Normal forward - maintain playback speed
           _pbVelocity = _pbPlaybackSpeed * speedMult;
@@ -7531,10 +7584,13 @@ function main() {
 
       // If at the end (paused, not LIVE), initiate immediate rewind
       if (atEnd) {
+        // "Live" button at the end should enter LIVE-follow, not rewind.
         _pbAtEndSincePerf = null;
         _pbWheelAccum = 0;
-        _pbIsRewinding = true;
-        _pbVelocity = _pbRewindSpeed; // immediate rewind velocity
+        _pbIsRewinding = false;
+        _pbVelocity = 0;
+        map._playbackLiveFollow = true;
+        if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
         map.setPlaybackPlaying(true);
         _pbLastPerf = 0;
         if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
@@ -8028,7 +8084,7 @@ function main() {
     const options = [];
     
     // Today (live)
-    options.push({ value: "live", label: "📡 Today (Live)" });
+    options.push({ value: "live", label: "🔮 Today (Live)" });
     
     // Past 6 days
     for (let i = 1; i <= 6; i++) {
@@ -8310,6 +8366,28 @@ function main() {
           const sMs = (typeof meta?.trail_update_start_ms === "number" && isFinite(meta.trail_update_start_ms)) ? meta.trail_update_start_ms : null;
           const eMs = (typeof meta?.trail_update_end_ms === "number" && isFinite(meta.trail_update_end_ms)) ? meta.trail_update_end_ms : null;
           if (sMs != null && eMs != null) {
+            // Also rewind playback time to replay the newest segment.
+            // Must account for playback speed (data-time consumed between server updates).
+            // Respect active scrub/drag so user interaction wins.
+            try {
+              if (!_pbScrubbing && !(typeof map?._hasPbMarkerInertia === "function" && map._hasPbMarkerInertia())) {
+                const bounds = map.getPlaybackBounds();
+                const hasPbBounds = isFinite(bounds?.minMs) && isFinite(bounds?.maxMs) && Number(bounds.maxMs) > Number(bounds.minMs);
+                if (hasPbBounds) {
+                  const updateIntervalMs = Number(eMs) - Number(sMs);
+                  const speedMult = map.getPlaybackSpeed() || 1.0;
+                  if (isFinite(updateIntervalMs) && updateIntervalMs > 0 && isFinite(speedMult) && speedMult > 0) {
+                    const targetMs = Number(bounds.maxMs) - updateIntervalMs * speedMult;
+                    const nextMs = clamp(targetMs, Number(bounds.minMs), Number(bounds.maxMs));
+                    const cur = map.getPlaybackTimeMs();
+                    if (cur == null || !isFinite(Number(cur)) || Math.abs(nextMs - Number(cur)) > 200) {
+                      map.setPlaybackTimeMs(nextMs);
+                    }
+                  }
+                }
+              }
+            } catch {}
+
             const bb = _collectBoundsForMobilesNewSegment(mobiles, sMs, eMs);
             if (bb && bb.visibleVehicleCount > 0 && bb.visiblePointCount > 0 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
               // Respect user interaction: if the user is panning/zooming, defer until after cooldown.
