@@ -651,6 +651,11 @@ class MapView {
     // This is the default "LIVE" experience (no rewinds).
     this._playbackLiveFollow = true;
 
+    // Foveated road matching: progressively match segments during playback
+    this._roadMatchedRangesById = new Map(); // id -> [{fromMs, toMs}] - already matched ranges
+    this._roadMatchPending = new Set(); // sensor IDs currently being fetched
+    this._roadMatchLastRequestMs = 0; // throttle requests
+
     // Data-time clock (UTC epoch ms) anchored to incoming trail timestamps.
     // This avoids using wall-clock Date.now() directly for decay timing.
     this._dataNowBaseMs = null; // UTC epoch ms
@@ -668,9 +673,15 @@ class MapView {
     // and scrub the global playhead from it. Only the last-interacted marker uses this.
     this._pbInertia2d = null; // { id, t0Ms, lastMs, posClient:{x,y}, vel:{x,y} }
     this._pbDebugPath = false;
+    this._pbDebugRawGps = true; // Show raw GPS path in debug mode (orange)
+    this._pbDebugRoadLines = true; // Show road graph lines in debug mode (blue)
     // Vehicle actual path buffer: records the dynamically computed positions (phys.lat/lon)
     // This is the ACTUAL path the vehicle takes, which differs based on speed/steering
     this._vehicleActualPathById = new Map(); // id -> [{lat, lon, d}]
+    // Raw GPS storage: original GPS coordinates before road snapping
+    this._rawGpsById = new Map(); // id -> [{lat, lon, t, ...}]
+    // Road graph edges cache (for debug visualization)
+    this._roadGraphEdges = null; // [{lat1, lon1, lat2, lon2}, ...] or null
 
     // Selection orchestration (polished camera + trace sync).
     this._selectOrchRAF = null;
@@ -3336,6 +3347,15 @@ class MapView {
             const bestMs = newestReadingMsFromState(state);
             if (bestMs == null || !isFinite(bestMs)) return null;
             const d = new Date(bestMs);
+
+            // If it's after midnight but before 5AM local time, "today's 5AM" is in the
+            // future relative to bestMs; in that case the live window should start at
+            // the previous day's 5AM.
+            const localHour = d.getHours();
+            if (localHour < 5) {
+              d.setDate(d.getDate() - 1);
+            }
+
             d.setHours(5, 0, 0, 0);
             const ms = d.getTime();
             return isFinite(ms) ? ms : null;
@@ -3400,6 +3420,208 @@ class MapView {
 
     // Track maxMs for other uses
     this._playbackLastMaxMs = this._playbackMaxMs;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // DEBUG: Fetch road graph edges for visualization
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  async _fetchRoadEdgesForViewport() {
+    if (!this._pbDebugPath || !this._pbDebugRoadLines) return;
+    if (this._roadEdgesFetching) return;
+    
+    // Get viewport bounds
+    const rect = this.overlayCanvas.getBoundingClientRect();
+    const w = rect.width, h = rect.height;
+    const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
+    
+    // Convert corners to lat/lon
+    const tl = worldToLatLon(centerW.x - w/2, centerW.y - h/2, this.zoom);
+    const br = worldToLatLon(centerW.x + w/2, centerW.y + h/2, this.zoom);
+    
+    const minLat = Math.min(tl.lat, br.lat);
+    const maxLat = Math.max(tl.lat, br.lat);
+    const minLon = Math.min(tl.lon, br.lon);
+    const maxLon = Math.max(tl.lon, br.lon);
+    
+    // Don't refetch if viewport hasn't changed much
+    const key = `${minLat.toFixed(3)},${maxLat.toFixed(3)},${minLon.toFixed(3)},${maxLon.toFixed(3)}`;
+    if (this._roadEdgesLastKey === key) return;
+    
+    this._roadEdgesFetching = true;
+    
+    try {
+      const url = `/api/road_edges?minLat=${minLat}&maxLat=${maxLat}&minLon=${minLon}&maxLon=${maxLon}&limit=8000`;
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      this._roadGraphEdges = data.edges || [];
+      this._roadEdgesLastKey = key;
+      // Trigger redraw
+      this.drawOverlay(this.lastState);
+    } catch (e) {
+      console.warn("Failed to fetch road edges:", e);
+    } finally {
+      this._roadEdgesFetching = false;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // FOVEATED ROAD MATCHING: Match segments progressively as vehicles drive.
+  // Uses vehicle physics lookahead (not arbitrary time) to determine what to match.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  _isRangeMatched(sensorId, fromMs, toMs) {
+    const ranges = this._roadMatchedRangesById.get(sensorId);
+    if (!ranges || ranges.length === 0) return false;
+    for (const r of ranges) {
+      if (r.fromMs <= fromMs && r.toMs >= toMs) return true;
+    }
+    return false;
+  }
+
+  _markRangeMatched(sensorId, fromMs, toMs) {
+    if (!this._roadMatchedRangesById.has(sensorId)) {
+      this._roadMatchedRangesById.set(sensorId, []);
+    }
+    this._roadMatchedRangesById.get(sensorId).push({ fromMs, toMs });
+  }
+
+  /**
+   * Request road matching for segments vehicles are about to drive through.
+   * Uses vehicle position + physics lookahead distance.
+   */
+  async _requestFoveatedRoadMatching() {
+    if (!this._historicalMode) return;
+    if (!this.playbackMode) return;
+    
+    // Throttle: max 1 batch per 500ms
+    const perfNow = performance.now();
+    if (perfNow - this._roadMatchLastRequestMs < 500) return;
+    this._roadMatchLastRequestMs = perfNow;
+    
+    const state = window._historicalState;
+    const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
+    
+    for (const m of mobiles) {
+      const id = m?.id;
+      if (!id) continue;
+      
+      if (this._roadMatchPending.has(id)) continue;
+      
+      // Skip TRAX (rail)
+      const sid = String(id).toUpperCase();
+      if (sid.startsWith("TRX") || sid.startsWith("TRAX")) continue;
+      
+      // Get vehicle physics state (or use playback time-based position)
+      const phys = this._physicsStateById?.get(String(id));
+      const pts = this._playbackPtsById.get(String(id));
+      if (!pts || pts.length < 2) continue;
+      
+      // Use physics distance if available, otherwise estimate from playback time
+      let currentD = 0;
+      if (phys && phys.d > 0) {
+        currentD = phys.d;
+      } else {
+        // Estimate position from playback time
+        const pbTimeMs = this.getPlaybackTimeMs();
+        if (pbTimeMs != null) {
+          let cumD = 0;
+          for (let i = 1; i < pts.length; i++) {
+            if (pts[i].tMs > pbTimeMs) break;
+            const prev = pts[i - 1], curr = pts[i];
+            const segD = haversineMeters(prev.lat, prev.lon, curr.lat, curr.lon);
+            if (isFinite(segD)) cumD += segD;
+          }
+          currentD = cumD;
+        }
+      }
+      
+      // Find segment ahead of vehicle using lookahead distance
+      const lookaheadD = currentD + MapView.CURVATURE_LOOKAHEAD * 2;
+      
+      // Find indices in trail corresponding to [currentD, lookaheadD]
+      let startIdx = 0, endIdx = pts.length - 1, cumD = 0;
+      for (let i = 1; i < pts.length; i++) {
+        const prev = pts[i - 1], curr = pts[i];
+        const segD = haversineMeters(prev.lat, prev.lon, curr.lat, curr.lon);
+        if (isFinite(segD)) cumD += segD;
+        if (cumD < currentD) startIdx = i;
+        if (cumD >= lookaheadD) { endIdx = i; break; }
+      }
+      
+      const fromMs = pts[startIdx]?.tMs;
+      const toMs = pts[endIdx]?.tMs;
+      if (!isFinite(fromMs) || !isFinite(toMs)) continue;
+      if (this._isRangeMatched(id, fromMs, toMs)) continue;
+      
+      // Get raw trail segment
+      const trail = Array.isArray(m?.trail) ? m.trail : [];
+      const segmentPts = trail.filter(p => {
+        const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
+        return tMs != null && tMs >= fromMs && tMs <= toMs;
+      });
+      
+      if (segmentPts.length < 2) continue;
+      if (segmentPts.some(p => p.wp === 1)) {
+        this._markRangeMatched(id, fromMs, toMs);
+        continue;
+      }
+      
+      this._roadMatchPending.add(id);
+      this._fetchAndApplyRoadMatch(id, segmentPts, fromMs, toMs);
+    }
+  }
+
+  async _fetchAndApplyRoadMatch(sensorId, trailSegment, fromMs, toMs) {
+    try {
+      const trailJson = JSON.stringify(trailSegment);
+      const url = `/api/match_segment?sensor=${encodeURIComponent(sensorId)}&trail=${encodeURIComponent(trailJson)}`;
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      
+      const data = await resp.json();
+      const matchedTrail = data.trail;
+      if (!Array.isArray(matchedTrail) || matchedTrail.length === 0) return;
+      
+      // Merge into state
+      const state = window._historicalState;
+      const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
+      const mobile = mobiles.find(m => m?.id === sensorId);
+      if (!mobile || !Array.isArray(mobile.trail)) return;
+      
+      // Build map of matched points by time
+      const matchedByTime = new Map();
+      for (const p of matchedTrail) {
+        const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
+        if (tMs != null) {
+          if (!matchedByTime.has(tMs)) matchedByTime.set(tMs, []);
+          matchedByTime.get(tMs).push(p);
+        }
+      }
+      
+      // Splice matched points into trail
+      const newTrail = [];
+      for (const p of mobile.trail) {
+        const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
+        if (tMs != null && matchedByTime.has(tMs)) {
+          newTrail.push(...matchedByTime.get(tMs));
+          matchedByTime.delete(tMs);
+        } else if (!p.wp) {
+          newTrail.push(p);
+        }
+      }
+      
+      mobile.trail = newTrail;
+      this._playbackPtsKey = ""; // Invalidate cache
+      this._ensurePlaybackPoints(state);
+      this._markRangeMatched(sensorId, fromMs, toMs);
+      
+    } catch (e) {
+      console.warn(`Road match error for ${sensorId}:`, e);
+    } finally {
+      this._roadMatchPending.delete(sensorId);
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -4762,6 +4984,9 @@ class MapView {
       const pr = primaryReadingFromPoint(p);
       const base = safeHex(pr?.color);
       
+      // Calculate screen position
+      const sp = getSp(u * ws, v * ws);
+
       // Clip trail at vehicle's time position
       if (shouldClipTrail && tMs != null && isFinite(tMs) && tMs > revealTimeMs) {
         if (prevTMs != null && isFinite(prevTMs) && prevTMs <= revealTimeMs && prevU != null && prevV != null) {
@@ -4777,7 +5002,7 @@ class MapView {
         break; // Stop collecting
       }
       
-      pts.push(getSp(u * ws, v * ws));
+      pts.push(sp);
       cols.push(base);
       times.push(tMs);
       
@@ -5433,6 +5658,114 @@ class MapView {
       if (selectedId) {
         const m = mobiles.find(x => x.id === selectedId);
         if (m) drawTrailFor(m, 1.0, worldToScreenFast);
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEBUG: Draw RAW GPS PATH (original GPS before road snapping) - orange dashed
+    // This shows the original GPS coordinates from the server, before any
+    // road-matching optimization is applied.
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (this._pbDebugPath && this._pbDebugRawGps && this.playbackMode) {
+      const sel = parseKey(this.selectedId);
+      const selId = (sel && sel.type === "mobile" && sel.id) ? sel.id : null;
+      if (selId) {
+        const rawGps = this._rawGpsById.get(String(selId));
+        if (rawGps && rawGps.length >= 2) {
+          const ws = worldSizeForZoom(this.zoom);
+          const pbTimeMs = this.getPlaybackTimeMs();
+          
+          ctx.save();
+          ctx.strokeStyle = "#ff8800"; // Orange for raw GPS
+          ctx.lineWidth = 2;
+          ctx.globalAlpha = 0.6;
+          ctx.setLineDash([4, 6]);
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          
+          let started = false;
+          for (let i = 0; i < rawGps.length; i++) {
+            const pt = rawGps[i];
+            const lat = Number(pt.lat), lon = Number(pt.lon);
+            if (!isFinite(lat) || !isFinite(lon)) continue;
+            
+            // Clip to playback time
+            const tMs = (pt && typeof pt.t === "string") ? parseUtcMs(pt.t) : null;
+            if (pbTimeMs != null && tMs != null && tMs > pbTimeMs) break;
+            
+            const norm = latLonToNorm(lat, lon);
+            const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
+            if (!started) {
+              ctx.moveTo(sp.x, sp.y);
+              started = true;
+            } else {
+              ctx.lineTo(sp.x, sp.y);
+            }
+          }
+          ctx.stroke();
+          
+          // Draw small markers at each raw GPS point
+          ctx.fillStyle = "#ff8800";
+          ctx.globalAlpha = 0.8;
+          for (let i = 0; i < rawGps.length; i++) {
+            const pt = rawGps[i];
+            const lat = Number(pt.lat), lon = Number(pt.lon);
+            if (!isFinite(lat) || !isFinite(lon)) continue;
+            
+            const tMs = (pt && typeof pt.t === "string") ? parseUtcMs(pt.t) : null;
+            if (pbTimeMs != null && tMs != null && tMs > pbTimeMs) break;
+            
+            const norm = latLonToNorm(lat, lon);
+            const sp = worldToScreenFast(norm.u * ws, norm.v * ws);
+            ctx.beginPath();
+            ctx.arc(sp.x, sp.y, 3, 0, 2 * Math.PI);
+            ctx.fill();
+          }
+          
+          ctx.restore();
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEBUG: Draw ROAD GRAPH EDGES (street centerlines from road graph)
+    // This shows the actual road network the server uses for snapping.
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (this._pbDebugPath && this._pbDebugRoadLines && this.playbackMode) {
+      // Fetch road edges for current viewport if needed (async, won't block)
+      this._fetchRoadEdgesForViewport();
+      
+      const edges = this._roadGraphEdges;
+      if (edges && edges.length > 0) {
+        const ws = worldSizeForZoom(this.zoom);
+        
+        ctx.save();
+        ctx.strokeStyle = "#444488"; // Dim blue for road lines
+        ctx.lineWidth = 1;
+        ctx.globalAlpha = 0.4;
+        ctx.setLineDash([]);
+        
+        for (const e of edges) {
+          const lat1 = Number(e.lat1), lon1 = Number(e.lon1);
+          const lat2 = Number(e.lat2), lon2 = Number(e.lon2);
+          if (!isFinite(lat1) || !isFinite(lon1) || !isFinite(lat2) || !isFinite(lon2)) continue;
+          
+          const n1 = latLonToNorm(lat1, lon1);
+          const n2 = latLonToNorm(lat2, lon2);
+          const sp1 = worldToScreenFast(n1.u * ws, n1.v * ws);
+          const sp2 = worldToScreenFast(n2.u * ws, n2.v * ws);
+          
+          // Skip if off-screen
+          if ((sp1.x < -50 && sp2.x < -50) || (sp1.x > w + 50 && sp2.x > w + 50)) continue;
+          if ((sp1.y < -50 && sp2.y < -50) || (sp1.y > h + 50 && sp2.y > h + 50)) continue;
+          
+          ctx.beginPath();
+          ctx.moveTo(sp1.x, sp1.y);
+          ctx.lineTo(sp2.x, sp2.y);
+          ctx.stroke();
+        }
+        
+        ctx.restore();
       }
     }
 
@@ -7516,6 +7849,14 @@ function main() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // FOVEATED ROAD MATCHING: Progressive snapping during playback
+    // Only run when playing (not scrubbing) and time is advancing
+    // ─────────────────────────────────────────────────────────────────────────
+    if (map._historicalMode && map.getPlaybackPlaying() && !_pbScrubbing && !_pbIsRewinding) {
+      map._requestFoveatedRoadMatching();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // RENDER
     // ─────────────────────────────────────────────────────────────────────────
     const waitingForVehiclesAtEnd =
@@ -7801,6 +8142,18 @@ function main() {
       
       window._historicalState = loadedState;
       
+      // Cache raw GPS coordinates before any processing
+      // This preserves the original GPS for debug visualization
+      map._rawGpsById = new Map();
+      const mobiles = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
+      for (const m of mobiles) {
+        if (m?.id && Array.isArray(m.trail)) {
+          // Deep copy the trail to preserve original coordinates
+          const rawTrail = m.trail.map(pt => ({...pt}));
+          map._rawGpsById.set(String(m.id), rawTrail);
+        }
+      }
+      
       // Reset ALL playback state for fresh historical data
       map._historicalMode = true;
       map._playbackPtsById = new Map();
@@ -7837,6 +8190,11 @@ function main() {
       
       // Draw overlay NOW with playback time already set
       map.drawOverlay(window._historicalState);
+      
+      // Fetch road edges for debug visualization if enabled
+      if (map._pbDebugPath && map._pbDebugRoadLines) {
+        map._fetchRoadEdgesForViewport();
+      }
       
       // Start playback loop
       _pbLastPerf = 0;
@@ -8029,6 +8387,18 @@ function main() {
       
       window._historicalState = loadedState;
       
+      // Cache raw GPS coordinates before any processing
+      // This preserves the original GPS for debug visualization
+      map._rawGpsById = new Map();
+      const mobiles = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
+      for (const m of mobiles) {
+        if (m?.id && Array.isArray(m.trail)) {
+          // Deep copy the trail to preserve original coordinates
+          const rawTrail = m.trail.map(pt => ({...pt}));
+          map._rawGpsById.set(String(m.id), rawTrail);
+        }
+      }
+      
       // Reset ALL playback state for fresh historical data
       map._historicalMode = true;
       map._playbackPtsById = new Map();
@@ -8121,7 +8491,6 @@ function main() {
     pbMenu.classList.add("visible");
     if (pbMenuBtn) pbMenuBtn.classList.add("open");
     updateDaysSubmenu();
-    updateDebugCheckState();
   }
   
   function togglePlaybackMenu() {
@@ -8366,6 +8735,10 @@ function main() {
     pbDebugEl.addEventListener("change", () => {
       localStorage.setItem(key, pbDebugEl.checked ? "1" : "0");
       map._pbDebugPath = pbDebugEl.checked;
+      // Fetch road edges when debug mode is enabled
+      if (map._pbDebugPath && map._pbDebugRoadLines) {
+        map._fetchRoadEdgesForViewport();
+      }
       map.drawOverlay(map.lastState);
     });
   }

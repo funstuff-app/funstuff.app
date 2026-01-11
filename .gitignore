@@ -20,3 +20,6 @@ htmlcov/
 
 # Logs
 *.log
+
+# Handoff screenshots
+HANDOFF_SCREENSHOTS/

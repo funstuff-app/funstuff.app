@@ -22,6 +22,12 @@ from .outliers import detect_spatial_outliers
 from .trails import extract_mobile_tracks, clean_trail, collapse_stationary_suffix
 from .utils import parse_utc_timestamp, coerce_float
 
+# We only need checking type for annotation or logic if we import it.
+# To avoid circular import at runtime if roads imports dashboard (unlikely but safe), we handle import inside.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .roads import RoadGraph
+
 
 def _pick_primary_reading_color(readings: dict[str, Any]) -> str:
     """Pick a color from readings, preferring PM25, then PM10, then OZNE."""
@@ -83,6 +89,7 @@ def normalize_state_for_dashboard(
     mobile_url: str,
     fixed_url: str,
     data_dir: str,
+    road_graph: "RoadGraph | None" = None,
 ) -> dict[str, Any]:
     """Normalize combined API data into a dashboard-friendly JSON shape.
 
@@ -94,10 +101,15 @@ def normalize_state_for_dashboard(
         mobile_url: URL for mobile data (for metadata).
         fixed_url: URL for fixed data (for metadata).
         data_dir: Data directory path (for metadata).
+        road_graph: Optional RoadGraph instance for map matching.
 
     Returns:
         Normalized state dict with 'ts', 'meta', 'mobile', and 'fixed' keys.
     """
+    # Lazy import to avoid circular dependency
+    if road_graph:
+        from .roads import snap_points_to_roads
+
     custom_names = custom_names or {}
     pinned_sensors = pinned_sensors or set()
 
@@ -223,11 +235,13 @@ def normalize_state_for_dashboard(
                         pts[idx]["m"] = 0 if overall_immobile else 1
                     continue
                 window_blob = {"Latitude": window_latitudes, "Longitude": window_longitudes, "TimeUTC": window_timestamps}
+                is_history_load = max_points > 1000
+
                 window_mobility = evaluate_mobility(
                     window_blob,
-                    assume_immobile_when_sparse=True,
-                    assume_immobile_when_low_coverage=True,
-                    allow_short_window_immobile=True,
+                    assume_immobile_when_sparse=not is_history_load,
+                    assume_immobile_when_low_coverage=not is_history_load,
+                    allow_short_window_immobile=not is_history_load,
                 )
                 is_window_immobile = bool(window_mobility.get("immobile"))
                 pts[idx]["m"] = 0 if is_window_immobile else 1
@@ -261,6 +275,17 @@ def normalize_state_for_dashboard(
             pts2 = collapse_stationary_suffix(pts, center_lat=float(stable_lat), center_lon=float(stable_lon), radius_m=70.0, min_pts=10)
             if pts2:
                 last2 = pts2[-1]
+
+        # Apply road graph snapping for vehicles (not rail/TRAX)
+        if road_graph and pts2 and not is_immobile:
+            try:
+                sid = sensor_id.upper()
+                if not (sid.startswith("TRX") or sid.startswith("TRAX")):
+                    snapped = snap_points_to_roads(pts2, road_graph, max_snap_m=75.0)
+                    if snapped:
+                        pts2 = snapped
+            except Exception:
+                pass
 
         # Collect readings
         readings: dict[str, Any] = {}

@@ -1,311 +1,102 @@
-## Project Structure
+# Agent Task: Fix Road Matching Feature
 
-```
-mobileair/
-├── mobile_air.py          # TUI application (Textual/Rich)
-├── dashboard_server.py    # HTTP server + state management
-├── mobileair_core.py      # Legacy core (being phased out)
-├── airnow_slc.py          # AirNow data fetcher
-├── mobileair/             # Core library package
-│   ├── dashboard.py       # normalize_state_for_dashboard()
-│   ├── mobility.py        # Movement/idle detection
-│   ├── trails.py          # Trail processing
-│   ├── aqi.py             # AQI calculations
-│   └── ...
-├── dashboard/             # Browser UI (vanilla JS, no framework)
-│   ├── index.html
-│   ├── app.js             # Main application (~5500 lines)
-│   ├── map_nav_engine.js  # Map projection/navigation
-│   └── tests/             # Node.js tests
-└── tests/                 # Python unit tests
-```
+Read `HANDOFF.md` in this repo first. It contains full context including screenshots demonstrating the problem and expected behavior.
 
+Read the **Road Matching Feature** section in `PLAYBOOK.md` for technical details about the client's vehicle physics system and why certain approaches failed.
 
+## Your Task
 
-## Key Principles
+Fix the road matching so that:
+1. GPS coordinates are snapped to the nearest road centerline
+2. NO additional waypoints are added between GPS points
+3. The output trail has the SAME number of points as input
 
-### 1. Separation of Concerns
+## Requirements
 
-- **Pure logic** goes in `mobileair/` package - no UI dependencies
-- **TUI code** stays in `mobile_air.py` - uses Textual/Rich
-- **Server code** in `dashboard_server.py` - HTTP handling + state machine
-- **Browser code** in `dashboard/` - vanilla JS, no build step
+1. Add a `snap_points_to_roads()` function to `mobileair/roads.py` that ONLY moves coordinates, does NOT add points
+2. Update `mobileair/dashboard.py` to use this function instead of `snap_trail_segments()`
+3. Verify your fix works BEFORE building
 
-### 2. The State Contract
+## Verification Steps (YOU MUST DO THESE)
 
-The JSON structure returned by `GET /api/state` is the contract between server and client. Changes must maintain compatibility:
+Before building, test your implementation directly:
 
 ```python
-# Server: mobileair/dashboard.py
-def normalize_state_for_dashboard(...) -> dict:
-    return {
-        "ts": float,           # Unix timestamp
-        "mobile": [...],       # Mobile sensor array
-        "fixed": [...],        # Fixed sensor array  
-        "meta": {...}          # Metadata
-    }
+# Run this to verify your changes work
+cd /Users/johusha/Stuff/mobileair && python3 -c "
+from mobileair.roads import RoadGraph, snap_points_to_roads
+
+rg = RoadGraph.load(RoadGraph.default_graph_path())
+
+# Test trail - 5 points in, should be 5 points out
+trail = [
+    {'lat': 40.760, 'lon': -111.890, 'm': 1, 't': '2026-01-10 12:00:00 UTC'},
+    {'lat': 40.761, 'lon': -111.888, 'm': 1, 't': '2026-01-10 12:01:00 UTC'},
+    {'lat': 40.762, 'lon': -111.886, 'm': 1, 't': '2026-01-10 12:02:00 UTC'},
+    {'lat': 40.763, 'lon': -111.884, 'm': 1, 't': '2026-01-10 12:03:00 UTC'},
+    {'lat': 40.764, 'lon': -111.882, 'm': 1, 't': '2026-01-10 12:04:00 UTC'},
+]
+
+result = snap_points_to_roads(trail, rg)
+
+# MUST pass these assertions
+assert len(result) == len(trail), f'Point count changed: {len(trail)} -> {len(result)}'
+assert not any(p.get('wp') == 1 for p in result), 'Waypoints were added - this is wrong'
+
+# Check that some points were snapped
+rm_count = sum(1 for p in result if p.get('rm') == 1)
+print(f'Input: {len(trail)} pts, Output: {len(result)} pts, Road-matched: {rm_count}')
+print('SUCCESS: Point count preserved, no waypoints added')
+"
 ```
 
-### 3. Trail Point `m` Flag
-
-Every trail point must have an `m` flag:
-- `m=1` → Moving (visible in playback)
-- `m=0` → Idle (hidden in playback, marker dimmed)
-
-This flag controls playback visibility. If you modify trail processing, ensure `m` is set correctly.
-
-### 4. Performance Matters
-
-The server handles many requests per second. Key optimizations:
-- `cached_json_bytes`: Pre-serialized JSON, updated once per fetch cycle
-- Avoid O(n) operations in request handlers
-- Client caches static overlays as canvas images
-
-## Common Tasks
-
-### Adding a New Pollutant
-
-1. Add breakpoints to `aqi_breakpoints.csv`
-2. Update `mobileair/aqi.py` if special handling needed
-3. Add color mapping in `dashboard_server.py:_get_aqi_color()`
-4. Update client `app.js:valueToAqi()` if needed
-
-### Modifying Mobility Detection
-
-1. Edit `mobileair/mobility.py:evaluate_mobility()`
-2. Update tests in `tests/test_mobility.py`
-3. Consider impact on `m` flag assignment in `mobileair/dashboard.py`
-
-### Adding a Data Source
-
-1. Create fetcher module (like `airnow_slc.py`)
-2. Add fetch loop in `dashboard_server.py`
-3. Merge data in `update_app_state_with_new_data()` or via helper
-4. Update `_inject_fixed_history()` if historical data is involved
-
-### Client-Side Changes
-
-1. Edit `dashboard/app.js` directly (no build step)
-2. Test with `node --check dashboard/app.js`
-3. Run JS tests: `cd dashboard/tests && node --test`
-
-## Debugging Tips
-
-### Default Debug Protocol (Observe → Act → Explain)
-
-When a failure is **ambiguous** (or you are not highly confident in the cause), do a quick check before interpreting the error text.
-
-- **Observe (lightweight):** run **1–2** cheapest checks that disambiguate the cause (e.g., `pwd`, `ls`, verify a file exists, confirm server reachable, inspect actual payload/log line).
-- **Act:** take exactly one corrective step based on what you observed.
-- **Explain:** summarize using the observed facts.
-
-For straightforward errors with an obvious fix, apply the fix and retry immediately (no ritual probing).
-
-### Check Raw API Data
-```python
-import requests
-mobile = requests.get("https://utahaq.chpc.utah.edu/jsondata/MobileMapData.json").json()
-fixed = requests.get("https://utahaq.chpc.utah.edu/jsondata/FixedSiteMapData.json").json()
-```
-
-### Test Normalization
-```python
-from mobileair import normalize_state_for_dashboard
-result = normalize_state_for_dashboard(
-    {"mobile": mobile, "fixed": fixed},
-    custom_names={}, pinned_sensors=set(), max_points=5000,
-    mobile_url="", fixed_url="", data_dir=""
-)
-```
-
-### Check Specific Sensor
-```python
-for m in result["mobile"]:
-    if m["id"] == "BUS10":
-        print(m["mobility"])
-        print(f"Trail points: {len(m['trail'])}")
-        print(f"Moving points: {sum(1 for p in m['trail'] if p.get('m')==1)}")
-```
-
-### Server State Inspection
-```python
-import dashboard_server as ds
-# Access app_state.fixed_history, app_state.airnow_readings, etc.
-```
-
-## Testing Requirements
-
-Before submitting changes:
-
+Run Python unit tests:
 ```bash
-# Must pass
 python -m unittest discover -s tests -p "test_*.py"
-
-# Should pass (requires Node.js)
-cd dashboard/tests && node --test
 ```
 
-## Common Pitfalls
-
-### 1. Forgetting `m` Flag
-If you create or modify trail points, always set the `m` flag. Missing `m` causes playback issues.
-
-### 2. Breaking JSON Serialization
-The server pre-serializes JSON. If you add non-serializable objects (datetime, custom classes), wrap them:
-```python
-# Bad
-entry["timestamp"] = datetime.now()
-
-# Good  
-entry["timestamp"] = datetime.now().isoformat() + "Z"
-```
-
-### 3. Modifying Shared State Without Lock
-```python
-# Bad
-app_state.fixed_history[sensor_id] = data
-
-# Good
-with app_state.lock:
-    app_state.fixed_history[sensor_id] = data
-```
-
-### 4. Client Canvas Coordinate Confusion
-The map uses multiple coordinate systems:
-- **Lat/Lon**: Geographic coordinates
-- **World coordinates**: Mercator-projected pixels at zoom level
-- **Screen coordinates**: Canvas pixel positions
-
-Use the conversion functions: `latLonToWorld()`, `worldToScreen()`, `worldToScreenFast()`
-
-## Code Style
-
-### Python
-- Type hints for function signatures
-- Docstrings for public functions
-- `snake_case` for functions and variables
-
-### JavaScript
-- No framework, vanilla JS only
-- `camelCase` for functions and variables
-- JSDoc comments for complex functions
-
-## File Locations for Common Changes
-
-| Change | File(s) |
-|--------|---------|
-| Mobility thresholds | `mobileair/mobility.py` |
-| Trail processing | `mobileair/dashboard.py`, `mobileair/trails.py` |
-| AQI colors | `dashboard_server.py:_get_aqi_color()`, `app.js:valueToAqi()` |
-| Playback behavior | `dashboard/app.js` (search `playback`) |
-| Fixed sensor history | `dashboard_server.py` (search `fixed_history`) |
-| Ghosting logic | `dashboard_server.py:update_app_state_with_new_data()` |
-| Map rendering | `dashboard/app.js:_drawOverlay()` |
-
-## Questions to Ask Before Changing
-
-1. **Does this affect the JSON contract?** If so, ensure backward compatibility.
-2. **Does this need to persist across restarts?** Use `fixed_history.json` or similar.
-3. **Is this logic or UI?** Put logic in `mobileair/`, UI in respective frontend.
-4. **Does this affect playback?** Check `m` flag handling.
-5. **Could this be slow in a loop?** Consider caching or pre-computation.
-
-### Widget Development Notes
-When creating TUI widgets with Rich:
-- Use `rich.panel.Panel` for bordered boxes - it handles alignment correctly
-- Use `rich.text.Text` for styled content inside panels
-- Do NOT manually draw box characters with Rich markup - the markup tags break width calculations
-- Example:
-```python
-from rich.panel import Panel
-from rich.text import Text
-
-content = Text()
-content.append("value", style="#b8bb26")
-return Panel(content, title="TITLE", width=21, height=6)
-```
-
-## Building the Native macOS Binary
-
-The TUI can be packaged as a standalone macOS executable using PyInstaller.
-
-### Build Command
+Only AFTER both pass, build and deploy:
 ```bash
-cd /Users/johusha/Stuff/mobileair
 rm -rf build/mobileair_bundle dist/mobileair_bundle
 python -m PyInstaller --noconfirm --clean --workpath build/mobileair_bundle mobileair.spec
-```
-
-If you ever see a PyInstaller runtime error like `ArchiveReadError: Python magic pattern mismatch`, it usually means the executable and embedded archive got out of sync (stale/partial rebuild). The clean rebuild above fixes it.
-
-### Verify Bundled Dashboard Assets
-If you add a new file under `dashboard/`, you must also add it to `mobileair.spec` `datas=[...]`.
-
-Sanity check that the built app includes all dashboard assets (especially any newly-added JS):
-```bash
-ls -la dist/mobileair_bundle/_internal/dashboard
-```
-
-### Deploy Command
-```bash
 ./deploy_local_safe.sh
 ```
 
-### Quick Verify / Debug
-
-Smoke-test the built binary before deploying:
-
+Then verify the deployed server:
 ```bash
-./dist/mobileair_bundle/mobileair --help
+# After restarting mobileair, run this
+curl -s "http://127.0.0.1:8766/api/history?date=2026-01-09" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for m in data.get('mobile', []):
+    trail = m.get('trail', [])
+    wp_count = sum(1 for p in trail if p.get('wp') == 1)
+    rm_count = sum(1 for p in trail if p.get('rm') == 1)
+    sid = m['id']
+    # BUS sensors should have 0 waypoints and >0 road-matched
+    # TRX sensors should have 0 of both (not snapped)
+    if sid.startswith('BUS'):
+        assert wp_count == 0, f'{sid}: has waypoints={wp_count}, expected 0'
+        print(f'{sid}: {len(trail)} pts, road-matched={rm_count} ✓')
+    elif sid.startswith('TRX'):
+        assert wp_count == 0 and rm_count == 0, f'{sid}: should not be snapped'
+        print(f'{sid}: {len(trail)} pts, not snapped (rail) ✓')
+print('ALL CHECKS PASSED')
+"
 ```
 
-Confirm the deployed binary matches what you built:
+## Do NOT
 
-```bash
-shasum -a 256 dist/mobileair_bundle/mobileair
-shasum -a 256 ~/.local/mobileair/mobileair
-```
+- Do NOT use `snap_trail_segments()` - it adds waypoints
+- Do NOT use `trace_road_between_gps_points()` - it densifies paths
+- Do NOT add ANY waypoints or intermediate points
+- Do NOT build and ask user to test - run the verification yourself
+- Do NOT skip TRAX exclusion check
 
-Confirm what `mobileair` you are running:
+## Success Criteria
 
-```bash
-command -v mobileair
-which -a mobileair
-ls -la ~/.local/bin/mobileair
-```
-
-### Run the Binary
-```bash
-    ~/.local/mobileair/mobileair
-```
-
-### Headless Mode (Server Only)
-To run the dashboard server without the TUI (useful for logging/debugging):
-```bash
-~/.local/mobileair/mobileair --headless
-```
-This prints all stdout/stderr to the terminal instead of redirecting to a log file.
-
-You can also specify host and port:
-```bash
-~/.local/mobileair/mobileair --headless --host 0.0.0.0 --port 8766
-```
-
-### Build + Deploy One-Liner
-```bash
-cd /Users/johusha/Stuff/mobileair && rm -rf build/mobileair_bundle dist/mobileair_bundle && python -m PyInstaller --noconfirm --clean --workpath build/mobileair_bundle mobileair.spec 2>&1 | tail -3 && ./deploy_local_safe.sh && echo "Done"
-
-```
-
-### Dashboard JS Tests
-Node’s test runner expects files/globs (not a directory path). Run:
-```bash
-node --test dashboard/tests/*.cjs
-```
-
-### Key Details
-- **Spec file**: `mobileair.spec` - PyInstaller configuration
-- **Output**: `dist/mobileair_bundle/` directory containing the executable and dependencies
-- **Install location**: `~/.local/mobileair/`
-- **Binary size**: ~34 MB
-- **Startup time**: ~1.6s warm, ~2.5s cold
+1. `snap_points_to_roads()` function exists and works
+2. All verification commands pass without errors
+3. Point counts are preserved (no waypoint additions)
+4. BUS sensors have `rm=1` markers on snapped points
+5. TRX sensors are unchanged (not snapped)
