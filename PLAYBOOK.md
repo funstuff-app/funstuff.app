@@ -138,3 +138,116 @@ If `which -a mobileair` shows an older wrapper earlier on PATH (e.g. under `/usr
 - Confirm the UI you changed no longer regresses (manual smoke test).
 - Confirm packaging includes new static assets (if any).
 - Confirm deploy did not delete the deploy target directory.
+
+---
+
+## Road Matching Feature
+
+### Background
+
+Vehicles (buses, trams) have GPS trails that don't align perfectly with roads. A bus might appear to drive through buildings. The goal is to snap GPS coordinates to the road network.
+
+A road graph exists at `~/.mobileair/roads/utah_centerlines_graph.json` (146k nodes). The `RoadGraph` class in `mobileair/roads.py` loads this.
+
+### The Client's Vehicle Physics System
+
+**This is critical to understand before modifying road matching.**
+
+The client (`dashboard/app.js`) has a vehicle animation system that takes sparse GPS and generates smooth paths:
+
+1. **Playback Points** (`_playbackPtsById`, ~line 3320) - Stores sparse GPS per vehicle
+
+2. **Progressive Spline Path** (`_getVehiclePath`, `_extendVehiclePath`, ~line 3520)
+   - Computes Catmull-Rom splines between GPS points
+   - Tension varies with playback speed
+   - Paths computed incrementally as vehicle drives
+
+3. **Vehicle Physics** (`_playbackSampleForMobile`, ~line 4170)
+   - Each vehicle has position (`phys.d`) and velocity (`phys.v`)
+   - `CURVATURE_LOOKAHEAD = 100` meters - how far ahead vehicle scans for curves
+   - Vehicles brake for curves, accelerate on straights
+
+4. **Lookahead Calculation** (~line 4318):
+   ```javascript
+   const lookaheadDist = MapView.CURVATURE_LOOKAHEAD * Math.max(1, controlScalar);
+   const curveLookaheadEnd = Math.min(phys.d + lookaheadDist, totalDist);
+   ```
+
+5. **Debug Visualization** (`_pbDebugPath`, `_vehicleRevealDist`)
+   - Cyan dots show computed path ahead of vehicle (visible when vehicle selected)
+   - This shows what client ALREADY generates from sparse GPS
+
+### What This Means
+
+The client takes 100 sparse GPS points and generates smooth paths client-side. It does NOT need densified waypoints from the server. It only needs GPS coordinates snapped to roads so the splines follow roads.
+
+### Failed Approaches
+
+1. **`snap_trail_segments()` with densification** - Called `trace_road_between_gps_points()` which adds waypoint every 25m. Result: 100 pts → 10,000+ pts. Client can't handle.
+
+2. **Foveated matching with arbitrary time windows** - Tried 10-minute lookahead. Time windows don't align with vehicle physics.
+
+3. **Client-side progressive matching** - Added `_requestFoveatedRoadMatching()` but still called densifying function.
+
+### Correct Approach
+
+**Phase 1: Simple Point Snapping**
+
+Create `snap_points_to_roads()` that:
+- Takes trail array and road graph
+- For each point with `m=1`, snap lat/lon to nearest road (within 40m)
+- Returns SAME number of points
+- Marks snapped points with `rm=1`
+
+**Phase 2: Foveated Optimization (for large historical trails)**
+
+Use client's existing lookahead:
+1. Track matched segments in `_roadMatchedRangesById`
+2. When vehicle's `curveLookaheadEnd` approaches unmatched segment, request match
+3. Server returns snapped coordinates (same point count)
+4. Client updates trail and invalidates spline cache
+
+This leverages client's existing physics instead of reinventing lookahead.
+
+### TRAX Exclusion
+
+TRAX sensors (`TRX*`) are light rail on dedicated tracks. Must NOT be snapped:
+```python
+if not (sid.startswith("TRX") or sid.startswith("TRAX")):
+```
+
+### Verification
+
+Test point snapping preserves count:
+```bash
+python3 -c "
+from mobileair.roads import RoadGraph, snap_points_to_roads
+rg = RoadGraph.load(RoadGraph.default_graph_path())
+trail = [{'lat': 40.76, 'lon': -111.89, 'm': 1, 't': 'x'}] * 5
+result = snap_points_to_roads(trail, rg)
+assert len(result) == 5; print('PASS')
+"
+```
+
+Test server endpoint:
+```bash
+curl -s "http://127.0.0.1:8766/api/history?date=2026-01-09" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for m in data.get('mobile', []):
+    t = m.get('trail', [])
+    wp = sum(1 for p in t if p.get('wp'))
+    rm = sum(1 for p in t if p.get('rm'))
+    print(f\"{m['id']}: {len(t)} pts, wp={wp}, rm={rm}\")
+"
+```
+
+Expected: `wp=0` for all. `rm>0` for BUS sensors.
+
+### Key Files
+
+| File | What |
+|------|------|
+| `mobileair/roads.py` | `RoadGraph`, `snap_to_edge()` (~186), snapping functions |
+| `mobileair/dashboard.py` | `normalize_state_for_dashboard()`, road matching call (~280) |
+| `dashboard/app.js` | `_playbackSampleForMobile` (~4170), `CURVATURE_LOOKAHEAD`, `_vehicleRevealDist` |

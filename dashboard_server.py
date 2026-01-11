@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
 from typing import Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 def _get_bundle_dir() -> Path:
@@ -48,6 +48,34 @@ from mobileair import (
     HEADERS,
 )
 from mobileair.dashboard import _pick_worst_reading_by_aqi
+
+# Optional offline road map-matching (see ROAD_DATA.md)
+from mobileair.roads import RoadGraph, match_trail_segment_offline
+
+# Module-level road graph cache (shared across historical and live data)
+_cached_road_graph: RoadGraph | None = None
+_road_graph_load_attempted: bool = False
+
+
+def get_cached_road_graph() -> RoadGraph | None:
+    """Get the cached road graph, loading it if needed.
+    
+    Returns None if the graph file doesn't exist or can't be loaded.
+    """
+    global _cached_road_graph, _road_graph_load_attempted
+    
+    if _road_graph_load_attempted:
+        return _cached_road_graph
+    
+    _road_graph_load_attempted = True
+    try:
+        p = os.environ.get("MOBILEAIR_ROAD_GRAPH") or RoadGraph.default_graph_path()
+        if os.path.exists(p):
+            _cached_road_graph = RoadGraph.load(p)
+    except Exception:
+        _cached_road_graph = None
+    
+    return _cached_road_graph
 
 # Import AirNow data fetcher
 try:
@@ -298,6 +326,9 @@ class AppState:
     
     # Wind/weather data from AirNow
     wind_data: dict[str, Any] = field(default_factory=dict)
+
+    # Optional offline road graph cache for map-matching.
+    road_graph: Any | None = None
     
     # Persistent fixed sensor history (shared with TUI)
     # Structure: { sensor_id: { pollutant: [{val, col, time, recorded_at}, ...] } }
@@ -535,6 +566,7 @@ def build_state(
         mobile_url=MOBILE_URL,
         fixed_url=FIXED_URL,
         data_dir=str(data_dir),
+        road_graph=get_cached_road_graph(),
     )
 
 
@@ -733,6 +765,9 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
         }
     
     # Now process through normalize_state_for_dashboard like live data
+    # NOTE: For historical data, we do NOT apply road graph snapping on load.
+    # The client will progressively snap segments during playback using the
+    # lookahead mechanism. This improves load time and allows real-time optimization.
     combined = {"mobile": mobile_raw, "fixed": {}}
     
     result = normalize_state_for_dashboard(
@@ -743,6 +778,7 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
         mobile_url=MOBILE_URL,
         fixed_url=FIXED_URL,
         data_dir=str(default_data_dir()),
+        road_graph=None,  # Disable road snapping for historical load
     )
     
     # Add historical metadata
@@ -786,6 +822,137 @@ def _max_mobile_trail_ms(mobiles: Any) -> int | None:
         return None
     return int(best_s * 1000)
 
+
+def _point_ms(p: Any) -> int | None:
+    if not isinstance(p, dict):
+        return None
+    t = p.get("t")
+    if not isinstance(t, str):
+        return None
+    dt = parse_utc_timestamp(t)
+    if dt is None:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def _day_start_5am_local_ms(anchor_ms: int) -> int | None:
+    try:
+        d = datetime.fromtimestamp(anchor_ms / 1000.0, tz=timezone.utc).astimezone()
+        d = d.replace(hour=5, minute=0, second=0, microsecond=0)
+        return int(d.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def _is_moving_point(p: Any) -> bool:
+    if not isinstance(p, dict):
+        return False
+    m = p.get("m")
+    return bool(m == 1 or m == "1" or m is True)
+
+
+def _lazy_backfill_road_matching_today(
+    pm: dict[str, Any],
+    road_graph: RoadGraph,
+    *,
+    max_segments: int = 3,
+    max_points_total: int = 5000,
+    max_points_per_seg: int = 40,
+) -> None:
+    """Incrementally map-match older (today-only) segments, walking backwards.
+
+    This is bounded work per update cycle and avoids reprocessing points.
+    Generated points are marked with rm=1.
+    """
+
+    trail = pm.get("trail")
+    if not isinstance(trail, list) or len(trail) < 2:
+        return
+
+    # Determine "today" based on the newest timestamp in the trail.
+    newest_ms: int | None = None
+    for k in range(len(trail) - 1, -1, -1):
+        newest_ms = _point_ms(trail[k])
+        if newest_ms is not None:
+            break
+    if newest_ms is None:
+        return
+
+    day_start_ms = _day_start_5am_local_ms(newest_ms)
+    if day_start_ms is None:
+        return
+
+    # Walk backwards over *raw* points (rm!=1) and replace raw segments.
+    segs_done = 0
+    cursor = len(trail) - 1
+    while segs_done < max_segments and cursor > 0 and len(trail) >= 2:
+        # Find the next raw point to snap (as the segment "next_point").
+        i = cursor
+        while i > 0:
+            pi = trail[i]
+            if isinstance(pi, dict) and pi.get("rm") == 1:
+                i -= 1
+                continue
+            i_ms = _point_ms(pi)
+            if i_ms is None:
+                i -= 1
+                continue
+            if i_ms < day_start_ms:
+                return
+            break
+
+        if i <= 0:
+            return
+
+        # Find previous raw point.
+        j = i - 1
+        while j >= 0:
+            pj = trail[j]
+            if isinstance(pj, dict) and pj.get("rm") == 1:
+                j -= 1
+                continue
+            if _point_ms(pj) is None:
+                j -= 1
+                continue
+            break
+
+        if j < 0:
+            return
+
+        prev_p = trail[j]
+        next_p = trail[i]
+
+        # Only map-match moving segments (avoid densifying idle jitter).
+        if not (_is_moving_point(prev_p) and _is_moving_point(next_p)):
+            cursor = j
+            continue
+
+        headroom = max(0, max_points_total - len(trail))
+        max_out = max(0, min(max_points_per_seg, headroom))
+        if max_out < 2:
+            return
+
+        try:
+            seg = match_trail_segment_offline(
+                road_graph,
+                prev_p,
+                next_p,
+                max_output_points=max_out,
+                spacing_m=25.0,
+            )
+        except Exception:
+            seg = None
+
+        if seg:
+            for p in seg:
+                if isinstance(p, dict):
+                    p["rm"] = 1
+            # Replace everything after prev up through next.
+            trail[j + 1 : i + 1] = seg
+            segs_done += 1
+
+        cursor = j
+
 def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now: float | None = None) -> None:
     if now is None:
         now = time.time()
@@ -796,6 +963,20 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
         st["meta"] = meta
 
     with app_state.lock:
+        # Lazy-load offline road graph (optional). If missing/unavailable, map-matching is skipped.
+        road_graph: RoadGraph | None = None
+        try:
+            rg = getattr(app_state, "road_graph", None)
+            if isinstance(rg, RoadGraph):
+                road_graph = rg
+            else:
+                p = os.environ.get("MOBILEAIR_ROAD_GRAPH") or RoadGraph.default_graph_path()
+                if os.path.exists(p):
+                    road_graph = RoadGraph.load(p)
+                    app_state.road_graph = road_graph
+        except Exception:
+            road_graph = None
+
         fresh_sids = set()
         for incoming_mobile in st.get("mobile", []):
             sid = incoming_mobile.get("id")
@@ -828,6 +1009,15 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                         incoming_mobile["_last_trail_ts"] = last_ts
                         for p in trail0:
                             if isinstance(p, dict) and "m" not in p: p["m"] = 1
+                            # Snap moving points to nearest road
+                            if road_graph is not None and isinstance(p, dict) and p.get("m") == 1:
+                                lat = p.get("lat")
+                                lon = p.get("lon")
+                                if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                                    snapped = road_graph.snap_to_nearest_road(float(lat), float(lon), max_snap_distance_m=50.0)
+                                    if snapped is not None:
+                                        p["lat"] = snapped[0]
+                                        p["lon"] = snapped[1]
             else:
                 pm = app_state.persistent_mobile[sid]
                 old_trail = pm.get("trail", [])
@@ -872,8 +1062,27 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                         nt_dt = parse_utc_timestamp(np.get("t"))
                         if last_old_ms and nt_dt and nt_dt.timestamp() <= last_old_ms:
                             continue
-                        if "m" not in np: np["m"] = 1
+                        if "m" not in np:
+                            np["m"] = 1
+
+                        # Snap GPS point to nearest road (if graph available and point is moving)
+                        if road_graph is not None and np.get("m") == 1:
+                            lat = np.get("lat")
+                            lon = np.get("lon")
+                            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                                snapped = road_graph.snap_to_nearest_road(float(lat), float(lon), max_snap_distance_m=50.0)
+                                if snapped is not None:
+                                    np["lat"] = snapped[0]
+                                    np["lon"] = snapped[1]
+
                         pm["trail"].append(np)
+
+                        # Keep last_old_ms in sync so we don't re-append the same segment.
+                        try:
+                            _, last_old_ms2 = _first_last_ts(pm["trail"])
+                            last_old_ms = last_old_ms2
+                        except Exception:
+                            pass
 
                 if len(pm["trail"]) > 5000:
                     pm["trail"] = pm["trail"][-5000:]
@@ -1682,6 +1891,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 return self._handle_tui_state()
             if self.path.startswith("/api/history"):
                 return self._handle_history_request()
+            if self.path.startswith("/api/match_segment"):
+                return self._handle_match_segment()
+            if self.path.startswith("/api/road_edges"):
+                return self._handle_road_edges()
             if self.path.startswith("/api/snapshots"):
                 return self._handle_list_snapshots()
             if self.path.startswith("/api/snapshot/load"):
@@ -1782,6 +1995,112 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 return self._send(500, body, "application/json")
+
+        def _handle_match_segment(self):
+            """Road-match a trail segment for a sensor during playback.
+            
+            Query params:
+                sensor: Sensor ID (e.g., BUS11)
+                from_ms: Start timestamp (epoch ms)
+                to_ms: End timestamp (epoch ms)
+                trail: JSON-encoded trail points to match
+            
+            Returns matched trail segment with waypoints added.
+            """
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            
+            sensor_id = query.get("sensor", [None])[0]
+            from_ms_str = query.get("from_ms", [None])[0]
+            to_ms_str = query.get("to_ms", [None])[0]
+            trail_json = query.get("trail", [None])[0]
+            
+            if not sensor_id or not trail_json:
+                return self._send(400, b'{"error": "sensor and trail required"}', "application/json")
+            
+            try:
+                trail = json.loads(trail_json)
+                if not isinstance(trail, list):
+                    raise ValueError("trail must be a list")
+            except (json.JSONDecodeError, ValueError) as e:
+                body = json.dumps({"error": f"Invalid trail: {e}"}).encode("utf-8")
+                return self._send(400, body, "application/json")
+            
+            # Skip TRAX (rail vehicles)
+            sid = sensor_id.upper()
+            if sid.startswith("TRX") or sid.startswith("TRAX"):
+                # Return original trail unchanged
+                body = json.dumps({"sensor": sensor_id, "trail": trail}).encode("utf-8")
+                return self._send(200, body, "application/json")
+            
+            # Road-match the segment
+            road_graph = get_cached_road_graph()
+            if not road_graph:
+                # No road graph, return original
+                body = json.dumps({"sensor": sensor_id, "trail": trail}).encode("utf-8")
+                return self._send(200, body, "application/json")
+            
+            try:
+                from mobileair.roads import snap_points_to_roads
+                matched = snap_points_to_roads(trail, road_graph, max_snap_m=75.0)
+                result_trail = matched if matched else trail
+            except Exception:
+                result_trail = trail
+            
+            body = json.dumps({"sensor": sensor_id, "trail": result_trail}).encode("utf-8")
+            return self._send(200, body, "application/json")
+
+        def _handle_road_edges(self):
+            """Return road graph edges for debug visualization.
+            
+            Query params:
+                minLat, maxLat, minLon, maxLon: Bounding box to filter edges
+                limit: Maximum number of edges to return (default 5000)
+            
+            Returns JSON array of edges: [{lat1, lon1, lat2, lon2}, ...]
+            """
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            
+            min_lat = float(query.get("minLat", ["-90"])[0])
+            max_lat = float(query.get("maxLat", ["90"])[0])
+            min_lon = float(query.get("minLon", ["-180"])[0])
+            max_lon = float(query.get("maxLon", ["180"])[0])
+            limit = int(query.get("limit", ["5000"])[0])
+            
+            road_graph = get_cached_road_graph()
+            if not road_graph:
+                return self._send(200, b'{"edges": []}', "application/json")
+            
+            edges = []
+            seen = set()
+            
+            for i, (lat, lon) in enumerate(road_graph.nodes):
+                # Skip nodes outside bounding box
+                if lat < min_lat or lat > max_lat or lon < min_lon or lon > max_lon:
+                    continue
+                
+                for j, _ in road_graph.adj[i]:
+                    # Avoid duplicates (edges are bidirectional)
+                    edge_key = (min(i, j), max(i, j))
+                    if edge_key in seen:
+                        continue
+                    seen.add(edge_key)
+                    
+                    lat2, lon2 = road_graph.nodes[j]
+                    edges.append({
+                        "lat1": lat, "lon1": lon,
+                        "lat2": lat2, "lon2": lon2
+                    })
+                    
+                    if len(edges) >= limit:
+                        break
+                
+                if len(edges) >= limit:
+                    break
+            
+            body = json.dumps({"edges": edges}).encode("utf-8")
+            return self._send(200, body, "application/json")
 
         def log_message(self, format, *args):
             return
