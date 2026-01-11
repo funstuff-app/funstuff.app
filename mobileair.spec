@@ -165,7 +165,7 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    codesign_identity=None,
+    codesign_identity='',  # Skip PyInstaller signing - we sign in deploy_local_safe.sh
     entitlements_file=None,
 )
 

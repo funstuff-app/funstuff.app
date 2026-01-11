@@ -256,6 +256,7 @@ class AirQualityApp(App):
         layout: vertical;
         background: #1d2021;
         color: #ebdbb2;
+        overflow: hidden;
     }
 
     Header {
@@ -312,6 +313,7 @@ class AirQualityApp(App):
         max-height: 50%;
         padding: 0;
         border-bottom: solid #458588;
+        scrollbar-gutter: stable;
     }
     #details_view {
         width: 100%;
@@ -329,6 +331,7 @@ class AirQualityApp(App):
         min-width: 45;
         border-right: solid #458588;
         background: #1d2021;
+        scrollbar-gutter: stable;
     }
     #json_container {
         width: 1fr;
@@ -336,6 +339,7 @@ class AirQualityApp(App):
         background: #1d2021;
         padding: 0;
         overflow: hidden;
+        scrollbar-gutter: stable;
     }
     #json_view {
         width: 100%;
@@ -473,7 +477,6 @@ class AirQualityApp(App):
         yield Header()
         with Horizontal(classes="status-bar"):
             yield Static("", id="summary_widget")
-            yield Static("", id="alerts_widget")
             yield Static("", id="sparkline_widget")
             yield Static("", id="region_widget")
             yield Static("", id="wind_indicator")
@@ -518,6 +521,13 @@ class AirQualityApp(App):
         self.action_refresh_data()
         # Poll every 1 minute (60 seconds)
         self.set_interval(60, self.action_refresh_data)
+
+    def on_resize(self) -> None:
+        """Handle terminal resize - force full repaint to prevent artifacts."""
+        # Use Textual's built-in screen clearing instead of raw ANSI sequences
+        # which bypass Textual's compositor and can cause artifacts
+        self.screen.styles.background = self.screen.styles.background  # Force style recalc
+        self.refresh(repaint=True, layout=True)
 
     def _bump_refresh_token(self) -> int:
         self._refresh_token += 1
@@ -757,11 +767,19 @@ class AirQualityApp(App):
         # Fall back to direct AirNow fetch
         if not wind_data or wind_data.get("wind_speed") is None:
             try:
-                from airnow_slc import fetch_hourly_data, filter_utah_hourly, get_hourly_data_url, extract_wind_data
+                from airnow_slc import fetch_hourly_data, filter_slc_hourly, get_hourly_data_url, extract_wind_data, fetch_monitoring_sites, filter_slc_area, get_slc_site_ids
                 url = get_hourly_data_url()
                 readings = fetch_hourly_data(url)
-                utah_readings = filter_utah_hourly(readings)
-                wind_data = extract_wind_data(utah_readings)
+                # Filter to SLC area only, not all of Utah
+                try:
+                    sites = fetch_monitoring_sites()
+                    slc_site_ids = get_slc_site_ids(sites)
+                    slc_readings = filter_slc_hourly(readings, slc_site_ids)
+                except Exception:
+                    # Fall back to Utah filter if site fetch fails
+                    from airnow_slc import filter_utah_hourly
+                    slc_readings = filter_utah_hourly(readings)
+                wind_data = extract_wind_data(slc_readings)
             except Exception:
                 pass
         
@@ -788,32 +806,14 @@ class AirQualityApp(App):
         temp_f = wind_data.get("temp_f")
         humidity = wind_data.get("humidity")
         
-        # 16 cardinal directions with visual distinction
-        # Main arrow + side indicator for "between" directions
-        arrows_16 = [
-            "↓",   # N
-            "↓·",  # NNE (down, dot right = slightly east)
-            "↙",   # NE
-            "·←",  # ENE
-            "←",   # E
-            "←·",  # ESE
-            "↖",   # SE
-            "·↑",  # SSE
-            "↑",   # S
-            "↑·",  # SSW
-            "↗",   # SW
-            "·→",  # WSW
-            "→",   # W
-            "→·",  # WNW
-            "↘",   # NW
-            "·↓",  # NNW
-        ]
-        idx16 = round(direction / 22.5) % 16
-        arrow = arrows_16[idx16]
+        # 8 cardinal directions - cardinal text provides the precision
+        arrows_8 = ["↓", "↙", "←", "↖", "↑", "↗", "→", "↘"]  # N, NE, E, SE, S, SW, W, NW
+        idx8 = round(direction / 45) % 8
+        arrow = arrows_8[idx8]
         
         gust_blocks = ["▁", "▂", "▃", "▅", "▇"]
         gust_bar = "".join(gust_blocks[:gust_level + 1])
-        gust_labels = ["Calm", "Light", "Mod", "Strong", "Gale!"]
+        gust_labels = ["Calm", "Light", "Moderate", "Strong", "Gale!"]
         gust_label = gust_labels[min(gust_level, 4)]
         
         gust_colors = ["#b8bb26", "#b8bb26", "#fabd2f", "#fe8019", "#fb4934"]
@@ -870,7 +870,8 @@ class AirQualityApp(App):
         # Count sensors
         mobile_sensors = set()
         fixed_sensors = set()
-        all_readings = []  # (aqi, sensor_name, pollutant)
+        # Collect readings by pollutant: {pollutant: [(aqi, sensor), ...]}
+        readings_by_pollutant: dict[str, list[tuple[float, str]]] = {"PM25": [], "PM10": [], "OZNE": []}
         
         # Map API pollutant names to our AQI names
         poll_map = {"PM25": "PM2_5", "PM10": "PM10", "OZNE": "O3"}
@@ -887,8 +888,8 @@ class AirQualityApp(App):
                     val = self._get_latest_value(s_data)
                     if val is not None:
                         aqi = self._value_to_aqi(aqi_key, val)
-                        if aqi is not None:
-                            all_readings.append((aqi, s_key, p_key))
+                        if aqi is not None and p_key in readings_by_pollutant:
+                            readings_by_pollutant[p_key].append((aqi, s_key))
         
         for p_key, details in fixed_data.items():
             if not isinstance(details, dict):
@@ -898,22 +899,46 @@ class AirQualityApp(App):
                 if s_key in ['LastUpdateUTC', 'LastUpdateLocal', 'VarName', 'VarUnit']:
                     continue
                 if isinstance(s_data, dict) and 'Value' in s_data:
+                    # Filter fixed sensors for SLC area only (same as sensor list)
+                    # Approx Salt Lake Valley: Lat 40.4 to 41.0, Lon -112.25 to -111.7
+                    try:
+                        lat = s_data.get('Latitude') or s_data.get('GLAT')
+                        lon = s_data.get('Longitude') or s_data.get('GLON')
+                        if lat is None or lon is None:
+                            continue
+                        flat = float(lat[-1]) if isinstance(lat, list) else float(lat)
+                        flon = float(lon[-1]) if isinstance(lon, list) else float(lon)
+                        if not (40.4 <= flat <= 41.0 and -112.25 <= flon <= -111.7):
+                            continue
+                    except (ValueError, TypeError, IndexError):
+                        continue
+                    
                     fixed_sensors.add(s_key)
                     val = self._get_latest_value(s_data)
                     if val is not None:
                         aqi = self._value_to_aqi(aqi_key, val)
-                        if aqi is not None:
-                            all_readings.append((aqi, s_key, p_key))
+                        if aqi is not None and p_key in readings_by_pollutant:
+                            readings_by_pollutant[p_key].append((aqi, s_key))
         
         n_mobile = len(mobile_sensors)
         n_fixed = len(fixed_sensors)
         
-        # Calculate avg and worst AQI
+        # Find the primary pollutant: whichever has the highest single AQI reading
+        primary_pollutant = None
+        max_aqi_overall = -1.0
+        for p_key, readings in readings_by_pollutant.items():
+            for aqi, _ in readings:
+                if aqi > max_aqi_overall:
+                    max_aqi_overall = aqi
+                    primary_pollutant = p_key
+        
+        # Calculate stats using ONLY the primary pollutant's readings
         avg_aqi = 0
-        worst = None
-        if all_readings:
-            avg_aqi = sum(r[0] for r in all_readings) / len(all_readings)
-            worst = max(all_readings, key=lambda x: x[0])
+        max_aqi = 0
+        if primary_pollutant and readings_by_pollutant[primary_pollutant]:
+            primary_readings = readings_by_pollutant[primary_pollutant]
+            avg_aqi = sum(r[0] for r in primary_readings) / len(primary_readings)
+            max_aqi = max(r[0] for r in primary_readings)
         
         level_info = self._aqi_level(avg_aqi)
         level = level_info.get("label", "Good") if isinstance(level_info, dict) else str(level_info)
@@ -925,27 +950,30 @@ class AirQualityApp(App):
         content.append(f"{n_mobile}", style="#83a598")
         content.append(" mobile ")
         content.append(f"{n_fixed}", style="#fabd2f")
-        content.append(" fixed\n")
+        content.append(" fix\n")
         content.append("Avg: ")
         content.append(f"{avg_aqi:.0f}", style=avg_color)
-        content.append(f" ({level[:4]})\n")
-        if worst:
-            w_info = self._aqi_level(worst[0])
-            w_level = w_info.get("label", "Good") if isinstance(w_info, dict) else str(w_info)
-            w_color = level_colors.get(w_level, "#928374")
+        content.append(f" {primary_pollutant[:4]}\n" if primary_pollutant else "\n")
+        if primary_pollutant and max_aqi > 0:
+            max_info = self._aqi_level(max_aqi)
+            max_level = max_info.get("label", "Good") if isinstance(max_info, dict) else str(max_info)
+            max_color = level_colors.get(max_level, "#928374")
             content.append("Max: ")
-            content.append(f"{worst[0]:.0f}", style=w_color)
-            content.append(f" {worst[2][:4]}")
+            content.append(f"{max_aqi:.0f}", style=max_color)
+            content.append(f" {primary_pollutant[:4]}")
         else:
             content.append("Max: -")
         
         return Panel(content, title="SUMMARY", width=21, height=6)
 
-    def _format_alerts_widget(self) -> Panel:
-        """Create alerts panel widget."""
+    # Track shown alerts to avoid spamming toasts
+    _last_alert_keys: set = set()
+
+    def _show_alert_toasts(self) -> None:
+        """Show air quality alerts as toast notifications."""
         data = self.current_data
         if not data:
-            return Panel("No data", title="ALERTS", width=21, height=6)
+            return
         
         alerts = []  # (aqi, sensor, pollutant, level_label)
         
@@ -966,32 +994,30 @@ class AirQualityApp(App):
                         val = self._get_latest_value(s_data)
                         if val is not None:
                             aqi = self._value_to_aqi(aqi_key, val)
-                            # Alert if USG or worse
+                            # Alert if USG or worse (AQI > 100)
                             if aqi and aqi > 100:
                                 level_info = self._aqi_level(aqi)
                                 level = level_info.get("label", "USG") if isinstance(level_info, dict) else "USG"
-                                name = self.custom_names.get(s_key, s_key)[:12]
-                                alerts.append((aqi, name, p_key, level))
+                                name = self.custom_names.get(s_key, s_key)
+                                alerts.append((aqi, name, p_key, level, s_key))
         
-        # Sort by AQI descending
-        alerts.sort(key=lambda x: x[0], reverse=True)
-        alerts = alerts[:2]  # Top 2 to fit
+        # Only show new alerts (not already shown)
+        current_keys = {f"{a[4]}:{a[2]}" for a in alerts}  # sensor:pollutant
+        new_alerts = [a for a in alerts if f"{a[4]}:{a[2]}" not in self._last_alert_keys]
+        self._last_alert_keys = current_keys
         
-        level_colors = {"USG": "#fe8019", "Unhealthy": "#fb4934", 
-                        "Very Unhealthy": "#d3869b", "Hazardous": "#cc241d"}
-        
-        content = Text()
-        if not alerts:
-            content.append("✓ All normal", style="#b8bb26")
-        else:
-            for i, (aqi, name, poll, level) in enumerate(alerts):
-                if i > 0:
-                    content.append("\n")
-                color = level_colors.get(level, "#fe8019")
-                content.append(f"{name[:8]:<8} {poll[:4]:<4} ")
-                content.append(f"{aqi:.0f}", style=color)
-        
-        return Panel(content, title="ALERTS", width=21, height=6)
+        # Show top 3 new alerts as toasts - timeout=0 means user must dismiss
+        new_alerts.sort(key=lambda x: x[0], reverse=True)
+        for aqi, name, poll, level, _ in new_alerts[:3]:
+            severity: Literal["information", "warning", "error"] = "warning"
+            if level in ("Unhealthy", "Very Unhealthy", "Hazardous"):
+                severity = "error"
+            self.notify(
+                f"{name}: {poll} AQI {aqi:.0f} ({level})",
+                title="⚠️ Air Quality Alert",
+                severity=severity,
+                timeout=0,  # Stay until dismissed (click or press any key)
+            )
 
     def _format_sparkline_widget(self) -> Panel:
         """Create sparkline trend widget for PM2.5."""
@@ -1049,8 +1075,12 @@ class AirQualityApp(App):
         content.append(f"{avg_val:.0f}", style=spark_color)
         content.append("\n")
         content.append("Hi: ")
-        content.append(f"{max_val:.0f}", style="#fb4934")
-        content.append(f" n={len(pm25_values)}")
+        # Color Hi based on its actual AQI level, not hardcoded red
+        max_aqi = self._value_to_aqi("PM2_5", max_val) or 0
+        max_level_info = self._aqi_level(max_aqi)
+        max_level = max_level_info.get("label", "Good") if isinstance(max_level_info, dict) else "Good"
+        max_color = level_colors.get(max_level, "#b8bb26")
+        content.append(f"{max_val:.0f}", style=max_color)
         
         return Panel(content, title="PM2.5", width=21, height=6)
 
@@ -1072,10 +1102,6 @@ class AirQualityApp(App):
         except Exception:
             pass
         try:
-            self.query_one("#alerts_widget", Static).update(self._format_alerts_widget())
-        except Exception:
-            pass
-        try:
             self.query_one("#sparkline_widget", Static).update(self._format_sparkline_widget())
         except Exception:
             pass
@@ -1083,6 +1109,8 @@ class AirQualityApp(App):
             self.query_one("#region_widget", Static).update(self._format_region_widget())
         except Exception:
             pass
+        # Show air quality alerts as toast notifications
+        self._show_alert_toasts()
 
     def update_status(self, message: str) -> None:
         """Update the footer status line."""

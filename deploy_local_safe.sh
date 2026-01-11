@@ -138,6 +138,24 @@ if [[ -d "$TARGET" ]]; then
 fi
 sudo_if_needed mv "$STAGING" "$TARGET"
 
+# Ad-hoc code sign the binary at its FINAL path to prevent macOS firewall prompts.
+# The firewall tracks by path + signature. Signing after mv ensures path is stable.
+# The '-' identity means ad-hoc (no Apple Developer ID required).
+if command -v codesign &>/dev/null; then
+  codesign --force --deep --sign - "$TARGET/mobileair" 2>/dev/null || true
+fi
+
+# Add to macOS firewall allowlist to prevent "accept incoming connections" prompts.
+# This requires sudo but only needs to be done once per path.
+FIREWALL_CMD="/usr/libexec/ApplicationFirewall/socketfilterfw"
+if [[ -x "$FIREWALL_CMD" ]]; then
+  echo "Adding to macOS firewall allowlist (may require sudo password)..."
+  # Remove any stale rule first, then add fresh
+  sudo "$FIREWALL_CMD" --remove "$TARGET/mobileair" >/dev/null 2>&1 || true
+  sudo "$FIREWALL_CMD" --add "$TARGET/mobileair"
+  sudo "$FIREWALL_CMD" --unblockapp "$TARGET/mobileair"
+fi
+
 install_wrapper
 
 # Note: leave backup in place so rollback is easy.
