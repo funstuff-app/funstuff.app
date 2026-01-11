@@ -56,6 +56,16 @@ from mobileair.roads import RoadGraph, match_trail_segment_offline
 _cached_road_graph: RoadGraph | None = None
 _road_graph_load_attempted: bool = False
 
+# When running in-process (bundled TUI mode), suppress stdout to avoid
+# interfering with Textual's alternate screen mode.
+_quiet_mode: bool = False
+
+
+def _log(msg: str) -> None:
+    """Print a log message unless running in quiet mode (in-process with TUI)."""
+    if not _quiet_mode:
+        print(msg, flush=True)
+
 
 def get_cached_road_graph() -> RoadGraph | None:
     """Get the cached road graph, loading it if needed.
@@ -83,6 +93,8 @@ try:
         fetch_monitoring_sites as _fetch_monitoring_sites,
         fetch_hourly_data as _fetch_hourly_data,
         filter_utah_hourly as _filter_utah_hourly,
+        filter_slc_hourly as _filter_slc_hourly,
+        get_slc_site_ids as _get_slc_site_ids,
         get_hourly_data_url as _get_hourly_data_url,
         get_hourly_data_url_historical as _get_hourly_data_url_historical,
         list_available_hourly_files as _list_available_hourly_files,
@@ -93,6 +105,8 @@ try:
     fetch_monitoring_sites = _fetch_monitoring_sites
     fetch_hourly_data = _fetch_hourly_data
     filter_utah_hourly = _filter_utah_hourly
+    filter_slc_hourly = _filter_slc_hourly
+    get_slc_site_ids = _get_slc_site_ids
     get_hourly_data_url = _get_hourly_data_url
     get_hourly_data_url_historical = _get_hourly_data_url_historical
     list_available_hourly_files = _list_available_hourly_files
@@ -114,6 +128,12 @@ except ImportError:
     
     def filter_utah_hourly(readings: list[dict]) -> list[dict]:
         return []
+    
+    def filter_slc_hourly(readings: list[dict], site_ids=None) -> list[dict]:
+        return []
+    
+    def get_slc_site_ids(sites: list[dict]) -> set[str]:
+        return set()
     
     def get_hourly_data_url() -> str:
         return ""
@@ -429,7 +449,7 @@ def save_fixed_history(app_state: AppState) -> None:
         )
         app_state.fixed_history_dirty = False
     except Exception as e:
-        print(f"[FixedHistory] Failed to save: {e}")
+        _log(f"[FixedHistory] Failed to save: {e}")
 
 
 def accumulate_fixed_reading(
@@ -1453,11 +1473,11 @@ def _pick_primary_key(readings: dict[str, dict[str, Any]]) -> str | None:
 
 def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_event: threading.Event) -> None:
     revision = 0
-    print(f"[FetchLoop] Starting with interval={interval_s}s", flush=True)
+    _log(f"[FetchLoop] Starting with interval={interval_s}s")
     while not stop_event.is_set():
         attempt_ts = time.time()
         try:
-            print(f"[FetchLoop] Fetching data...", flush=True)
+            _log(f"[FetchLoop] Fetching data...")
             mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=stdlib_get)
             fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=stdlib_get)
 
@@ -1475,13 +1495,13 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             # Preserve the force-refresh sequence across rebuild_state() calls.
             meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
             update_app_state_with_new_data(app_state, st)
-            print(f"[FetchLoop] Revision {revision} updated", flush=True)
+            _log(f"[FetchLoop] Revision {revision} updated")
             
             # Periodically save history
             if revision % 10 == 0:
                 save_fixed_history(app_state)
         except Exception as e:
-            print(f"[FetchLoop] Error: {type(e).__name__}: {e}", flush=True)
+            _log(f"[FetchLoop] Error: {type(e).__name__}: {e}")
             with app_state.lock:
                 st = app_state.state if isinstance(app_state.state, dict) else {"ts": time.time(), "mobile": [], "fixed": [], "meta": {}}
                 meta = st.setdefault("meta", {})
@@ -1512,7 +1532,7 @@ def airnow_fetch_loop(
         try:
             _fetch_airnow_data(app_state)
         except Exception as e:
-            print(f"[AirNow] Fetch error: {type(e).__name__}: {e}")
+            _log(f"[AirNow] Fetch error: {type(e).__name__}: {e}")
         
         stop_event.wait(interval_s)
 
@@ -1527,7 +1547,7 @@ def _fetch_airnow_data(app_state: AppState) -> None:
     
     if sites_empty:
         try:
-            print("[AirNow] Fetching site metadata...")
+            _log("[AirNow] Fetching site metadata...")
             all_sites = fetch_monitoring_sites()
             
             # Filter to SLC-area sites and build lookup
@@ -1546,9 +1566,9 @@ def _fetch_airnow_data(app_state: AppState) -> None:
             with app_state.lock:
                 app_state.airnow_sites = sites_by_id
             
-            print(f"[AirNow] Loaded {len(sites_by_id)} SLC-area sites")
+            _log(f"[AirNow] Loaded {len(sites_by_id)} SLC-area sites")
         except Exception as e:
-            print(f"[AirNow] Error fetching sites: {e}")
+            _log(f"[AirNow] Error fetching sites: {e}")
     
     # Determine which hours to fetch based on mobile data time range
     with app_state.lock:
@@ -1585,7 +1605,7 @@ def _fetch_airnow_data(app_state: AppState) -> None:
                                   for f in available_files[-3:]]
         
         if not hours_to_fetch:
-            print("[AirNow] No hours to fetch")
+            _log("[AirNow] No hours to fetch")
             return
         
         # Fetch hourly data for each hour
@@ -1662,9 +1682,9 @@ def _fetch_airnow_data(app_state: AppState) -> None:
                 for k in sorted_keys[:-48]:
                     del app_state.airnow_readings_by_hour[k]
         
-        print(f"[AirNow] Updated {len(all_readings)} sites with hourly data")
+        _log(f"[AirNow] Updated {len(all_readings)} sites with hourly data")
         
-        # Extract wind data from the most recent hour
+        # Extract wind data from the most recent hour (SLC area only)
         try:
             with app_state.lock:
                 sorted_hours = sorted(app_state.airnow_readings_by_hour.keys())
@@ -1672,13 +1692,20 @@ def _fetch_airnow_data(app_state: AppState) -> None:
                 latest_hour = sorted_hours[-1]
                 with app_state.lock:
                     latest_readings = app_state.airnow_readings_by_hour.get(latest_hour, [])
-                wind_data = extract_wind_data(latest_readings)
+                # Filter to SLC area for wind - valley floor conditions during inversion
+                try:
+                    sites = fetch_monitoring_sites()
+                    slc_site_ids = get_slc_site_ids(sites)
+                    slc_readings = filter_slc_hourly(latest_readings, slc_site_ids)
+                except Exception:
+                    slc_readings = latest_readings  # Fallback to all Utah
+                wind_data = extract_wind_data(slc_readings)
                 with app_state.lock:
                     app_state.wind_data = wind_data
                 if wind_data.get("wind_speed") is not None:
-                    print(f"[AirNow] Wind: {wind_data.get('wind_speed_mph', 0):.1f} mph from {wind_data.get('wind_dir_cardinal', '?')} (gust level {wind_data.get('gust_level', 0)})")
+                    _log(f"[AirNow] Wind: {wind_data.get('wind_speed_mph', 0):.1f} mph from {wind_data.get('wind_dir_cardinal', '?')} (gust level {wind_data.get('gust_level', 0)}, {wind_data.get('stations', 0)} SLC stations)")
         except Exception as e:
-            print(f"[AirNow] Wind extraction error: {e}")
+            _log(f"[AirNow] Wind extraction error: {e}")
         
         # Trigger a state rebuild to merge new data
         with app_state.lock:
@@ -1692,7 +1719,7 @@ def _fetch_airnow_data(app_state: AppState) -> None:
         save_fixed_history(app_state)
         
     except Exception as e:
-        print(f"[AirNow] Error fetching hourly data: {e}")
+        _log(f"[AirNow] Error fetching hourly data: {e}")
 
 
 def apply_sensor_names_inplace(state: dict[str, Any], custom_names: dict[str, Any]) -> bool:
@@ -2166,7 +2193,7 @@ def main() -> int:
     
     # Load persistent fixed sensor history
     load_fixed_history(app_state, data_dir)
-    print(f"[FixedHistory] Loaded {len(app_state.fixed_history)} sensors from history")
+    _log(f"[FixedHistory] Loaded {len(app_state.fixed_history)} sensors from history")
     
     stop_event = threading.Event()
 
@@ -2180,9 +2207,9 @@ def main() -> int:
             kwargs=dict(app_state=app_state, interval_s=1200.0, stop_event=stop_event),
             daemon=True
         ).start()
-        print("[AirNow] Hourly data integration enabled (20-min refresh)")
+        _log("[AirNow] Hourly data integration enabled (20-min refresh)")
     else:
-        print("[AirNow] Integration not available (airnow_slc.py not found)")
+        _log("[AirNow] Integration not available (airnow_slc.py not found)")
 
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir))
     # Timeout for individual requests - helps with Safari/iOS connection issues
@@ -2244,6 +2271,9 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
     Returns (stop_event, httpd) so the caller can stop it later.
     Used when running as a bundled executable where subprocess isn't available.
     """
+    global _quiet_mode
+    _quiet_mode = True  # Suppress stdout to avoid interfering with Textual TUI
+    
     data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     static_dir = _get_bundle_dir() / "dashboard"
