@@ -874,8 +874,9 @@ class AirQualityApp(App):
         # Count sensors
         mobile_sensors = set()
         fixed_sensors = set()
-        # Collect readings by pollutant: {pollutant: [(aqi, sensor), ...]}
-        readings_by_pollutant: dict[str, list[tuple[float, str]]] = {"PM25": [], "PM10": [], "OZNE": []}
+        # Collect readings by pollutant: {pollutant: [(aqi, val, sensor), ...]}
+        # Store both AQI (for sorting/coloring) and raw value (for display)
+        readings_by_pollutant: dict[str, list[tuple[float, float, str]]] = {"PM25": [], "PM10": [], "OZNE": []}
         
         # Map API pollutant names to our AQI names
         poll_map = {"PM25": "PM2_5", "PM10": "PM10", "OZNE": "O3"}
@@ -893,7 +894,7 @@ class AirQualityApp(App):
                     if val is not None:
                         aqi = self._value_to_aqi(aqi_key, val)
                         if aqi is not None and p_key in readings_by_pollutant:
-                            readings_by_pollutant[p_key].append((aqi, s_key))
+                            readings_by_pollutant[p_key].append((aqi, val, s_key))
         
         for p_key, details in fixed_data.items():
             if not isinstance(details, dict):
@@ -922,7 +923,7 @@ class AirQualityApp(App):
                     if val is not None:
                         aqi = self._value_to_aqi(aqi_key, val)
                         if aqi is not None and p_key in readings_by_pollutant:
-                            readings_by_pollutant[p_key].append((aqi, s_key))
+                            readings_by_pollutant[p_key].append((aqi, val, s_key))
         
         n_mobile = len(mobile_sensors)
         n_fixed = len(fixed_sensors)
@@ -931,16 +932,21 @@ class AirQualityApp(App):
         primary_pollutant = None
         max_aqi_overall = -1.0
         for p_key, readings in readings_by_pollutant.items():
-            for aqi, _ in readings:
+            for aqi, val, _ in readings:
                 if aqi > max_aqi_overall:
                     max_aqi_overall = aqi
                     primary_pollutant = p_key
         
         # Calculate stats using ONLY the primary pollutant's readings
-        avg_aqi = 0
-        max_aqi = 0
+        # Use raw values for display, AQI for coloring
+        avg_val = 0.0
+        max_val = 0.0
+        avg_aqi = 0.0
+        max_aqi = 0.0
         if primary_pollutant and readings_by_pollutant[primary_pollutant]:
             primary_readings = readings_by_pollutant[primary_pollutant]
+            avg_val = sum(r[1] for r in primary_readings) / len(primary_readings)
+            max_val = max(r[1] for r in primary_readings)
             avg_aqi = sum(r[0] for r in primary_readings) / len(primary_readings)
             max_aqi = max(r[0] for r in primary_readings)
         
@@ -956,14 +962,14 @@ class AirQualityApp(App):
         content.append(f"{n_fixed}", style="#fabd2f")
         content.append(" fix\n")
         content.append("Avg: ")
-        content.append(f"{avg_aqi:.0f}", style=avg_color)
+        content.append(f"{avg_val:.0f}", style=avg_color)
         content.append(f" {primary_pollutant[:4]}\n" if primary_pollutant else "\n")
-        if primary_pollutant and max_aqi > 0:
+        if primary_pollutant and max_val > 0:
             max_info = self._aqi_level(max_aqi)
             max_level = max_info.get("label", "Good") if isinstance(max_info, dict) else str(max_info)
             max_color = level_colors.get(max_level, "#928374")
             content.append("Max: ")
-            content.append(f"{max_aqi:.0f}", style=max_color)
+            content.append(f"{max_val:.0f}", style=max_color)
             content.append(f" {primary_pollutant[:4]}")
         else:
             content.append("Max: -")
