@@ -478,6 +478,7 @@ class AirQualityApp(App):
         with Horizontal(classes="status-bar"):
             yield Static("", id="summary_widget")
             yield Static("", id="sparkline_widget")
+            yield Static("", id="pm10_widget")
             yield Static("", id="region_widget")
             yield Static("", id="wind_indicator")
         with Vertical(classes="main-content"):
@@ -787,17 +788,18 @@ class AirQualityApp(App):
             self.call_from_thread(self.update_wind_indicator, wind_data)
     
     def update_wind_indicator(self, wind_data: dict) -> None:
-        """Update the wind indicator display with ASCII art."""
+        """Store wind data and update the weather widget."""
+        self._wind_data = wind_data
         try:
-            indicator = self._format_wind_indicator(wind_data)
-            self.query_one("#wind_indicator", Static).update(indicator)
+            self.query_one("#wind_indicator", Static).update(self._format_weather_widget())
         except Exception:
             pass
     
-    def _format_wind_indicator(self, wind_data: dict) -> Panel:
-        """Create a wind indicator widget using Rich Panel."""
+    def _format_weather_widget(self) -> Panel:
+        """Create a weather widget using Rich Panel."""
+        wind_data = getattr(self, '_wind_data', None)
         if not wind_data or wind_data.get("wind_speed") is None:
-            return Panel("No data", title="WIND", width=21, height=6)
+            return Panel("No data", title="WEATHER", width=21, height=6)
         
         speed_mph = wind_data.get("wind_speed_mph", 0) or 0
         direction = wind_data.get("wind_dir", 0) or 0
@@ -827,11 +829,13 @@ class AirQualityApp(App):
         content.append(gust_bar, style=gust_color)
         content.append(f" {gust_label}\n")
         if temp_f is not None:
+            content.append("T: ", style="#928374")
             content.append(f"{temp_f:.0f}°F", style="#ebdbb2")
-            if humidity:
-                content.append(f" {humidity:.0f}%", style="#83a598")
+            if humidity is not None:
+                content.append(" RH: ", style="#928374")
+                content.append(f"{humidity:.0f}%", style="#83a598")
         
-        return Panel(content, title="WIND", width=21, height=6)
+        return Panel(content, title="WEATHER", width=21, height=6)
 
     def _get_latest_value(self, s_data: dict) -> float | None:
         """Extract the latest numeric value from sensor data (handles array or scalar)."""
@@ -948,7 +952,7 @@ class AirQualityApp(App):
         
         content = Text()
         content.append(f"{n_mobile}", style="#83a598")
-        content.append(" mobile ")
+        content.append(" mob ")
         content.append(f"{n_fixed}", style="#fabd2f")
         content.append(" fix\n")
         content.append("Avg: ")
@@ -964,7 +968,7 @@ class AirQualityApp(App):
         else:
             content.append("Max: -")
         
-        return Panel(content, title="SUMMARY", width=21, height=6)
+        return Panel(content, title="SUMMARY", width=17, height=6)
 
     # Track shown alerts to avoid spamming toasts
     _last_alert_keys: set = set()
@@ -1071,18 +1075,82 @@ class AirQualityApp(App):
         content.append("\n")
         content.append("Lo: ")
         content.append(f"{min_val:.0f}", style="#b8bb26")
-        content.append(" Avg: ")
-        content.append(f"{avg_val:.0f}", style=spark_color)
-        content.append("\n")
-        content.append("Hi: ")
+        content.append(" Hi: ")
         # Color Hi based on its actual AQI level, not hardcoded red
         max_aqi = self._value_to_aqi("PM2_5", max_val) or 0
         max_level_info = self._aqi_level(max_aqi)
         max_level = max_level_info.get("label", "Good") if isinstance(max_level_info, dict) else "Good"
         max_color = level_colors.get(max_level, "#b8bb26")
         content.append(f"{max_val:.0f}", style=max_color)
+        content.append("\n")
+        content.append("Avg: ")
+        content.append(f"{avg_val:.0f}", style=spark_color)
         
-        return Panel(content, title="PM2.5", width=21, height=6)
+        return Panel(content, title="PM2.5", width=17, height=6)
+
+    def _format_pm10_widget(self) -> Panel:
+        """Create PM10 sparkline trend widget."""
+        data = self.current_data
+        if not data:
+            return Panel("No data", title="PM10", width=17, height=6)
+        
+        # Collect recent PM10 values - API uses "PM10" key
+        pm10_values = []
+        mobile_data = data.get("mobile", {})
+        
+        pm10_data = mobile_data.get("PM10", {})
+        if isinstance(pm10_data, dict):
+            for s_key, s_data in pm10_data.items():
+                if s_key in ['LastUpdateUTC', 'LastUpdateLocal', 'VarName', 'VarUnit']:
+                    continue
+                if isinstance(s_data, dict) and 'Value' in s_data:
+                    val = self._get_latest_value(s_data)
+                    if val is not None:
+                        pm10_values.append(val)
+        
+        if not pm10_values:
+            return Panel("No data", title="PM10", width=17, height=6)
+        
+        # Create sparkline from current values across sensors
+        blocks = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        min_val = min(pm10_values)
+        max_val = max(pm10_values)
+        avg_val = sum(pm10_values) / len(pm10_values)
+        
+        # Normalize and create sparkline
+        spark = ""
+        if max_val > min_val:
+            for v in pm10_values[:10]:  # Limit to 10 points
+                idx = int((v - min_val) / (max_val - min_val) * 7)
+                idx = max(0, min(7, idx))
+                spark += blocks[idx]
+        else:
+            spark = blocks[4] * min(len(pm10_values), 10)
+        
+        # Color based on avg AQI
+        avg_aqi = self._value_to_aqi("PM10", avg_val) or 0
+        level_info = self._aqi_level(avg_aqi)
+        level = level_info.get("label", "Good") if isinstance(level_info, dict) else "Good"
+        level_colors = {"Good": "#b8bb26", "Moderate": "#fabd2f", "USG": "#fe8019", 
+                        "Unhealthy": "#fb4934", "Very Unhealthy": "#d3869b", "Hazardous": "#cc241d"}
+        spark_color = level_colors.get(level, "#83a598")
+        
+        content = Text()
+        content.append(spark, style=spark_color)
+        content.append("\n")
+        content.append("Lo: ")
+        content.append(f"{min_val:.0f}", style="#b8bb26")
+        content.append(" Hi: ")
+        max_aqi = self._value_to_aqi("PM10", max_val) or 0
+        max_level_info = self._aqi_level(max_aqi)
+        max_level = max_level_info.get("label", "Good") if isinstance(max_level_info, dict) else "Good"
+        max_color = level_colors.get(max_level, "#b8bb26")
+        content.append(f"{max_val:.0f}", style=max_color)
+        content.append("\n")
+        content.append("Avg: ")
+        content.append(f"{avg_val:.0f}", style=spark_color)
+        
+        return Panel(content, title="PM10", width=17, height=6)
 
     def _format_region_widget(self) -> Panel:
         """Create region/location info widget."""
@@ -1106,7 +1174,15 @@ class AirQualityApp(App):
         except Exception:
             pass
         try:
+            self.query_one("#pm10_widget", Static).update(self._format_pm10_widget())
+        except Exception:
+            pass
+        try:
             self.query_one("#region_widget", Static).update(self._format_region_widget())
+        except Exception:
+            pass
+        try:
+            self.query_one("#wind_indicator", Static).update(self._format_weather_widget())
         except Exception:
             pass
         # Show air quality alerts as toast notifications

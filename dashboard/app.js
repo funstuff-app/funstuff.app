@@ -3327,96 +3327,109 @@ class MapView {
     const key = this._playbackPointsKeyForState(state);
     const cacheHit = (this._playbackPtsKey === key);
     
+    // In LIVE mode, always update maxMs from current data even on cache hit
+    // (new data may have extended the timeline)
     if (cacheHit && !this._playbackLiveFollow) {
-      // Cache hit and not in LIVE mode - skip entirely
       return;
     }
     
-    // Rebuild playback points if cache miss
-    if (!cacheHit) {
-      this._playbackPtsKey = key;
-      
-      const nextPtsById = new Map();
-      let minMs = Infinity;
-      let maxMs = -Infinity;
+    // Rebuild playback points if cache miss OR in LIVE mode
+    this._playbackPtsKey = key;
+    
+    const nextPtsById = new Map();
+    let minMs = Infinity;
+    let maxMs = -Infinity;
 
-      // Live playback is "today only"; clamp the window start to 5:00 AM local time.
-      // Use the newest reading timestamp to determine what "today" means.
-      const liveDayStartMs = (!this._historicalMode)
-        ? (() => {
-            const bestMs = newestReadingMsFromState(state);
-            if (bestMs == null || !isFinite(bestMs)) return null;
-            const d = new Date(bestMs);
+    // Live playback is "today only"; clamp the window start to 5:00 AM local time.
+    // Use the newest reading timestamp to determine what "today" means.
+    const liveDayStartMs = (!this._historicalMode)
+      ? (() => {
+          const bestMs = newestReadingMsFromState(state);
+          if (bestMs == null || !isFinite(bestMs)) return null;
+          const d = new Date(bestMs);
 
-            // If it's after midnight but before 5AM local time, "today's 5AM" is in the
-            // future relative to bestMs; in that case the live window should start at
-            // the previous day's 5AM.
-            const localHour = d.getHours();
-            if (localHour < 5) {
-              d.setDate(d.getDate() - 1);
-            }
+          // If it's after midnight but before 5AM local time, "today's 5AM" is in the
+          // future relative to bestMs; in that case the live window should start at
+          // the previous day's 5AM.
+          const localHour = d.getHours();
+          if (localHour < 5) {
+            d.setDate(d.getDate() - 1);
+          }
 
-            d.setHours(5, 0, 0, 0);
-            const ms = d.getTime();
-            return isFinite(ms) ? ms : null;
-          })()
-        : null;
+          d.setHours(5, 0, 0, 0);
+          const ms = d.getTime();
+          return isFinite(ms) ? ms : null;
+        })()
+      : null;
 
-      const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
-      for (const m of mobiles) {
-        const id = m && m.id != null ? String(m.id) : "";
-        if (!id) continue;
+    const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
+    for (const m of mobiles) {
+      const id = m && m.id != null ? String(m.id) : "";
+      if (!id) continue;
 
-        const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
-        const persisted = this._historicalMode ? [] : (this._persistedTrailById.get(id)?.trail || []);
-        const src = (persisted.length >= 2) ? persisted : serverTrail;
-        if (!Array.isArray(src) || src.length < 2) continue;
+      const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
+      const persisted = this._historicalMode ? [] : (this._persistedTrailById.get(id)?.trail || []);
+      const src = (persisted.length >= 2) ? persisted : serverTrail;
+      if (!Array.isArray(src) || src.length < 2) continue;
 
-        const pts = [];
-        for (const p of src) {
-          const lat = Number(p?.lat);
-          const lon = Number(p?.lon);
-          if (!isFinite(lat) || !isFinite(lon)) continue;
-          const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
-          if (tMs == null || !isFinite(tMs)) continue;
-          pts.push({ lat, lon, tMs, m: p.m, readings: p.readings });
+      const pts = [];
+      for (const p of src) {
+        const lat = Number(p?.lat);
+        const lon = Number(p?.lon);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+        const tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
+        if (tMs == null || !isFinite(tMs)) continue;
+        pts.push({ lat, lon, tMs, m: p.m, readings: p.readings });
+      }
+      if (pts.length >= 1) {
+        pts.sort((a, b) => a.tMs - b.tMs);
+
+        let filtered = pts;
+        if (liveDayStartMs != null && isFinite(liveDayStartMs)) {
+          filtered = pts.filter(p => p.tMs >= liveDayStartMs);
         }
-        if (pts.length >= 1) {
-          pts.sort((a, b) => a.tMs - b.tMs);
+        if (!Array.isArray(filtered) || filtered.length < 2) {
+          continue;
+        }
 
-          let filtered = pts;
-          if (liveDayStartMs != null && isFinite(liveDayStartMs)) {
-            filtered = pts.filter(p => p.tMs >= liveDayStartMs);
-          }
-          if (!Array.isArray(filtered) || filtered.length < 2) {
-            continue;
-          }
+        // Update timeline bounds from ALL data points (before movement filter)
+        minMs = Math.min(minMs, filtered[0].tMs);
+        maxMs = Math.max(maxMs, filtered[filtered.length - 1].tMs);
 
-          // Ignore trails that are effectively just GPS jitter.
-          let totalM = 0;
-          for (let i = 1; i < filtered.length; i++) {
-            const a = filtered[i - 1];
-            const b = filtered[i];
-            const d = haversineMeters(a.lat, a.lon, b.lat, b.lon);
-            if (isFinite(d)) totalM += d;
-            if (totalM >= MapView.MIN_TRAIL_LENGTH_M) break;
-          }
-          if (totalM < MapView.MIN_TRAIL_LENGTH_M) {
-            continue;
-          }
-
-          minMs = Math.min(minMs, filtered[0].tMs);
-          maxMs = Math.max(maxMs, filtered[filtered.length - 1].tMs);
+        // Only add to playback points if there's actual movement (not just GPS jitter)
+        let totalM = 0;
+        for (let i = 1; i < filtered.length; i++) {
+          const a = filtered[i - 1];
+          const b = filtered[i];
+          const d = haversineMeters(a.lat, a.lon, b.lat, b.lon);
+          if (isFinite(d)) totalM += d;
+          if (totalM >= MapView.MIN_TRAIL_LENGTH_M) break;
+        }
+        if (totalM >= MapView.MIN_TRAIL_LENGTH_M) {
           nextPtsById.set(id, filtered);
         }
       }
-
-      this._playbackPtsById = nextPtsById;
-      // NOTE: liveDayStartMs is a *filter floor* (exclude overnight data), not a forced UI range.
-      // Keeping min bound at the first actual point avoids a long empty "dead zone" on fresh loads.
-      this._playbackMinMs = isFinite(minMs) ? minMs : null;
-      this._playbackMaxMs = isFinite(maxMs) ? maxMs : null;
     }
+
+    this._playbackPtsById = nextPtsById;
+    
+    // Use server meta timestamps as fallback when no trails qualify
+    const serverStartMs = state?.meta?.trail_update_start_ms;
+    const serverEndMs = state?.meta?.trail_update_end_ms;
+    
+    if (!isFinite(minMs) && typeof serverStartMs === "number" && isFinite(serverStartMs)) {
+      minMs = serverStartMs;
+    }
+    if (!isFinite(maxMs) && typeof serverEndMs === "number" && isFinite(serverEndMs)) {
+      maxMs = serverEndMs;
+    }
+    // Also extend maxMs if server has newer data
+    if (isFinite(maxMs) && typeof serverEndMs === "number" && isFinite(serverEndMs) && serverEndMs > maxMs) {
+      maxMs = serverEndMs;
+    }
+    
+    this._playbackMinMs = isFinite(minMs) ? minMs : null;
+    this._playbackMaxMs = isFinite(maxMs) ? maxMs : null;
 
     // Track maxMs for other uses
     this._playbackLastMaxMs = this._playbackMaxMs;
@@ -6387,9 +6400,12 @@ function updateSidebarPlaybackValues() {
   const state = map._historicalMode ? window._historicalState : window.__lastState;
   if (!state || !Array.isArray(state.mobile)) return;
   
-  const nowPerfMs = performance.now();
   const t = map.getPlaybackTimeMs();
   if (t == null || !isFinite(t)) return;
+  
+  // At the live edge, use live values - don't update readings
+  const atEnd = map.isPlaybackAtEnd(100);
+  if (atEnd) return;
   
   for (const m of state.mobile) {
     if (!m || m.id == null) continue;
@@ -6398,22 +6414,10 @@ function updateSidebarPlaybackValues() {
     const itemEl = listMobileEl.querySelector(`[data-id="${m.id}"]`);
     if (!itemEl) continue;
     
-    // Check if marker is visible at current playback time using the same logic as the map
-    const sample = map._playbackSampleForMobile(m, nowPerfMs);
-    const isVisible = sample && sample.visible !== false;
-    
-    if (!isVisible) {
-      if (!itemEl.classList.contains("hidden")) {
-        itemEl.classList.add("hidden");
-      }
-      continue;
-    }
-    
+    // Always show sensor - never hide
     if (itemEl.classList.contains("hidden")) {
       itemEl.classList.remove("hidden");
     }
-    
-    if (!sample || !sample.reading) continue;
     
     // Get playback points for this sensor
     const pts = map._playbackPtsById.get(String(m.id));
@@ -7067,6 +7071,7 @@ function main() {
   // Track when we hit the end and are waiting for vehicles to physically reach the
   // end of their paths (no fixed pause; rewind triggers when vehicles are done).
   let _pbAtEndSincePerf = null;   // performance.now() when we started waiting at end
+  let _pbArrivedAtEndViaPlayback = false; // true only if we PLAYED to the end (not scrolled)
   
   // Track when ease-in phase started (for wall-time-based easing)
   let _pbEaseStartPerf = null;
@@ -7469,10 +7474,16 @@ function main() {
 
     if (pbPlayEl) {
       if (followingLive) {
+        // LIVE mode: show Live button highlighted
         pbPlayEl.textContent = "Live";
         pbPlayEl.classList.add("isLive");
+      } else if (map.getPlaybackPlaying()) {
+        // Playing but not LIVE: show Pause
+        pbPlayEl.textContent = "Pause";
+        pbPlayEl.classList.remove("isLive");
       } else {
-        pbPlayEl.textContent = map.getPlaybackPlaying() ? "Pause" : (atEnd ? "Live" : "Play");
+        // Paused: show Play
+        pbPlayEl.textContent = "Play";
         pbPlayEl.classList.remove("isLive");
       }
     }
@@ -7574,7 +7585,9 @@ function main() {
     // If the server updates every ~10 minutes and playback speed is 5x, the client will
     // have consumed ~50 minutes of data-time between updates; we must rewind ~50 minutes
     // of data-time to replay what happened since the last update.
-    if (hasBounds && map._playbackLiveFollow && (newDataArrived || forceCameraFit)) {
+    // NOTE: Only rewind if playback is actively playing. If paused or just sitting at the end,
+    // don't seek backward - just let new data extend forward.
+    if (hasBounds && (newDataArrived || forceCameraFit) && map.getPlaybackPlaying()) {
       const meta = map.lastState?.meta;
       const sMs = (meta && typeof meta.trail_update_start_ms === "number" && isFinite(meta.trail_update_start_ms)) ? meta.trail_update_start_ms : null;
       const eMs = (meta && typeof meta.trail_update_end_ms === "number" && isFinite(meta.trail_update_end_ms)) ? meta.trail_update_end_ms : null;
@@ -7746,24 +7759,27 @@ function main() {
         // new data. When new data arrives, resume playing.
         // ─────────────────────────────────────────────────────────────────────
         if (atEnd) {
-          // At live edge, waiting for new data - just hold position
+          // At live edge, waiting for new data
+          // Only set rewind timer if we PLAYED here (had positive velocity last frame)
+          // NOT if we just arrived via drag/scroll (velocity was already 0)
+          if (_pbAtEndSincePerf == null && _pbVelocity > 0) {
+            _pbAtEndSincePerf = now;
+          }
           _pbVelocity = 0;
         } else {
           // Have data ahead - play toward live edge at user-selected speed
           _pbVelocity = _pbPlaybackSpeed * speedMult;
+          _pbAtEndSincePerf = null;
         }
       } else if (map.getPlaybackPlaying()) {
-        // Normal forward playback
+        // Normal forward playback (LIVE mode off)
+        // Wait at end for new data. No auto-rewind (that's only in LIVE mode).
         if (atEnd) {
-          // At end, not LIVE, not rewinding: hold playhead and let vehicle physics
-          // finish moving to the end of their paths; rewind will trigger when all
-          // vehicles are actually at the end.
-          if (_pbAtEndSincePerf == null) _pbAtEndSincePerf = now;
+          // At end, waiting for new data
           _pbVelocity = 0;
         } else {
           // Normal forward - maintain playback speed
           _pbVelocity = _pbPlaybackSpeed * speedMult;
-          _pbAtEndSincePerf = null;
         }
       } else if (!map.getPlaybackPlaying() && Math.abs(_pbVelocity) > _pbVelocityThreshold) {
         // Coasting after wheel - apply friction
@@ -7771,28 +7787,38 @@ function main() {
         const frictionFactor = Math.pow(friction, dt);
         _pbVelocity *= frictionFactor;
         
-        // When velocity decays to playback speed, resume playback
+        // When velocity decays, resume playback IF we're at the end (so new data plays).
+        // If not at end, just stop.
         const playbackSpeed = _pbPlaybackSpeed * speedMult;
         if (_pbVelocity > 0 && _pbVelocity <= playbackSpeed) {
-          // Forward coasting reached playback speed - resume
           _pbIsWheelCoasting = false;
           if (_pbCommitLoopStartOnCoastEnd) {
             _pbLoopStartMs = tMs;
             _pbCommitLoopStartOnCoastEnd = false;
           }
-          _pbVelocity = playbackSpeed;
-          map.setPlaybackPlaying(true);
-          updatePlaybackUi();
+          if (atEnd) {
+            // At end - enter LIVE mode, but velocity=0 (we're waiting, not playing)
+            // This prevents immediate rewind trigger
+            map._playbackLiveFollow = true;
+            _pbVelocity = 0;
+            map.setPlaybackPlaying(true);
+          } else {
+            _pbVelocity = 0;
+          }
         } else if (_pbVelocity < 0 && Math.abs(_pbVelocity) < _pbVelocityThreshold) {
-          // Backward coasting stopped - resume forward playback
           _pbIsWheelCoasting = false;
           if (_pbCommitLoopStartOnCoastEnd) {
             _pbLoopStartMs = tMs;
             _pbCommitLoopStartOnCoastEnd = false;
           }
-          _pbVelocity = playbackSpeed;
-          map.setPlaybackPlaying(true);
-          updatePlaybackUi();
+          if (atEnd) {
+            // At end - enter LIVE mode, but velocity=0 (we're waiting, not playing)
+            map._playbackLiveFollow = true;
+            _pbVelocity = 0;
+            map.setPlaybackPlaying(true);
+          } else {
+            _pbVelocity = 0;
+          }
         }
       }
       
@@ -7821,6 +7847,10 @@ function main() {
         if (nextMs >= b.maxMs && _pbVelocity > 0) {
           _pbVelocity = 0;
           nextMs = b.maxMs;
+          // Scrolled to the end - enter LIVE mode
+          map._playbackLiveFollow = true;
+          _pbIsWheelCoasting = false;
+          map.setPlaybackPlaying(true);
         }
         
         if (nextMs !== tMs) {
@@ -7859,10 +7889,13 @@ function main() {
     // ─────────────────────────────────────────────────────────────────────────
     // RENDER
     // ─────────────────────────────────────────────────────────────────────────
+    // Auto-rewind when we've played through to the end.
+    // LIVE mode only controls camera follow, not playback/rewind behavior.
+    // Only trigger rewind in LIVE mode
     const waitingForVehiclesAtEnd =
       !_pbIsRewinding &&
       map.getPlaybackPlaying() &&
-      !map._playbackLiveFollow &&
+      map._playbackLiveFollow &&
       hasBounds &&
       tMs != null &&
       isFinite(tMs) &&
@@ -7880,6 +7913,7 @@ function main() {
         _pbIsRewinding = true;
         _pbVelocity = _pbRewindSpeed;
         _pbAtEndSincePerf = null;
+        _pbArrivedAtEndViaPlayback = false;
       }
     }
 
@@ -7974,22 +8008,24 @@ function main() {
 
       const atEnd = map.isPlaybackAtEnd(100);
       
-      // If in LIVE mode, clicking toggles pause/play but stays in LIVE mode
+      // If in LIVE mode, clicking turns OFF live camera follow (but keeps playback running).
+      // This allows the user to stay at the end receiving new data, but without the camera auto-following.
       if (map._playbackLiveFollow) {
-        if (map.getPlaybackPlaying()) {
-          // Pause LIVE playback (but stay in LIVE mode)
-          map.setPlaybackPlaying(false);
-          _pbVelocity = 0;
-          _pbWheelAccum = 0;
-          updatePlaybackUi();
-        } else {
-          // Resume LIVE playback
+        map._playbackLiveFollow = false;
+        if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
+        // Set loop start to current position so rewind doesn't go to beginning of time
+        const curMs = map.getPlaybackTimeMs();
+        if (curMs != null && isFinite(curMs)) {
+          _pbLoopStartMs = curMs;
+        }
+        // Keep playback running (or start it if paused)
+        if (!map.getPlaybackPlaying()) {
           _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
           map.setPlaybackPlaying(true);
           _pbLastPerf = 0;
           if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-          updatePlaybackUi();
         }
+        updatePlaybackUi();
         return;
       }
 
@@ -8004,24 +8040,7 @@ function main() {
         return;
       }
 
-      // If at the end (paused, not LIVE), initiate immediate rewind
-      if (atEnd) {
-        // If we don't have a loop start yet, fall back to the global min.
-        if (_pbLoopStartMs == null || !isFinite(Number(_pbLoopStartMs))) {
-          _pbLoopStartMs = b.minMs;
-        }
-        _pbAtEndSincePerf = null;
-        _pbWheelAccum = 0;
-        _pbIsRewinding = true;
-        _pbVelocity = _pbRewindSpeed; // immediate rewind velocity
-        map.setPlaybackPlaying(true);
-        _pbLastPerf = 0;
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
-        return;
-      }
-
-      // Normal play from current position (not LIVE, not at end)
+      // Paused - just play from current position
       _pbAtEndSincePerf = null;
       _pbWheelAccum = 0;
       _pbIsRewinding = false;
@@ -8654,6 +8673,7 @@ function main() {
       _pbVelocity = 0;
       _pbWheelAccum = 0;
       _pbAtEndSincePerf = null;
+      _pbArrivedAtEndViaPlayback = false; // user is scrubbing, not playing
       _pbIsRewinding = false;
       _pbEaseStartPerf = null;
       _pbIsWheelCoasting = false;
@@ -8669,6 +8689,10 @@ function main() {
     pbScrubEl.addEventListener("pointerup", () => {
       _pbScrubbing = false;
       _pbVelocity = 0;
+      // If at end, enter LIVE mode
+      if (map.isPlaybackAtEnd(100)) {
+        map._playbackLiveFollow = true;
+      }
       map.setPlaybackPlaying(true);
       _pbLastPerf = performance.now();
       if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
@@ -8707,6 +8731,7 @@ function main() {
       e.preventDefault();
       // Cancel any pending rewind and stop normal playback
       _pbAtEndSincePerf = null;
+      _pbArrivedAtEndViaPlayback = false; // user is scrolling, not playing
       _pbIsRewinding = false;
       map.setPlaybackPlaying(false); // Let wheel nudge control velocity
       // Exit LIVE mode on scroll
@@ -8890,7 +8915,10 @@ function main() {
 
       // Keep DVR UI in sync even when the RAF loop is idle.
       if (map.playbackMode) {
-        try { updatePlaybackUi(); } catch {}
+        try { 
+          updatePlaybackUi(); 
+          updateSidebarPlaybackValues(); // Apply playback-time visibility to sidebar
+        } catch {}
       }
       saveViewSoon();
     } catch (e) {
