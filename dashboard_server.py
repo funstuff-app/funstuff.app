@@ -452,6 +452,115 @@ def save_fixed_history(app_state: AppState) -> None:
         _log(f"[FixedHistory] Failed to save: {e}")
 
 
+def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
+    """Load today's saved snapshot and seed persistent_mobile state.
+    
+    This enables seamless continuity when the server restarts: the saved trail
+    data is merged with incoming live data instead of starting from scratch.
+    
+    Returns True if snapshot was loaded, False otherwise (fails silently).
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        snapshot = load_snapshot(data_dir, today_str)
+        if snapshot is None:
+            return False
+        
+        mobiles = snapshot.get("mobile", [])
+        if not isinstance(mobiles, list) or not mobiles:
+            return False
+        
+        now = time.time()
+        loaded_count = 0
+        
+        with app_state.lock:
+            for m in mobiles:
+                sid = m.get("id")
+                if not sid:
+                    continue
+                
+                # Only load if not already present in persistent_mobile
+                if sid in app_state.persistent_mobile:
+                    continue
+                
+                # Initialize the mobile entry from snapshot
+                trail = m.get("trail", [])
+                if not isinstance(trail, list):
+                    trail = []
+                
+                # Ensure trail points have movement markers
+                for p in trail:
+                    if isinstance(p, dict) and "m" not in p:
+                        p["m"] = 1  # Assume moving for historical data
+                
+                # Get last trail timestamp
+                last_ts = None
+                if trail:
+                    last_p = trail[-1]
+                    last_ts = last_p.get("t") if isinstance(last_p, dict) else None
+                
+                # Set up persistent mobile state
+                m["_last_seen"] = now
+                m["_idle"] = bool(m.get("immobile"))
+                m["_idle_breakout_hits"] = 0
+                m["_idle_since_t"] = last_ts if m.get("_idle") else None
+                m["_last_trail_ts"] = last_ts
+                m["trail"] = trail
+                
+                # Mark as ghosted initially - live data will clear this if sensor is online
+                m["ghosted"] = True
+                m["_sticky_ghosted"] = True
+                m["_from_snapshot"] = True  # Mark origin for debugging
+                
+                app_state.persistent_mobile[sid] = m
+                loaded_count += 1
+        
+        if loaded_count > 0:
+            _log(f"[Snapshot] Loaded {loaded_count} mobiles from today's snapshot ({today_str})")
+        return loaded_count > 0
+        
+    except Exception as e:
+        # Fail silently - this is optional persistence
+        _log(f"[Snapshot] Could not load today's snapshot: {e}")
+        return False
+
+
+def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
+    """Save current state as today's snapshot.
+    
+    Called on graceful shutdown to persist the accumulated trail data.
+    Returns True if saved successfully, False otherwise.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        with app_state.lock:
+            # Build state from persistent_mobile
+            state_bytes = app_state.cached_json_bytes
+            if not state_bytes:
+                return False
+            state = json.loads(state_bytes.decode("utf-8"))
+        
+        # Validate there's something worth saving
+        mobiles = state.get("mobile", [])
+        if not isinstance(mobiles, list) or not mobiles:
+            _log("[Snapshot] Nothing to save (no mobile sensors)")
+            return False
+        
+        # Check if we have any trails worth saving
+        total_points = sum(len(m.get("trail", [])) for m in mobiles if isinstance(m, dict))
+        if total_points < 10:
+            _log("[Snapshot] Not enough data to save (fewer than 10 trail points)")
+            return False
+        
+        result = save_snapshot(data_dir, today_str, state)
+        _log(f"[Snapshot] Saved today's state: {result.get('filename')} ({result.get('size_bytes')} bytes)")
+        return True
+        
+    except Exception as e:
+        _log(f"[Snapshot] Failed to save today's snapshot: {e}")
+        return False
+
+
 def accumulate_fixed_reading(
     app_state: AppState,
     sensor_id: str,
@@ -2195,6 +2304,9 @@ def main() -> int:
     load_fixed_history(app_state, data_dir)
     _log(f"[FixedHistory] Loaded {len(app_state.fixed_history)} sensors from history")
     
+    # Load today's snapshot to restore trail history on restart
+    load_today_snapshot(app_state, data_dir)
+    
     stop_event = threading.Event()
 
     threading.Thread(target=fetch_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=args.interval, stop_event=stop_event), daemon=True).start()
@@ -2261,6 +2373,9 @@ def main() -> int:
     except KeyboardInterrupt: pass
     finally:
         stop_event.set()
+        # Save today's snapshot on graceful shutdown
+        save_today_snapshot(app_state, data_dir)
+        save_fixed_history(app_state)
         httpd.shutdown()
     return 0
 
@@ -2286,6 +2401,9 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
     
     load_fixed_history(app_state, data_dir)
     
+    # Load today's snapshot to restore trail history on restart
+    load_today_snapshot(app_state, data_dir)
+    
     stop_event = threading.Event()
 
     threading.Thread(target=fetch_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=interval, stop_event=stop_event), daemon=True).start()
@@ -2302,9 +2420,10 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
     # Timeout for individual requests - helps with Safari/iOS connection issues
     httpd.timeout = 30
 
-    # Expose app_state for in-process callers without any new endpoint.
+    # Expose app_state and data_dir for in-process callers (for shutdown save).
     try:
         setattr(httpd, "app_state", app_state)
+        setattr(httpd, "data_dir", data_dir)
     except Exception:
         pass
     
@@ -2315,6 +2434,12 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             pass
         finally:
             stop_event.set()
+            # Save today's snapshot on shutdown
+            try:
+                save_today_snapshot(app_state, data_dir)
+                save_fixed_history(app_state)
+            except Exception:
+                pass
     
     server_thread = threading.Thread(target=serve, daemon=True)
     server_thread.start()
