@@ -3327,13 +3327,13 @@ class MapView {
     const key = this._playbackPointsKeyForState(state);
     const cacheHit = (this._playbackPtsKey === key);
     
-    // In LIVE mode, always update maxMs from current data even on cache hit
-    // (new data may have extended the timeline)
-    if (cacheHit && !this._playbackLiveFollow) {
+    // Cache key includes state revision, so if data changed the key will differ.
+    // No need to bypass cache in LIVE mode - the key handles it.
+    if (cacheHit) {
       return;
     }
     
-    // Rebuild playback points if cache miss OR in LIVE mode
+    // Rebuild playback points on cache miss
     this._playbackPtsKey = key;
     
     const nextPtsById = new Map();
@@ -7474,11 +7474,15 @@ function main() {
 
     if (pbPlayEl) {
       if (followingLive) {
-        // LIVE mode: show Live button highlighted
+        // LIVE mode enabled: show Live button highlighted
         pbPlayEl.textContent = "Live";
         pbPlayEl.classList.add("isLive");
+      } else if (atEnd) {
+        // At end but LIVE not enabled: show Live button (not highlighted)
+        pbPlayEl.textContent = "Live";
+        pbPlayEl.classList.remove("isLive");
       } else if (map.getPlaybackPlaying()) {
-        // Playing but not LIVE: show Pause
+        // Playing but not at end: show Pause
         pbPlayEl.textContent = "Pause";
         pbPlayEl.classList.remove("isLive");
       } else {
@@ -7759,27 +7763,24 @@ function main() {
         // new data. When new data arrives, resume playing.
         // ─────────────────────────────────────────────────────────────────────
         if (atEnd) {
-          // At live edge, waiting for new data
-          // Only set rewind timer if we PLAYED here (had positive velocity last frame)
-          // NOT if we just arrived via drag/scroll (velocity was already 0)
-          if (_pbAtEndSincePerf == null && _pbVelocity > 0) {
-            _pbAtEndSincePerf = now;
-          }
+          // At live edge, waiting for new data - just hold position
           _pbVelocity = 0;
         } else {
           // Have data ahead - play toward live edge at user-selected speed
           _pbVelocity = _pbPlaybackSpeed * speedMult;
-          _pbAtEndSincePerf = null;
         }
       } else if (map.getPlaybackPlaying()) {
-        // Normal forward playback (LIVE mode off)
-        // Wait at end for new data. No auto-rewind (that's only in LIVE mode).
+        // Normal forward playback
         if (atEnd) {
-          // At end, waiting for new data
+          // At end, not LIVE, not rewinding: hold playhead and let vehicle physics
+          // finish moving to the end of their paths; rewind will trigger when all
+          // vehicles are actually at the end.
+          if (_pbAtEndSincePerf == null) _pbAtEndSincePerf = now;
           _pbVelocity = 0;
         } else {
           // Normal forward - maintain playback speed
           _pbVelocity = _pbPlaybackSpeed * speedMult;
+          _pbAtEndSincePerf = null;
         }
       } else if (!map.getPlaybackPlaying() && Math.abs(_pbVelocity) > _pbVelocityThreshold) {
         // Coasting after wheel - apply friction
@@ -7787,38 +7788,28 @@ function main() {
         const frictionFactor = Math.pow(friction, dt);
         _pbVelocity *= frictionFactor;
         
-        // When velocity decays, resume playback IF we're at the end (so new data plays).
-        // If not at end, just stop.
+        // When velocity decays to playback speed, resume playback
         const playbackSpeed = _pbPlaybackSpeed * speedMult;
         if (_pbVelocity > 0 && _pbVelocity <= playbackSpeed) {
+          // Forward coasting reached playback speed - resume
           _pbIsWheelCoasting = false;
           if (_pbCommitLoopStartOnCoastEnd) {
             _pbLoopStartMs = tMs;
             _pbCommitLoopStartOnCoastEnd = false;
           }
-          if (atEnd) {
-            // At end - enter LIVE mode, but velocity=0 (we're waiting, not playing)
-            // This prevents immediate rewind trigger
-            map._playbackLiveFollow = true;
-            _pbVelocity = 0;
-            map.setPlaybackPlaying(true);
-          } else {
-            _pbVelocity = 0;
-          }
+          _pbVelocity = playbackSpeed;
+          map.setPlaybackPlaying(true);
+          updatePlaybackUi();
         } else if (_pbVelocity < 0 && Math.abs(_pbVelocity) < _pbVelocityThreshold) {
+          // Backward coasting stopped - resume forward playback
           _pbIsWheelCoasting = false;
           if (_pbCommitLoopStartOnCoastEnd) {
             _pbLoopStartMs = tMs;
             _pbCommitLoopStartOnCoastEnd = false;
           }
-          if (atEnd) {
-            // At end - enter LIVE mode, but velocity=0 (we're waiting, not playing)
-            map._playbackLiveFollow = true;
-            _pbVelocity = 0;
-            map.setPlaybackPlaying(true);
-          } else {
-            _pbVelocity = 0;
-          }
+          _pbVelocity = playbackSpeed;
+          map.setPlaybackPlaying(true);
+          updatePlaybackUi();
         }
       }
       
@@ -7847,10 +7838,6 @@ function main() {
         if (nextMs >= b.maxMs && _pbVelocity > 0) {
           _pbVelocity = 0;
           nextMs = b.maxMs;
-          // Scrolled to the end - enter LIVE mode
-          map._playbackLiveFollow = true;
-          _pbIsWheelCoasting = false;
-          map.setPlaybackPlaying(true);
         }
         
         if (nextMs !== tMs) {
@@ -7889,13 +7876,10 @@ function main() {
     // ─────────────────────────────────────────────────────────────────────────
     // RENDER
     // ─────────────────────────────────────────────────────────────────────────
-    // Auto-rewind when we've played through to the end.
-    // LIVE mode only controls camera follow, not playback/rewind behavior.
-    // Only trigger rewind in LIVE mode
     const waitingForVehiclesAtEnd =
       !_pbIsRewinding &&
       map.getPlaybackPlaying() &&
-      map._playbackLiveFollow &&
+      !map._playbackLiveFollow &&
       hasBounds &&
       tMs != null &&
       isFinite(tMs) &&
@@ -7913,7 +7897,6 @@ function main() {
         _pbIsRewinding = true;
         _pbVelocity = _pbRewindSpeed;
         _pbAtEndSincePerf = null;
-        _pbArrivedAtEndViaPlayback = false;
       }
     }
 
@@ -8025,6 +8008,19 @@ function main() {
           _pbLastPerf = 0;
           if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
         }
+        updatePlaybackUi();
+        return;
+      }
+
+      // If at end and paused (button shows "Live" but not highlighted), enable LIVE mode
+      if (atEnd && !map.getPlaybackPlaying()) {
+        map._playbackLiveFollow = true;
+        _pbVelocity = 0;
+        _pbAtEndSincePerf = null;
+        _pbIsRewinding = false;
+        map.setPlaybackPlaying(true);
+        _pbLastPerf = 0;
+        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
         updatePlaybackUi();
         return;
       }
@@ -8654,15 +8650,9 @@ function main() {
       const clampedT = clamp(tMs, b.minMs, b.maxMs);
       map.setPlaybackTimeMs(clampedT);
 
-      // Entering LIVE state ONLY when the slider is dragged all the way to the end.
-      const maxMs = Number(pbScrubEl.max);
-      // Use a more generous epsilon (1.5s) for "snapping" to live follow when dragging near the end.
-      map._playbackLiveFollow = (isFinite(maxMs) && relMs >= maxMs - 1500);
-
-      // If the user leaves the playhead somewhere (non-LIVE), treat it as replay point A.
-      if (!map._playbackLiveFollow) {
-        _pbLoopStartMs = clampedT;
-      }
+      // Don't auto-enable LIVE mode when dragging - user must click the Live button.
+      // Just track where the user left the playhead as replay point A.
+      _pbLoopStartMs = clampedT;
 
       updatePlaybackUi();
       map.drawOverlay(map.lastState);
@@ -8689,10 +8679,7 @@ function main() {
     pbScrubEl.addEventListener("pointerup", () => {
       _pbScrubbing = false;
       _pbVelocity = 0;
-      // If at end, enter LIVE mode
-      if (map.isPlaybackAtEnd(100)) {
-        map._playbackLiveFollow = true;
-      }
+      // Don't auto-enable LIVE mode when released at end - user must click Live button.
       map.setPlaybackPlaying(true);
       _pbLastPerf = performance.now();
       if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
