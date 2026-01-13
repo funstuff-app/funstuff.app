@@ -249,7 +249,10 @@ function valueToAqi(pollutantKey, value) {
 
   // unit normalization + truncation
   if (k === "ozone") {
-    if (v >= 1.0) v = v / 1000.0; // ppb -> ppm
+    // Feed values are always in ppb; convert to ppm for AQI lookup.
+    // Negative values are invalid sensor readings.
+    if (v <= 0) return null;
+    v = v / 1000.0;
     v = Math.floor(v * 1000) / 1000; // 3 decimals
   } else if (k === "pm2.5") {
     v = Math.floor(v * 10) / 10; // 1 decimal
