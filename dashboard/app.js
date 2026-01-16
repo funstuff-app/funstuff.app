@@ -2530,6 +2530,12 @@ class MapView {
     this._prunePerMobileCachesForState(state);
     this._updatePersistedTrails(state);
     this._invalidateOverlayStatic();
+    
+    // In playback mode, ensure playback points are refreshed with new state data
+    if (this.playbackMode) {
+      this._ensurePlaybackPoints(state);
+    }
+    
     // Optimization: state polling updates trails/markers, but the basemap is tied only
     // to view (center/zoom/theme/size). Avoid redrawing tiles unless the view changed.
     const viewSig = (() => {
@@ -3323,15 +3329,23 @@ class MapView {
 
   _playbackPointsKeyForState(state) {
     const revKey = this._tracePointsKeyForState(state);
-    return `${revKey}|persist:${this._persistedTrailRev}|v2`;
+    // Include trail point count per sensor to detect data changes
+    let trailSig = "";
+    const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
+    for (const m of mobiles) {
+      const id = m?.id || "";
+      const trail = Array.isArray(m?.trail) ? m.trail : [];
+      const lastT = trail.length > 0 ? (trail[trail.length - 1]?.t || "") : "";
+      trailSig += `${id}:${trail.length}:${lastT}|`;
+    }
+    return `${revKey}|persist:${this._persistedTrailRev}|trail:${trailSig}|v3`;
   }
 
   _ensurePlaybackPoints(state) {
     const key = this._playbackPointsKeyForState(state);
     const cacheHit = (this._playbackPtsKey === key);
     
-    // Cache key includes state revision, so if data changed the key will differ.
-    // No need to bypass cache in LIVE mode - the key handles it.
+    // Cache key includes trail signatures, so if data changed the key will differ.
     if (cacheHit) {
       return;
     }
@@ -3370,9 +3384,11 @@ class MapView {
       const id = m && m.id != null ? String(m.id) : "";
       if (!id) continue;
 
+      // In playback mode, always prefer server trail for fresh readings/colors.
+      // Persisted trail is only used in non-playback live mode for continuity.
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
-      const persisted = this._historicalMode ? [] : (this._persistedTrailById.get(id)?.trail || []);
-      const src = (persisted.length >= 2) ? persisted : serverTrail;
+      const persisted = (this._historicalMode || this.playbackMode) ? [] : (this._persistedTrailById.get(id)?.trail || []);
+      const src = (serverTrail.length >= 2) ? serverTrail : (persisted.length >= 2 ? persisted : serverTrail);
       if (!Array.isArray(src) || src.length < 2) continue;
 
       const pts = [];
@@ -4949,11 +4965,14 @@ class MapView {
     const pbTimeMs = this.getPlaybackTimeMs();
     const revealTimeMs = pbTimeMs;
     
-    // Get trail source - always use raw trail for rendering
+    // Get trail source
+    // In playback mode, always prefer server trail for fresh readings/colors.
+    // Persisted trail is only used in non-playback live mode for continuity.
     const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
     const hasServerTrail = serverTrail.length >= 2;
-    const persistedTrail = (id && !this._historicalMode) ? (this._persistedTrailById.get(id)?.trail || []) : [];
-    const trail = (persistedTrail.length >= 2) ? persistedTrail : (hasServerTrail ? serverTrail : []);
+    const useServerTrail = this.playbackMode || hasServerTrail;
+    const persistedTrail = (id && !this._historicalMode && !this.playbackMode) ? (this._persistedTrailById.get(id)?.trail || []) : [];
+    const trail = useServerTrail ? (hasServerTrail ? serverTrail : persistedTrail) : (persistedTrail.length >= 2 ? persistedTrail : serverTrail);
     if (!Array.isArray(trail) || trail.length < 2) return null;
     
     const isGhost = !!m.ghosted;

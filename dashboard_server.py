@@ -877,8 +877,17 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
             "Value": pm10_vals,
         }
         
-        # OZNE - filter out negative values (bad sensor data)
-        ozne_by_ts = {ts: val for ts, val in ozne_pts if val is None or val >= 0}
+        # OZNE - filter out negative values and statistical outliers (sensor glitches)
+        # Use IQR-based outlier detection: values beyond Q3 + 10*IQR are sensor errors
+        ozne_valid = [val for ts, val in ozne_pts if val is not None and val >= 0]
+        ozne_upper = float('inf')
+        if len(ozne_valid) >= 10:
+            sorted_vals = sorted(ozne_valid)
+            q1 = sorted_vals[len(sorted_vals) // 4]
+            q3 = sorted_vals[(3 * len(sorted_vals)) // 4]
+            iqr = q3 - q1
+            ozne_upper = q3 + 10 * max(iqr, 20)  # At least 20 ppb margin
+        ozne_by_ts = {ts: val for ts, val in ozne_pts if val is None or (0 <= val <= ozne_upper)}
         ozne_vals = []
         last_ozne = None
         for ts in all_gps_times:
