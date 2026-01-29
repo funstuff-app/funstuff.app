@@ -1,0 +1,42 @@
+# DustyTrails Docker Compose
+# Local development and testing configuration
+#
+# Usage:
+#   docker compose up --build        # Build and run
+#   docker compose up -d             # Run in background
+#   docker compose logs -f           # View logs
+#   docker compose down              # Stop and remove
+
+services:
+  dustytrails:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dustytrails
+    ports:
+      - "8766:8766"
+    environment:
+      # Data directory inside container
+      - MOBILEAIR_DATA_DIR=/data
+      # Optional: AirNow API key for enhanced data
+      # - AIRNOW_API_KEY=${AIRNOW_API_KEY}
+      # Optional: Road graph path (if using custom graph)
+      # - MOBILEAIR_ROAD_GRAPH=/data/roads/utah_centerlines_graph.json
+      # Optional: TRAX tram line graph
+      # - MOBILEAIR_TRAM_LINE_GRAPH=/data/roads/trax_lines_graph.json
+    volumes:
+      # Persistent data directory
+      - dustytrails-data:/data
+      # Optional: Mount local road graph data (read-only)
+      # - ~/.mobileair/roads:/data/roads:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8766/api/config', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  dustytrails-data:
+    name: dustytrails-data

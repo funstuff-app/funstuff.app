@@ -49,11 +49,40 @@ const TILE_THEMES = {
   },
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Server Configuration (loaded from /api/config for CDN/scaling support)
+// ─────────────────────────────────────────────────────────────────────────────
+let appConfig = {
+  dataMode: "proxy",     // "proxy" = fetch via server, "direct" = fetch from .edu/.gov directly
+  apiBaseUrl: "/api",    // Base URL for API calls (allows CDN prefix override)
+  cacheTtl: 30,          // Server-side cache TTL hint (seconds)
+  version: "1.0.0",      // Server version for compatibility checks
+};
+
+/**
+ * Load server configuration from /api/config endpoint.
+ * Falls back to defaults if unavailable (e.g., offline, older server).
+ */
+async function loadConfig() {
+  try {
+    const res = await fetch("/api/config", { cache: "no-store" });
+    if (res.ok) {
+      const cfg = await res.json();
+      // Merge with defaults (server may not provide all fields)
+      appConfig = { ...appConfig, ...cfg };
+      console.log("[Config] Loaded:", appConfig);
+    }
+  } catch (e) {
+    console.warn("[Config] Using defaults, server config unavailable:", e.message);
+  }
+}
+
 const THEME_STORAGE_KEY = "mobileair.mapTheme";
 const DIM_STORAGE_PREFIX = "mobileair.mapDim."; // per theme (0..100)
 const SAT_STORAGE_PREFIX = "mobileair.mapSat."; // per theme (0..150 => saturate factor = v/100)
 const VIEW_STORAGE_KEY = "mobileair.mapView"; // {lat, lon, zoom}
 const TRACE_STORAGE_KEY = "mobileair.traceMode"; // "1" or "0"
+const LIVE_MODE_STORAGE_KEY = "mobileair.liveFollow"; // "1" = LIVE follow mode
 const MAX_TRAIL_LEN = 1000;
 
 function applyMapFilterVars({ saturate, brightness, contrast, shadowLift }) {
@@ -654,6 +683,8 @@ class MapView {
     // LIVE follow-tail: when true, keep playhead pinned to end-of-data (maxMs).
     // This is the default "LIVE" experience (no rewinds).
     this._playbackLiveFollow = true;
+    // Track whether initial playback position has been set (to apply 10-min offset once)
+    this._playbackInitialized = false;
 
     // Foveated road matching: progressively match segments during playback
     this._roadMatchedRangesById = new Map(); // id -> [{fromMs, toMs}] - already matched ranges
@@ -1743,13 +1774,12 @@ class MapView {
       this._playbackNewestSegmentStartMs = null;
       this._playbackLastMaxMs = null;
       this._playbackLiveFollow = true;
+      this._playbackInitialized = false;
     } else {
       // Entering DVR starts in LIVE follow-tail at the end-of-data.
       this._playbackLiveFollow = true;
-      // Immediately jump to the live edge
-      if (this._playbackMaxMs != null) {
-        this._playbackNowMs = this._playbackMaxMs;
-      }
+      this._playbackInitialized = false;  // Will be initialized by playback loop
+      // Don't set _playbackNowMs here - let the playback loop handle it with 10-min offset
     }
     this._invalidateOverlayStatic();
     this.drawOverlay(this.lastState);
@@ -3495,7 +3525,7 @@ class MapView {
     this._roadEdgesFetching = true;
     
     try {
-      const url = `/api/road_edges?minLat=${minLat}&maxLat=${maxLat}&minLon=${minLon}&maxLon=${maxLon}&limit=8000`;
+      const url = `${appConfig.apiBaseUrl}/road_edges?minLat=${minLat}&maxLat=${maxLat}&minLon=${minLon}&maxLon=${maxLon}&limit=8000`;
       const resp = await fetch(url);
       if (!resp.ok) return;
       const data = await resp.json();
@@ -3876,7 +3906,7 @@ class MapView {
     this._tramEdgesFetching = true;
     
     try {
-      const url = `/api/tram_line_edges?minLat=${minLat}&maxLat=${maxLat}&minLon=${minLon}&maxLon=${maxLon}&limit=8000`;
+      const url = `${appConfig.apiBaseUrl}/tram_line_edges?minLat=${minLat}&maxLat=${maxLat}&minLon=${minLon}&maxLon=${maxLon}&limit=8000`;
       const resp = await fetch(url);
       if (!resp.ok) return;
       const data = await resp.json();
@@ -4002,7 +4032,7 @@ class MapView {
   async _fetchAndApplyRoadMatch(sensorId, trailSegment, fromMs, toMs) {
     try {
       const trailJson = JSON.stringify(trailSegment);
-      const url = `/api/match_segment?sensor=${encodeURIComponent(sensorId)}&trail=${encodeURIComponent(trailJson)}`;
+      const url = `${appConfig.apiBaseUrl}/match_segment?sensor=${encodeURIComponent(sensorId)}&trail=${encodeURIComponent(trailJson)}`;
       const resp = await fetch(url);
       if (!resp.ok) return;
       
@@ -7106,7 +7136,8 @@ function escapeHtml(s) {
 }
 
 async function fetchState() {
-  const res = await fetch("/api/state", { cache: "no-store" });
+  const url = `${appConfig.apiBaseUrl}/state`;
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return await res.json();
 }
@@ -7974,14 +8005,7 @@ function main() {
     const durMs = hasBounds ? (b.maxMs - b.minMs) : 1;
     const prevKnownMaxMs = _pbLastKnownMaxMs;
     
-    // LIVE mode: if playhead is uninitialized, start at maxMs
-    if (map._playbackLiveFollow && hasBounds && (tMs == null || !isFinite(tMs))) {
-      tMs = b.maxMs;
-      map.setPlaybackTimeMs(tMs);
-      // In LIVE mode, the replay loop start should track where playback starts.
-      // This matters if the user later exits LIVE and the system auto-rewinds.
-      _pbLoopStartMs = tMs;
-    }
+    // Playhead initialization is handled in tick() when data arrives
 
     // ─────────────────────────────────────────────────────────────────────────
     // DETECT DATA CHANGES (new data arrived, or data trimmed)
@@ -8085,9 +8109,10 @@ function main() {
     let liveBufferMs = 0;
     
     if (hasBounds && map._playbackLiveFollow) {
-      // Initialize playhead to maxMs if it's not set yet (first data arrival in LIVE mode)
+      // Initialize playhead if not set (handled above, but keep for safety)
       if (tMs == null || !isFinite(tMs)) {
-        tMs = b.maxMs;
+        const INITIAL_OFFSET_MS = 10 * 60 * 1000;
+        tMs = Math.max(b.minMs, b.maxMs - INITIAL_OFFSET_MS);
         map.setPlaybackTimeMs(tMs);
       }
       
@@ -8410,11 +8435,16 @@ function main() {
     traceEl.checked = (saved == null) ? true : (saved === "1");
     if (saved == null) localStorage.setItem(TRACE_STORAGE_KEY, "1");
     map.setPlaybackMode(traceEl.checked);
+    // Restore LIVE mode state from localStorage (default to LIVE=true)
+    try {
+      const savedLive = localStorage.getItem(LIVE_MODE_STORAGE_KEY);
+      if (savedLive === "0") {
+        map._playbackLiveFollow = false;
+      }
+    } catch {}
     if (pbBarEl) pbBarEl.classList.toggle("hidden", !traceEl.checked);
     if (traceEl.checked) {
       map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
-      // Don't set playhead here - let the playback loop handle initialization
-      // when current data arrives. This avoids stale 5:00 PM timestamps.
       map.setPlaybackPlaying(false);
       updatePlaybackUi();
       _pbLastPerf = 0;
@@ -8445,6 +8475,13 @@ function main() {
   } else {
     // DVR toggle hidden - default to playback mode always ON
     map.setPlaybackMode(true);
+    // Restore LIVE mode state from localStorage (default to LIVE=true)
+    try {
+      const savedLive = localStorage.getItem(LIVE_MODE_STORAGE_KEY);
+      if (savedLive === "0") {
+        map._playbackLiveFollow = false;
+      }
+    } catch {}
     if (pbBarEl) pbBarEl.classList.remove("hidden");
     map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
     map.setPlaybackPlaying(false);
@@ -8469,6 +8506,7 @@ function main() {
       // This allows the user to stay at the end receiving new data, but without the camera auto-following.
       if (map._playbackLiveFollow) {
         map._playbackLiveFollow = false;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
         if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
         // Set loop start to current position so rewind doesn't go to beginning of time
         const curMs = map.getPlaybackTimeMs();
@@ -8489,6 +8527,7 @@ function main() {
       // If at end and paused (button shows "Live" but not highlighted), enable LIVE mode
       if (atEnd && !map.getPlaybackPlaying()) {
         map._playbackLiveFollow = true;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
         _pbVelocity = 0;
         _pbAtEndSincePerf = null;
         _pbIsRewinding = false;
@@ -8620,7 +8659,7 @@ function main() {
     updateSaveButtonState();
     
     try {
-      const resp = await fetch(`/api/history?date=${encodeURIComponent(dateStr)}`);
+      const resp = await fetch(`${appConfig.apiBaseUrl}/history?date=${encodeURIComponent(dateStr)}`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const loadedState = await resp.json();
       
@@ -8750,7 +8789,7 @@ function main() {
     }
     
     try {
-      const resp = await fetch(`/api/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(stateToSave)
@@ -8786,7 +8825,7 @@ function main() {
     // Fetch available snapshots
     let snapshots = [];
     try {
-      const resp = await fetch("/api/snapshots");
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       snapshots = data.snapshots || [];
@@ -8871,7 +8910,7 @@ function main() {
     updateSaveButtonState();
     
     try {
-      const resp = await fetch(`/api/snapshot/load?date=${encodeURIComponent(dateStr)}`);
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`);
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `HTTP ${resp.status}`);
@@ -9156,6 +9195,7 @@ function main() {
       _pbLastScrubTime = performance.now();
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false; // exit live mode when user grabs slider
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
       _resetLiveTracking();
       updatePlaybackUi();
     });
@@ -9206,6 +9246,7 @@ function main() {
       map.setPlaybackPlaying(false); // Let wheel nudge control velocity
       // Exit LIVE mode on scroll
       map._playbackLiveFollow = false;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
       _pbIsWheelCoasting = true;
       _pbCommitLoopStartOnCoastEnd = true;
       // Horizontal scroll (two-finger swipe): deltaX > 0 = swipe right = backward in time
@@ -9319,13 +9360,20 @@ function main() {
         }
       }
 
-      // Compute playback points + playhead initialization BEFORE drawing.
-      // Must run in BOTH DVR and LIVE modes.
+      // Compute playback points BEFORE drawing.
       map._ensurePlaybackPoints(st);
-      const bounds = map.getPlaybackBounds();
-      const nextMax = (bounds.maxMs != null && isFinite(Number(bounds.maxMs))) ? Number(bounds.maxMs) : null;
-      if (map.getPlaybackTimeMs() == null && nextMax != null) {
-        map.setPlaybackTimeMs(nextMax);
+      
+      // Initialize playhead on first data load: 10 minutes behind maxMs for LIVE mode
+      if (!map._playbackInitialized) {
+        const b = map.getPlaybackBounds();
+        if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
+          const INITIAL_OFFSET_MS = 10 * 60 * 1000;
+          const initMs = map._playbackLiveFollow 
+            ? Math.max(b.minMs, b.maxMs - INITIAL_OFFSET_MS)
+            : b.maxMs;
+          map.setPlaybackTimeMs(initMs);
+          map._playbackInitialized = true;
+        }
       }
 
       // Forced refresh (from the TUI): trigger a camera refit using the server-provided
@@ -9420,8 +9468,12 @@ function main() {
     }
   }
 
-  tick();
-  setInterval(tick, POLL_MS);
+  // Load server config before starting data polling
+  // This allows the server to control CDN/caching behavior
+  loadConfig().then(() => {
+    tick();
+    setInterval(tick, POLL_MS);
+  });
 }
 
 main();

@@ -1672,9 +1672,167 @@ def _pick_primary_key(readings: dict[str, dict[str, Any]]) -> str | None:
     return next(iter(readings.keys()), None)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Adaptive Polling for Upstream Data
+# The upstream .edu/.gov servers update approximately every 10 minutes.
+# We use adaptive polling to minimize requests while staying responsive.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AdaptivePoller:
+    """Learns upstream update patterns and adapts polling frequency.
+    
+    Strategy:
+    - After detecting a data change, back off and wait ~8-9 minutes
+    - As we approach the predicted update time, increase polling frequency
+    - Track observed intervals to learn the actual update schedule
+    - Allow for significant variance (upstream can drift by several minutes)
+    """
+    
+    # Upstream updates roughly every 10 minutes, but can vary
+    DEFAULT_INTERVAL_S = 600.0  # 10 minutes
+    MIN_INTERVAL_S = 300.0      # 5 minutes (minimum expected)
+    MAX_INTERVAL_S = 900.0      # 15 minutes (maximum expected)
+    
+    # Polling rates
+    BACKOFF_POLL_S = 120.0      # Poll every 2 min during backoff (just in case)
+    APPROACH_POLL_S = 30.0      # Poll every 30s when approaching expected update
+    ACTIVE_POLL_S = 15.0        # Poll every 15s when within the update window
+    
+    # When to start ramping up polling (seconds before predicted update)
+    APPROACH_WINDOW_S = 120.0   # Start polling faster 2 min before predicted
+    ACTIVE_WINDOW_S = 60.0      # Poll most frequently 1 min before/after predicted
+    
+    # How many intervals to remember for learning
+    MAX_HISTORY = 10
+    
+    def __init__(self):
+        self.last_update_utc: str | None = None  # Last seen LastUpdateUTC
+        self.last_change_ts: float | None = None  # When we detected the change
+        self.observed_intervals: list[float] = []  # Learned intervals
+        self.predicted_interval: float = self.DEFAULT_INTERVAL_S
+        self.poll_count = 0
+        
+    def _extract_last_update_utc(self, data: dict | None) -> str | None:
+        """Extract LastUpdateUTC string from upstream data."""
+        if not isinstance(data, dict):
+            return None
+        # Check PM25 section (most reliable)
+        pm25 = data.get("PM25", {})
+        if isinstance(pm25, dict):
+            return pm25.get("LastUpdateUTC")
+        return None
+    
+    def _parse_update_timestamp(self, utc_str: str) -> float | None:
+        """Parse LastUpdateUTC string to Unix timestamp."""
+        try:
+            # Format: "2026-01-25 05:08 UTC"
+            dt = datetime.strptime(utc_str.replace(" UTC", ""), "%Y-%m-%d %H:%M")
+            dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return None
+    
+    def _update_prediction(self):
+        """Update predicted interval based on observed history."""
+        if not self.observed_intervals:
+            return
+        
+        # Use weighted average favoring recent observations
+        weights = [1.0 + 0.5 * i for i in range(len(self.observed_intervals))]
+        total_weight = sum(weights)
+        weighted_sum = sum(w * v for w, v in zip(weights, self.observed_intervals))
+        avg = weighted_sum / total_weight
+        
+        # Clamp to reasonable bounds
+        self.predicted_interval = max(self.MIN_INTERVAL_S, min(self.MAX_INTERVAL_S, avg))
+    
+    def check_for_change(self, mobile_data: dict | None, fixed_data: dict | None) -> bool:
+        """Check if upstream data changed. Returns True if changed."""
+        # Get the latest LastUpdateUTC from either dataset
+        mobile_utc = self._extract_last_update_utc(mobile_data)
+        fixed_utc = self._extract_last_update_utc(fixed_data)
+        
+        # Use whichever is available (prefer mobile, it updates more reliably)
+        current_utc = mobile_utc or fixed_utc
+        if not current_utc:
+            return False
+        
+        if self.last_update_utc is None:
+            # First fetch - initialize
+            self.last_update_utc = current_utc
+            self.last_change_ts = time.time()
+            return True
+        
+        if current_utc != self.last_update_utc:
+            # Data changed! Learn from this interval
+            now = time.time()
+            if self.last_change_ts:
+                interval = now - self.last_change_ts
+                # Only learn from reasonable intervals (ignore outliers)
+                if self.MIN_INTERVAL_S * 0.5 <= interval <= self.MAX_INTERVAL_S * 2:
+                    self.observed_intervals.append(interval)
+                    if len(self.observed_intervals) > self.MAX_HISTORY:
+                        self.observed_intervals.pop(0)
+                    self._update_prediction()
+                    _log(f"[AdaptivePoller] Learned interval: {interval:.0f}s, predicted: {self.predicted_interval:.0f}s")
+            
+            self.last_update_utc = current_utc
+            self.last_change_ts = now
+            return True
+        
+        return False
+    
+    def get_next_poll_delay(self) -> float:
+        """Calculate how long to wait before the next poll."""
+        self.poll_count += 1
+        
+        if self.last_change_ts is None:
+            # No data yet - poll at normal rate
+            return self.APPROACH_POLL_S
+        
+        now = time.time()
+        time_since_change = now - self.last_change_ts
+        time_until_predicted = self.predicted_interval - time_since_change
+        
+        # Determine polling rate based on where we are in the cycle
+        if time_until_predicted > self.APPROACH_WINDOW_S:
+            # Well before expected update - back off
+            delay = self.BACKOFF_POLL_S
+            phase = "backoff"
+        elif time_until_predicted > self.ACTIVE_WINDOW_S:
+            # Approaching expected update - moderate polling
+            delay = self.APPROACH_POLL_S
+            phase = "approach"
+        elif time_until_predicted > -self.ACTIVE_WINDOW_S:
+            # Within active window (before or just after predicted) - poll frequently
+            delay = self.ACTIVE_POLL_S
+            phase = "active"
+        else:
+            # Past the predicted window - something's off, poll moderately
+            # but increase frequency gradually (upstream might be delayed)
+            overdue = -time_until_predicted
+            if overdue < 120:
+                delay = self.ACTIVE_POLL_S
+            elif overdue < 300:
+                delay = self.APPROACH_POLL_S
+            else:
+                # Very overdue - maybe upstream is down, back off
+                delay = self.BACKOFF_POLL_S
+            phase = "overdue"
+        
+        # Log occasionally (every 5th poll or on phase changes)
+        if self.poll_count % 5 == 0:
+            _log(f"[AdaptivePoller] Phase: {phase}, next poll in {delay:.0f}s, "
+                 f"time since change: {time_since_change:.0f}s, predicted interval: {self.predicted_interval:.0f}s")
+        
+        return delay
+
+
 def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_event: threading.Event) -> None:
     revision = 0
-    _log(f"[FetchLoop] Starting with interval={interval_s}s")
+    poller = AdaptivePoller()
+    _log(f"[FetchLoop] Starting with adaptive polling (base interval ~{poller.DEFAULT_INTERVAL_S:.0f}s)")
+    
     while not stop_event.is_set():
         attempt_ts = time.time()
         try:
@@ -1691,6 +1849,11 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             if isinstance(fixed_raw, dict):
                 fixed_raw.pop("_cache_age_s", None)
             
+            # Check if upstream data changed (for adaptive polling)
+            data_changed = poller.check_for_change(mobile, fixed_raw)
+            if data_changed:
+                _log(f"[FetchLoop] Upstream data changed!")
+            
             # Get data age from the actual LastUpdateUTC in the data
             def get_data_age_s(data: dict | None) -> int | None:
                 if not isinstance(data, dict):
@@ -1702,7 +1865,6 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
                     if last_update:
                         try:
                             # Parse "2026-01-25 05:08 UTC" format
-                            from datetime import datetime, timezone
                             dt = datetime.strptime(last_update.replace(" UTC", ""), "%Y-%m-%d %H:%M")
                             dt = dt.replace(tzinfo=timezone.utc)
                             age = int(time.time() - dt.timestamp())
@@ -1742,6 +1904,10 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
                 meta["mobile_data_age_s"] = mobile_data_age
             if fixed_data_age is not None:
                 meta["fixed_data_age_s"] = fixed_data_age
+            # Include adaptive polling info in meta
+            meta["polling_predicted_interval_s"] = poller.predicted_interval
+            if poller.last_change_ts:
+                meta["polling_time_since_change_s"] = int(time.time() - poller.last_change_ts)
             # Preserve the force-refresh sequence across rebuild_state() calls.
             meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
             update_app_state_with_new_data(app_state, st)
@@ -1769,7 +1935,10 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
                         app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
                     except Exception:
                         pass
-        stop_event.wait(interval_s)
+        
+        # Use adaptive polling delay instead of fixed interval
+        next_delay = poller.get_next_poll_delay()
+        stop_event.wait(next_delay)
 
 
 def airnow_fetch_loop(
@@ -2088,7 +2257,24 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     
     return sanitized
 
-def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
+def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, server_config: dict | None = None):
+    """Create HTTP request handler with injected dependencies.
+    
+    Args:
+        app_state: Shared application state
+        static_dir: Path to static files (dashboard/)
+        data_dir: Path to data directory (~/.mobileair)
+        server_config: Server configuration for /api/config endpoint
+    """
+    # Default config for backwards compatibility
+    if server_config is None:
+        server_config = {
+            "dataMode": "proxy",
+            "apiBaseUrl": "/api",
+            "cacheTtl": 30,
+            "version": "1.0.0",
+        }
+    
     class Handler(BaseHTTPRequestHandler):
         # Disable keep-alive to avoid Safari/iOS hanging on connections
         protocol_version = "HTTP/1.1"
@@ -2108,12 +2294,26 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 # TLS handshake failed - common with untrusted certs
                 pass
         
-        def _send(self, code: int, body: bytes, content_type: str):
+        def _send(self, code: int, body: bytes, content_type: str, cache_control: str | None = None):
+            """Send HTTP response with optional cache control.
+            
+            Args:
+                code: HTTP status code
+                body: Response body bytes
+                content_type: Content-Type header value
+                cache_control: Optional Cache-Control header value. If None, defaults to "no-store, max-age=0".
+                              For CDN caching, use values like:
+                              - "public, max-age=30, s-maxage=30" for API data (30s edge cache)
+                              - "public, max-age=300" for config (5min cache)
+                              - "public, max-age=86400, immutable" for static assets with cache-busting
+            """
+            if cache_control is None:
+                cache_control = "no-store, max-age=0"
             try:
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Cache-Control", cache_control)
                 # Connection: close helps Safari/iOS release connections properly
                 self.send_header("Connection", "close")
                 # Allow cross-origin requests (useful for dev/testing)
@@ -2125,16 +2325,19 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 pass
 
         def do_GET(self):
+            # Static HTML - short cache, may change frequently during development
             if self.path in ("/", "/index.html"):
-                return self._send(200, (static_dir / "index.html").read_bytes(), "text/html")
+                return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="public, max-age=300")
+            # JavaScript assets - cache for 1 day (use cache-busting query params for updates)
             if self.path == "/app.js":
-                return self._send(200, (static_dir / "app.js").read_bytes(), "text/javascript")
+                return self._send(200, (static_dir / "app.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
             if self.path == "/map_nav_engine.js":
-                return self._send(200, (static_dir / "map_nav_engine.js").read_bytes(), "text/javascript")
+                return self._send(200, (static_dir / "map_nav_engine.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
             if self.path == "/camera_fit_logic.js":
-                return self._send(200, (static_dir / "camera_fit_logic.js").read_bytes(), "text/javascript")
+                return self._send(200, (static_dir / "camera_fit_logic.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
+            # CSS - cache for 1 day
             if self.path == "/styles.css":
-                return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css")
+                return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css", cache_control="public, max-age=86400")
             if self.path == "/manifest.json":
                 # Generate manifest dynamically with explicit http:// URL for PWA
                 host_header = self.headers.get("Host", "localhost:8765")
@@ -2156,23 +2359,31 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                     ]
                 }
                 return self._send(200, json.dumps(manifest).encode(), "application/manifest+json")
+            # Icons - cache for 1 week (rarely change)
             if self.path == "/icon.svg":
-                return self._send(200, (static_dir / "icon.svg").read_bytes(), "image/svg+xml")
+                return self._send(200, (static_dir / "icon.svg").read_bytes(), "image/svg+xml", cache_control="public, max-age=604800, immutable")
             if self.path.startswith("/icon-") and self.path.endswith(".png"):
                 fname = self.path.lstrip("/")
                 fpath = static_dir / fname
                 if fpath.exists():
-                    return self._send(200, fpath.read_bytes(), "image/png")
+                    return self._send(200, fpath.read_bytes(), "image/png", cache_control="public, max-age=604800, immutable")
+            # TUI interface files
             if self.path == "/tui.html":
-                return self._send(200, (static_dir / "tui.html").read_bytes(), "text/html")
+                return self._send(200, (static_dir / "tui.html").read_bytes(), "text/html", cache_control="public, max-age=300")
             if self.path == "/tui.css":
-                return self._send(200, (static_dir / "tui.css").read_bytes(), "text/css")
+                return self._send(200, (static_dir / "tui.css").read_bytes(), "text/css", cache_control="public, max-age=86400")
             if self.path == "/tui.js":
-                return self._send(200, (static_dir / "tui.js").read_bytes(), "text/javascript")
+                return self._send(200, (static_dir / "tui.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
+            if self.path.startswith("/api/config"):
+                # Return server configuration for client scaling/caching decisions
+                # Cache for 5 minutes - config changes rarely
+                body = json.dumps(server_config).encode("utf-8")
+                return self._send(200, body, "application/json", cache_control="public, max-age=300")
             if self.path.startswith("/api/state"):
+                # Cache for 30 seconds at CDN edge - data updates every ~30-60s
                 with app_state.lock:
                     _ensure_force_refresh_seq_cached(app_state)
-                    return self._send(200, app_state.cached_json_bytes, "application/json")
+                    return self._send(200, app_state.cached_json_bytes, "application/json", cache_control="public, max-age=30, s-maxage=30")
             if self.path.startswith("/api/raw"):
                 # Return raw Utah AQ data for TUI remote mode
                 with app_state.lock:
@@ -2505,14 +2716,28 @@ def _guess_lan_ips() -> list[str]:
     return ips
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--https", action="store_true")
-    parser.add_argument("--cert", default="")
-    parser.add_argument("--key", default="")
-    parser.add_argument("--interval", type=float, default=60.0)
+    parser = argparse.ArgumentParser(description="DustyTrails dashboard server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8765, help="Port to listen on")
+    parser.add_argument("--https", action="store_true", help="Enable HTTPS with self-signed cert")
+    parser.add_argument("--cert", default="", help="Path to TLS certificate")
+    parser.add_argument("--key", default="", help="Path to TLS private key")
+    parser.add_argument("--interval", type=float, default=60.0, help="Data fetch interval in seconds")
+    parser.add_argument(
+        "--data-mode",
+        choices=["proxy", "direct"],
+        default="proxy",
+        help="Data mode: 'proxy' = clients fetch via server API (default), 'direct' = clients fetch from .edu/.gov directly"
+    )
     args = parser.parse_args()
+    
+    # Build server config for /api/config endpoint
+    server_config = {
+        "dataMode": args.data_mode,
+        "apiBaseUrl": "/api",
+        "cacheTtl": 30,
+        "version": "1.0.0",
+    }
 
     data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -2547,7 +2772,7 @@ def main() -> int:
     else:
         _log("[AirNow] Integration not available (airnow_slc.py not found)")
 
-    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir))
+    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir, server_config=server_config))
     # Timeout for individual requests - helps with Safari/iOS connection issues
     httpd.timeout = 30
 
@@ -2640,7 +2865,14 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             daemon=True
         ).start()
 
-    httpd = ThreadingHTTPServer((host, port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir))
+    # Default config for in-process server (TUI mode)
+    server_config = {
+        "dataMode": "proxy",
+        "apiBaseUrl": "/api",
+        "cacheTtl": 30,
+        "version": "1.0.0",
+    }
+    httpd = ThreadingHTTPServer((host, port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir, server_config=server_config))
     # Timeout for individual requests - helps with Safari/iOS connection issues
     httpd.timeout = 30
 
