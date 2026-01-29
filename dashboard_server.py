@@ -659,6 +659,33 @@ def _accumulate_fixed_history_from_raw(app_state: AppState, fixed_raw: dict[str,
                 accumulate_fixed_reading(app_state, sensor_id, str(pollutant_key), value, color, time_utc)
 
 
+def _accumulate_home_sensor_reading(app_state: AppState, st: dict[str, Any]) -> None:
+    """Accumulate the home sensor reading into history (same as other fixed sensors)."""
+    fixed_list = st.get("fixed", [])
+    if not isinstance(fixed_list, list):
+        return
+    
+    for sensor in fixed_list:
+        if sensor.get("id") != "Home":
+            continue
+        
+        readings = sensor.get("readings", {})
+        if not isinstance(readings, dict):
+            return
+        
+        pm25 = readings.get("PM25", {})
+        if not isinstance(pm25, dict):
+            return
+        
+        value = pm25.get("value")
+        color = pm25.get("color", "#cccccc")
+        time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        if value is not None:
+            accumulate_fixed_reading(app_state, "Home", "PM25", value, color, time_utc)
+        return
+
+
 def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
     """Inject history arrays into fixed sensor readings from accumulated history."""
     fixed_list = st.get("fixed", [])
@@ -1889,6 +1916,9 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
                 app_state.raw_fixed = fixed_raw if isinstance(fixed_raw, dict) else {}
             
             st = build_state(data_dir=data_dir, mobile_json=mobile, fixed_json=fixed_raw, max_points=5000)
+            
+            # Accumulate home sensor reading into history (uses same mechanism as other fixed sensors)
+            _accumulate_home_sensor_reading(app_state, st)
             
             # Inject history arrays into fixed sensors
             _inject_fixed_history(app_state, st)
