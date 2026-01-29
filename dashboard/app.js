@@ -8093,14 +8093,14 @@ function main() {
     // If the server updates every ~10 minutes and playback speed is 5x, the client will
     // have consumed ~50 minutes of data-time between updates; we must rewind ~50 minutes
     // of data-time to replay what happened since the last update.
-    // When new data arrives, rewind playback to time_until_next_update behind maxMs
-    // This gives playback runway to animate until the next server update
+    // When new data arrives, rewind playback to give runway for animation
+    // We just got fresh data, so time until next update is the full predicted interval
     // Account for playback speed: at 5x, we consume data 5x faster, so need 5x runway
-    if (hasBounds && (newDataArrived || forceCameraFit) && map.getPlaybackPlaying()) {
+    // Check both playing AND liveFollow since LIVE mode at end has playing=false
+    if (hasBounds && (newDataArrived || forceCameraFit) && (map.getPlaybackPlaying() || map._playbackLiveFollow)) {
       const meta = map.lastState?.meta;
       const predictedIntervalS = Number(meta?.polling_predicted_interval_s) || 600;
-      const timeSinceChangeS = Number(meta?.polling_time_since_change_s) || 0;
-      const timeUntilNextMs = Math.max(60000, (predictedIntervalS - timeSinceChangeS) * 1000);
+      const timeUntilNextMs = predictedIntervalS * 1000;
       const speed = map.getPlaybackSpeed() || 1.0;
       const offsetMs = timeUntilNextMs * speed;
       
@@ -8111,6 +8111,11 @@ function main() {
         tMs = nextMs;
         map.setPlaybackTimeMs(tMs);
         _pbLoopStartMs = tMs;
+        // Start playback if we were waiting in LIVE mode
+        if (map._playbackLiveFollow && !map.getPlaybackPlaying()) {
+          _pbVelocity = _pbPlaybackSpeed * speed;
+          map.setPlaybackPlaying(true);
+        }
       }
     }
     
@@ -8124,8 +8129,11 @@ function main() {
     if (hasBounds && map._playbackLiveFollow) {
       // Initialize playhead if not set (handled above, but keep for safety)
       if (tMs == null || !isFinite(tMs)) {
-        const INITIAL_OFFSET_MS = 10 * 60 * 1000;
-        tMs = Math.max(b.minMs, b.maxMs - INITIAL_OFFSET_MS);
+        const meta = map.lastState?.meta;
+        const predictedIntervalS = Number(meta?.polling_predicted_interval_s) || 600;
+        const speed = map.getPlaybackSpeed() || 1.0;
+        const offsetMs = predictedIntervalS * 1000 * speed;
+        tMs = Math.max(b.minMs, b.maxMs - offsetMs);
         map.setPlaybackTimeMs(tMs);
       }
       
@@ -9377,6 +9385,7 @@ function main() {
       map._ensurePlaybackPoints(st);
       
       // Initialize playhead on first data load: offset based on time until next server update
+      // Use timeSinceChangeS here since we don't know how stale the initial data is
       // Account for playback speed: at 5x, we consume data 5x faster, so need 5x runway
       if (!map._playbackInitialized) {
         const b = map.getPlaybackBounds();
