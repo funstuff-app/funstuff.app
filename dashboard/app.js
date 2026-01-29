@@ -1437,8 +1437,9 @@ class MapView {
     const z0 = this.zoom;
     const lat1 = Number(centerLat);
     const lon1 = Number(centerLon);
-    const z1 = Number(zoom);
+    const z1 = clamp(Number(zoom), this._zoomMin || 1, this._zoomMax || 20);
     if (!isFinite(lat1) || !isFinite(lon1) || !isFinite(z1)) return;
+    if (!isFinite(lat0) || !isFinite(lon0) || !isFinite(z0)) return;
 
     const t0 = performance.now();
     // Only used for auto-centering / fit-to-bounds. Keep it snappy.
@@ -1446,7 +1447,22 @@ class MapView {
 
     if (this._centerAnimRAF) cancelAnimationFrame(this._centerAnimRAF);
 
+    // Safety: limit animation frames to prevent runaway loops
+    let frameCount = 0;
+    const maxFrames = Math.ceil(dur / 8) + 60;
+
     const step = () => {
+      frameCount++;
+      if (frameCount > maxFrames) {
+        console.warn('_animateTo: exceeded max frames, forcing completion');
+        this.zoom = z1;
+        this.center = { lat: lat1, lon: lon1 };
+        this.draw(this.lastState);
+        this._notifyViewChanged();
+        this._centerAnimRAF = null;
+        return;
+      }
+
       const t = clamp((performance.now() - t0) / dur, 0, 1);
       // “light” ease-out (cubic)
       const ease = 1 - Math.pow(1 - t, 3);
@@ -8077,27 +8093,24 @@ function main() {
     // If the server updates every ~10 minutes and playback speed is 5x, the client will
     // have consumed ~50 minutes of data-time between updates; we must rewind ~50 minutes
     // of data-time to replay what happened since the last update.
-    // NOTE: Only rewind if playback is actively playing. If paused or just sitting at the end,
-    // don't seek backward - just let new data extend forward.
+    // When new data arrives, rewind playback to time_until_next_update behind maxMs
+    // This gives playback runway to animate until the next server update
+    // Account for playback speed: at 5x, we consume data 5x faster, so need 5x runway
     if (hasBounds && (newDataArrived || forceCameraFit) && map.getPlaybackPlaying()) {
       const meta = map.lastState?.meta;
-      const sMs = (meta && typeof meta.trail_update_start_ms === "number" && isFinite(meta.trail_update_start_ms)) ? meta.trail_update_start_ms : null;
-      const eMs = (meta && typeof meta.trail_update_end_ms === "number" && isFinite(meta.trail_update_end_ms)) ? meta.trail_update_end_ms : null;
-      const updateIntervalMs = (sMs != null && eMs != null) ? (eMs - sMs) : null;
-      const speedMult = map.getPlaybackSpeed() || 1.0;
-      if (updateIntervalMs != null && isFinite(updateIntervalMs) && updateIntervalMs > 0 && isFinite(speedMult) && speedMult > 0) {
-        const rewindMs = updateIntervalMs * speedMult;
-        const targetMs = b.maxMs - rewindMs;
-        const nextMs = clamp(targetMs, b.minMs, b.maxMs);
-        // Apply when the target is materially different.
-        // (On a forced refresh we may need to seek forward or backward depending on where
-        // the playhead currently is; the intention is to jump to the replay start.)
-        if (tMs == null || !isFinite(tMs) || Math.abs(nextMs - tMs) > 200) {
-          tMs = nextMs;
-          map.setPlaybackTimeMs(tMs);
-          // Update replay loop start to the beginning of this replay segment.
-          _pbLoopStartMs = tMs;
-        }
+      const predictedIntervalS = Number(meta?.polling_predicted_interval_s) || 600;
+      const timeSinceChangeS = Number(meta?.polling_time_since_change_s) || 0;
+      const timeUntilNextMs = Math.max(60000, (predictedIntervalS - timeSinceChangeS) * 1000);
+      const speed = map.getPlaybackSpeed() || 1.0;
+      const offsetMs = timeUntilNextMs * speed;
+      
+      const targetMs = b.maxMs - offsetMs;
+      const nextMs = clamp(targetMs, b.minMs, b.maxMs);
+      
+      if (tMs == null || !isFinite(tMs) || Math.abs(nextMs - tMs) > 200) {
+        tMs = nextMs;
+        map.setPlaybackTimeMs(tMs);
+        _pbLoopStartMs = tMs;
       }
     }
     
@@ -9363,13 +9376,20 @@ function main() {
       // Compute playback points BEFORE drawing.
       map._ensurePlaybackPoints(st);
       
-      // Initialize playhead on first data load: 10 minutes behind maxMs for LIVE mode
+      // Initialize playhead on first data load: offset based on time until next server update
+      // Account for playback speed: at 5x, we consume data 5x faster, so need 5x runway
       if (!map._playbackInitialized) {
         const b = map.getPlaybackBounds();
         if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
-          const INITIAL_OFFSET_MS = 10 * 60 * 1000;
+          const meta = st?.meta || {};
+          const predictedIntervalS = Number(meta.polling_predicted_interval_s) || 600;
+          const timeSinceChangeS = Number(meta.polling_time_since_change_s) || 0;
+          const timeUntilNextMs = Math.max(60000, (predictedIntervalS - timeSinceChangeS) * 1000);
+          const speed = map.getPlaybackSpeed() || 1.0;
+          const offsetMs = timeUntilNextMs * speed;
+          
           const initMs = map._playbackLiveFollow 
-            ? Math.max(b.minMs, b.maxMs - INITIAL_OFFSET_MS)
+            ? Math.max(b.minMs, b.maxMs - offsetMs)
             : b.maxMs;
           map.setPlaybackTimeMs(initMs);
           map._playbackInitialized = true;
