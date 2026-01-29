@@ -2325,20 +2325,23 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 pass
 
         def do_GET(self):
+            # Strip query string for path matching (cache-busting params like ?v=123)
+            path_no_query = self.path.split('?')[0]
+            
             # Static HTML - short cache, may change frequently during development
-            if self.path in ("/", "/index.html"):
+            if path_no_query in ("/", "/index.html"):
                 return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="public, max-age=300")
             # JavaScript assets - cache for 1 day (use cache-busting query params for updates)
-            if self.path == "/app.js":
+            if path_no_query == "/app.js":
                 return self._send(200, (static_dir / "app.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
-            if self.path == "/map_nav_engine.js":
+            if path_no_query == "/map_nav_engine.js":
                 return self._send(200, (static_dir / "map_nav_engine.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
-            if self.path == "/camera_fit_logic.js":
+            if path_no_query == "/camera_fit_logic.js":
                 return self._send(200, (static_dir / "camera_fit_logic.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
             # CSS - cache for 1 day
-            if self.path == "/styles.css":
+            if path_no_query == "/styles.css":
                 return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css", cache_control="public, max-age=86400")
-            if self.path == "/manifest.json":
+            if path_no_query == "/manifest.json":
                 # Generate manifest dynamically with explicit http:// URL for PWA
                 host_header = self.headers.get("Host", "localhost:8765")
                 base_url = f"http://{host_header}"

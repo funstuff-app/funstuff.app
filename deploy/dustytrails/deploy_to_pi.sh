@@ -62,17 +62,22 @@ patch_dashboard_for_subpath() {
         sed "$@" "$file" > "$tmp" && mv "$tmp" "$file"
     }
     
-    # Patch index.html - convert absolute paths to relative
-    # href="/manifest.json" → href="manifest.json"
-    # href="/styles.css" → href="styles.css"
-    # src="/app.js" → src="app.js"
+    # Cache-busting version based on timestamp
+    local cache_bust="v=$(date +%s)"
+    
+    # Patch index.html - convert absolute paths to relative + add cache busting
+    # Handle both absolute (/app.js) and relative (app.js) paths
     patch_file "$dashboard_dir/index.html" \
         -e 's|href="/manifest.json"|href="manifest.json"|g' \
-        -e 's|href="/styles.css"|href="styles.css"|g' \
         -e 's|href="/icon-180.png"|href="icon-180.png"|g' \
-        -e 's|src="/map_nav_engine.js"|src="map_nav_engine.js"|g' \
-        -e 's|src="/camera_fit_logic.js"|src="camera_fit_logic.js"|g' \
-        -e 's|src="/app.js"|src="app.js"|g'
+        -e "s|href=\"/styles.css\"|href=\"styles.css?${cache_bust}\"|g" \
+        -e "s|href=\"styles.css\"|href=\"styles.css?${cache_bust}\"|g" \
+        -e "s|src=\"/map_nav_engine.js\"|src=\"map_nav_engine.js?${cache_bust}\"|g" \
+        -e "s|src=\"map_nav_engine.js\"|src=\"map_nav_engine.js?${cache_bust}\"|g" \
+        -e "s|src=\"/camera_fit_logic.js\"|src=\"camera_fit_logic.js?${cache_bust}\"|g" \
+        -e "s|src=\"camera_fit_logic.js\"|src=\"camera_fit_logic.js?${cache_bust}\"|g" \
+        -e "s|src=\"/app.js\"|src=\"app.js?${cache_bust}\"|g" \
+        -e "s|src=\"app.js\"|src=\"app.js?${cache_bust}\"|g"
     
     # NOTE: API paths kept absolute - tunnel serves at root, not subpath
     # patch_file "$dashboard_dir/app.js" \
@@ -221,6 +226,9 @@ build_staging() {
     # The reverse proxy uses handle_path which strips /dustytrails prefix,
     # so backend paths remain as-is. But browser-side paths need fixing.
     patch_dashboard_for_subpath
+    
+    # Minify JavaScript for production
+    minify_javascript
     
     # Copy icons if they exist
     for icon in icon-180.png icon-192.png icon-512.png icon-maskable-512.png icon.svg; do
