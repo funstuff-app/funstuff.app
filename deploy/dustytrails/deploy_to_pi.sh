@@ -94,6 +94,33 @@ patch_dashboard_for_subpath() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Minify JavaScript files for production
+# ─────────────────────────────────────────────────────────────────────────────
+minify_javascript() {
+    if ! command -v terser &> /dev/null; then
+        log_info "terser not found, skipping minification"
+        return 0
+    fi
+    
+    log_info "Minifying JavaScript files..."
+    local dashboard_dir="$STAGING_DIR/dashboard"
+    
+    for jsfile in "$dashboard_dir"/*.js; do
+        if [[ -f "$jsfile" ]]; then
+            local basename=$(basename "$jsfile")
+            local tmp="${jsfile}.min"
+            if terser "$jsfile" --compress --mangle -o "$tmp" 2>/dev/null; then
+                mv "$tmp" "$jsfile"
+                log_info "  Minified $basename"
+            else
+                log_info "  Skipped $basename (minification failed)"
+                rm -f "$tmp"
+            fi
+        fi
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Parse arguments
 # ─────────────────────────────────────────────────────────────────────────────
 FILES_ONLY=0

@@ -1,0 +1,64 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+.pytest_cache
+*.egg-info
+
+# IDE
+.cursor
+.vscode
+.idea
+*.swp
+*.swo
+
+# Tests (not needed in production image)
+tests/
+dashboard/tests/
+*_test.py
+test_*.py
+run_tests.py
+
+# Build artifacts
+*.spec
+build/
+dist/
+
+# Data files (mounted as volumes)
+*.json
+!aqi_breakpoints.csv
+fixed_history.json
+trax_graph_debug.geojson
+
+# Deploy scripts (not needed in image)
+deploy/
+*.sh
+!dashboard_server.py
+
+# Documentation
+*.md
+!mobileair/*.py
+
+# Local development
+.env
+*.pem
+*.key
+*.cert
+
+# Tools (not needed in production)
+tools/
+watchdog/
+watchdog_run.py
+
+# Misc
+.DS_Store
+Thumbs.db
