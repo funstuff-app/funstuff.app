@@ -26,3 +26,6 @@ HANDOFF_SCREENSHOTS/
 
 # Deployment staging
 deploy/*/.staging/
+
+# Deployment
+deploy/
