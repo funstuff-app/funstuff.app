@@ -8100,7 +8100,8 @@ function main() {
     if (hasBounds && (newDataArrived || forceCameraFit) && (map.getPlaybackPlaying() || map._playbackLiveFollow)) {
       const meta = map.lastState?.meta;
       const predictedIntervalS = Number(meta?.polling_predicted_interval_s) || 600;
-      const timeUntilNextMs = predictedIntervalS * 1000;
+      const timeSinceChangeS = Number(meta?.polling_time_since_change_s) || 0;
+      const timeUntilNextMs = Math.max(60000, (predictedIntervalS - timeSinceChangeS) * 1000);
       const speed = map.getPlaybackSpeed() || 1.0;
       const offsetMs = timeUntilNextMs * speed;
       
