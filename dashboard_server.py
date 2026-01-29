@@ -41,6 +41,7 @@ def _get_bundle_dir() -> Path:
 from mobileair import (
     parse_utc_timestamp,
     fetch_json_with_cache,
+    default_cache_path,
     normalize_state_for_dashboard,
     stdlib_get,
     MOBILE_URL,
@@ -55,6 +56,35 @@ from mobileair.roads import RoadGraph, match_trail_segment_offline
 # Module-level road graph cache (shared across historical and live data)
 _cached_road_graph: RoadGraph | None = None
 _road_graph_load_attempted: bool = False
+
+# Tram line graph override for TRAX (synthetic line data)
+# When provided, TRX vehicles will snap to this graph instead of road graph.
+# Set via MOBILEAIR_TRAM_LINE_GRAPH env var or mobileair.config.TRAM_LINE_GRAPH_PATH.
+_cached_tram_line_graph: RoadGraph | None = None
+_tram_line_graph_load_attempted: bool = False
+
+
+def get_cached_tram_line_graph() -> RoadGraph | None:
+    """Get the cached tram line graph for TRAX vehicles.
+    
+    Returns None if no tram line graph is configured or can't be loaded.
+    Uses same format as road graph (RoadGraph class).
+    """
+    global _cached_tram_line_graph, _tram_line_graph_load_attempted
+    
+    if _tram_line_graph_load_attempted:
+        return _cached_tram_line_graph
+    
+    _tram_line_graph_load_attempted = True
+    try:
+        from mobileair.config import TRAM_LINE_GRAPH_PATH
+        p = os.environ.get("MOBILEAIR_TRAM_LINE_GRAPH") or TRAM_LINE_GRAPH_PATH
+        if p and os.path.exists(p):
+            _cached_tram_line_graph = RoadGraph.load(p)
+    except Exception:
+        _cached_tram_line_graph = None
+    
+    return _cached_tram_line_graph
 
 # When running in-process (bundled TUI mode), suppress stdout to avoid
 # interfering with Textual's alternate screen mode.
@@ -337,6 +367,10 @@ class AppState:
     # Pre-serialized JSON bytes to prevent CPU spikes on every GET request.
     # Must be initialized from `state` so /api/state is valid immediately.
     cached_json_bytes: bytes = b"{}"
+    
+    # Raw Utah AQ data (for TUI remote mode)
+    raw_mobile: dict[str, Any] = field(default_factory=dict)
+    raw_fixed: dict[str, Any] = field(default_factory=dict)
     
     # AirNow cached data
     airnow_sites: dict[str, dict[str, Any]] = field(default_factory=dict)  # site_id -> site metadata
@@ -696,6 +730,7 @@ def build_state(
         fixed_url=FIXED_URL,
         data_dir=str(data_dir),
         road_graph=get_cached_road_graph(),
+        tram_line_graph=get_cached_tram_line_graph(),
     )
 
 
@@ -716,6 +751,31 @@ HISTORY_VARS = ["GLAT", "GLON", "PM25", "PM10", "OZNE"]
 _history_cache: dict[tuple[str, str], tuple[float, list]] = {}
 _HISTORY_CACHE_TTL = 3600  # 1 hour
 
+# Track when history server was last known to be down (for fast-fail)
+_history_server_down_until = 0.0
+
+
+def _is_history_server_reachable() -> bool:
+    """Quick check if history server is reachable (2s timeout)."""
+    global _history_server_down_until
+    now = time.time()
+    
+    # If we recently determined server is down, fast-fail
+    if now < _history_server_down_until:
+        return False
+    
+    # HEAD request to a known file (lightweight, no body download)
+    import urllib.request
+    test_url = f"{HISTORY_BASE_URL}/BUS06_GLAT_TS_10080.json"
+    try:
+        req = urllib.request.Request(test_url, method='HEAD')
+        req.add_header("User-Agent", "MobileAir/1.0")
+        urllib.request.urlopen(req, timeout=2)
+        return True
+    except Exception:
+        _history_server_down_until = now + 60
+        return False
+
 
 def _fetch_history_file(sensor: str, var: str) -> list:
     """Fetch a single history file with caching."""
@@ -731,12 +791,13 @@ def _fetch_history_file(sensor: str, var: str) -> list:
     # Fetch from server
     url = f"{HISTORY_BASE_URL}/{sensor}_{var}_TS_10080.json"
     try:
-        resp = stdlib_get(url, timeout=30, headers=HEADERS)
+        resp = stdlib_get(url, timeout=3, headers=HEADERS)
         resp.raise_for_status()
         data = resp.json().get("TimeDataUTC", [])
         _history_cache[cache_key] = (now, data)
         return data
-    except Exception:
+    except Exception as e:
+        _log(f"[History] Failed to fetch {sensor}/{var}: {e}")
         # On error, return stale cache if available, else empty
         if cache_key in _history_cache:
             return _history_cache[cache_key][1]
@@ -758,6 +819,11 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
     from datetime import datetime, timezone, timedelta
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
+    # Check if history server is reachable (will use AirNow-only if not)
+    utah_aq_available = _is_history_server_reachable()
+    if not utah_aq_available:
+        _log(f"[History] Utah AQ server unreachable, will use AirNow-only for {date_str}")
+    
     # Parse date and compute day boundaries (UTC)
     try:
         day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -769,29 +835,32 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
     end_ms = int(day_end.timestamp() * 1000)
     
     # Fetch data for all sensors in parallel (using cached week files)
-    def fetch_sensor_var(sensor: str, var: str) -> tuple[str, str, list]:
-        try:
-            all_points = _fetch_history_file(sensor, var)
-            # Filter to requested day
-            points = [
-                (ts, val) for ts, val in all_points
-                if start_ms <= ts < end_ms
-            ]
-            return sensor, var, points
-        except Exception:
-            return sensor, var, []
-    
-    # Parallel fetch
+    # Skip if Utah AQ is unavailable - we'll still have Home sensor + AirNow
     raw_data: dict[str, dict[str, list]] = {s: {} for s in HISTORY_SENSORS}
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [
-            executor.submit(fetch_sensor_var, sensor, var)
-            for sensor in HISTORY_SENSORS
-            for var in HISTORY_VARS
-        ]
-        for future in as_completed(futures):
-            sensor, var, points = future.result()
-            raw_data[sensor][var] = points
+    
+    if utah_aq_available:
+        def fetch_sensor_var(sensor: str, var: str) -> tuple[str, str, list]:
+            try:
+                all_points = _fetch_history_file(sensor, var)
+                # Filter to requested day
+                points = [
+                    (ts, val) for ts, val in all_points
+                    if start_ms <= ts < end_ms
+                ]
+                return sensor, var, points
+            except Exception:
+                return sensor, var, []
+        
+        # Parallel fetch
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [
+                executor.submit(fetch_sensor_var, sensor, var)
+                for sensor in HISTORY_SENSORS
+                for var in HISTORY_VARS
+            ]
+            for future in as_completed(futures):
+                sensor, var, points = future.result()
+                raw_data[sensor][var] = points
     
     # Build raw API format: {PM25: {sensor: {TimeUTC, GLAT, GLON, Value}}, PM10: {...}, OZNE: {...}}
     # This matches the format of MobileMapData.json so normalize_state_for_dashboard can process it
@@ -903,10 +972,16 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
         }
     
     # Now process through normalize_state_for_dashboard like live data
-    # NOTE: For historical data, we do NOT apply road graph snapping on load.
-    # The client will progressively snap segments during playback using the
-    # lookahead mechanism. This improves load time and allows real-time optimization.
+    # NOTE: For historical data on past days, we do NOT apply road graph snapping
+    # (too slow). The client progressively snaps during playback.
+    # For TODAY's historical data, we DO apply road snapping (same as live).
+    # Override: MOBILEAIR_FORCE_ROAD_SNAP_HISTORICAL=1 forces snapping for all dates (testing)
     combined = {"mobile": mobile_raw, "fixed": {}}
+    
+    # Check if this is today's data - if so, use road graph like live data
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    force_snap = os.environ.get("MOBILEAIR_FORCE_ROAD_SNAP_HISTORICAL", "").strip() == "1"
+    use_road_graph = (date_str == today_str) or force_snap
     
     result = normalize_state_for_dashboard(
         combined,
@@ -916,12 +991,20 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
         mobile_url=MOBILE_URL,
         fixed_url=FIXED_URL,
         data_dir=str(default_data_dir()),
-        road_graph=None,  # Disable road snapping for historical load
+        road_graph=get_cached_road_graph() if use_road_graph else None,
+        tram_line_graph=get_cached_tram_line_graph() if use_road_graph else None,
     )
     
     # Add historical metadata
     result["meta"]["historical"] = True
     result["meta"]["date"] = date_str
+    
+    # Track data availability
+    mobile_count = len(result.get("mobile", []))
+    if not utah_aq_available:
+        result["meta"]["utah_aq_unavailable"] = True
+        if mobile_count == 0:
+            result["meta"]["mobile_data_unavailable"] = True
     
     return result
 
@@ -1596,12 +1679,53 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
         attempt_ts = time.time()
         try:
             _log(f"[FetchLoop] Fetching data...")
-            mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=stdlib_get)
-            fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=stdlib_get)
+            mobile_cache = default_cache_path(MOBILE_URL, mobile_url=MOBILE_URL, fixed_url=FIXED_URL, data_dir=str(data_dir))
+            fixed_cache = default_cache_path(FIXED_URL, mobile_url=MOBILE_URL, fixed_url=FIXED_URL, data_dir=str(data_dir))
+            # Uses 6s timeout when cache exists (see fetch_json_with_cache), falls back to cache on failure
+            mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=stdlib_get, cache_path=mobile_cache)
+            fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=stdlib_get, cache_path=fixed_cache)
+
+            # Remove any cache tracking metadata (we use the data's own timestamps now)
+            if isinstance(mobile, dict):
+                mobile.pop("_cache_age_s", None)
+            if isinstance(fixed_raw, dict):
+                fixed_raw.pop("_cache_age_s", None)
+            
+            # Get data age from the actual LastUpdateUTC in the data
+            def get_data_age_s(data: dict | None) -> int | None:
+                if not isinstance(data, dict):
+                    return None
+                # Check PM25 section for LastUpdateUTC
+                pm25 = data.get("PM25", {})
+                if isinstance(pm25, dict):
+                    last_update = pm25.get("LastUpdateUTC")
+                    if last_update:
+                        try:
+                            # Parse "2026-01-25 05:08 UTC" format
+                            from datetime import datetime, timezone
+                            dt = datetime.strptime(last_update.replace(" UTC", ""), "%Y-%m-%d %H:%M")
+                            dt = dt.replace(tzinfo=timezone.utc)
+                            age = int(time.time() - dt.timestamp())
+                            return max(0, age)
+                        except Exception:
+                            pass
+                return None
+            
+            mobile_data_age = get_data_age_s(mobile)
+            fixed_data_age = get_data_age_s(fixed_raw)
+            # Data is stale if older than 30 minutes
+            data_stale = (mobile_data_age is not None and mobile_data_age > 1800) or \
+                         (fixed_data_age is not None and fixed_data_age > 1800)
+            data_age_s = max(mobile_data_age or 0, fixed_data_age or 0) if data_stale else None
 
             # Accumulate fixed sensor history from raw data
             _accumulate_fixed_history_from_raw(app_state, fixed_raw)
 
+            # Store raw data for TUI remote mode
+            with app_state.lock:
+                app_state.raw_mobile = mobile if isinstance(mobile, dict) else {}
+                app_state.raw_fixed = fixed_raw if isinstance(fixed_raw, dict) else {}
+            
             st = build_state(data_dir=data_dir, mobile_json=mobile, fixed_json=fixed_raw, max_points=5000)
             
             # Inject history arrays into fixed sensors
@@ -1610,6 +1734,14 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             revision += 1
             meta = st.setdefault("meta", {})
             meta.update({"last_fetch_attempt_ts": attempt_ts, "last_fetch_ok_ts": attempt_ts, "server_revision": revision})
+            # Use actual data timestamps to determine staleness
+            if data_stale:
+                meta["data_stale"] = True
+                meta["data_age_s"] = data_age_s
+            if mobile_data_age is not None:
+                meta["mobile_data_age_s"] = mobile_data_age
+            if fixed_data_age is not None:
+                meta["fixed_data_age_s"] = fixed_data_age
             # Preserve the force-refresh sequence across rebuild_state() calls.
             meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
             update_app_state_with_new_data(app_state, st)
@@ -1620,16 +1752,23 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
                 save_fixed_history(app_state)
         except Exception as e:
             _log(f"[FetchLoop] Error: {type(e).__name__}: {e}")
-            with app_state.lock:
-                st = app_state.state if isinstance(app_state.state, dict) else {"ts": time.time(), "mobile": [], "fixed": [], "meta": {}}
+            # Still build state with empty data so Home sensor from Dirigera is included
+            try:
+                st = build_state(data_dir=data_dir, mobile_json=None, fixed_json=None, max_points=5000)
                 meta = st.setdefault("meta", {})
                 meta["last_fetch_error"] = f"{type(e).__name__}: {e}"
                 meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
-                app_state.state = st
-                try:
-                    app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
-                except Exception:
-                    pass
+                # Use update_app_state_with_new_data so AirNow sensors get merged in
+                update_app_state_with_new_data(app_state, st)
+            except Exception as inner_e:
+                _log(f"[FetchLoop] Inner error: {type(inner_e).__name__}: {inner_e}")
+                with app_state.lock:
+                    st = {"ts": time.time(), "mobile": [], "fixed": [], "meta": {"last_fetch_error": str(e)}}
+                    app_state.state = st
+                    try:
+                        app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
+                    except Exception:
+                        pass
         stop_event.wait(interval_s)
 
 
@@ -1643,8 +1782,8 @@ def airnow_fetch_loop(
     if not AIRNOW_AVAILABLE:
         return
     
-    # Initial delay to let main fetch loop populate mobile data first
-    stop_event.wait(5.0)
+    # Wait for main fetch loop to complete at least once (Utah AQ has 10s timeout)
+    stop_event.wait(15.0)
     
     while not stop_event.is_set():
         try:
@@ -1935,6 +2074,8 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     
     # Check file size before reading
     file_size = filepath.stat().st_size
+    if file_size == 0:
+        return None  # Empty file treated as not found
     if file_size > MAX_SNAPSHOT_SIZE_BYTES:
         raise JsonValidationError(f"Snapshot file too large: {file_size} bytes")
     
@@ -1999,8 +2140,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 host_header = self.headers.get("Host", "localhost:8765")
                 base_url = f"http://{host_header}"
                 manifest = {
-                    "name": "MobileAir Dashboard",
-                    "short_name": "MobileAir",
+                    "name": "DustyTrails",
+                    "short_name": "DustyTrails",
                     "description": "Real-time air quality monitoring dashboard for Utah mobile and fixed sensors",
                     "start_url": base_url + "/",
                     "scope": base_url + "/",
@@ -2032,6 +2173,11 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 with app_state.lock:
                     _ensure_force_refresh_seq_cached(app_state)
                     return self._send(200, app_state.cached_json_bytes, "application/json")
+            if self.path.startswith("/api/raw"):
+                # Return raw Utah AQ data for TUI remote mode
+                with app_state.lock:
+                    raw = {"mobile": app_state.raw_mobile, "fixed": app_state.raw_fixed}
+                return self._send(200, json.dumps(raw).encode("utf-8"), "application/json")
             if self.path.startswith("/api/tui"):
                 return self._handle_tui_state()
             if self.path.startswith("/api/history"):
@@ -2040,6 +2186,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 return self._handle_match_segment()
             if self.path.startswith("/api/road_edges"):
                 return self._handle_road_edges()
+            if self.path.startswith("/api/tram_line_edges"):
+                return self._handle_tram_line_edges()
             if self.path.startswith("/api/snapshots"):
                 return self._handle_list_snapshots()
             if self.path.startswith("/api/snapshot/load"):
@@ -2171,23 +2319,27 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                 body = json.dumps({"error": f"Invalid trail: {e}"}).encode("utf-8")
                 return self._send(400, body, "application/json")
             
-            # Skip TRAX (rail vehicles)
+            # Determine which graph to use based on vehicle type
             sid = sensor_id.upper()
-            if sid.startswith("TRX") or sid.startswith("TRAX"):
-                # Return original trail unchanged
-                body = json.dumps({"sensor": sensor_id, "trail": trail}).encode("utf-8")
-                return self._send(200, body, "application/json")
+            is_trax = sid.startswith("TRX") or sid.startswith("TRAX")
             
-            # Road-match the segment
-            road_graph = get_cached_road_graph()
-            if not road_graph:
-                # No road graph, return original
+            if is_trax:
+                # TRX: Use tram line graph ONLY
+                graph = get_cached_tram_line_graph()
+                snap_distance = 50.0
+            else:
+                # Buses: Use road graph
+                graph = get_cached_road_graph()
+                snap_distance = 75.0
+            
+            if not graph:
+                # No appropriate graph, return original trail unchanged
                 body = json.dumps({"sensor": sensor_id, "trail": trail}).encode("utf-8")
                 return self._send(200, body, "application/json")
             
             try:
                 from mobileair.roads import snap_points_to_roads
-                matched = snap_points_to_roads(trail, road_graph, max_snap_m=75.0)
+                matched = snap_points_to_roads(trail, graph, max_snap_m=snap_distance)
                 result_trail = matched if matched else trail
             except Exception:
                 result_trail = trail
@@ -2245,6 +2397,69 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path):
                     break
             
             body = json.dumps({"edges": edges}).encode("utf-8")
+            return self._send(200, body, "application/json")
+
+        def _handle_tram_line_edges(self):
+            """Return tram line graph edges for debug visualization.
+            
+            Query params:
+                minLat, maxLat, minLon, maxLon: Bounding box to filter edges
+                limit: Maximum number of edges to return (default 5000)
+            
+            Returns JSON: {
+                "edges": [{lat1, lon1, lat2, lon2, elev1?, elev2?}, ...],
+                "has_elevation": bool
+            }
+            """
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            
+            min_lat = float(query.get("minLat", ["-90"])[0])
+            max_lat = float(query.get("maxLat", ["90"])[0])
+            min_lon = float(query.get("minLon", ["-180"])[0])
+            max_lon = float(query.get("maxLon", ["180"])[0])
+            limit = int(query.get("limit", ["5000"])[0])
+            
+            tram_graph = get_cached_tram_line_graph()
+            if not tram_graph:
+                return self._send(200, b'{"edges": [], "has_elevation": false}', "application/json")
+            
+            has_elev = tram_graph.elevations is not None and len(tram_graph.elevations) > 0
+            edges = []
+            seen = set()
+            
+            for i, (lat, lon) in enumerate(tram_graph.nodes):
+                # Skip nodes outside bounding box
+                if lat < min_lat or lat > max_lat or lon < min_lon or lon > max_lon:
+                    continue
+                
+                for j, _ in tram_graph.adj[i]:
+                    # Avoid duplicates (edges are bidirectional)
+                    edge_key = (min(i, j), max(i, j))
+                    if edge_key in seen:
+                        continue
+                    seen.add(edge_key)
+                    
+                    lat2, lon2 = tram_graph.nodes[j]
+                    edge = {
+                        "lat1": lat, "lon1": lon,
+                        "lat2": lat2, "lon2": lon2
+                    }
+                    
+                    # Add elevation if available
+                    if has_elev:
+                        edge["elev1"] = tram_graph.elevations[i]
+                        edge["elev2"] = tram_graph.elevations[j]
+                    
+                    edges.append(edge)
+                    
+                    if len(edges) >= limit:
+                        break
+                
+                if len(edges) >= limit:
+                    break
+            
+            body = json.dumps({"edges": edges, "has_elevation": has_elev}).encode("utf-8")
             return self._send(200, body, "application/json")
 
         def log_message(self, format, *args):

@@ -20,7 +20,8 @@ const TILE_THEMES = {
     label: "CARTO Dark (all)",
     template: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
-    filter: { saturate: 0.90, brightness: 0.92, contrast: 1.08 },
+    filter: { saturate: 1.45, brightness: 0.80, contrast: 1.08 },
+    defaultDim: 70,
   },
   carto_dark_nolabels: {
     label: "CARTO Dark (no labels)",
@@ -685,6 +686,9 @@ class MapView {
     this._rawGpsById = new Map(); // id -> [{lat, lon, t, ...}]
     // Road graph edges cache (for debug visualization)
     this._roadGraphEdges = null; // [{lat1, lon1, lat2, lon2}, ...] or null
+    // Tram line graph edges cache (for debug visualization)
+    this._tramLineEdges = null; // [{lat1, lon1, lat2, lon2, elev1?, elev2?}, ...] or null
+    this._tramLineHasElevation = false; // Whether elevation data is available
 
     // Selection orchestration (polished camera + trace sync).
     this._selectOrchRAF = null;
@@ -2507,10 +2511,15 @@ class MapView {
 
     // Update the data-time clock from the newest trail timestamp we can see.
     // Use only the last point of each trail for efficiency.
+    // Also detect if we have TRX vehicles (for track edge fetching)
     try {
       const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
       let maxT = null;
+      let hasTrx = false;
       for (const m of mobiles) {
+        const id = m?.id ? String(m.id).toUpperCase() : "";
+        if (id.startsWith("TRX") || id.startsWith("TRAX")) hasTrx = true;
+        
         const tr = Array.isArray(m?.trail) ? m.trail : null;
         if (!tr || tr.length < 1) continue;
         const last = tr[tr.length - 1];
@@ -2523,6 +2532,9 @@ class MapView {
         this._dataNowBaseMs = maxT;
         this._dataNowBasePerfMs = performance.now();
       }
+      this._hasTrxVehicles = hasTrx;
+      // Fetch tram track edges for curve rendering when TRX vehicles present
+      if (hasTrx) this._fetchTramLineEdgesForViewport();
     } catch {
       // ignore
     }
@@ -3499,6 +3511,388 @@ class MapView {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // Walk between server-assigned edges (no re-snapping)
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  _walkBetweenServerEdges(t0, t1, edges, toScreen) {
+    // t0 and t1 have ea=[lat,lon] and eb=[lat,lon] from server
+    // Walk from t0's position to t1's position along track edges
+    
+    const distM = (lat1, lon1, lat2, lon2) => {
+      const dlat = (lat2 - lat1) * 111000;
+      const dlon = (lon2 - lon1) * 111000 * Math.cos(lat1 * Math.PI / 180);
+      return Math.hypot(dlat, dlon);
+    };
+    
+    const coordsMatch = (a, b, threshold = 0.0001) => {
+      return Math.abs(a[0] - b[0]) < threshold && Math.abs(a[1] - b[1]) < threshold;
+    };
+    
+    // Start point and its edge
+    const startLat = t0.lat, startLon = t0.lon;
+    const startEa = t0.ea, startEb = t0.eb;
+    
+    // End point and its edge
+    const endLat = t1.lat, endLon = t1.lon;
+    const endEa = t1.ea, endEb = t1.eb;
+    
+    // If on same edge, just return the two points
+    if (coordsMatch(startEa, endEa) && coordsMatch(startEb, endEb)) {
+      return [toScreen(startLat, startLon), toScreen(endLat, endLon)];
+    }
+    if (coordsMatch(startEa, endEb) && coordsMatch(startEb, endEa)) {
+      return [toScreen(startLat, startLon), toScreen(endLat, endLon)];
+    }
+    
+    // Find shared vertex between start and end edges
+    let sharedVertex = null;
+    if (coordsMatch(startEb, endEa)) sharedVertex = startEb;
+    else if (coordsMatch(startEb, endEb)) sharedVertex = startEb;
+    else if (coordsMatch(startEa, endEa)) sharedVertex = startEa;
+    else if (coordsMatch(startEa, endEb)) sharedVertex = startEa;
+    
+    if (sharedVertex) {
+      // Direct connection through shared vertex
+      return [
+        toScreen(startLat, startLon),
+        toScreen(sharedVertex[0], sharedVertex[1]),
+        toScreen(endLat, endLon)
+      ];
+    }
+    
+    // Need to walk through intermediate edges
+    // Find which endpoint of start edge is closer to end
+    const d1 = distM(startEa[0], startEa[1], endLat, endLon);
+    const d2 = distM(startEb[0], startEb[1], endLat, endLon);
+    let current = d1 < d2 ? startEa : startEb;
+    
+    const path = [toScreen(startLat, startLon)];
+    const visited = new Set();
+    visited.add(`${startEa[0]},${startEa[1]}-${startEb[0]},${startEb[1]}`);
+    
+    const CONNECT_THRESH = 0.0003; // ~30m in degrees
+    
+    for (let step = 0; step < 50; step++) {
+      path.push(toScreen(current[0], current[1]));
+      
+      // Check if we reached end edge
+      if (coordsMatch(current, endEa, CONNECT_THRESH) || coordsMatch(current, endEb, CONNECT_THRESH)) {
+        path.push(toScreen(endLat, endLon));
+        return path;
+      }
+      
+      // Find connected edge closest to destination
+      let bestEdge = null;
+      let bestDist = Infinity;
+      let bestNext = null;
+      
+      for (const e of edges) {
+        const key = `${e.lat1},${e.lon1}-${e.lat2},${e.lon2}`;
+        if (visited.has(key)) continue;
+        
+        const e1 = [e.lat1, e.lon1];
+        const e2 = [e.lat2, e.lon2];
+        
+        // Check if edge connects to current position
+        let nextPt = null;
+        if (coordsMatch(current, e1, CONNECT_THRESH)) nextPt = e2;
+        else if (coordsMatch(current, e2, CONNECT_THRESH)) nextPt = e1;
+        
+        if (nextPt) {
+          const dist = distM(nextPt[0], nextPt[1], endLat, endLon);
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestEdge = e;
+            bestNext = nextPt;
+          }
+        }
+      }
+      
+      if (!bestEdge) {
+        // Stuck - return what we have plus end point
+        if (distM(current[0], current[1], endLat, endLon) < 200) {
+          path.push(toScreen(endLat, endLon));
+          return path;
+        }
+        return null; // Can't complete path
+      }
+      
+      visited.add(`${bestEdge.lat1},${bestEdge.lon1}-${bestEdge.lat2},${bestEdge.lon2}`);
+      current = bestNext;
+    }
+    
+    return null; // Too many steps
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // DEBUG: Fetch tram line graph edges for visualization
+  // ─────────────────────────────────────────────────────────────────────────────
+  
+  // Find the nearest track edge and snap point for a given lat/lon
+  // Returns { edge, snapLat, snapLon, t } or null
+  _snapToTrackEdge(lat, lon, edges) {
+    if (!edges || edges.length === 0) return null;
+    
+    let bestEdge = null;
+    let bestDist = Infinity;
+    let bestSnap = null;
+    let bestT = 0;
+    const MAX_DIST_DEG = 0.01; // ~1km in degrees
+    
+    for (const e of edges) {
+      // Quick bounding box check
+      const minLat = Math.min(e.lat1, e.lat2) - MAX_DIST_DEG;
+      const maxLat = Math.max(e.lat1, e.lat2) + MAX_DIST_DEG;
+      const minLon = Math.min(e.lon1, e.lon2) - MAX_DIST_DEG;
+      const maxLon = Math.max(e.lon1, e.lon2) + MAX_DIST_DEG;
+      
+      if (lat < minLat || lat > maxLat || lon < minLon || lon > maxLon) continue;
+      
+      // Project point onto edge segment
+      const ax = e.lon1, ay = e.lat1;
+      const bx = e.lon2, by = e.lat2;
+      const px = lon, py = lat;
+      
+      const abx = bx - ax, aby = by - ay;
+      const apx = px - ax, apy = py - ay;
+      const abLen2 = abx * abx + aby * aby;
+      
+      if (abLen2 < 1e-12) continue;
+      
+      const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / abLen2));
+      const projLon = ax + t * abx;
+      const projLat = ay + t * aby;
+      
+      const dist = Math.hypot(px - projLon, py - projLat);
+      if (dist < bestDist && dist < MAX_DIST_DEG) {
+        bestDist = dist;
+        bestEdge = e;
+        bestSnap = { lat: projLat, lon: projLon };
+        bestT = t;
+      }
+    }
+    
+    if (!bestEdge) return null;
+    return { edge: bestEdge, snapLat: bestSnap.lat, snapLon: bestSnap.lon, t: bestT };
+  }
+  
+  // Walk along track edges from point A to point B using greedy edge-following
+  // Returns array of screen points along the track, or null if can't find path
+  _walkTrackPath(lat1, lon1, lat2, lon2, edges, toScreen) {
+    if (!edges || edges.length === 0) {
+      if (!this._walkNoEdgesLogged) {
+        console.log(`[WALK DEBUG] No edges available`);
+        this._walkNoEdgesLogged = true;
+      }
+      return null;
+    }
+    
+    // Snap both endpoints to nearest edge
+    const snap1 = this._snapToTrackEdge(lat1, lon1, edges);
+    const snap2 = this._snapToTrackEdge(lat2, lon2, edges);
+    
+    if (!snap1 || !snap2) {
+      if (!this._walkDebugLogged) {
+        console.log(`[WALK DEBUG] snap failed: snap1=${!!snap1}, snap2=${!!snap2}, pt1=(${lat1?.toFixed(5)},${lon1?.toFixed(5)}), pt2=(${lat2?.toFixed(5)},${lon2?.toFixed(5)}), edges=${edges.length}`);
+        // Sample a few edges near the point
+        const sampleEdges = edges.filter(e => {
+          const d1 = Math.hypot(e.lat1 - lat1, e.lon1 - lon1);
+          const d2 = Math.hypot(e.lat2 - lat1, e.lon2 - lon1);
+          return d1 < 0.01 || d2 < 0.01;
+        }).slice(0, 3);
+        console.log(`[WALK DEBUG] Nearby edges for pt1: ${JSON.stringify(sampleEdges)}`);
+        this._walkDebugLogged = true;
+      }
+      return null;
+    }
+    
+    // Log first successful snap
+    if (!this._walkSnapLogged) {
+      console.log(`[WALK DEBUG] snap1: edge=(${snap1.edge.lat1.toFixed(5)},${snap1.edge.lon1.toFixed(5)})-(${snap1.edge.lat2.toFixed(5)},${snap1.edge.lon2.toFixed(5)}), snap=(${snap1.snapLat.toFixed(5)},${snap1.snapLon.toFixed(5)})`);
+      console.log(`[WALK DEBUG] snap2: edge=(${snap2.edge.lat1.toFixed(5)},${snap2.edge.lon1.toFixed(5)})-(${snap2.edge.lat2.toFixed(5)},${snap2.edge.lon2.toFixed(5)}), snap=(${snap2.snapLat.toFixed(5)},${snap2.snapLon.toFixed(5)})`);
+      this._walkSnapLogged = true;
+    }
+    
+    // If both on same edge, just return the two snapped points
+    if (snap1.edge === snap2.edge) {
+      return [
+        toScreen(snap1.snapLat, snap1.snapLon),
+        toScreen(snap2.snapLat, snap2.snapLon)
+      ];
+    }
+    
+    // Helper: distance in meters (approximate)
+    const distM = (lat1, lon1, lat2, lon2) => {
+      const dlat = (lat2 - lat1) * 111000;
+      const dlon = (lon2 - lon1) * 111000 * Math.cos(lat1 * Math.PI / 180);
+      return Math.hypot(dlat, dlon);
+    };
+    
+    // Helper: get endpoint of edge closer to target
+    const closerEndpoint = (edge, targetLat, targetLon) => {
+      const d1 = distM(edge.lat1, edge.lon1, targetLat, targetLon);
+      const d2 = distM(edge.lat2, edge.lon2, targetLat, targetLon);
+      return d1 < d2 
+        ? { lat: edge.lat1, lon: edge.lon1 }
+        : { lat: edge.lat2, lon: edge.lon2 };
+    };
+    
+    // Helper: check if point is an endpoint of edge (within threshold)
+    const isOnEdge = (pt, edge) => {
+      return distM(pt.lat, pt.lon, edge.lat1, edge.lon1) < 25 ||
+             distM(pt.lat, pt.lon, edge.lat2, edge.lon2) < 25;
+    };
+    
+    // Helper: find edges connected to a point (endpoint within threshold)
+    const CONNECT_DIST = 25; // meters - increased for OSM data tolerance
+    const findConnectedEdges = (pt, visitedEdges) => {
+      const connected = [];
+      for (const e of edges) {
+        // Skip already visited edges
+        const eKey = `${e.lat1},${e.lon1}-${e.lat2},${e.lon2}`;
+        if (visitedEdges.has(eKey)) continue;
+        
+        const d1 = distM(pt.lat, pt.lon, e.lat1, e.lon1);
+        const d2 = distM(pt.lat, pt.lon, e.lat2, e.lon2);
+        
+        if (d1 < CONNECT_DIST) {
+          connected.push({ edge: e, otherEnd: { lat: e.lat2, lon: e.lon2 }, key: eKey, dist: d1 });
+        } else if (d2 < CONNECT_DIST) {
+          connected.push({ edge: e, otherEnd: { lat: e.lat1, lon: e.lon1 }, key: eKey, dist: d2 });
+        }
+      }
+      return connected;
+    };
+    
+    // Greedy walk: always move toward destination
+    const path = [toScreen(snap1.snapLat, snap1.snapLon)];
+    const visitedEdges = new Set();
+    
+    // Mark starting edge as visited
+    const startEdgeKey = `${snap1.edge.lat1},${snap1.edge.lon1}-${snap1.edge.lat2},${snap1.edge.lon2}`;
+    visitedEdges.add(startEdgeKey);
+    
+    // Start from endpoint of edge1 closer to destination
+    let current = closerEndpoint(snap1.edge, lat2, lon2);
+    path.push(toScreen(current.lat, current.lon));
+    
+    // Log the walk start
+    if (!this._walkStartLogged) {
+      const startDist = distM(snap1.snapLat, snap1.snapLon, snap2.snapLat, snap2.snapLon);
+      console.log(`[WALK DEBUG] Starting walk: from (${current.lat.toFixed(5)},${current.lon.toFixed(5)}) to edge at (${snap2.edge.lat1.toFixed(5)},${snap2.edge.lon1.toFixed(5)}), direct=${startDist.toFixed(1)}m`);
+      this._walkStartLogged = true;
+    }
+    
+    for (let step = 0; step < 100; step++) {
+      // Check if we reached edge2
+      if (isOnEdge(current, snap2.edge)) {
+        path.push(toScreen(snap2.snapLat, snap2.snapLon));
+        if (!this._walkSuccessLogged) {
+          console.log(`[WALK DEBUG] SUCCESS after ${step} steps, path length=${path.length}`);
+          this._walkSuccessLogged = true;
+        }
+        return path;
+      }
+      
+      // Find connected edges
+      const connected = findConnectedEdges(current, visitedEdges);
+      if (connected.length === 0) {
+        // Stuck - complete path to destination and return what we have
+        const directDist = distM(current.lat, current.lon, snap2.snapLat, snap2.snapLon);
+        if (directDist < 500) {
+          path.push(toScreen(snap2.snapLat, snap2.snapLon));
+          return path;
+        }
+        if (!this._walkStuckLogged) {
+          console.log(`[WALK DEBUG] STUCK at step ${step}: no connected edges from (${current.lat.toFixed(5)},${current.lon.toFixed(5)}), directDist=${directDist.toFixed(1)}m, visited=${visitedEdges.size}`);
+          this._walkStuckLogged = true;
+        }
+        return null;
+      }
+      
+      // Pick next edge - prefer continuing the track over jumping
+      // If only one option, take it (this follows curves correctly)
+      // If multiple options (junction), pick closest to destination
+      let bestChoice = null;
+      if (connected.length === 1) {
+        // Only one option - follow it (this is the key to following curves!)
+        bestChoice = connected[0];
+      } else {
+        // Multiple options (junction) - pick by distance, but prefer closer connections
+        let bestScore = Infinity;
+        for (const choice of connected) {
+          // Score = distance to destination + penalty for loose connection
+          const destDist = distM(choice.otherEnd.lat, choice.otherEnd.lon, lat2, lon2);
+          const connDist = choice.dist; // How tightly connected (closer = better)
+          const score = destDist + connDist * 10; // Penalize loose connections
+          if (score < bestScore) {
+            bestScore = score;
+            bestChoice = choice;
+          }
+        }
+      }
+      
+      if (!bestChoice) return null;
+      
+      visitedEdges.add(bestChoice.key);
+      current = bestChoice.otherEnd;
+      path.push(toScreen(current.lat, current.lon));
+    }
+    
+    // Too many steps
+    if (!this._walkTooManyLogged) {
+      console.log(`[WALK DEBUG] TOO MANY STEPS (100), path length=${path.length}`);
+      this._walkTooManyLogged = true;
+    }
+    return null;
+  }
+  
+  async _fetchTramLineEdgesForViewport() {
+    // Always fetch if we have TRX vehicles OR debug mode is on
+    if (!this._pbDebugPath && !this._pbDebugRoadLines && !this._hasTrxVehicles) return;
+    if (this._tramEdgesFetching) return;
+    
+    // Get viewport bounds
+    const rect = this.overlayCanvas.getBoundingClientRect();
+    const w = rect.width, h = rect.height;
+    const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
+    
+    // Convert corners to lat/lon with 3x buffer for trail path walking
+    // Trails can extend well beyond the visible viewport
+    const bufferW = w * 1.5;
+    const bufferH = h * 1.5;
+    const tl = worldToLatLon(centerW.x - bufferW, centerW.y - bufferH, this.zoom);
+    const br = worldToLatLon(centerW.x + bufferW, centerW.y + bufferH, this.zoom);
+    
+    const minLat = Math.min(tl.lat, br.lat);
+    const maxLat = Math.max(tl.lat, br.lat);
+    const minLon = Math.min(tl.lon, br.lon);
+    const maxLon = Math.max(tl.lon, br.lon);
+    
+    // Don't refetch if viewport hasn't changed much (use coarse key to avoid excessive fetches)
+    const key = `${minLat.toFixed(2)},${maxLat.toFixed(2)},${minLon.toFixed(2)},${maxLon.toFixed(2)}`;
+    if (this._tramEdgesLastKey === key) return;
+    
+    this._tramEdgesFetching = true;
+    
+    try {
+      const url = `/api/tram_line_edges?minLat=${minLat}&maxLat=${maxLat}&minLon=${minLon}&maxLon=${maxLon}&limit=8000`;
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      this._tramLineEdges = data.edges || [];
+      this._tramLineHasElevation = data.has_elevation || false;
+      this._tramEdgesLastKey = key;
+      // Trigger redraw
+      this.drawOverlay(this.lastState);
+    } catch (e) {
+      console.warn("Failed to fetch tram line edges:", e);
+    } finally {
+      this._tramEdgesFetching = false;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // FOVEATED ROAD MATCHING: Match segments progressively as vehicles drive.
   // Uses vehicle physics lookahead (not arbitrary time) to determine what to match.
   // ─────────────────────────────────────────────────────────────────────────────
@@ -3541,9 +3935,9 @@ class MapView {
       
       if (this._roadMatchPending.has(id)) continue;
       
-      // Skip TRAX (rail)
-      const sid = String(id).toUpperCase();
-      if (sid.startsWith("TRX") || sid.startsWith("TRAX")) continue;
+      // Skip TRAX (rail) - COMMENTED OUT: will use tram line data instead of road graph
+      // const sid = String(id).toUpperCase();
+      // if (sid.startsWith("TRX") || sid.startsWith("TRAX")) continue;
       
       // Get vehicle physics state (or use playback time-based position)
       const phys = this._physicsStateById?.get(String(id));
@@ -4960,7 +5354,7 @@ class MapView {
   _collectTrailData(m, toScreen) {
     const id = m && m.id != null ? String(m.id) : "";
     
-    // Get reveal time (for clipping trail at vehicle position)
+// Get reveal time (for clipping trail at vehicle position)
     // Use playback time directly - vehicle physics are synced to this
     const pbTimeMs = this.getPlaybackTimeMs();
     const revealTimeMs = pbTimeMs;
@@ -5222,9 +5616,9 @@ class MapView {
 
         // Use the 'm' (moving) flag from the server point to determine if
         // this segment should be hidden/faded (jitter) or bright (historical data).
-        const p1 = trail[i];
+        const trailPt = trail[i];
         // IMPORTANT: "moving" must be explicit. Missing/undefined m is treated as idle.
-        const isMoving = !!(p1 && (p1.m === 1 || p1.m === "1" || p1.m === true));
+        const isMoving = !!(trailPt && (trailPt.m === 1 || trailPt.m === "1" || trailPt.m === true));
         
         const segColor0 = cols[i] || cols[i - 1] || "#ffffff";
         let segColor = segColor0;
@@ -5283,8 +5677,11 @@ class MapView {
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
         ctx.beginPath();
-        ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
-        ctx.lineTo(pts[i].x, pts[i].y);
+        
+        const p0 = pts[i - 1];
+        const p1 = pts[i];
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
         ctx.stroke();
         ctx.restore();
       }
@@ -5793,6 +6190,68 @@ class MapView {
           // Skip if off-screen
           if ((sp1.x < -50 && sp2.x < -50) || (sp1.x > w + 50 && sp2.x > w + 50)) continue;
           if ((sp1.y < -50 && sp2.y < -50) || (sp1.y > h + 50 && sp2.y > h + 50)) continue;
+          
+          ctx.beginPath();
+          ctx.moveTo(sp1.x, sp1.y);
+          ctx.lineTo(sp2.x, sp2.y);
+          ctx.stroke();
+        }
+        
+        ctx.restore();
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEBUG: Draw TRAM LINE GRAPH EDGES (rail lines from tram line graph)
+    // This shows the tram network used for TRAX snapping.
+    // Color by elevation: green (low/ground) -> cyan (high/elevated tracks)
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (this._pbDebugPath && this._pbDebugRoadLines && this.playbackMode) {
+      // Fetch tram line edges for current viewport if needed (async, won't block)
+      this._fetchTramLineEdgesForViewport();
+      
+      const tramEdges = this._tramLineEdges;
+      const hasElevation = this._tramLineHasElevation;
+      if (tramEdges && tramEdges.length > 0) {
+        const ws = worldSizeForZoom(this.zoom);
+        
+        // Elevation color mapping: green (1280m) -> cyan (1500m)
+        // SLC base elevation ~1280m, elevated tracks can be 1400m+
+        const minElev = 1280, maxElev = 1500;
+        const elevRange = maxElev - minElev;
+        
+        const elevToColor = (elev) => {
+          if (!hasElevation || elev == null) return "#44aa66"; // Default green
+          const t = Math.max(0, Math.min(1, (elev - minElev) / elevRange));
+          // Interpolate: green (68, 170, 102) -> cyan (68, 200, 220)
+          const r = 68;
+          const g = Math.round(170 + t * 30);
+          const b = Math.round(102 + t * 118);
+          return `rgb(${r},${g},${b})`;
+        };
+        
+        ctx.save();
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.7;
+        ctx.setLineDash([]);
+        
+        for (const e of tramEdges) {
+          const lat1 = Number(e.lat1), lon1 = Number(e.lon1);
+          const lat2 = Number(e.lat2), lon2 = Number(e.lon2);
+          if (!isFinite(lat1) || !isFinite(lon1) || !isFinite(lat2) || !isFinite(lon2)) continue;
+          
+          const n1 = latLonToNorm(lat1, lon1);
+          const n2 = latLonToNorm(lat2, lon2);
+          const sp1 = worldToScreenFast(n1.u * ws, n1.v * ws);
+          const sp2 = worldToScreenFast(n2.u * ws, n2.v * ws);
+          
+          // Skip if off-screen
+          if ((sp1.x < -50 && sp2.x < -50) || (sp1.x > w + 50 && sp2.x > w + 50)) continue;
+          if ((sp1.y < -50 && sp2.y < -50) || (sp1.y > h + 50 && sp2.y > h + 50)) continue;
+          
+          // Color by average elevation of edge
+          const avgElev = (e.elev1 != null && e.elev2 != null) ? (e.elev1 + e.elev2) / 2 : null;
+          ctx.strokeStyle = elevToColor(avgElev);
           
           ctx.beginPath();
           ctx.moveTo(sp1.x, sp1.y);
@@ -6652,28 +7111,7 @@ async function fetchState() {
   return await res.json();
 }
 
-function injectCastleFixedMarker(state) {
-  if (!state || typeof state !== "object") return state;
-  const st = state;
-  const fixed = Array.isArray(st.fixed) ? st.fixed : [];
-  const id = "Home";
-  const exists = fixed.some((f) => f && String(f.id) === id);
-  if (exists) {
-    if (!Array.isArray(st.fixed)) st.fixed = fixed;
-    return st;
-  }
-  const marker = {
-    id,
-    name: "Home",
-    lat: 40.77091,
-    lon: -111.85921,
-    emoji: "🏰",
-    color: "#ffffff",
-    readings: {},
-  };
-  st.fixed = [...fixed, marker];
-  return st;
-}
+// injectCastleFixedMarker removed - Home sensor now provided by backend with real PM2.5 data
 
 function newestReadingMsFromState(st) {
   // Prefer the most recent timestamp from any mobile breadcrumb point.
@@ -6916,14 +7354,16 @@ function main() {
 
   function loadDimForTheme(themeKey) {
     const raw = localStorage.getItem(DIM_STORAGE_PREFIX + themeKey);
-    const v = raw == null ? 50 : Number(raw);
-    const clamped = Math.max(0, Math.min(100, isFinite(v) ? v : 50));
+    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
+    const def = t.defaultDim ?? 50;
+    const v = raw == null ? def : Number(raw);
+    const clamped = Math.max(0, Math.min(100, isFinite(v) ? v : def));
     return clamped;
   }
 
   function loadSatForTheme(themeKey) {
     const raw = localStorage.getItem(SAT_STORAGE_PREFIX + themeKey);
-    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_voyager;
+    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
     const def = Math.round(100 * (t.filter?.saturate ?? 0.55));
     const v = raw == null ? def : Number(raw);
     const clamped = Math.max(0, Math.min(150, isFinite(v) ? v : def));
@@ -6931,7 +7371,7 @@ function main() {
   }
 
   function applyThemeAndFilters(themeKey, dimVal0to100, satVal0to150) {
-    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_voyager;
+    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
     map.setTheme(themeKey);
 
     const dim01 = (dimVal0to100 / 100);
@@ -6960,7 +7400,7 @@ function main() {
     }
 
     const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
-    const initialTheme = TILE_THEMES[savedTheme] ? savedTheme : "carto_voyager";
+    const initialTheme = TILE_THEMES[savedTheme] ? savedTheme : "carto_dark_all";
     themeEl.value = initialTheme;
 
     const initialDim = loadDimForTheme(initialTheme);
@@ -6980,7 +7420,7 @@ function main() {
     });
   } else {
     // Fallback (no UI)
-    applyThemeAndFilters("carto_voyager", 50, Math.round(100 * (TILE_THEMES.carto_voyager.filter?.saturate ?? 0.55)));
+    applyThemeAndFilters("carto_dark_all", 70, Math.round(100 * (TILE_THEMES.carto_dark_all.filter?.saturate ?? 1.30)));
   }
 
   // Restore view after map is initialized (theme/filter doesn't affect center/zoom).
@@ -6988,7 +7428,7 @@ function main() {
 
   if (dimEl) {
     dimEl.addEventListener("input", () => {
-      const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_voyager";
+      const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_dark_all";
       const v = Number(dimEl.value);
       const clamped = Math.max(0, Math.min(100, isFinite(v) ? v : 50));
       localStorage.setItem(DIM_STORAGE_PREFIX + themeKey, String(clamped));
@@ -7000,7 +7440,7 @@ function main() {
 
   if (satEl) {
     satEl.addEventListener("input", () => {
-      const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_voyager";
+      const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_dark_all";
       const v = Number(satEl.value);
       const clamped = Math.max(0, Math.min(150, isFinite(v) ? v : loadSatForTheme(themeKey)));
       localStorage.setItem(SAT_STORAGE_PREFIX + themeKey, String(clamped));
@@ -7063,8 +7503,10 @@ function main() {
     }
   });
 
-  document.getElementById("zoomIn").addEventListener("click", () => map.zoomBy(1));
-  document.getElementById("zoomOut").addEventListener("click", () => map.zoomBy(-1));
+  const zoomInEl = document.getElementById("zoomIn");
+  const zoomOutEl = document.getElementById("zoomOut");
+  if (zoomInEl) zoomInEl.addEventListener("click", () => map.zoomBy(1));
+  if (zoomOutEl) zoomOutEl.addEventListener("click", () => map.zoomBy(-1));
   const traceEl = document.getElementById("toggleTrace");
   const pbBarEl = document.getElementById("playbackBar");
   const pbPlayEl = document.getElementById("pbPlay");
@@ -8000,6 +8442,16 @@ function main() {
         _pbLastUiPerf = 0;
       }
     });
+  } else {
+    // DVR toggle hidden - default to playback mode always ON
+    map.setPlaybackMode(true);
+    if (pbBarEl) pbBarEl.classList.remove("hidden");
+    map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
+    map.setPlaybackPlaying(false);
+    updatePlaybackUi();
+    _pbLastPerf = 0;
+    _pbLastUiPerf = 0;
+    if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
   }
 
   if (pbPlayEl) {
@@ -8172,6 +8624,12 @@ function main() {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const loadedState = await resp.json();
       
+      // Check for server-side error (e.g., Utah AQ down)
+      if (loadedState?.meta?.data_unavailable) {
+        const errMsg = loadedState.meta.error || "Historical data unavailable";
+        throw new Error(errMsg);
+      }
+      
       // Validate the loaded data before using it
       if (!validateStateSchema(loadedState)) {
         throw new Error("Invalid data structure received from server");
@@ -8179,15 +8637,16 @@ function main() {
       
       window._historicalState = loadedState;
       
-      // Cache raw GPS coordinates before any processing
-      // This preserves the original GPS for debug visualization
-      map._rawGpsById = new Map();
-      const mobiles = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
-      for (const m of mobiles) {
-        if (m?.id && Array.isArray(m.trail)) {
-          // Deep copy the trail to preserve original coordinates
-          const rawTrail = m.trail.map(pt => ({...pt}));
-          map._rawGpsById.set(String(m.id), rawTrail);
+      // Cache raw GPS coordinates only if debug mode is enabled
+      // (Deep copying all trails is expensive and only needed for debug visualization)
+      if (map._pbDebugPath) {
+        map._rawGpsById = new Map();
+        const mobs = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
+        for (const m of mobs) {
+          if (m?.id && Array.isArray(m.trail)) {
+            const rawTrail = m.trail.map(pt => ({...pt}));
+            map._rawGpsById.set(String(m.id), rawTrail);
+          }
         }
       }
       
@@ -8240,9 +8699,11 @@ function main() {
     } catch (e) {
       console.error("Failed to load historical data:", e);
       if (statusEl) {
-        statusEl.textContent = "Error loading history";
+        statusEl.textContent = e.message || "Error loading history";
         statusEl.classList.add("offline");
       }
+      // Show alert for user visibility
+      alert(`Failed to load historical data:\n${e.message}`);
     } finally {
       _isLoadingData = false;
       updateSaveButtonState();
@@ -8424,15 +8885,15 @@ function main() {
       
       window._historicalState = loadedState;
       
-      // Cache raw GPS coordinates before any processing
-      // This preserves the original GPS for debug visualization
-      map._rawGpsById = new Map();
-      const mobiles = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
-      for (const m of mobiles) {
-        if (m?.id && Array.isArray(m.trail)) {
-          // Deep copy the trail to preserve original coordinates
-          const rawTrail = m.trail.map(pt => ({...pt}));
-          map._rawGpsById.set(String(m.id), rawTrail);
+      // Cache raw GPS coordinates only if debug mode is enabled
+      if (map._pbDebugPath) {
+        map._rawGpsById = new Map();
+        const mobs = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
+        for (const m of mobs) {
+          if (m?.id && Array.isArray(m.trail)) {
+            const rawTrail = m.trail.map(pt => ({...pt}));
+            map._rawGpsById.set(String(m.id), rawTrail);
+          }
         }
       }
       
@@ -8777,16 +9238,16 @@ function main() {
     });
   }
 
-  const POLL_MS = 2000;
+  const POLL_MS = 30000;  // 30 seconds
   let _tickInFlight = false;
   let _tickLastForceRefreshSeq = null;
 
   async function tick() {
     if (_tickInFlight) return;
     
-    // Skip live data fetching when viewing historical data
+    // Skip live data fetching when viewing historical data OR while loading it
     // Playback loop handles all drawing in historical mode
-    if (window._historicalState) {
+    if (window._historicalState || _isLoadingData) {
       return;
     }
     
@@ -8807,8 +9268,8 @@ function main() {
       return;
     }
 
-    // Add static POI marker(s) using existing fixed-marker overlay rendering.
-    st = injectCastleFixedMarker(st);
+    // Ensure st.fixed is always an array (Home sensor now provided by backend)
+    if (!Array.isArray(st.fixed)) st.fixed = [];
 
     window.__lastState = st;
     
@@ -8816,9 +9277,30 @@ function main() {
     updateSaveButtonState();
     
     if (statusEl) {
-      statusEl.textContent = "Live";
-      statusEl.classList.remove("offline");
-      statusEl.classList.add("live");
+      const meta = st.meta || {};
+      const mobileCount = Array.isArray(st.mobile) ? st.mobile.length : 0;
+      const fixedCount = Array.isArray(st.fixed) ? st.fixed.length : 0;
+      const hasData = mobileCount > 0 || fixedCount > 0;
+      
+      if (!hasData) {
+        // No data yet - still loading
+        statusEl.textContent = "Loading...";
+        statusEl.classList.remove("live");
+        statusEl.classList.remove("offline");
+      } else if (meta.data_stale) {
+        // Data is stale - show age from actual data timestamps
+        const ageS = meta.data_age_s || 0;
+        const ageMin = Math.floor(ageS / 60);
+        const ageHr = Math.floor(ageMin / 60);
+        const ageStr = ageHr > 0 ? `${ageHr}h` : `${ageMin}m`;
+        statusEl.textContent = `Stale (${ageStr} old)`;
+        statusEl.classList.remove("live");
+        statusEl.classList.add("offline");
+      } else {
+        statusEl.textContent = "Live";
+        statusEl.classList.remove("offline");
+        statusEl.classList.add("live");
+      }
     }
     const bestMs = newestReadingMsFromState(st);
     if (bestMs != null) {

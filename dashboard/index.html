@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MobileAir Dashboard</title>
+  <title>DustyTrails BETA</title>
   
   <!-- PWA / Add to Dock -->
-  <link rel="manifest" href="/manifest.json" />
+  <link rel="manifest" href="manifest.json" />
   <meta name="theme-color" content="#111826" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="MobileAir" />
+  <meta name="apple-mobile-web-app-title" content="DustyTrails" />
   <link rel="apple-touch-icon" href="/icon-180.png" />
   
   <link rel="stylesheet" href="/styles.css" />
@@ -25,13 +25,14 @@
       <button id="menuBtn" class="menuBtn" type="button" title="Toggle sensor list" aria-label="Toggle menu">
         <span class="hamburger"></span>
       </button>
-      <div class="brand">MobileAir</div>
+      <div class="brand">DustyTrails <span style="opacity:0.6;font-size:0.8em">BETA</span></div>
       <div class="status">
         <span id="statusText">Loading…</span>
         <span class="sep">•</span>
         <span id="lastUpdated">—</span>
       </div>
       <div class="controls">
+        <!-- Hidden controls - commented out but functional in code
         <label class="select">
           <span>Theme</span>
           <select id="mapTheme" aria-label="Map theme"></select>
@@ -50,6 +51,28 @@
           <input type="checkbox" id="toggleTrace" />
           <span>DVR</span>
         </label>
+        -->
+      </div>
+      <!-- DVR menu in topbar -->
+      <div class="pbMenuWrap topbarMenu">
+        <button id="pbMenuBtn" type="button" class="pbMenuBtn" title="More options">⋮</button>
+        <div id="pbMenu" class="pbMenu hidden">
+          <div class="pbMenuItem" data-action="save">
+            <span class="pbMenuIcon">💾</span>
+            <span class="pbMenuLabel">Save Day</span>
+          </div>
+          <div class="pbMenuItem" data-action="load">
+            <span class="pbMenuIcon">📂</span>
+            <span class="pbMenuLabel">Load Day</span>
+          </div>
+          <div class="pbMenuDivider"></div>
+          <div class="pbMenuItem pbMenuSub" data-submenu="days">
+            <span class="pbMenuArrow">‹</span>
+            <span class="pbMenuIcon">📅</span>
+            <span class="pbMenuLabel">Select Day</span>
+            <div class="pbSubmenu" id="pbDaysSubmenu"></div>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -59,50 +82,33 @@
           <canvas id="tilesCanvas"></canvas>
           <canvas id="overlayCanvas"></canvas>
 
-          <div id="playbackBar" class="playbackBar hidden" role="group" aria-label="Playback controls">
-            <button id="pbPlay" type="button" title="Play/Pause">Play</button>
-            <div class="pbTimes" aria-hidden="true">
+          <div id="playbackBar" class="playbackBar" role="group" aria-label="Playback controls">
+            <div class="pbRow1">
+              <button id="pbPlay" type="button" title="Play/Pause">Live</button>
+              <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" />
+              <label class="pbSpeed" title="Playback speed">
+                <span>Speed</span>
+                <select id="pbSpeed" aria-label="Playback speed">
+                  <option value="1" selected>1×</option>
+                  <option value="5">5×</option>
+                  <option value="10">10×</option>
+                  <option value="20">20×</option>
+                </select>
+              </label>
+            </div>
+            <div class="pbRow2">
               <span id="pbLeft">—</span>
               <span class="sep">•</span>
               <span id="pbNow">—</span>
               <span class="sep">•</span>
               <span id="pbRight">—</span>
             </div>
-            <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" />
-            <label class="pbSpeed" title="Playback speed">
-              <span>Speed</span>
-              <select id="pbSpeed" aria-label="Playback speed">
-                <option value="1" selected>1×</option>
-                <option value="5">5×</option>
-                <option value="10">10×</option>
-                <option value="20">20×</option>
-              </select>
-            </label>
+            <!-- Debug emoji button - hidden but functional
             <label class="pbDebugLabel" title="Show full path ahead">
               <input type="checkbox" id="pbDebugPath" />
               <span>🐛</span>
             </label>
-            <!-- Menu button with dropup -->
-            <div class="pbMenuWrap">
-              <button id="pbMenuBtn" type="button" class="pbMenuBtn" title="More options">⋮</button>
-              <div id="pbMenu" class="pbMenu hidden">
-                <div class="pbMenuItem" data-action="save">
-                  <span class="pbMenuIcon">💾</span>
-                  <span class="pbMenuLabel">Save Day</span>
-                </div>
-                <div class="pbMenuItem" data-action="load">
-                  <span class="pbMenuIcon">📂</span>
-                  <span class="pbMenuLabel">Load Day</span>
-                </div>
-                <div class="pbMenuDivider"></div>
-                <div class="pbMenuItem pbMenuSub" data-submenu="days">
-                  <span class="pbMenuIcon">📅</span>
-                  <span class="pbMenuLabel">Select Day</span>
-                  <span class="pbMenuArrow">›</span>
-                  <div class="pbSubmenu" id="pbDaysSubmenu"></div>
-                </div>
-              </div>
-            </div>
+            -->
           </div>
 
           <!-- Sidebar panel (integrated, overlays map) -->
@@ -129,11 +135,15 @@
         </div>
       </section>
     </main>
+    
+    <footer id="appFooter">
+      <div class="footerContent">© 2026 Joshua Parker. All rights reserved.</div>
+    </footer>
   </div>
 
-  <script src="/map_nav_engine.js"></script>
-  <script src="/camera_fit_logic.js"></script>
-  <script src="/app.js"></script>
+  <script src="map_nav_engine.js"></script>
+  <script src="camera_fit_logic.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
 

@@ -271,7 +271,7 @@ def fetch_monitoring_sites(url: Optional[str] = None) -> list[dict]:
     if url is None:
         url = get_today_url()
     
-    print(f"Fetching: {url}")
+    # print(f"Fetching: {url}")  # Suppressed - interferes with TUI
     
     with urllib.request.urlopen(url, timeout=30) as response:
         content = response.read().decode("utf-8", errors="replace")
@@ -299,16 +299,10 @@ def fetch_hourly_data(url: Optional[str] = None) -> list[dict]:
     if url is None:
         url = get_hourly_data_url()
     
-    print(f"Fetching hourly data: {url}")
+    # print(f"Fetching hourly data: {url}")  # Suppressed - interferes with TUI
     
-    try:
-        with urllib.request.urlopen(url, timeout=30) as response:
-            content = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            print(f"  File not found (data may not be available yet)")
-            return []
-        raise
+    with urllib.request.urlopen(url, timeout=30) as response:
+        content = response.read().decode("utf-8", errors="replace")
     
     readings = []
     for line in content.splitlines():

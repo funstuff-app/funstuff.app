@@ -70,9 +70,9 @@ EXCLUDES = [
     'Tkinter',
     'wx',
     
-    # HTTP libs we don't use anymore (using stdlib)
-    'requests',
-    'urllib3',
+    # HTTP libs - requests needed for dirigera
+    # 'requests',
+    # 'urllib3',
     
     # Other unnecessary
     'setuptools',
@@ -137,6 +137,15 @@ a = Analysis(
         'mobileair.trails',
         'mobileair.tui_format',
         'mobileair.utils',
+        'mobileair.dirigera_home',
+        'dirigera',
+        'dirigera.hub',
+        'pydantic',
+        'websocket',
+        'websocket._core',
+        'dotenv',
+        'requests',
+        'urllib3',
     ],
     hookspath=[],
     hooksconfig={},
