@@ -1,8 +1,0 @@
-# DustyTrails Kubernetes Namespace
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: dustytrails
-  labels:
-    app: dustytrails
-    environment: production
