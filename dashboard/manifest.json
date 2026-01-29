@@ -1,6 +1,6 @@
 {
-  "name": "MobileAir Dashboard",
-  "short_name": "MobileAir",
+  "name": "DustyTrails",
+  "short_name": "DustyTrails",
   "description": "Real-time air quality monitoring dashboard for Utah mobile and fixed sensors",
   "start_url": "/",
   "display": "standalone",

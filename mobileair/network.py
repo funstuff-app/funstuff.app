@@ -58,26 +58,16 @@ class StdlibResponse:
             )
 
 
-# Cache SSL context to avoid recreating it on every request
-_SSL_CONTEXT: ssl.SSLContext | None = None
-
-
 def stdlib_get(url: str, headers: dict | None = None, timeout: float = 10) -> StdlibResponse:
     """Simple HTTP GET using Python stdlib (no requests/urllib3 needed)."""
-    global _SSL_CONTEXT
-    
     req = urllib.request.Request(url)
     if headers:
         for k, v in headers.items():
             req.add_header(k, v)
     req.add_header("User-Agent", "MobileAir/1.0")
     
-    # Use cached SSL context for HTTPS requests
-    context = None
-    if url.startswith('https://'):
-        if _SSL_CONTEXT is None:
-            _SSL_CONTEXT = _get_ssl_context()
-        context = _SSL_CONTEXT
+    # Create fresh SSL context for each request to avoid stale connection state
+    context = _get_ssl_context() if url.startswith('https://') else None
     
     with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
         data = resp.read()
@@ -94,6 +84,20 @@ def default_cache_path(url: str, *, mobile_url: str, fixed_url: str, data_dir: s
     return os.path.join(data_dir, f"cache_{digest}.json")
 
 
+def _read_cache(cache_path: str) -> Any | None:
+    """Read cached data from disk, returning None if unavailable."""
+    try:
+        if os.path.exists(cache_path):
+            with open(cache_path, "r") as f:
+                cached_raw = json.load(f)
+            if isinstance(cached_raw, dict) and "_fetched_at" in cached_raw and "_data" in cached_raw:
+                return cached_raw["_data"]
+            return cached_raw
+    except Exception:
+        pass
+    return None
+
+
 def fetch_json_with_cache(
     url: str,
     *,
@@ -102,11 +106,9 @@ def fetch_json_with_cache(
     cache_path: str | None = None,
     request_get: Callable[..., Any] | None = None,
     notify: Callable[[str, str], None] | None = None,
+    prefer_cache: bool = False,
 ) -> Any | None:
-    """Fetch JSON from a URL with a best-effort on-disk cache.
-
-    - On success: caches response JSON to cache_path (if provided).
-    - On failure: returns cached JSON if available, else None.
+    """Fetch JSON from a URL with on-disk cache fallback.
 
     Args:
         url: The URL to fetch.
@@ -115,6 +117,7 @@ def fetch_json_with_cache(
         cache_path: Path to cache file (optional).
         request_get: Optional replacement for stdlib_get (for testing).
         notify: Optional callback for status messages (message, severity).
+        prefer_cache: If True and cache exists, return it immediately without network.
 
     Returns:
         Parsed JSON data, or None on failure.
@@ -126,36 +129,36 @@ def fetch_json_with_cache(
         if notify:
             notify(msg, severity)
 
+    # Check for existing cache first
+    cached = _read_cache(cache_path) if cache_path else None
+
+    # If prefer_cache mode and we have cache, return immediately (no network)
+    if prefer_cache and cached is not None:
+        return cached
+
+    # Use shorter timeout when we have cached data to avoid long blocking
+    # 6 seconds gives slow/intermittent servers a fair chance while staying responsive
+    effective_timeout = 6.0 if cached is not None else timeout
+
+    # Try network fetch
     try:
-        resp = request_get(url, headers=headers, timeout=timeout)
+        resp = request_get(url, headers=headers, timeout=effective_timeout)
         if hasattr(resp, "raise_for_status"):
             resp.raise_for_status()
         data = resp.json() if hasattr(resp, "json") else json.loads(resp.text)
 
+        # Update cache on success
         if cache_path:
             try:
                 os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                cache_wrapper = {"_fetched_at": time.time(), "_data": data}
                 with open(cache_path, "w") as f:
-                    json.dump(data, f)
+                    json.dump(cache_wrapper, f)
             except Exception:
                 pass
 
         return data
     except Exception as e:
-        _notify(f"Error fetching data from {url}: {e}", "error")
-
-        if cache_path:
-            try:
-                if os.path.exists(cache_path):
-                    with open(cache_path, "r") as f:
-                        cached = json.load(f)
-                    try:
-                        age_s = max(0, int(time.time() - os.path.getmtime(cache_path)))
-                        _notify(f"Using cached data ({age_s}s old) for {url}", "warning")
-                    except Exception:
-                        _notify(f"Using cached data for {url}", "warning")
-                    return cached
-            except Exception:
-                pass
-
-        return None
+        _notify(f"Error fetching {url}: {e}", "warning")
+        # Return cached data on network failure
+        return cached

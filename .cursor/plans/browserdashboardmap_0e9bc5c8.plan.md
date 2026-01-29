@@ -36,8 +36,6 @@ flowchart TD
   dashboard --> tiles[TileLoader]
 ```
 
-
-
 - **PythonFetcher**: periodically fetches `MobileMapData.json` and `FixedSiteMapData.json`, normalizes and extracts:
 - **current position** per mobile sensor
 - **breadcrumb polyline** per mobile sensor from historical `Latitude/Longitude/TimeUTC`

@@ -97,6 +97,16 @@ MOBILE_URL = "https://utahaq.chpc.utah.edu/jsondata/MobileMapData.json"
 FIXED_URL = "https://utahaq.chpc.utah.edu/jsondata/FixedSiteMapData.json"
 
 # ============================================================================
+# Tram/Rail Line Override (synthetic line data for TRAX)
+# ============================================================================
+# When set, TRX vehicles will use this line graph instead of the road graph.
+# Format: same as road graph (JSON with nodes/edges), but for tram/rail lines.
+# Set via MOBILEAIR_TRAM_LINE_GRAPH environment variable or override here.
+# Default: ~/.mobileair/roads/trax_lines_graph.json (built from GPS traces)
+import os as _os
+TRAM_LINE_GRAPH_PATH: str | None = _os.path.expanduser("~/.mobileair/roads/trax_lines_graph.json")
+
+# ============================================================================
 # HTTP Headers for requests
 # ============================================================================
 HEADERS = {

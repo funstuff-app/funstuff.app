@@ -20,12 +20,38 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
 
 #app { height: 100%; display: flex; flex-direction: column; }
 
+#appFooter {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(11, 15, 20, 0.7);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-top: 1px solid rgba(255,255,255,0.04);
+  z-index: 5;
+  pointer-events: none;
+}
+
+.footerContent {
+  font-size: 11px;
+  color: rgba(232, 238, 247, 0.35);
+  letter-spacing: 0.3px;
+}
+
 #topbar {
-  height: 52px;
+  height: calc(52px + env(safe-area-inset-top, 0px));
+  padding-top: calc(10px + env(safe-area-inset-top, 0px));
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 14px;
+  padding-left: 14px;
+  padding-right: 14px;
+  padding-bottom: 10px;
   border-bottom: 1px solid var(--border);
   background: linear-gradient(180deg, rgba(17,24,38,0.9), rgba(15,22,35,0.9));
 }
@@ -239,12 +265,12 @@ aside, section { min-height: 0; }
 .playbackBar {
   position: absolute;
   left: 50%;
-  bottom: 14px;
+  bottom: 42px;  /* 28px footer + 14px spacing */
   transform: translateX(-50%);
   z-index: 12;
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  gap: 6px;
   padding: 10px 12px;
   border-radius: 12px;
   border: 1px solid rgba(255,255,255,0.10);
@@ -255,6 +281,41 @@ aside, section { min-height: 0; }
   width: 680px;
 }
 
+.pbRow1 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+
+.pbRow1 input[type="range"] {
+  flex: 1;
+}
+
+.pbRow2 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: rgba(147,164,186,0.92);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  padding: 0 calc(64px + 10px) 0 calc(64px + 10px); /* Match Live button width + gap on both sides */
+}
+
+.pbRow2 .sep {
+  opacity: 0.5;
+}
+
+#pbLeft, #pbNow, #pbRight {
+  display: inline-block;
+  min-width: 10ch;
+  font-variant-numeric: tabular-nums;
+}
+
+#pbLeft { text-align: left; }
+#pbNow { text-align: center; }
+#pbRight { text-align: right; }
+
 .playbackBar button {
   height: 30px;
   min-width: 64px;
@@ -264,7 +325,6 @@ aside, section { min-height: 0; }
   background: rgba(17,24,38,0.80);
   color: rgba(232,238,247,0.92);
   cursor: pointer;
-  /* Ensure entire button area is clickable */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -284,23 +344,6 @@ aside, section { min-height: 0; }
   accent-color: var(--accent);
 }
 
-.pbTimes {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: rgba(147,164,186,0.92);
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-/* Prevent layout shift when time changes from 1-digit to 2-digit hour (9:xx -> 10:xx). */
-#pbLeft, #pbNow, #pbRight {
-  display: inline-block;
-  min-width: 10ch; /* e.g. "10:00:00 PM" */
-  text-align: center;
-  font-variant-numeric: tabular-nums;
-}
 
 .pbSpeed {
   display: inline-flex;
@@ -339,6 +382,22 @@ aside, section { min-height: 0; }
 /* Playback menu (dropup) */
 .pbMenuWrap {
   position: relative;
+}
+
+/* Menu in topbar */
+.topbarMenu {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
+
+.topbarMenu .pbMenu {
+  bottom: auto;
+  top: calc(100% + 8px);
+  margin-top: 0;
+  margin-bottom: 0;
+  right: 0;
+  left: auto;
 }
 
 .pbMenuBtn {
@@ -426,6 +485,7 @@ aside, section { min-height: 0; }
   color: rgba(232,238,247,0.5);
   font-size: 18px;
   font-weight: 300;
+  margin-right: 8px;
 }
 .pbMenuSub:hover .pbMenuArrow {
   color: var(--accent);
@@ -467,21 +527,21 @@ aside, section { min-height: 0; }
   position: absolute;
   top: -10px;
   bottom: -10px;
-  left: 100%;
+  right: 100%;
   width: 20px;
   pointer-events: auto;
 }
 .pbSubmenu {
   position: absolute;
-  left: calc(100% + 2px);
-  bottom: -12px;
+  right: calc(100% + 2px);
+  top: 0;
   min-width: 180px;
   max-height: 320px;
   overflow-y: auto;
   background: rgba(17, 24, 38, 0.97);
   border: 1px solid rgba(255,255,255,0.14);
   border-radius: 14px;
-  box-shadow: 8px 0 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0,0,0,0.2);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0,0,0,0.2);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   padding: 8px 0;

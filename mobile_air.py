@@ -717,8 +717,23 @@ class AirQualityApp(App):
         now = datetime.now()
         self.call_from_thread(self.update_status, f"Fetching data at {now.strftime('%H:%M:%S')}...")
 
-        mobile_data = self.fetch_data(MOBILE_URL)
-        fixed_data = self.fetch_data(FIXED_URL)
+        if _REMOTE_CONFIG["url"]:
+            # Remote mode: fetch from server's /api/raw endpoint
+            try:
+                resp = stdlib_get(f"{_REMOTE_CONFIG['url']}/api/raw", timeout=10)
+                if resp.status_code == 200:
+                    raw = resp.json()
+                    mobile_data = raw.get("mobile", {})
+                    fixed_data = raw.get("fixed", {})
+                else:
+                    mobile_data = None
+                    fixed_data = None
+            except Exception:
+                mobile_data = None
+                fixed_data = None
+        else:
+            mobile_data = self.fetch_data(MOBILE_URL)
+            fixed_data = self.fetch_data(FIXED_URL)
 
         # Also fetch wind data
         self.fetch_wind_data()
@@ -756,9 +771,13 @@ class AirQualityApp(App):
         wind_data = None
         
         # Try dashboard server first (faster, already cached)
-        port = int(os.environ.get("MOBILEAIR_DASHBOARD_PORT", "8766"))
+        if _REMOTE_CONFIG["url"]:
+            server_url = f"{_REMOTE_CONFIG['url']}/api/state"
+        else:
+            port = int(os.environ.get("MOBILEAIR_DASHBOARD_PORT", "8766"))
+            server_url = f"http://127.0.0.1:{port}/api/state"
         try:
-            resp = stdlib_get(f"http://127.0.0.1:{port}/api/state", timeout=2)
+            resp = stdlib_get(server_url, timeout=2)
             if resp.status_code == 200:
                 state = resp.json()
                 wind_data = state.get("wind", {})
@@ -1961,18 +1980,28 @@ def _run_headless_server(host: str, port: int):
         sys.exit(0)
 
 
+_REMOTE_CONFIG = {"url": None}  # Set by --remote flag
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="MobileAir TUI and dashboard server")
     parser.add_argument("--headless", action="store_true",
                         help="Run dashboard server only (no TUI). Stdout/stderr visible.")
+    parser.add_argument("--remote", type=str, metavar="URL",
+                        help="Connect to remote server (e.g. https://dustytrails.funstuff.app)")
     parser.add_argument("--host", default=os.environ.get("MOBILEAIR_DASHBOARD_HOST", "0.0.0.0"),
                         help="Dashboard server host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("MOBILEAIR_DASHBOARD_PORT", "8766")),
                         help="Dashboard server port (default: 8766)")
     args = parser.parse_args()
 
-    if args.headless:
+    if args.remote:
+        _REMOTE_CONFIG["url"] = args.remote.rstrip('/')
+        # Run full TUI in remote mode (no local server)
+        app = AirQualityApp(dashboard_handle=None)
+        app.run()
+    elif args.headless:
         _run_headless_server(args.host, args.port)
     else:
         dashboard_handle = _start_dashboard_server_process()

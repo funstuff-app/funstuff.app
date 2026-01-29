@@ -87,8 +87,9 @@ class RoadGraph:
 
     File format: JSON
     {
-      "version": 1,
-      "nodes": [[lat, lon], ...],
+      "version": 1,  // or 2 for elevation support
+      "has_elevation": false,  // true if nodes have [lat, lon, elev]
+      "nodes": [[lat, lon], ...],  // or [[lat, lon, elev], ...]
       "adj": [[ [to, dist_m], ... ], ...]
     }
 
@@ -96,10 +97,13 @@ class RoadGraph:
     on how the file is built; routing treats adjacency as given.
     """
 
-    def __init__(self, nodes: list[tuple[float, float]], adj: list[list[tuple[int, float]]], *, cfg: RoadGraphConfig | None = None):
-        self.nodes = nodes
+    def __init__(self, nodes: list[tuple[float, float]], adj: list[list[tuple[int, float]]], *, 
+                 cfg: RoadGraphConfig | None = None, 
+                 elevations: list[float] | None = None):
+        self.nodes = nodes  # [(lat, lon), ...]
         self.adj = adj
         self.cfg = cfg or RoadGraphConfig()
+        self.elevations = elevations  # [elev_m, ...] or None if no elevation data
         self._grid: dict[tuple[int, int], list[int]] = {}
         self._build_grid_index()
 
@@ -114,19 +118,28 @@ class RoadGraph:
             obj = json.load(f)
         if not isinstance(obj, dict):
             raise ValueError("road graph must be a JSON object")
-        if int(obj.get("version") or 0) != 1:
-            raise ValueError("unsupported road graph version")
+        
+        version = int(obj.get("version") or 0)
+        if version not in (1, 2):
+            raise ValueError(f"unsupported road graph version: {version}")
+        
+        has_elevation = obj.get("has_elevation", False)
         nodes_raw = obj.get("nodes")
         adj_raw = obj.get("adj")
         if not isinstance(nodes_raw, list) or not isinstance(adj_raw, list):
             raise ValueError("invalid road graph shape")
 
         nodes: list[tuple[float, float]] = []
+        elevations: list[float] | None = [] if has_elevation else None
+        
         for n in nodes_raw:
-            if not isinstance(n, list) or len(n) != 2:
+            if not isinstance(n, list) or len(n) < 2:
                 raise ValueError("invalid node")
             lat, lon = float(n[0]), float(n[1])
             nodes.append((lat, lon))
+            if elevations is not None:
+                elev = float(n[2]) if len(n) >= 3 else 0.0
+                elevations.append(elev)
 
         adj: list[list[tuple[int, float]]] = []
         for row in adj_raw:
@@ -143,7 +156,7 @@ class RoadGraph:
 
         if len(adj) != len(nodes):
             raise ValueError("adj length must equal nodes length")
-        return cls(nodes, adj, cfg=cfg)
+        return cls(nodes, adj, cfg=cfg, elevations=elevations)
 
     def _build_grid_index(self) -> None:
         g = self.cfg.grid_deg
@@ -303,6 +316,111 @@ class RoadGraph:
         
         return (best_lat, best_lon, best_edge[0], best_edge[1])
 
+    def snap_to_edge_directed(
+        self,
+        lat: float,
+        lon: float,
+        *,
+        travel_bearing: float | None = None,
+        prev_edge: tuple[int, int] | None = None,
+        max_snap_distance_m: float = 100.0,
+    ) -> tuple[float, float, int, int] | None:
+        """Snap using direction matching + continuity.
+        
+        Direction matching is crucial for parallel tracks in depots.
+        An edge going the same direction as vehicle travel gets huge preference.
+        """
+        if not self.nodes or not self.adj:
+            return None
+        
+        # Get candidate nodes from grid
+        g = self.cfg.grid_deg
+        r = self.cfg.grid_radius
+        base = (int(math.floor(lat / g)), int(math.floor(lon / g)))
+        
+        candidate_nodes: set[int] = set()
+        for di in range(-r, r + 1):
+            for dj in range(-r, r + 1):
+                key = (base[0] + di, base[1] + dj)
+                for idx in self._grid.get(key, []):
+                    candidate_nodes.add(idx)
+        
+        if not candidate_nodes:
+            for idx in range(min(1000, len(self.nodes))):
+                candidate_nodes.add(idx)
+        
+        # Build set of connected nodes from prev_edge
+        connected_nodes: set[int] = set()
+        if prev_edge:
+            pa, pb = prev_edge
+            connected_nodes.add(pa)
+            connected_nodes.add(pb)
+            for neighbor, _ in self.adj[pa]:
+                connected_nodes.add(neighbor)
+            for neighbor, _ in self.adj[pb]:
+                connected_nodes.add(neighbor)
+        
+        # Collect all candidate edges
+        checked_edges: set[tuple[int, int]] = set()
+        candidates: list[tuple[float, float, float, int, int, float, bool]] = []
+        # lat, lon, dist, a, b, edge_bearing, connected
+        
+        for node_idx in candidate_nodes:
+            a_lat, a_lon = self.nodes[node_idx]
+            for to_idx, _ in self.adj[node_idx]:
+                edge_key = (min(node_idx, to_idx), max(node_idx, to_idx))
+                if edge_key in checked_edges:
+                    continue
+                checked_edges.add(edge_key)
+                
+                b_lat, b_lon = self.nodes[to_idx]
+                proj_lat, proj_lon, dist = _project_point_to_segment(
+                    lat, lon, a_lat, a_lon, b_lat, b_lon
+                )
+                
+                if dist <= max_snap_distance_m:
+                    edge_bearing = _bearing_between(a_lat, a_lon, b_lat, b_lon)
+                    is_connected = (node_idx in connected_nodes or to_idx in connected_nodes)
+                    candidates.append((proj_lat, proj_lon, dist, node_idx, to_idx, edge_bearing, is_connected))
+        
+        if not candidates:
+            return None
+        
+        # Score each candidate
+        best = None
+        best_score = float('inf')
+        
+        for snap_lat, snap_lon, dist, a, b, edge_bearing, connected in candidates:
+            # Base score is distance
+            score = dist
+            
+            # Direction bonus: edges aligned with travel direction get huge preference
+            # This is the KEY for selecting correct track among parallels
+            if travel_bearing is not None:
+                # Check both directions of edge (track is bidirectional)
+                angle_diff = min(
+                    _angle_diff(travel_bearing, edge_bearing),
+                    _angle_diff(travel_bearing, (edge_bearing + 180) % 360)
+                )
+                # angle_diff is 0-90 (since we check both directions)
+                # 0 = perfect match, 90 = perpendicular
+                # Give MASSIVE preference to aligned edges
+                if angle_diff < 30:  # Within 30 degrees
+                    score *= 0.1  # 90% bonus
+                elif angle_diff < 60:
+                    score *= 0.5  # 50% bonus
+                # Perpendicular edges get no bonus
+            
+            # Continuity bonus: connected edges get preference
+            if connected:
+                score *= 0.5  # Additional 50% bonus
+            
+            if score < best_score:
+                best_score = score
+                best = (snap_lat, snap_lon, a, b)
+        
+        return best
+
     def route(self, start: int, goal: int) -> list[int] | None:
         if start == goal:
             return [start]
@@ -396,7 +514,7 @@ def _trace_path_nodes(
     road: RoadGraph,
     snap0: tuple[float, float, int, int],
     snap1: tuple[float, float, int, int],
-    max_walk_edges: int = 50,
+    max_walk_edges: int = 100,
 ) -> list[tuple[float, float]] | None:
     """Find intermediate geometry nodes between two snapped points.
     
@@ -415,41 +533,69 @@ def _trace_path_nodes(
         corner = shared_nodes.pop()
         return [road.nodes[corner]]
     
-    # BFS
-    from collections import deque
+    # Dijkstra (shortest path by distance) instead of BFS
+    # This prevents zigzag paths through long crossing edges
+    import heapq
     start_nodes = {edge0_a, edge0_b}
     goal_nodes = {edge1_a, edge1_b}
     
-    queue: deque[tuple[int, list[int]]] = deque()
-    visited: set[int] = set()
+    # Priority queue: (distance, node, path)
+    pq: list[tuple[float, int, list[int]]] = []
+    dist: dict[int, float] = {}
     
     for sn in start_nodes:
-        queue.append((sn, [sn]))
-        visited.add(sn)
+        heapq.heappush(pq, (0.0, sn, [sn]))
+        dist[sn] = 0.0
     
     found_path: list[int] | None = None
     edges_checked = 0
     
-    while queue and edges_checked < max_walk_edges:
-        cur, path = queue.popleft()
+    while pq and edges_checked < max_walk_edges:
+        d, cur, path = heapq.heappop(pq)
+        
         if cur in goal_nodes:
             found_path = path
             break
         
-        for nxt, _ in road.adj[cur]:
+        # Skip if we've found a better path to this node
+        if d > dist.get(cur, float('inf')):
+            continue
+        
+        for nxt, edge_dist in road.adj[cur]:
             edges_checked += 1
             if edges_checked >= max_walk_edges:
                 break
-            if nxt not in visited:
-                visited.add(nxt)
-                queue.append((nxt, path + [nxt]))
+            new_dist = d + edge_dist
+            if new_dist < dist.get(nxt, float('inf')):
+                dist[nxt] = new_dist
+                heapq.heappush(pq, (new_dist, nxt, path + [nxt]))
     
     if found_path is None:
         return None
+    
+    # Sanity checks to prevent zigzag/triangular detour paths
+    direct_dist = _haversine_m(snap0_lat, snap0_lon, snap1_lat, snap1_lon)
+    path_dist = dist.get(found_path[-1], 0.0) if found_path else 0.0
+    
+    # Check 1: Path should not be much longer than direct distance (tightened from 3x to 1.8x)
+    if direct_dist > 30 and path_dist > direct_dist * 1.8:
+        return None
+    
+    # Check 2: No node in the path should deviate too far from the direct line
+    # This prevents triangular detours where path goes perpendicular then back
+    # Max allowed deviation: 150m or 50% of direct distance, whichever is larger
+    max_deviation = max(150.0, direct_dist * 0.5)
+    for node_idx in found_path:
+        node_lat, node_lon = road.nodes[node_idx][:2]
+        # Distance from node to line segment (snap0 -> snap1)
+        proj_lat, proj_lon, _ = _project_point_to_segment(
+            node_lat, node_lon, snap0_lat, snap0_lon, snap1_lat, snap1_lon
+        )
+        deviation = _haversine_m(node_lat, node_lon, proj_lat, proj_lon)
+        if deviation > max_deviation:
+            return None
         
     # Convert node indices to coords
-    # Note: path includes start_node (one of edge0's ends) and end_node (one of edge1's ends)
-    # We want these because they are geometry points.
     coords = []
     for idx in found_path:
         coords.append(road.nodes[idx])
@@ -465,7 +611,7 @@ def trace_road_between_gps_points(
     max_waypoints: int = 20,
     spacing_m: float = 25.0,
     max_snap_distance_m: float = 50.0,
-    max_walk_edges: int = 50,
+    max_walk_edges: int = 100,
 ) -> list[dict[str, Any]] | None:
     """Add waypoints along the road geometry between two GPS points.
     
@@ -696,6 +842,148 @@ def snap_trail_segments(
     return result
 
 
+def _offset_point_right(
+    lat: float, lon: float,
+    bearing_deg: float,
+    offset_m: float,
+) -> tuple[float, float]:
+    """Offset a point perpendicular to a bearing (to the right).
+    
+    For right-hand drive (US), vehicles travel on the right side of the road.
+    Bearing is the direction of travel (0=north, 90=east).
+    """
+    if offset_m == 0:
+        return (lat, lon)
+    
+    # Perpendicular to the right means bearing + 90 degrees
+    perp_bearing = math.radians((bearing_deg + 90) % 360)
+    
+    # Convert offset to degrees (rough approximation)
+    # 1 degree latitude ≈ 111km
+    # 1 degree longitude ≈ 111km * cos(lat)
+    lat_rad = math.radians(lat)
+    meters_per_deg_lat = 111320
+    meters_per_deg_lon = 111320 * math.cos(lat_rad)
+    
+    # Offset in lat/lon
+    dlat = (offset_m * math.cos(perp_bearing)) / meters_per_deg_lat
+    dlon = (offset_m * math.sin(perp_bearing)) / meters_per_deg_lon
+    
+    return (lat + dlat, lon + dlon)
+
+
+def _bearing_between(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate bearing in degrees from point 1 to point 2."""
+    lat1_r = math.radians(lat1)
+    lat2_r = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    
+    x = math.sin(dlon) * math.cos(lat2_r)
+    y = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
+    
+    bearing = math.degrees(math.atan2(x, y))
+    return (bearing + 360) % 360
+
+
+def _angle_diff(a: float, b: float) -> float:
+    """Smallest angle difference between two bearings (0-180)."""
+    d = abs(a - b) % 360
+    return d if d <= 180 else 360 - d
+
+
+def snap_vehicle_simple(
+    trail: list[dict[str, Any]],
+    graph: "RoadGraph",
+    *,
+    max_snap_m: float = 50.0,
+    lane_offset_m: float = 0.0,
+) -> list[dict[str, Any]] | None:
+    """Vehicle snapping with direction + continuity matching.
+    
+    Uses vehicle direction of travel to select correct track among parallels.
+    Also prefers edges connected to previous snap for continuity.
+    
+    Args:
+        trail: List of trail points with lat, lon, t keys.
+        graph: RoadGraph instance (road or tram track).
+        max_snap_m: Maximum distance to snap a point to an edge.
+        lane_offset_m: Offset to the right side of the road (for right-hand drive).
+    
+    Returns:
+        Snapped trail with same number of points, or None if too few snap.
+    """
+    if not trail:
+        return None
+    
+    result: list[dict[str, Any]] = []
+    snap_count = 0
+    prev_edge: tuple[int, int] | None = None
+    prev_lat: float | None = None
+    prev_lon: float | None = None
+    
+    for pt in trail:
+        lat = pt.get("lat")
+        lon = pt.get("lon")
+        
+        if not (_is_finite(lat) and _is_finite(lon)):
+            result.append(pt)
+            prev_edge = None
+            prev_lat = None
+            prev_lon = None
+            continue
+        
+        # Calculate direction of travel from previous point
+        travel_bearing: float | None = None
+        if prev_lat is not None and prev_lon is not None:
+            # Only use direction if we moved at least 5m
+            dist = _haversine_m(prev_lat, prev_lon, lat, lon)
+            if dist > 5:
+                travel_bearing = _bearing_between(prev_lat, prev_lon, lat, lon)
+        
+        # Try to snap with direction + continuity preference
+        snap = graph.snap_to_edge_directed(
+            float(lat), float(lon), 
+            travel_bearing=travel_bearing,
+            prev_edge=prev_edge,
+            max_snap_distance_m=max_snap_m
+        )
+        
+        if snap is None:
+            result.append(pt)
+            prev_lat = lat
+            prev_lon = lon
+            continue
+        
+        snap_lat, snap_lon, edge_a, edge_b = snap
+        snap_count += 1
+        prev_edge = (edge_a, edge_b)
+        prev_lat = lat
+        prev_lon = lon
+        
+        # Get edge endpoint coordinates for client-side track following
+        a_lat, a_lon = graph.nodes[edge_a]
+        b_lat, b_lon = graph.nodes[edge_b]
+        
+        # Apply lane offset for buses
+        if lane_offset_m != 0:
+            bearing = _bearing_between(a_lat, a_lon, b_lat, b_lon)
+            snap_lat, snap_lon = _offset_point_right(snap_lat, snap_lon, bearing, lane_offset_m)
+        
+        new_pt = dict(pt)
+        new_pt["lat"] = snap_lat
+        new_pt["lon"] = snap_lon
+        new_pt["rm"] = 1
+        # Include edge coordinates for client to draw along track
+        new_pt["ea"] = [a_lat, a_lon]  # edge point A
+        new_pt["eb"] = [b_lat, b_lon]  # edge point B
+        result.append(new_pt)
+    
+    if len(trail) > 1 and snap_count < len(trail) * 0.3:
+        return None
+    
+    return result
+
+
 def snap_points_to_roads(
     trail: list[dict[str, Any]],
     road: RoadGraph,
@@ -761,7 +1049,7 @@ def snap_points_to_roads(
         if s_prev and s_curr:
              path_coords = _trace_path_nodes(road, s_prev, s_curr)
         
-        # If we found intermediate geometry
+        # If we found intermediate geometry, use snapped path
         if path_coords:
             # Interpolate times
             t0 = parse_utc_timestamp(p_prev_orig.get("t") or "")
@@ -796,11 +1084,14 @@ def snap_points_to_roads(
                         wp["wp"] = 1
                         # Don't set 'rm' on waypoints (they are graph nodes, so effectively on road, but reserve rm for checks)
                         result.append(wp)
-
-        # Add current point
-        if s_curr:
+            
+            # Add snapped current point (path was found)
             result.append(make_pt(p_curr_orig, s_curr[0], s_curr[1], is_snap=True))
         else:
+            # NO PATH FOUND - fall back to original GPS coordinates
+            # This prevents zigzag artifacts when snapped points are on disconnected components
+            # or when the traced path was rejected by sanity checks.
+            # Using raw GPS here ensures the trail follows the actual vehicle trajectory.
             result.append(p_curr_orig)
 
     return result

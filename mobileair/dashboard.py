@@ -90,6 +90,7 @@ def normalize_state_for_dashboard(
     fixed_url: str,
     data_dir: str,
     road_graph: "RoadGraph | None" = None,
+    tram_line_graph: "RoadGraph | None" = None,
 ) -> dict[str, Any]:
     """Normalize combined API data into a dashboard-friendly JSON shape.
 
@@ -101,14 +102,15 @@ def normalize_state_for_dashboard(
         mobile_url: URL for mobile data (for metadata).
         fixed_url: URL for fixed data (for metadata).
         data_dir: Data directory path (for metadata).
-        road_graph: Optional RoadGraph instance for map matching.
+        road_graph: Optional RoadGraph instance for map matching (buses, etc).
+        tram_line_graph: Optional RoadGraph for TRAX/tram vehicles (built from GPS traces).
 
     Returns:
         Normalized state dict with 'ts', 'meta', 'mobile', and 'fixed' keys.
     """
     # Lazy import to avoid circular dependency
-    if road_graph:
-        from .roads import snap_points_to_roads
+    if road_graph or tram_line_graph:
+        from .roads import snap_vehicle_simple
 
     custom_names = custom_names or {}
     pinned_sensors = pinned_sensors or set()
@@ -276,16 +278,30 @@ def normalize_state_for_dashboard(
             if pts2:
                 last2 = pts2[-1]
 
-        # Apply road graph snapping for vehicles (not rail/TRAX)
-        if road_graph and pts2 and not is_immobile:
-            try:
-                sid = sensor_id.upper()
-                if not (sid.startswith("TRX") or sid.startswith("TRAX")):
-                    snapped = snap_points_to_roads(pts2, road_graph, max_snap_m=75.0)
+        # Apply road/track snapping for vehicles
+        # TRX = tram tracks ONLY, BUS = roads ONLY - NO FALLBACKS
+        if pts2 and not is_immobile:
+            sid = sensor_id.upper()
+            is_trax = sid.startswith("TRX") or sid.startswith("TRAX")
+            
+            if is_trax:
+                # Trams: ONLY use tram track graph (no fallback to roads)
+                # Use large snap radius (200m) because GPS can drift significantly
+                if tram_line_graph:
+                    try:
+                        snapped = snap_vehicle_simple(pts2, tram_line_graph, max_snap_m=200.0, lane_offset_m=0)
+                        if snapped:
+                            pts2 = snapped
+                    except Exception:
+                        pass
+            elif road_graph:
+                # Buses: ONLY use road graph (no fallback)
+                try:
+                    snapped = snap_vehicle_simple(pts2, road_graph, max_snap_m=75.0, lane_offset_m=2.5)
                     if snapped:
                         pts2 = snapped
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
         # Collect readings
         readings: dict[str, Any] = {}
@@ -420,6 +436,12 @@ def normalize_state_for_dashboard(
     )
     if fixed_outliers:
         fixed_sensors = [s for s in fixed_sensors if str(s.get("id")) not in fixed_outliers]
+
+    # Add home sensor from Dirigera hub
+    from .dirigera_home import get_home_sensor_entry
+    home_entry = get_home_sensor_entry()
+    if home_entry:
+        fixed_sensors.insert(0, home_entry)
 
     # Sort mobile sensors
     mobile_sensors.sort(

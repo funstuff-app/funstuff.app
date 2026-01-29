@@ -2,5 +2,7 @@ requests>=2.31.0
 textual>=0.55.0
 rich>=13.7.0
 certifi>=2023.0.0
+python-dotenv>=1.0.0
+dirigera>=1.0.0
 
 
