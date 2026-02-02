@@ -14,7 +14,7 @@
   <meta name="apple-mobile-web-app-title" content="DustyTrails" />
   <link rel="apple-touch-icon" href="/icon-180.png" />
   
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=20260201m" />
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
@@ -55,15 +55,16 @@
       </div>
       <!-- DVR menu in topbar -->
       <div class="pbMenuWrap topbarMenu">
+        <button id="shareBtn" type="button" class="shareBtn" title="Share" aria-label="Share"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 7l4-4 4 4"/><path d="M5 11v9a2 2 0 002 2h10a2 2 0 002-2v-9"/></svg></button>
         <button id="pbMenuBtn" type="button" class="pbMenuBtn" title="More options">⋮</button>
         <div id="pbMenu" class="pbMenu hidden">
           <div class="pbMenuItem" data-action="save">
             <span class="pbMenuIcon">💾</span>
-            <span class="pbMenuLabel">Save Day</span>
+            <span class="pbMenuLabel">Save Snapshot</span>
           </div>
           <div class="pbMenuItem" data-action="load">
             <span class="pbMenuIcon">📂</span>
-            <span class="pbMenuLabel">Load Day</span>
+            <span class="pbMenuLabel">Load Snapshot</span>
           </div>
           <div class="pbMenuDivider"></div>
           <div class="pbMenuItem pbMenuSub" data-submenu="days">
@@ -82,35 +83,6 @@
           <canvas id="tilesCanvas"></canvas>
           <canvas id="overlayCanvas"></canvas>
 
-          <div id="playbackBar" class="playbackBar" role="group" aria-label="Playback controls">
-            <div class="pbRow1">
-              <button id="pbPlay" type="button" title="Play/Pause">Live</button>
-              <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" />
-              <label class="pbSpeed" title="Playback speed">
-                <span>Speed</span>
-                <select id="pbSpeed" aria-label="Playback speed">
-                  <option value="1" selected>1×</option>
-                  <option value="5">5×</option>
-                  <option value="10">10×</option>
-                  <option value="20">20×</option>
-                </select>
-              </label>
-            </div>
-            <div class="pbRow2">
-              <span id="pbLeft">—</span>
-              <span class="sep">•</span>
-              <span id="pbNow">—</span>
-              <span class="sep">•</span>
-              <span id="pbRight">—</span>
-            </div>
-            <!-- Debug emoji button - hidden but functional
-            <label class="pbDebugLabel" title="Show full path ahead">
-              <input type="checkbox" id="pbDebugPath" />
-              <span>🐛</span>
-            </label>
-            -->
-          </div>
-
           <!-- Sidebar panel (integrated, overlays map) -->
           <aside id="sidebar" class="sidebarPanel">
             <div class="sidebarHeader">
@@ -125,13 +97,30 @@
             <div id="sensorListMobile" class="list" role="tabpanel" aria-labelledby="tabMobile"></div>
             <div id="sensorListFixed" class="list hidden" role="tabpanel" aria-labelledby="tabPermanent"></div>
           </aside>
+        </div>
 
-          <!-- <aside id="details" class="overlayPanel">
-            <div class="panelTitle">Details</div>
-            <div id="detailsBody" class="detailsBody">
-              <div class="muted">Select a vehicle…</div>
-            </div>
-          </aside> -->
+        <!-- Playback controls - OUTSIDE mapRoot to avoid canvas touch interference -->
+        <div id="playbackBar" class="playbackBar" role="group" aria-label="Playback controls">
+          <div class="pbRow1">
+            <button id="pbPlay" type="button" title="Play/Pause">Live</button>
+            <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" />
+            <label class="pbSpeed" title="Playback speed">
+              <span>Speed</span>
+              <select id="pbSpeed" aria-label="Playback speed">
+                <option value="1" selected>1×</option>
+                <option value="5">5×</option>
+                <option value="10">10×</option>
+                <option value="20">20×</option>
+              </select>
+            </label>
+          </div>
+          <div class="pbRow2">
+            <span id="pbLeft">—</span>
+            <span class="sep">•</span>
+            <span id="pbNow">—</span>
+            <span class="sep">•</span>
+            <span id="pbRight">—</span>
+          </div>
         </div>
       </section>
     </main>
@@ -141,9 +130,9 @@
     </footer>
   </div>
 
-  <script src="map_nav_engine.js"></script>
-  <script src="camera_fit_logic.js"></script>
-  <script src="app.js"></script>
+  <script src="map_nav_engine.js?v=20260131"></script>
+  <script src="camera_fit_logic.js?v=20260131"></script>
+  <script src="app.js?v=20260201n"></script>
 </body>
 </html>
 

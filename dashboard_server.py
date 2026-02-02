@@ -595,6 +595,49 @@ def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         return False
 
 
+def _clamp_impossible_values(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """NULL out impossible sensor values at the source.
+    
+    Modifies data in-place, setting values outside plausible ranges to None:
+    - PM2.5: 0-999 ug/m3
+    - PM10: 0-2000 ug/m3  
+    - OZNE: 0-600 ppb
+    """
+    if not isinstance(data, dict):
+        return data
+    
+    bounds = {"PM25": (0.0, 999.0), "PM10": (0.0, 2000.0), "OZNE": (0.0, 600.0)}
+    
+    for pollutant, (lo, hi) in bounds.items():
+        section = data.get(pollutant)
+        if not isinstance(section, dict):
+            continue
+        for sensor_id, sensor_data in section.items():
+            if sensor_id in ("LastUpdateUTC", "LastUpdateLocal", "VarName", "VarUnit"):
+                continue
+            if not isinstance(sensor_data, dict):
+                continue
+            vals = sensor_data.get("Value")
+            if isinstance(vals, list):
+                def nullify(v):
+                    if v is None:
+                        return None
+                    try:
+                        fv = float(v)
+                        return v if lo <= fv <= hi else None
+                    except (ValueError, TypeError):
+                        return v
+                sensor_data["Value"] = [nullify(v) for v in vals]
+            elif vals is not None:
+                try:
+                    fv = float(vals)
+                    if fv < lo or fv > hi:
+                        sensor_data["Value"] = None
+                except (ValueError, TypeError):
+                    pass
+    return data
+
+
 def accumulate_fixed_reading(
     app_state: AppState,
     sensor_id: str,
@@ -629,9 +672,12 @@ def accumulate_fixed_reading(
         "recorded_at": now_ts,
     })
     
-    # Keep last 100 entries (more than TUI's 50 for longer playback)
-    if len(hist) > 100:
-        app_state.fixed_history[sensor_id][pollutant] = hist[-100:]
+    # Keep history based on sensor type:
+    # - Home sensor: 5760 entries (~48 hours at 30-second intervals) to span today + yesterday
+    # - Utah sensors: 2880 entries (~24 hours at 5-10 min intervals spans days anyway)
+    max_entries = 5760 if sensor_id == "Home" else 2880
+    if len(hist) > max_entries:
+        app_state.fixed_history[sensor_id][pollutant] = hist[-max_entries:]
     
     app_state.fixed_history_dirty = True
 
@@ -831,7 +877,7 @@ def _fetch_history_file(sensor: str, var: str) -> list:
         return []
 
 
-def fetch_historical_day(date_str: str) -> dict[str, Any]:
+def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_dir: Path | None = None) -> dict[str, Any]:
     """Fetch week-long data and filter to a specific day.
     
     Returns data in RAW API FORMAT so it can be processed by 
@@ -839,10 +885,15 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
     
     Args:
         date_str: Date in YYYY-MM-DD format (UTC)
+        app_state: Optional AppState for accessing Home sensor history
+        data_dir: Data directory for loading snapshots (defaults to ~/.mobileair)
     
     Returns:
         Dict with 'mobile' in raw API format (same as MobileMapData.json)
     """
+    # Default data_dir if not provided
+    if data_dir is None:
+        data_dir = default_data_dir()
     from datetime import datetime, timezone, timedelta
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
@@ -1032,6 +1083,72 @@ def fetch_historical_day(date_str: str) -> dict[str, Any]:
         result["meta"]["utah_aq_unavailable"] = True
         if mobile_count == 0:
             result["meta"]["mobile_data_unavailable"] = True
+    
+    # Add Home sensor with historical data
+    # Priority: 1) fixed_history (recent data), 2) saved snapshot for that day
+    home_entry = None
+    
+    if app_state:
+        home_hist = app_state.fixed_history.get("Home", {}).get("PM25", [])
+        if home_hist:
+            # Filter history to requested day
+            filtered_hist = [
+                e for e in home_hist
+                if e.get("time") and e["time"].startswith(date_str)
+            ]
+            
+            if filtered_hist:
+                # Build history arrays from fixed_history
+                history_values = []
+                history_colors = []
+                history_times = []
+                for entry in filtered_hist:
+                    val = entry.get("val")
+                    try:
+                        history_values.append(float(val) if val is not None else None)
+                    except (ValueError, TypeError):
+                        history_values.append(None)
+                    history_colors.append(entry.get("col", "#cccccc"))
+                    history_times.append(entry.get("time"))
+                
+                # Use last historical value as display value (not current)
+                last_val = history_values[-1] if history_values else None
+                last_col = history_colors[-1] if history_colors else "#cccccc"
+                
+                home_entry = {
+                    "id": "Home",
+                    "name": "Home",
+                    "pinned": True,
+                    "lat": 40.7608,  # Default SLC coords
+                    "lon": -111.891,
+                    "readings": {
+                        "PM25": {
+                            "value": last_val,
+                            "color": last_col,
+                            "history": history_values,
+                            "history_colors": history_colors,
+                            "history_times": history_times,
+                        }
+                    },
+                }
+    
+    # If no data from fixed_history, try loading from a saved snapshot
+    if not home_entry:
+        try:
+            snapshot = load_snapshot(data_dir, date_str)
+            if snapshot and isinstance(snapshot.get("fixed"), list):
+                for sensor in snapshot["fixed"]:
+                    if sensor.get("id") == "Home":
+                        home_entry = sensor
+                        break
+        except Exception:
+            pass
+    
+    # Insert Home sensor at beginning of fixed list
+    if home_entry:
+        if "fixed" not in result:
+            result["fixed"] = []
+        result["fixed"].insert(0, home_entry)
     
     return result
 
@@ -1855,13 +1972,72 @@ class AdaptivePoller:
         return delay
 
 
+def _update_home_sensor_in_state(app_state: AppState) -> None:
+    """Poll the Home sensor and update its value in app_state without full rebuild."""
+    try:
+        from mobileair.dirigera_home import get_home_sensor_entry
+        home_entry = get_home_sensor_entry()
+        if not home_entry:
+            return
+        
+        # Accumulate the reading into history (every 30s poll)
+        pm25_reading = home_entry.get("readings", {}).get("PM25", {})
+        value = pm25_reading.get("value")
+        color = pm25_reading.get("color", "#cccccc")
+        if value is not None:
+            time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            accumulate_fixed_reading(app_state, "Home", "PM25", value, color, time_utc)
+        
+        with app_state.lock:
+            st = app_state.state
+            if not st or not isinstance(st.get("fixed"), list):
+                return
+            
+            # Find and update Home sensor in fixed list
+            for i, sensor in enumerate(st["fixed"]):
+                if sensor.get("id") == "Home":
+                    # Preserve history from existing entry
+                    old_readings = sensor.get("readings", {})
+                    new_readings = home_entry.get("readings", {})
+                    for key, reading in new_readings.items():
+                        if key in old_readings and isinstance(old_readings[key], dict):
+                            reading["history"] = old_readings[key].get("history", [])
+                            reading["history_colors"] = old_readings[key].get("history_colors", [])
+                            reading["history_times"] = old_readings[key].get("history_times", [])
+                    home_entry["readings"] = new_readings
+                    st["fixed"][i] = home_entry
+                    break
+    except Exception as e:
+        _log(f"[HomeSensor] Update error: {e}")
+
+
 def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_event: threading.Event) -> None:
     revision = 0
     poller = AdaptivePoller()
+    last_home_poll = 0.0
+    last_snapshot_save = 0.0
+    HOME_POLL_INTERVAL = 30.0  # Poll Home sensor every 30 seconds
+    SNAPSHOT_SAVE_INTERVAL = 300.0  # Auto-save snapshot every 5 minutes
     _log(f"[FetchLoop] Starting with adaptive polling (base interval ~{poller.DEFAULT_INTERVAL_S:.0f}s)")
     
     while not stop_event.is_set():
         attempt_ts = time.time()
+        
+        # Poll Home sensor frequently regardless of AirNow timing
+        if attempt_ts - last_home_poll >= HOME_POLL_INTERVAL:
+            _update_home_sensor_in_state(app_state)
+            last_home_poll = attempt_ts
+        
+        # Auto-save snapshot every 5 minutes to prevent data loss on crash/restart
+        if attempt_ts - last_snapshot_save >= SNAPSHOT_SAVE_INTERVAL:
+            try:
+                save_fixed_history(app_state)
+                if save_today_snapshot(app_state, data_dir):
+                    _log(f"[FetchLoop] Auto-saved today's snapshot")
+                last_snapshot_save = attempt_ts
+            except Exception as e:
+                _log(f"[FetchLoop] Auto-save error: {e}")
+        
         try:
             _log(f"[FetchLoop] Fetching data...")
             mobile_cache = default_cache_path(MOBILE_URL, mobile_url=MOBILE_URL, fixed_url=FIXED_URL, data_dir=str(data_dir))
@@ -1869,6 +2045,9 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             # Uses 6s timeout when cache exists (see fetch_json_with_cache), falls back to cache on failure
             mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=stdlib_get, cache_path=mobile_cache)
             fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=stdlib_get, cache_path=fixed_cache)
+
+            # Clamp impossible sensor values at the source
+            mobile = _clamp_impossible_values(mobile)
 
             # Remove any cache tracking metadata (we use the data's own timestamps now)
             if isinstance(mobile, dict):
@@ -1943,9 +2122,16 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             update_app_state_with_new_data(app_state, st)
             _log(f"[FetchLoop] Revision {revision} updated")
             
-            # Periodically save history
+            # Periodically save history and snapshot
             if revision % 10 == 0:
                 save_fixed_history(app_state)
+            # Save today's snapshot every 30 revisions (~5 hours with adaptive polling)
+            # This preserves mobile trails across unexpected restarts
+            if revision % 30 == 0 and revision > 0:
+                try:
+                    save_today_snapshot(app_state, data_dir)
+                except Exception as snap_e:
+                    _log(f"[FetchLoop] Snapshot save error: {snap_e}")
         except Exception as e:
             _log(f"[FetchLoop] Error: {type(e).__name__}: {e}")
             # Still build state with empty data so Home sensor from Dirigera is included
@@ -1966,9 +2152,21 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
                     except Exception:
                         pass
         
-        # Use adaptive polling delay instead of fixed interval
+        # Use adaptive polling delay, but wake up every 30s to poll Home sensor
         next_delay = poller.get_next_poll_delay()
-        stop_event.wait(next_delay)
+        next_airnow_poll = time.time() + next_delay
+        
+        while not stop_event.is_set() and time.time() < next_airnow_poll:
+            # Poll Home sensor every 30 seconds
+            if time.time() - last_home_poll >= HOME_POLL_INTERVAL:
+                _update_home_sensor_in_state(app_state)
+                last_home_poll = time.time()
+            
+            # Sleep until next Home poll or AirNow poll, whichever is sooner
+            time_to_airnow = next_airnow_poll - time.time()
+            time_to_home = HOME_POLL_INTERVAL - (time.time() - last_home_poll)
+            sleep_time = max(1.0, min(time_to_airnow, time_to_home))
+            stop_event.wait(sleep_time)
 
 
 def airnow_fetch_loop(
@@ -2526,7 +2724,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._send(400, b'{"error": "date parameter required"}', "application/json")
             
             try:
-                result = fetch_historical_day(date_str)
+                result = fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir)
                 body = json.dumps(result).encode("utf-8")
                 return self._send(200, body, "application/json")
             except Exception as e:

@@ -51,10 +51,27 @@ def _pick_primary_pollutant_key(readings: dict[str, Any]) -> str | None:
     return next(iter(readings.keys()), None)
 
 
+def _is_plausible_value(pollutant_key: str, value: Any) -> bool:
+    """Check if a pollutant value is plausible (not sensor noise)."""
+    import math
+    try:
+        fv = float(value)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(fv):
+        return False
+    key = normalize_pollutant_key(pollutant_key)
+    bounds = {"pm2.5": (0.0, 999.0), "pm10": (0.0, 2000.0), "ozone": (0.0, 600.0)}.get(key)
+    if bounds and not (bounds[0] <= fv <= bounds[1]):
+        return False
+    return True
+
+
 def _pick_worst_reading_by_aqi(readings: dict[str, Any]) -> dict[str, Any]:
     """Pick the reading with the highest AQI (non-linear) among available pollutants.
     
     Returns {key, value, color, aqi} (aqi may be None).
+    Filters out implausible values (sensor noise) before picking.
     """
     best = {"key": None, "value": None, "color": "#ffffff", "aqi": None}
     best_aqi = -1.0
@@ -63,6 +80,11 @@ def _pick_worst_reading_by_aqi(readings: dict[str, Any]) -> dict[str, Any]:
             continue
         val = v.get("value")
         col = v.get("color") or "#ffffff"
+        
+        # Skip implausible values (sensor noise like OZNE=1472)
+        if not _is_plausible_value(k, val):
+            continue
+        
         aqi = value_to_aqi(normalize_pollutant_key(str(k)), val)
         try:
             aqi_f = float(aqi) if aqi is not None else -1.0
@@ -197,56 +219,60 @@ def normalize_state_for_dashboard(
             mobility_info = evaluate_mobility(trail_blob)
 
             # Per-point moving flag used by playback visibility.
-            point_times = [parse_utc_timestamp(p.get("t")) if isinstance(p, dict) else None for p in pts]
-            lookback_s = float(max(60.0, IMMOBILITY_LOOKBACK_MINUTES * 120.0))
-            window_start_idx = 0
+            # Mark all points as moving - the playback physics handles realistic movement.
             for idx in range(len(pts)):
-                current_dt = point_times[idx]
-                if current_dt is None:
-                    if isinstance(pts[idx], dict):
-                        pts[idx]["m"] = 0
-                    continue
-
-                cutoff_dt = current_dt - timedelta(seconds=lookback_s)
-                while window_start_idx < idx and point_times[window_start_idx] is not None and point_times[window_start_idx] < cutoff_dt:
-                    window_start_idx += 1
-
-                window_points = pts[window_start_idx : idx + 1]
-                window_latitudes: list[float] = []
-                window_longitudes: list[float] = []
-                window_timestamps: list[str] = []
-                for window_point in window_points:
-                    if not isinstance(window_point, dict):
-                        continue
-                    lat_f = coerce_float(window_point.get("lat"))
-                    lon_f = coerce_float(window_point.get("lon"))
-                    ts_str = window_point.get("t") if isinstance(window_point.get("t"), str) else None
-                    if lat_f is None or lon_f is None or not ts_str:
-                        continue
-                    window_latitudes.append(float(lat_f))
-                    window_longitudes.append(float(lon_f))
-                    window_timestamps.append(ts_str)
-                if len(window_latitudes) < 2:
-                    # Not enough points in window to evaluate movement
-                    # Use overall mobility classification as the default
-                    overall_immobile = bool(mobility_info.get("immobile"))
-                    if idx > 0 and isinstance(pts[idx-1], dict) and pts[idx-1].get("m") is not None:
-                        pts[idx]["m"] = pts[idx-1].get("m")
-                    else:
-                        # For first point, use overall mobility status
-                        pts[idx]["m"] = 0 if overall_immobile else 1
-                    continue
-                window_blob = {"Latitude": window_latitudes, "Longitude": window_longitudes, "TimeUTC": window_timestamps}
-                is_history_load = max_points > 1000
-
-                window_mobility = evaluate_mobility(
-                    window_blob,
-                    assume_immobile_when_sparse=not is_history_load,
-                    assume_immobile_when_low_coverage=not is_history_load,
-                    allow_short_window_immobile=not is_history_load,
-                )
-                is_window_immobile = bool(window_mobility.get("immobile"))
-                pts[idx]["m"] = 0 if is_window_immobile else 1
+                if isinstance(pts[idx], dict):
+                    pts[idx]["m"] = 1
+            
+            # DISABLED: Expensive per-point mobility evaluation (was taking minutes for historical data)
+            # Uncomment to re-enable per-point moving/stopped classification:
+            #
+            # point_times = [parse_utc_timestamp(p.get("t")) if isinstance(p, dict) else None for p in pts]
+            # lookback_s = float(max(60.0, IMMOBILITY_LOOKBACK_MINUTES * 120.0))
+            # window_start_idx = 0
+            # for idx in range(len(pts)):
+            #     current_dt = point_times[idx]
+            #     if current_dt is None:
+            #         if isinstance(pts[idx], dict):
+            #             pts[idx]["m"] = 0
+            #         continue
+            #
+            #     cutoff_dt = current_dt - timedelta(seconds=lookback_s)
+            #     while window_start_idx < idx and point_times[window_start_idx] is not None and point_times[window_start_idx] < cutoff_dt:
+            #         window_start_idx += 1
+            #
+            #     window_points = pts[window_start_idx : idx + 1]
+            #     window_latitudes: list[float] = []
+            #     window_longitudes: list[float] = []
+            #     window_timestamps: list[str] = []
+            #     for window_point in window_points:
+            #         if not isinstance(window_point, dict):
+            #             continue
+            #         lat_f = coerce_float(window_point.get("lat"))
+            #         lon_f = coerce_float(window_point.get("lon"))
+            #         ts_str = window_point.get("t") if isinstance(window_point.get("t"), str) else None
+            #         if lat_f is None or lon_f is None or not ts_str:
+            #             continue
+            #         window_latitudes.append(float(lat_f))
+            #         window_longitudes.append(float(lon_f))
+            #         window_timestamps.append(ts_str)
+            #     if len(window_latitudes) < 2:
+            #         overall_immobile = bool(mobility_info.get("immobile"))
+            #         if idx > 0 and isinstance(pts[idx-1], dict) and pts[idx-1].get("m") is not None:
+            #             pts[idx]["m"] = pts[idx-1].get("m")
+            #         else:
+            #             pts[idx]["m"] = 0 if overall_immobile else 1
+            #         continue
+            #     window_blob = {"Latitude": window_latitudes, "Longitude": window_longitudes, "TimeUTC": window_timestamps}
+            #
+            #     window_mobility = evaluate_mobility(
+            #         window_blob,
+            #         assume_immobile_when_sparse=True,
+            #         assume_immobile_when_low_coverage=True,
+            #         allow_short_window_immobile=True,
+            #     )
+            #     is_window_immobile = bool(window_mobility.get("immobile"))
+            #     pts[idx]["m"] = 0 if is_window_immobile else 1
 
         is_immobile = bool(mobility_info.get("immobile"))
         forced_active = False
