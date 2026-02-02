@@ -650,10 +650,11 @@ class MapView {
     this._overlayStaticKey = "";
     this._overlayStaticDirty = true;
 
-    // Playback-mode optimization: cache the static underlay (fixed markers + trails).
-    // This lets us redraw only moving markers without re-stroking the whole trail layer.
-    this._overlayUnderlayCanvas = null; // offscreen canvas in device pixels
-    this._overlayUnderlayKey = "";
+    // Playback-mode optimization: cache trails to offscreen canvas.
+    // Trails only need redrawing when view changes or playback time advances significantly.
+    this._trailCacheCanvas = null;
+    this._trailCacheKey = "";
+    this._trailCacheTimeMs = null;
 
     // Trace-mode optimization: cache cleaned point lists per mobile id for sampling.
     this._tracePtsById = new Map(); // id -> [{lat,lon}, ...]
@@ -785,13 +786,6 @@ class MapView {
 
     window.addEventListener("resize", () => this.resize());
     
-    // Use ResizeObserver to detect actual container size changes - critical for iOS PWA
-    // standalone mode where viewport settles after initial load
-    if (typeof ResizeObserver !== "undefined") {
-      this._resizeObserver = new ResizeObserver(() => this.resize());
-      this._resizeObserver.observe(this.tilesCanvas.parentElement);
-    }
-    
     this.overlayCanvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
     // Safari (macOS) provides native trackpad pinch as gesture events.
     this.overlayCanvas.addEventListener("gesturestart", (e) => this.onGestureStart(e), { passive: false });
@@ -808,13 +802,6 @@ class MapView {
     this.overlayCanvas.addEventListener("touchcancel", (e) => this.onTouchEnd(e), { passive: false });
 
     this.resize();
-    
-    // iOS PWA standalone mode: viewport can settle late, causing squished canvas.
-    // Schedule additional resize checks to catch late layout changes.
-    if (window.navigator.standalone || window.matchMedia("(display-mode: standalone)").matches) {
-      setTimeout(() => this.resize(), 100);
-      setTimeout(() => this.resize(), 500);
-    }
   }
 
   _cancelCameraAnimations() {
@@ -2425,18 +2412,30 @@ class MapView {
 
   resize() {
     const dpr = window.devicePixelRatio || 1;
-    const rect = this.tilesCanvas.getBoundingClientRect();
-    const w = Math.max(1, Math.floor(rect.width));
-    const h = Math.max(1, Math.floor(rect.height));
+    const parent = this.tilesCanvas.parentElement;
+    // Use clientWidth/clientHeight (integers) - more stable than getBoundingClientRect
+    const w = Math.max(1, parent.clientWidth);
+    const h = Math.max(1, parent.clientHeight);
+
+    // Guard: skip if nothing changed (prevents feedback loops)
+    if (w === this._cssW && h === this._cssH && dpr === this._dpr) return;
 
     this._dpr = dpr;
     this._cssW = w;
     this._cssH = h;
 
+    // Set internal canvas dimensions
     this.tilesCanvas.width = Math.floor(w * dpr);
     this.tilesCanvas.height = Math.floor(h * dpr);
     this.overlayCanvas.width = Math.floor(w * dpr);
     this.overlayCanvas.height = Math.floor(h * dpr);
+
+    // Set explicit CSS pixel dimensions - critical for iOS PWA standalone mode
+    // where percentage-based sizing can be calculated incorrectly
+    this.tilesCanvas.style.width = w + 'px';
+    this.tilesCanvas.style.height = h + 'px';
+    this.overlayCanvas.style.width = w + 'px';
+    this.overlayCanvas.style.height = h + 'px';
 
     this.tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.octx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -2445,6 +2444,9 @@ class MapView {
     this._tilesSnapshotCanvas = null;
     this._tilesSnapshotMeta = null;
     this._invalidateOverlayStatic();
+    // Invalidate trail cache on resize
+    this._trailCacheCanvas = null;
+    this._trailCacheKey = "";
 
     this.draw(this.lastState);
   }
@@ -5824,9 +5826,14 @@ class MapView {
     const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
     const fixed = Array.isArray(state.fixed) ? state.fixed : [];
 
-    // Playback-mode: trails are clipped to playback time, so we redraw them each frame.
-    // Caching doesn't help here since the visible trail changes as time advances.
-    const canUseUnderlay = false;
+    // Playback-mode trail caching: redraw trails only when view changes or time advances by 500ms+
+    // This dramatically reduces CPU/GPU load since trail rendering is expensive.
+    const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    const trailCacheKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}`;
+    const trailTimeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? Math.abs(pbTimeMs - this._trailCacheTimeMs) : Infinity;
+    const trailCacheValid = this._trailCacheCanvas && 
+                            this._trailCacheKey === trailCacheKey && 
+                            trailTimeDelta < 500; // Redraw trails every 500ms of playback time
 
     // Precompute center world once per frame; avoids repeated center projection in worldToScreen().
     const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
@@ -6116,41 +6123,184 @@ class MapView {
     };
 
     // In trace mode (without playback), trails are part of the cached static overlay.
-    // In playback underlay mode, trails are already present.
-    if (!useStaticOverlay && !canUseUnderlay) {
-      // Note: we intentionally do not render trails for mobiles missing from the payload.
+    // In playback mode, use trail caching to avoid redrawing every frame.
+    if (!useStaticOverlay) {
+      // Trail cache: only redraw when view changes or playback time advances significantly
+      if (!trailCacheValid) {
+        // Create or resize the trail cache canvas
+        if (!this._trailCacheCanvas) this._trailCacheCanvas = document.createElement("canvas");
+        this._trailCacheCanvas.width = Math.floor(w * dpr);
+        this._trailCacheCanvas.height = Math.floor(h * dpr);
+        const tctx = this._trailCacheCanvas.getContext("2d");
+        if (tctx) {
+          tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          tctx.clearRect(0, 0, w, h);
 
-      // Draw order: oldest trails first, newest trails last.
-      const trailLastMs = (m) => {
-        const id = (m && m.id != null) ? String(m.id) : "";
-        const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
-        const persistedTrail = id ? (this._persistedTrailById.get(id)?.trail || []) : [];
-        const src = (persistedTrail.length >= 2) ? persistedTrail : serverTrail;
-        if (!Array.isArray(src) || src.length < 1) return Number.NEGATIVE_INFINITY;
-        const last = src[src.length - 1];
-        if (last && last._tMs !== undefined) {
-          const t = last._tMs;
-          return (t == null || !isFinite(t)) ? Number.NEGATIVE_INFINITY : Number(t);
+          // Draw order: oldest trails first, newest trails last.
+          const trailLastMs = (m) => {
+            const id = (m && m.id != null) ? String(m.id) : "";
+            const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
+            const persistedTrail = id ? (this._persistedTrailById.get(id)?.trail || []) : [];
+            const src = (persistedTrail.length >= 2) ? persistedTrail : serverTrail;
+            if (!Array.isArray(src) || src.length < 1) return Number.NEGATIVE_INFINITY;
+            const last = src[src.length - 1];
+            if (last && last._tMs !== undefined) {
+              const t = last._tMs;
+              return (t == null || !isFinite(t)) ? Number.NEGATIVE_INFINITY : Number(t);
+            }
+            const tStr = (last && typeof last.t === "string") ? last.t : null;
+            const tMs = tStr ? parseUtcMs(tStr) : null;
+            try { if (last) last._tMs = tMs; } catch {}
+            return (tMs == null || !isFinite(tMs)) ? Number.NEGATIVE_INFINITY : Number(tMs);
+          };
+
+          // Temporarily redirect drawTrailFor to use the cache canvas context
+          const origCtx = ctx;
+          const drawTrailForCached = (m, alphaMul, toScreen) => {
+            const id = m && m.id != null ? String(m.id) : "";
+            const data = this._collectTrailData(m, toScreen);
+            if (!data) return false;
+            const { pts, cols, times, trail, isGhost } = data;
+            const isSelTrail = (selectedId && m.id === selectedId);
+
+            let visMinT = Infinity, visMaxT = -Infinity;
+            for (let i = 1; i < pts.length; i++) {
+              if (!pts[i - 1] || !pts[i]) continue;
+              const p1 = trail[i];
+              const isMoving = !!(p1 && (p1.m === 1 || p1.m === "1" || p1.m === true));
+              const willDraw = this._pbDebugPath || isMoving;
+              if (!willDraw) continue;
+              const t1 = times[i];
+              if (t1 != null && isFinite(t1)) {
+                if (t1 < visMinT) visMinT = t1;
+                if (t1 > visMaxT) visMaxT = t1;
+              }
+            }
+            if (!(visMaxT > visMinT)) {
+              for (const t of times) {
+                if (t != null && isFinite(t)) {
+                  if (t < visMinT) visMinT = t;
+                  if (t > visMaxT) visMaxT = t;
+                }
+              }
+            }
+
+            const alpha = (isSelTrail ? 1.0 : 0.85) * alphaMul;
+            const lw = isSelTrail ? 4.2 : 3.4;
+            const dash = [2, 10];
+            const FADE_TIME_MS = 45 * 60 * 1000;
+            const FADE_TAIL_FRAC = 0.20;
+            const FADE_START_FRAC = 1.0 - FADE_TAIL_FRAC;
+            const livePlaybackTimeMs = this.getPlaybackTimeMs();
+            const hasPlaybackTime = livePlaybackTimeMs != null && isFinite(livePlaybackTimeMs);
+            const pbBounds = this.getPlaybackBounds();
+            const boundsMaxMs = (pbBounds.maxMs != null && isFinite(pbBounds.maxMs)) ? pbBounds.maxMs : null;
+            const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) 
+              : (isFinite(visMaxT) ? visMaxT 
+              : (boundsMaxMs != null ? boundsMaxMs 
+              : this._dataNowMs()));
+
+            let batchColor = null;
+            let batchAlpha = null;
+            let batchPts = [];
+
+            tctx.lineWidth = lw;
+            tctx.setLineDash(dash);
+            tctx.lineCap = "round";
+            tctx.lineJoin = "round";
+
+            const flushBatch = () => {
+              if (batchPts.length < 2) { batchPts = []; return; }
+              tctx.globalAlpha = batchAlpha;
+              tctx.strokeStyle = batchColor;
+              tctx.beginPath();
+              for (let k = 0; k < batchPts.length - 1; k++) {
+                tctx.moveTo(batchPts[k].x, batchPts[k].y);
+                tctx.lineTo(batchPts[k+1].x, batchPts[k+1].y);
+              }
+              tctx.stroke();
+              batchPts = [];
+            };
+
+            const fadeStartAgeMs = FADE_TIME_MS * FADE_START_FRAC;
+            const isLive = !this.playbackMode;
+
+            for (let i = 1; i < pts.length; i++) {
+              const ptPrev = pts[i-1];
+              const ptCurr = pts[i];
+              if (!ptPrev || !ptCurr) { flushBatch(); continue; }
+
+              const p1 = trail[i];
+              const isMoving = !!(p1 && (p1.m === 1 || p1.m === "1" || p1.m === true));
+              const segColor0 = cols[i] || cols[i - 1] || "#ffffff";
+              let segColor = segColor0;
+              let alphaMul2 = 1.0;
+
+              if (!isMoving) {
+                if (this._pbDebugPath) {
+                  segColor = dimHex(segColor0, 0.25);
+                } else {
+                  segColor = desatHex(dimHex(segColor0, 0.35), 0.30);
+                  alphaMul2 = 0.5;
+                }
+              } else if (isGhost && isLive) {
+                segColor = desatHex(dimHex(segColor0, 0.65), 0.25);
+              }
+
+              const t1 = times[i];
+              if (!(t1 != null && isFinite(t1) && isFinite(refNowMs))) { flushBatch(); continue; }
+
+              const ageMs = refNowMs - t1;
+              if (ageMs >= FADE_TIME_MS) { flushBatch(); continue; }
+
+              let tailAlpha = 1.0;
+              if (ageMs > fadeStartAgeMs) {
+                const u = (ageMs - fadeStartAgeMs) / (FADE_TIME_MS - fadeStartAgeMs);
+                tailAlpha = (1 - u) * (1 - u);
+                if (tailAlpha <= 0.01) { flushBatch(); continue; }
+              }
+
+              const finalAlpha = alpha * tailAlpha * alphaMul2;
+              if (segColor !== batchColor || Math.abs(finalAlpha - batchAlpha) > 0.01) {
+                flushBatch();
+                batchColor = segColor;
+                batchAlpha = finalAlpha;
+                batchPts = [];
+              }
+              batchPts.push(ptPrev);
+              batchPts.push(ptCurr);
+            }
+            flushBatch();
+            tctx.setLineDash([]);
+            tctx.globalAlpha = 1.0;
+            return true;
+          };
+
+          const alphaOther = selectedId ? 0.35 : 1.0;
+          const nonSelected = mobiles
+            .filter(m => !(selectedId && m.id === selectedId))
+            .slice()
+            .sort((a, b) => trailLastMs(a) - trailLastMs(b));
+
+          for (const m of nonSelected) {
+            drawTrailForCached(m, alphaOther, worldToScreenFast);
+          }
+
+          if (selectedId) {
+            const m = mobiles.find(x => x.id === selectedId);
+            if (m) drawTrailForCached(m, 1.0, worldToScreenFast);
+          }
         }
-        const tStr = (last && typeof last.t === "string") ? last.t : null;
-        const tMs = tStr ? parseUtcMs(tStr) : null;
-        try { if (last) last._tMs = tMs; } catch {}
-        return (tMs == null || !isFinite(tMs)) ? Number.NEGATIVE_INFINITY : Number(tMs);
-      };
-
-      const alphaOther = selectedId ? 0.35 : 1.0;
-      const nonSelected = mobiles
-        .filter(m => !(selectedId && m.id === selectedId))
-        .slice()
-        .sort((a, b) => trailLastMs(a) - trailLastMs(b));
-
-      for (const m of nonSelected) {
-        drawTrailFor(m, alphaOther, worldToScreenFast);
+        this._trailCacheKey = trailCacheKey;
+        this._trailCacheTimeMs = pbTimeMs;
       }
 
-      if (selectedId) {
-        const m = mobiles.find(x => x.id === selectedId);
-        if (m) drawTrailFor(m, 1.0, worldToScreenFast);
+      // Blit cached trails to main canvas
+      if (this._trailCacheCanvas) {
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(this._trailCacheCanvas, 0, 0);
+        ctx.restore();
       }
     }
 
