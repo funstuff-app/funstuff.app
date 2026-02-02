@@ -784,6 +784,14 @@ class MapView {
     this._pinchZooming = false;
 
     window.addEventListener("resize", () => this.resize());
+    
+    // Use ResizeObserver to detect actual container size changes - critical for iOS PWA
+    // standalone mode where viewport settles after initial load
+    if (typeof ResizeObserver !== "undefined") {
+      this._resizeObserver = new ResizeObserver(() => this.resize());
+      this._resizeObserver.observe(this.tilesCanvas.parentElement);
+    }
+    
     this.overlayCanvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
     // Safari (macOS) provides native trackpad pinch as gesture events.
     this.overlayCanvas.addEventListener("gesturestart", (e) => this.onGestureStart(e), { passive: false });
@@ -800,6 +808,13 @@ class MapView {
     this.overlayCanvas.addEventListener("touchcancel", (e) => this.onTouchEnd(e), { passive: false });
 
     this.resize();
+    
+    // iOS PWA standalone mode: viewport can settle late, causing squished canvas.
+    // Schedule additional resize checks to catch late layout changes.
+    if (window.navigator.standalone || window.matchMedia("(display-mode: standalone)").matches) {
+      setTimeout(() => this.resize(), 100);
+      setTimeout(() => this.resize(), 500);
+    }
   }
 
   _cancelCameraAnimations() {
@@ -8514,6 +8529,12 @@ function main() {
   }
 
   if (pbPlayEl) {
+    // iOS fix: handle touchend to avoid 300ms delay and text click issues
+    pbPlayEl.addEventListener("touchend", (e) => {
+      e.preventDefault();
+      pbPlayEl.click();
+    }, { passive: false });
+    
     pbPlayEl.addEventListener("click", () => {
       // Enable playback mode if not already (e.g. historical data)
       if (!map.playbackMode) {
@@ -9013,6 +9034,7 @@ function main() {
   const pbMenuBtn = document.getElementById("pbMenuBtn");
   const pbMenu = document.getElementById("pbMenu");
   const pbDaysSubmenu = document.getElementById("pbDaysSubmenu");
+  const shareBtn = document.getElementById("shareBtn");
   
   // Menu close delay for better UX
   let _menuHideTimer = null;
@@ -9146,6 +9168,19 @@ function main() {
     pbMenuBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       togglePlaybackMenu();
+    });
+  }
+  
+  // Share button - opens native share dialog
+  if (shareBtn) {
+    shareBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!navigator.share) return;
+      shareBtn.classList.add("open");
+      try {
+        await navigator.share({ title: "DustyTrails", url: window.location.href });
+      } catch (_) {}
+      shareBtn.classList.remove("open");
     });
   }
   

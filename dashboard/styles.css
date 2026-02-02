@@ -15,10 +15,25 @@
 }
 
 * { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+html, body {
+  height: 100%;
+  /* Fix for PWA standalone mode on iOS where 100% doesn't fill viewport correctly */
+  height: 100dvh;
+  height: -webkit-fill-available;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 
-#app { height: 100%; display: flex; flex-direction: column; }
+#app {
+  height: 100%;
+  /* Match body's PWA fix */
+  height: 100dvh;
+  height: -webkit-fill-available;
+  display: flex;
+  flex-direction: column;
+}
 
 #appFooter {
   position: fixed;
@@ -138,7 +153,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
   flex: 1;
   display: grid;
   grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
   min-height: 0;
+  min-width: 0;
 }
 
 aside, section { min-height: 0; }
@@ -227,11 +244,20 @@ aside, section { min-height: 0; }
 .reading .k { opacity: 0.85; }
 .reading .v { font-weight: 700; }
 
-#mapPane { position: relative; background: #081018; }
+#mapPane {
+  position: relative;
+  background: #081018;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+}
 #mapRoot {
   position: relative;
   width: 100%;
   height: 100%;
+  min-height: 0;
+  min-width: 0;
   overflow: hidden;
   /* Prevent browser overscroll/bounce effects */
   overscroll-behavior: none;
@@ -327,7 +353,7 @@ aside, section { min-height: 0; }
 #pbNow { text-align: center; }
 #pbRight { text-align: right; }
 
-.playbackBar button {
+button#pbPlay {
   height: 30px;
   min-width: 64px;
   padding: 0 12px;
@@ -336,12 +362,17 @@ aside, section { min-height: 0; }
   background: rgba(17,24,38,0.80);
   color: rgba(232,238,247,0.92);
   cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  text-align: center;
+  line-height: 28px;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: rgba(0,0,0,0);
+  touch-action: manipulation;
 }
-.playbackBar button:hover { border-color: rgba(255,255,255,0.16); }
-.playbackBar button.isLive {
+button#pbPlay * {
+  pointer-events: none !important;
+}
+button#pbPlay:hover { border-color: rgba(255,255,255,0.16); }
+button#pbPlay.isLive {
   background: rgba(108, 195, 255, 0.2);
   border-color: rgba(108, 195, 255, 0.6);
   color: #6cc3ff;
@@ -411,6 +442,36 @@ aside, section { min-height: 0; }
   left: auto;
 }
 
+.shareBtn {
+  width: 32px;
+  height: 30px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(17,24,38,0.80);
+  color: rgba(232,238,247,0.92);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.12s ease;
+  margin-right: 8px;
+}
+.shareBtn:hover {
+  border-color: rgba(255,255,255,0.22);
+  background: rgba(24,32,48,0.95);
+}
+.shareBtn:active,
+.shareBtn.open {
+  background: rgba(108, 195, 255, 0.15);
+  border-color: var(--accent);
+  transform: scale(0.96);
+}
+.shareBtn svg {
+  width: 18px;
+  height: 18px;
+}
+
 .pbMenuBtn {
   width: 32px;
   height: 30px;
@@ -431,12 +492,11 @@ aside, section { min-height: 0; }
   border-color: rgba(255,255,255,0.22);
   background: rgba(24,32,48,0.95);
 }
-.pbMenuBtn:active {
-  transform: scale(0.96);
-}
+.pbMenuBtn:active,
 .pbMenuBtn.open {
   background: rgba(108, 195, 255, 0.15);
   border-color: var(--accent);
+  transform: scale(0.96);
 }
 
 .pbMenu {
