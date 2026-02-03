@@ -754,7 +754,9 @@ def trace_road_between_gps_points(
         return None
     
     # Build output points (excluding first, including last)
-    base = dict(next_point)
+    # Use prev_point as base so waypoints inherit readings from where we're traveling FROM
+    # (not next_point's future readings which would cause marker to show future values)
+    base = dict(prev_point)
     out: list[dict[str, Any]] = []
     n = len(densified)
     for i in range(1, n):

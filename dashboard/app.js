@@ -658,9 +658,9 @@ class MapView {
     this._overlayStaticDirty = true;
 
     // Playback-mode optimization: cache trails to offscreen canvas.
-    // Trails only need redrawing when view changes or playback time advances significantly.
+    // Trails only need redrawing when view changes; time advances use incremental updates.
     this._trailCacheCanvas = null;
-    this._trailCacheKey = "";
+    this._trailCacheViewKey = "";
     this._trailCacheTimeMs = null;
 
     // Trace-mode optimization: cache cleaned point lists per mobile id for sampling.
@@ -2453,7 +2453,7 @@ class MapView {
     this._invalidateOverlayStatic();
     // Invalidate trail cache on resize
     this._trailCacheCanvas = null;
-    this._trailCacheKey = "";
+    this._trailCacheViewKey = "";
 
     this.draw(this.lastState);
   }
@@ -5833,14 +5833,20 @@ class MapView {
     const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
     const fixed = Array.isArray(state.fixed) ? state.fixed : [];
 
-    // Playback-mode trail caching: redraw trails only when view changes or time advances by 500ms+
-    // This dramatically reduces CPU/GPU load since trail rendering is expensive.
+    // Playback-mode trail caching with incremental updates:
+    // - Full redraw when view changes (pan/zoom/resize/selection) or time rewinds
+    // - Incremental extension when playback time advances by >=100ms (draw only new segments)
+    // - No trail update if time advanced <100ms (just blit existing cache)
     const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
-    const trailCacheKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}`;
-    const trailTimeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? Math.abs(pbTimeMs - this._trailCacheTimeMs) : Infinity;
-    const trailCacheValid = this._trailCacheCanvas && 
-                            this._trailCacheKey === trailCacheKey && 
-                            trailTimeDelta < 500; // Redraw trails every 500ms of playback time
+    const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}`;
+    const viewChanged = !this._trailCacheCanvas || this._trailCacheViewKey !== trailViewKey;
+    const timeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? (pbTimeMs - this._trailCacheTimeMs) : 0;
+    const timeRewound = timeDelta < 0;
+    const timeAdvancedEnough = timeDelta >= 100; // Threshold: update trails every 100ms of playback time
+    // Cache valid if view unchanged, time hasn't rewound, and time hasn't advanced enough to need update
+    const trailCacheValid = !viewChanged && !timeRewound && !timeAdvancedEnough;
+    // Incremental mode: draw only new segments when time advances (but view unchanged)
+    const incrementalMinTimeMs = (!viewChanged && !timeRewound && timeAdvancedEnough) ? this._trailCacheTimeMs : null;
 
     // Precompute center world once per frame; avoids repeated center projection in worldToScreen().
     const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
@@ -6133,16 +6139,24 @@ class MapView {
     // In trace mode (without playback), trails are part of the cached static overlay.
     // In playback mode, use trail caching to avoid redrawing every frame.
     if (!useStaticOverlay) {
-      // Trail cache: only redraw when view changes or playback time advances significantly
-      if (!trailCacheValid) {
-        // Create or resize the trail cache canvas
-        if (!this._trailCacheCanvas) this._trailCacheCanvas = document.createElement("canvas");
-        this._trailCacheCanvas.width = Math.floor(w * dpr);
-        this._trailCacheCanvas.height = Math.floor(h * dpr);
+      // Trail cache: full redraw on view change, incremental on time advance (>=100ms threshold)
+      const needsFullRedraw = viewChanged || timeRewound;
+      const needsIncrementalUpdate = !needsFullRedraw && timeAdvancedEnough && incrementalMinTimeMs != null;
+
+      if (needsFullRedraw || needsIncrementalUpdate) {
+        // Create or resize the trail cache canvas (only on full redraw)
+        if (needsFullRedraw) {
+          if (!this._trailCacheCanvas) this._trailCacheCanvas = document.createElement("canvas");
+          this._trailCacheCanvas.width = Math.floor(w * dpr);
+          this._trailCacheCanvas.height = Math.floor(h * dpr);
+        }
         const tctx = this._trailCacheCanvas.getContext("2d");
         if (tctx) {
           tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          tctx.clearRect(0, 0, w, h);
+          // Only clear on full redraw; incremental mode draws on top of existing cache
+          if (needsFullRedraw) {
+            tctx.clearRect(0, 0, w, h);
+          }
 
           // Draw order: oldest trails first, newest trails last.
           const trailLastMs = (m) => {
@@ -6163,13 +6177,15 @@ class MapView {
           };
 
           // Temporarily redirect drawTrailFor to use the cache canvas context
+          // minTimeMs: if set, only draw segments with time > minTimeMs (incremental mode)
           const origCtx = ctx;
-          const drawTrailForCached = (m, alphaMul, toScreen) => {
+          const drawTrailForCached = (m, alphaMul, toScreen, minTimeMs = null) => {
             const id = m && m.id != null ? String(m.id) : "";
             const data = this._collectTrailData(m, toScreen);
             if (!data) return false;
             const { pts, cols, times, trail, isGhost } = data;
             const isSelTrail = (selectedId && m.id === selectedId);
+            const useIncrementalFilter = minTimeMs != null && isFinite(minTimeMs);
 
             let visMinT = Infinity, visMaxT = -Infinity;
             for (let i = 1; i < pts.length; i++) {
@@ -6258,6 +6274,9 @@ class MapView {
               const t1 = times[i];
               if (!(t1 != null && isFinite(t1) && isFinite(refNowMs))) { flushBatch(); continue; }
 
+              // Incremental mode: skip segments already drawn in previous cache
+              if (useIncrementalFilter && t1 <= minTimeMs) { continue; }
+
               const ageMs = refNowMs - t1;
               if (ageMs >= FADE_TIME_MS) { flushBatch(); continue; }
 
@@ -6290,16 +6309,18 @@ class MapView {
             .slice()
             .sort((a, b) => trailLastMs(a) - trailLastMs(b));
 
+          // Pass incrementalMinTimeMs to skip already-drawn segments in incremental mode
+          const timeFilter = needsIncrementalUpdate ? incrementalMinTimeMs : null;
           for (const m of nonSelected) {
-            drawTrailForCached(m, alphaOther, worldToScreenFast);
+            drawTrailForCached(m, alphaOther, worldToScreenFast, timeFilter);
           }
 
           if (selectedId) {
             const m = mobiles.find(x => x.id === selectedId);
-            if (m) drawTrailForCached(m, 1.0, worldToScreenFast);
+            if (m) drawTrailForCached(m, 1.0, worldToScreenFast, timeFilter);
           }
         }
-        this._trailCacheKey = trailCacheKey;
+        this._trailCacheViewKey = trailViewKey;
         this._trailCacheTimeMs = pbTimeMs;
       }
 
