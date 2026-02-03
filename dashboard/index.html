@@ -14,7 +14,7 @@
   <meta name="apple-mobile-web-app-title" content="DustyTrails" />
   <link rel="apple-touch-icon" href="/icon-180.png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260201q" />
+  <link rel="stylesheet" href="/styles.css?v=20260202n" />
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
@@ -32,26 +32,11 @@
         <span id="lastUpdated">—</span>
       </div>
       <div class="controls">
-        <!-- Hidden controls - commented out but functional in code
-        <label class="select">
-          <span>Theme</span>
-          <select id="mapTheme" aria-label="Map theme"></select>
-        </label>
-        <label class="sliderCtl" title="Map dimming affects only the basemap tiles">
-          <span>Dim</span>
-          <input id="mapDim" type="range" min="0" max="100" step="1" />
-        </label>
-        <label class="sliderCtl" title="Basemap saturation; on dark themes values > 100 also lift shadows toward gray (tiles only)">
-          <span>Sat</span>
-          <input id="mapSat" type="range" min="0" max="150" step="1" />
-        </label>
-        <button id="zoomOut" title="Zoom out">−</button>
-        <button id="zoomIn" title="Zoom in">+</button>
-        <label class="toggle" title="DVR playback: scrub and play historical trails in sync">
-          <input type="checkbox" id="toggleTrace" />
-          <span>DVR</span>
-        </label>
-        -->
+        <!-- Hidden theme select (controlled via menu) -->
+        <select id="mapTheme" aria-label="Map theme" style="display:none"></select>
+        <!-- Hidden sliders (controlled via menu) -->
+        <input id="mapDim" type="range" min="0" max="150" step="1" style="display:none" />
+        <input id="mapSat" type="range" min="0" max="150" step="1" style="display:none" />
       </div>
       <!-- DVR menu in topbar -->
       <div class="pbMenuWrap topbarMenu">
@@ -72,6 +57,27 @@
             <span class="pbMenuIcon">📅</span>
             <span class="pbMenuLabel">Select Day</span>
             <div class="pbSubmenu" id="pbDaysSubmenu"></div>
+          </div>
+          <div class="pbMenuItem pbMenuSub" data-submenu="theme">
+            <span class="pbMenuArrow">‹</span>
+            <span class="pbMenuIcon">🎨</span>
+            <span class="pbMenuLabel">Theme</span>
+            <div class="pbSubmenu" id="pbThemeSubmenu"></div>
+          </div>
+          <div class="pbMenuItem pbMenuSub" data-submenu="display">
+            <span class="pbMenuArrow">‹</span>
+            <span class="pbMenuIcon">🖥️</span>
+            <span class="pbMenuLabel">Display</span>
+            <div class="pbSubmenu pbSubmenuSliders" id="pbDisplaySubmenu">
+              <label class="pbSliderRow">
+                <span>Dim</span>
+                <input id="menuDim" type="range" min="0" max="150" step="1" />
+              </label>
+              <label class="pbSliderRow">
+                <span>Sat</span>
+                <input id="menuSat" type="range" min="0" max="150" step="1" />
+              </label>
+            </div>
           </div>
         </div>
       </div>
@@ -132,7 +138,7 @@
 
   <script src="map_nav_engine.js?v=20260131"></script>
   <script src="camera_fit_logic.js?v=20260131"></script>
-  <script src="app.js?v=20260201r"></script>
+  <script src="app.js?v=20260202r"></script>
 </body>
 </html>
 

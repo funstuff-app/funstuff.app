@@ -15,6 +15,7 @@ const TILE_THEMES = {
     template: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
+    bgColor: "#c4c0b8",
   },
   carto_dark_all: {
     label: "CARTO Dark (all)",
@@ -22,30 +23,35 @@ const TILE_THEMES = {
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 1.45, brightness: 0.80, contrast: 1.08 },
     defaultDim: 70,
+    bgColor: "#282828", // CARTO Dark Matter background
   },
   carto_dark_nolabels: {
     label: "CARTO Dark (no labels)",
     template: "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 0.90, brightness: 0.95, contrast: 1.06 },
+    bgColor: "#282828",
   },
   carto_positron_all: {
     label: "CARTO Positron (all)",
     template: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 0.45, brightness: 0.60, contrast: 1.10 },
+    bgColor: "#a8a8a6",
   },
   carto_positron_nolabels: {
     label: "CARTO Positron (no labels)",
     template: "https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 0.45, brightness: 0.60, contrast: 1.10 },
+    bgColor: "#a8a8a6",
   },
   osm: {
     label: "OSM Standard",
     template: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     subdomains: [""],
     filter: { saturate: 0.45, brightness: 0.62, contrast: 1.12 },
+    bgColor: "#b5b2ab",
   },
 };
 
@@ -77,7 +83,8 @@ async function loadConfig() {
   }
 }
 
-const THEME_STORAGE_KEY = "mobileair.mapTheme";
+const THEME_STORAGE_KEY_DARK = "mobileair.mapTheme.dark";
+const THEME_STORAGE_KEY_LIGHT = "mobileair.mapTheme.light";
 const DIM_STORAGE_PREFIX = "mobileair.mapDim."; // per theme (0..100)
 const SAT_STORAGE_PREFIX = "mobileair.mapSat."; // per theme (0..150 => saturate factor = v/100)
 const VIEW_STORAGE_KEY = "mobileair.mapView"; // {lat, lon, zoom}
@@ -5844,6 +5851,7 @@ class MapView {
     // In playback underlay mode, fixed markers are already present.
     // Get playback time for fixed sensors with history
     const fixedPbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    const canUseUnderlay = false; // Underlay mode not currently implemented
     
     if (!useStaticOverlay && !canUseUnderlay && this.showFixed) {
       for (const f of fixed) {
@@ -5933,7 +5941,7 @@ class MapView {
     // Reveal trail up to playback time (works in both DVR and LIVE modes).
     // LIVE mode uses playback time at the live edge.
     const isLive = !this.playbackMode;
-    const pbTimeMs = this.getPlaybackTimeMs();
+    const trailRevealTimeMs = this.getPlaybackTimeMs();
 
     const drawTrailFor = (m, alphaMul, toScreen) => {
       const id = m && m.id != null ? String(m.id) : "";
@@ -7564,17 +7572,28 @@ function main() {
     return 0.55 + dim01 * 0.35;
   }
 
+  // Map theme variants to shared settings key (e.g., carto_dark_all and carto_dark_nolabels share settings)
+  function getThemeSettingsKey(themeKey) {
+    const k = String(themeKey);
+    if (k.startsWith("carto_dark")) return "carto_dark";
+    if (k.startsWith("carto_positron")) return "carto_positron";
+    return k; // osm, carto_voyager, etc. stay as-is
+  }
+
   function loadDimForTheme(themeKey) {
-    const raw = localStorage.getItem(DIM_STORAGE_PREFIX + themeKey);
+    const settingsKey = getThemeSettingsKey(themeKey);
+    const raw = localStorage.getItem(DIM_STORAGE_PREFIX + settingsKey);
     const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
     const def = t.defaultDim ?? 50;
     const v = raw == null ? def : Number(raw);
-    const clamped = Math.max(0, Math.min(100, isFinite(v) ? v : def));
+    const dimMax = isThemeDark(themeKey) ? 150 : 100;
+    const clamped = Math.max(0, Math.min(dimMax, isFinite(v) ? v : def));
     return clamped;
   }
 
   function loadSatForTheme(themeKey) {
-    const raw = localStorage.getItem(SAT_STORAGE_PREFIX + themeKey);
+    const settingsKey = getThemeSettingsKey(themeKey);
+    const raw = localStorage.getItem(SAT_STORAGE_PREFIX + settingsKey);
     const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
     const def = Math.round(100 * (t.filter?.saturate ?? 0.55));
     const v = raw == null ? def : Number(raw);
@@ -7600,6 +7619,55 @@ function main() {
       contrast: t.filter?.contrast ?? 1.12,
       shadowLift,
     });
+    // Set map background color to match theme (prevents flash while tiles load)
+    if (t.bgColor) {
+      document.documentElement.style.setProperty('--map-bg', t.bgColor);
+    }
+  }
+
+  // Detect system color scheme preference
+  function isSystemDarkMode() {
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+  
+  function isThemeDark(themeKey) {
+    return String(themeKey).includes("dark");
+  }
+  
+  function getThemeStorageKey() {
+    return isSystemDarkMode() ? THEME_STORAGE_KEY_DARK : THEME_STORAGE_KEY_LIGHT;
+  }
+  
+  function getDefaultThemeForMode() {
+    return isSystemDarkMode() ? "carto_dark_all" : "carto_voyager";
+  }
+  
+  function getSavedThemeForCurrentMode() {
+    const key = getThemeStorageKey();
+    const saved = localStorage.getItem(key);
+    return (saved && TILE_THEMES[saved]) ? saved : getDefaultThemeForMode();
+  }
+  
+  function saveThemeForMode(themeKey) {
+    // Save to the appropriate key based on whether this is a dark or light theme
+    const isDark = isThemeDark(themeKey);
+    const key = isDark ? THEME_STORAGE_KEY_DARK : THEME_STORAGE_KEY_LIGHT;
+    localStorage.setItem(key, themeKey);
+  }
+
+  // Track current theme for menu updates
+  let _currentThemeKey = getSavedThemeForCurrentMode();
+
+  function applyTheme(themeKey, skipSubmenuUpdate) {
+    _currentThemeKey = themeKey;
+    if (themeEl) themeEl.value = themeKey;
+    const dim = loadDimForTheme(themeKey);
+    if (dimEl) dimEl.value = String(dim);
+    const sat = loadSatForTheme(themeKey);
+    if (satEl) satEl.value = String(sat);
+    applyThemeAndFilters(themeKey, dim, sat);
+    // updateThemeSubmenu is defined later, only call it when triggered by system theme change
+    if (!skipSubmenuUpdate && window._updateThemeSubmenu) window._updateThemeSubmenu();
   }
 
   if (themeEl) {
@@ -7611,28 +7679,35 @@ function main() {
       themeEl.appendChild(opt);
     }
 
-    const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
-    const initialTheme = TILE_THEMES[savedTheme] ? savedTheme : "carto_dark_all";
-    themeEl.value = initialTheme;
-
-    const initialDim = loadDimForTheme(initialTheme);
-    if (dimEl) dimEl.value = String(initialDim);
-    const initialSat = loadSatForTheme(initialTheme);
-    if (satEl) satEl.value = String(initialSat);
-    applyThemeAndFilters(initialTheme, initialDim, initialSat);
+    // Load saved theme for current system mode
+    const initialTheme = getSavedThemeForCurrentMode();
+    applyTheme(initialTheme, true); // skip submenu update on init (not created yet)
 
     themeEl.addEventListener("change", () => {
       const k = themeEl.value;
-      localStorage.setItem(THEME_STORAGE_KEY, k);
+      _currentThemeKey = k;
+      saveThemeForMode(k);
       const dim = loadDimForTheme(k);
       if (dimEl) dimEl.value = String(dim);
       const sat = loadSatForTheme(k);
       if (satEl) satEl.value = String(sat);
       applyThemeAndFilters(k, dim, sat);
+      updateThemeSubmenu();
     });
   } else {
-    // Fallback (no UI)
-    applyThemeAndFilters("carto_dark_all", 70, Math.round(100 * (TILE_THEMES.carto_dark_all.filter?.saturate ?? 1.30)));
+    // Fallback (no UI) - use system preference
+    const fallbackTheme = getSavedThemeForCurrentMode();
+    _currentThemeKey = fallbackTheme;
+    const fallbackT = TILE_THEMES[fallbackTheme];
+    applyThemeAndFilters(fallbackTheme, fallbackT.defaultDim ?? 70, Math.round(100 * (fallbackT.filter?.saturate ?? 1.30)));
+  }
+  
+  // Listen for system theme changes
+  if (window.matchMedia) {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      const newTheme = getSavedThemeForCurrentMode();
+      applyTheme(newTheme);
+    });
   }
 
   // Restore view after map is initialized (theme/filter doesn't affect center/zoom).
@@ -7641,9 +7716,12 @@ function main() {
   if (dimEl) {
     dimEl.addEventListener("input", () => {
       const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_dark_all";
+      const settingsKey = getThemeSettingsKey(themeKey);
+      const isDark = isThemeDark(themeKey);
+      const dimMax = isDark ? 150 : 100;
       const v = Number(dimEl.value);
-      const clamped = Math.max(0, Math.min(100, isFinite(v) ? v : 50));
-      localStorage.setItem(DIM_STORAGE_PREFIX + themeKey, String(clamped));
+      const clamped = Math.max(0, Math.min(dimMax, isFinite(v) ? v : 50));
+      localStorage.setItem(DIM_STORAGE_PREFIX + settingsKey, String(clamped));
       const sat = satEl ? Number(satEl.value) : loadSatForTheme(themeKey);
       const satClamped = Math.max(0, Math.min(150, isFinite(sat) ? sat : loadSatForTheme(themeKey)));
       applyThemeAndFilters(themeKey, clamped, satClamped);
@@ -7653,11 +7731,14 @@ function main() {
   if (satEl) {
     satEl.addEventListener("input", () => {
       const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_dark_all";
+      const settingsKey = getThemeSettingsKey(themeKey);
+      const isDark = isThemeDark(themeKey);
+      const dimMax = isDark ? 150 : 100;
       const v = Number(satEl.value);
       const clamped = Math.max(0, Math.min(150, isFinite(v) ? v : loadSatForTheme(themeKey)));
-      localStorage.setItem(SAT_STORAGE_PREFIX + themeKey, String(clamped));
+      localStorage.setItem(SAT_STORAGE_PREFIX + settingsKey, String(clamped));
       const dim = dimEl ? Number(dimEl.value) : loadDimForTheme(themeKey);
-      const dimClamped = Math.max(0, Math.min(100, isFinite(dim) ? dim : loadDimForTheme(themeKey)));
+      const dimClamped = Math.max(0, Math.min(dimMax, isFinite(dim) ? dim : loadDimForTheme(themeKey)));
       applyThemeAndFilters(themeKey, dimClamped, clamped);
     });
   }
@@ -9200,8 +9281,12 @@ function main() {
       pbMenu.classList.add("hidden");
     }
     if (pbMenuBtn) pbMenuBtn.classList.remove("open");
-    // Also hide submenu
+    // Also hide submenus
     if (pbDaysSubmenu) pbDaysSubmenu.classList.remove("visible");
+    const pbThemeSubmenuEl = document.getElementById("pbThemeSubmenu");
+    if (pbThemeSubmenuEl) pbThemeSubmenuEl.classList.remove("visible");
+    const pbDisplaySubmenuEl = document.getElementById("pbDisplaySubmenu");
+    if (pbDisplaySubmenuEl) pbDisplaySubmenuEl.classList.remove("visible");
   }
   
   function closePlaybackMenu() {
@@ -9234,33 +9319,67 @@ function main() {
     }
   }
   
-  // Submenu hover handling with delay
-  let _submenuHideTimer = null;
+  // Centralized submenu show/hide with debouncing
+  const SUBMENU_SHOW_DELAY = 80; // ms before showing a different submenu
   const SUBMENU_HIDE_DELAY = 200; // ms before hiding submenu
+  let _submenuShowTimer = null;
+  let _submenuHideTimer = null;
+  let _currentSubmenu = null; // track which submenu is open
   
-  function showSubmenu() {
+  function showSubmenuDebounced(submenuEl, parentEl, onShow) {
+    // Cancel any pending hide
     if (_submenuHideTimer) {
       clearTimeout(_submenuHideTimer);
       _submenuHideTimer = null;
     }
-    if (pbDaysSubmenu) pbDaysSubmenu.classList.add("visible");
+    // If this submenu is already open, no delay needed
+    if (_currentSubmenu === submenuEl) {
+      if (_submenuShowTimer) clearTimeout(_submenuShowTimer);
+      _submenuShowTimer = null;
+      return;
+    }
+    // Cancel any pending show of a different submenu
+    if (_submenuShowTimer) clearTimeout(_submenuShowTimer);
+    _submenuShowTimer = setTimeout(() => {
+      _submenuShowTimer = null;
+      // Hide all submenus
+      const pbThemeSubmenu = document.getElementById("pbThemeSubmenu");
+      if (pbThemeSubmenu) pbThemeSubmenu.classList.remove("visible");
+      const pbDisplaySubmenu = document.getElementById("pbDisplaySubmenu");
+      if (pbDisplaySubmenu) pbDisplaySubmenu.classList.remove("visible");
+      if (pbDaysSubmenu) pbDaysSubmenu.classList.remove("visible");
+      // Show requested submenu
+      if (onShow) onShow();
+      submenuEl.classList.add("visible");
+      _currentSubmenu = submenuEl;
+    }, SUBMENU_SHOW_DELAY);
   }
   
-  function hideSubmenuDelayed() {
+  function hideSubmenuDebounced(submenuEl, parentEl, e) {
+    // Don't hide if moving to parent menu item or submenu itself
+    if (e && e.relatedTarget && (parentEl.contains(e.relatedTarget) || submenuEl.contains(e.relatedTarget))) {
+      return;
+    }
+    // Cancel pending show
+    if (_submenuShowTimer) {
+      clearTimeout(_submenuShowTimer);
+      _submenuShowTimer = null;
+    }
     if (_submenuHideTimer) clearTimeout(_submenuHideTimer);
     _submenuHideTimer = setTimeout(() => {
-      if (pbDaysSubmenu) pbDaysSubmenu.classList.remove("visible");
+      submenuEl.classList.remove("visible");
+      if (_currentSubmenu === submenuEl) _currentSubmenu = null;
       _submenuHideTimer = null;
     }, SUBMENU_HIDE_DELAY);
   }
   
-  // Wire up submenu parent hover
-  const pbMenuSubEl = document.querySelector(".pbMenuSub");
+  // Wire up Days submenu
+  const pbMenuSubEl = document.querySelector(".pbMenuSub[data-submenu='days']");
   if (pbMenuSubEl && pbDaysSubmenu) {
-    pbMenuSubEl.addEventListener("mouseenter", showSubmenu);
-    pbMenuSubEl.addEventListener("mouseleave", hideSubmenuDelayed);
-    pbDaysSubmenu.addEventListener("mouseenter", showSubmenu);
-    pbDaysSubmenu.addEventListener("mouseleave", hideSubmenuDelayed);
+    pbMenuSubEl.addEventListener("mouseenter", () => showSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, null));
+    pbMenuSubEl.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, e));
+    pbDaysSubmenu.addEventListener("mouseenter", () => showSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, null));
+    pbDaysSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, e));
   }
   
   function updateDaysSubmenu() {
@@ -9302,6 +9421,50 @@ function main() {
     }
   }
   
+  // Theme submenu
+  const pbThemeSubmenu = document.getElementById("pbThemeSubmenu");
+  
+  function updateThemeSubmenu() {
+    if (!pbThemeSubmenu) return;
+    pbThemeSubmenu.innerHTML = "";
+    
+    const keys = Object.keys(TILE_THEMES);
+    for (const k of keys) {
+      const item = document.createElement("div");
+      item.className = "pbSubmenuItem";
+      if (k === _currentThemeKey) {
+        item.classList.add("active");
+      }
+      item.textContent = TILE_THEMES[k].label || k;
+      item.dataset.value = k;
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        _currentThemeKey = k;
+        saveThemeForMode(k);
+        if (themeEl) themeEl.value = k;
+        const dim = loadDimForTheme(k);
+        if (dimEl) dimEl.value = String(dim);
+        const sat = loadSatForTheme(k);
+        if (satEl) satEl.value = String(sat);
+        applyThemeAndFilters(k, dim, sat);
+        updateThemeSubmenu();
+        // Keep menu open so user can easily try different themes
+      });
+      pbThemeSubmenu.appendChild(item);
+    }
+  }
+  // Register for use by applyTheme (defined earlier)
+  window._updateThemeSubmenu = updateThemeSubmenu;
+  
+  // Wire up Theme submenu hover (uses centralized debounce)
+  const pbThemeSubEl = document.querySelector(".pbMenuSub[data-submenu='theme']");
+  if (pbThemeSubEl && pbThemeSubmenu) {
+    pbThemeSubEl.addEventListener("mouseenter", () => showSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, updateThemeSubmenu));
+    pbThemeSubEl.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, e));
+    pbThemeSubmenu.addEventListener("mouseenter", () => showSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, updateThemeSubmenu));
+    pbThemeSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, e));
+  }
+  
   function handleMenuAction(action) {
     switch (action) {
       case "save":
@@ -9332,6 +9495,43 @@ function main() {
       } catch (_) {}
       shareBtn.classList.remove("open");
     });
+  }
+  
+  // Display submenu (dim/sat sliders in three-dot menu)
+  const pbDisplaySubmenu = document.getElementById("pbDisplaySubmenu");
+  const menuDimEl = document.getElementById("menuDim");
+  const menuSatEl = document.getElementById("menuSat");
+  
+  // Wire up Display submenu hover (uses centralized debounce)
+  const pbDisplaySubEl = document.querySelector(".pbMenuSub[data-submenu='display']");
+  if (pbDisplaySubEl && pbDisplaySubmenu) {
+    function syncDisplaySliders() {
+      if (menuDimEl && dimEl) menuDimEl.value = dimEl.value;
+      if (menuSatEl && satEl) menuSatEl.value = satEl.value;
+    }
+    
+    pbDisplaySubEl.addEventListener("mouseenter", () => showSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, syncDisplaySliders));
+    pbDisplaySubEl.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, e));
+    pbDisplaySubmenu.addEventListener("mouseenter", () => showSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, syncDisplaySliders));
+    pbDisplaySubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, e));
+    
+    // Wire up menu sliders to control the hidden original sliders
+    if (menuDimEl) {
+      menuDimEl.addEventListener("input", () => {
+        if (dimEl) {
+          dimEl.value = menuDimEl.value;
+          dimEl.dispatchEvent(new Event("input"));
+        }
+      });
+    }
+    if (menuSatEl) {
+      menuSatEl.addEventListener("input", () => {
+        if (satEl) {
+          satEl.value = menuSatEl.value;
+          satEl.dispatchEvent(new Event("input"));
+        }
+      });
+    }
   }
   
   // Handle clicks on menu items
