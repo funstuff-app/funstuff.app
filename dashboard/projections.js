@@ -1,6 +1,6 @@
 // Navigation/projection engine (unit-tested) loaded via /map_nav_engine.js
-const NAV = (typeof window !== "undefined" && window.MobileAirNavEngine) ? window.MobileAirNavEngine : null;
-const NAV_PROJ = (NAV && typeof NAV.createProjector === "function") ? NAV.createProjector({ tileSize: TILE_SIZE }) : null;
+var NAV = (typeof window !== "undefined" && window.MobileAirNavEngine) ? window.MobileAirNavEngine : null;
+var NAV_PROJ = (NAV && typeof NAV.createProjector === "function") ? NAV.createProjector({ tileSize: TILE_SIZE }) : null;
 function clamp(n, lo, hi) {
   if (NAV && typeof NAV.clamp === "function") return NAV.clamp(n, lo, hi);
   return Math.max(lo, Math.min(hi, n));
