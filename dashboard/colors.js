@@ -1,0 +1,60 @@
+function safeHex(c) {
+  if (!c) return "#3388ff";
+  let s = String(c).trim();
+  if (s.startsWith("dim ")) s = s.slice(4).trim();
+  if (s.startsWith("#") && (s.length === 7 || s.length === 4)) return s;
+  return "#3388ff";
+}
+
+function dimHex(hex, amt = 0.6) {
+  // Mix a hex color toward a neutral gray (like the TUI "dim" behavior) without transparency.
+  const h = safeHex(hex);
+  const m = /^#([0-9a-f]{6})$/i.exec(h);
+  if (!m) return "#6b7280";
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  const tr = 0x6b, tg = 0x72, tb = 0x80; // slate-ish target
+  const rr = Math.round(r * (1 - amt) + tr * amt);
+  const gg = Math.round(g * (1 - amt) + tg * amt);
+  const bb = Math.round(b * (1 - amt) + tb * amt);
+  return `#${((1 << 24) + (rr << 16) + (gg << 8) + bb).toString(16).slice(1)}`;
+}
+
+function grayHex(hex) {
+  // Convert a hex color to grayscale (preserves luminance).
+  const h = safeHex(hex);
+  const m = /^#([0-9a-f]{6})$/i.exec(h);
+  if (!m) return "#6b7280";
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  const y = Math.max(0, Math.min(255, Math.round((0.2126 * r) + (0.7152 * g) + (0.0722 * b))));
+  const s = y.toString(16).padStart(2, "0");
+  return `#${s}${s}${s}`;
+}
+
+function desatHex(hex, amt = 0.25) {
+  // Desaturate by mixing toward grayscale while keeping luminance roughly stable.
+  const a = clamp(Number(amt), 0, 1);
+  const h = safeHex(hex);
+  const m = /^#([0-9a-f]{6})$/i.exec(h);
+  if (!m) return "#6b7280";
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  const gh = grayHex(h);
+  const gm = /^#([0-9a-f]{6})$/i.exec(gh);
+  if (!gm) return h;
+  const gn = parseInt(gm[1], 16);
+  const gr = (gn >> 16) & 255;
+  const gg = (gn >> 8) & 255;
+  const gb = gn & 255;
+  const rr = Math.round(r * (1 - a) + gr * a);
+  const gg2 = Math.round(g * (1 - a) + gg * a);
+  const bb = Math.round(b * (1 - a) + gb * a);
+  return `#${((1 << 24) + (rr << 16) + (gg2 << 8) + bb).toString(16).slice(1)}`;
+}
