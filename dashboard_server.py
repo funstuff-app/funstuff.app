@@ -2611,10 +2611,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 body = json.dumps(server_config).encode("utf-8")
                 return self._send(200, body, "application/json", cache_control="public, max-age=300")
             if self.path.startswith("/api/state"):
-                # Cache for 30 seconds at CDN edge - data updates every ~30-60s
+                # Short edge cache - data must stay fresh
                 with app_state.lock:
                     _ensure_force_refresh_seq_cached(app_state)
-                    return self._send(200, app_state.cached_json_bytes, "application/json", cache_control="public, max-age=30, s-maxage=30")
+                    return self._send(200, app_state.cached_json_bytes, "application/json", cache_control="public, max-age=15, s-maxage=30")
             if self.path.startswith("/api/raw"):
                 # Return raw Utah AQ data for TUI remote mode
                 with app_state.lock:
