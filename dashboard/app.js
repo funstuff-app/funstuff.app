@@ -639,7 +639,7 @@ class MapView {
     this.showFixed = true;
     this.showMobile = true;
     // Label visibility is per-sensor-type (mobile vs fixed)
-    this.showMobileLabels = true;
+    this.showMobileLabels = false;
     this.showFixedLabels = true;
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
@@ -652,6 +652,9 @@ class MapView {
     this._cssW = 1;
     this._cssH = 1;
 
+    // OS detection for platform-specific input handling (Windows mouse wheel vs macOS trackpad)
+    this._isWindows = /Win/.test(navigator.platform || navigator.userAgent);
+
     // Trace-mode optimization: cache static overlay (trails + fixed markers).
     this._overlayStaticCanvas = null; // offscreen canvas in device pixels
     this._overlayStaticKey = "";
@@ -662,6 +665,7 @@ class MapView {
     this._trailCacheCanvas = null;
     this._trailCacheViewKey = "";
     this._trailCacheTimeMs = null;
+    this._lastTrailRedrawPerf = 0;
 
     // Trace-mode optimization: cache cleaned point lists per mobile id for sampling.
     this._tracePtsById = new Map(); // id -> [{lat,lon}, ...]
@@ -940,9 +944,10 @@ class MapView {
     const state = this.lastState;
     if (!state) return;
 
-    // FAST PATH: During active touch, just translate/scale cached canvases instead of redrawing.
-    // This avoids expensive path operations on every 120Hz touch event.
-    if (this._touchActive && this._panSnapshotOverlay && this._panSnapshotTiles && this._panSnapshotCenter) {
+    // FAST PATH: During active touch OR mouse drag, just translate/scale cached canvases instead of redrawing.
+    // This avoids expensive path operations on every high-frequency input event.
+    const usingFastPath = (this._touchActive || this._mouseDragging) && this._panSnapshotOverlay && this._panSnapshotTiles && this._panSnapshotCenter;
+    if (usingFastPath) {
       const dpr = this._dpr || 1;
       const w = this._cssW || 1;
       const h = this._cssH || 1;
@@ -1122,6 +1127,10 @@ class MapView {
       startZoom: this.zoom,
       lastPinchDist: pinchDist,
       lastMidpoint: { x: midX, y: midY },
+      // Track for tap detection (single touch, minimal movement)
+      tapCandidate: touches.length === 1,
+      tapStartTime: performance.now(),
+      tapStartPos: { x: midX, y: midY },
     };
     
     // Store anchor for inertia
@@ -1210,13 +1219,22 @@ class MapView {
     // Pan: translate based on midpoint delta from last frame
     const dmx = midX - this._touchState.lastMidpoint.x;
     const dmy = midY - this._touchState.lastMidpoint.y;
-    
+
     if (Math.abs(dmx) > 0.5 || Math.abs(dmy) > 0.5) {
       const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
       const nx = c.x - dmx;
       const ny = clamp(c.y - dmy, 0, c.ws - 1);
       const ll = worldToLatLon(nx, ny, this.zoom);
       this.center = { lat: ll.lat, lon: ll.lon };
+    }
+
+    // Invalidate tap if moved too far from start (use 25px threshold for iOS finger drift)
+    if (this._touchState.tapCandidate && this._touchState.tapStartPos) {
+      const tdx = midX - this._touchState.tapStartPos.x;
+      const tdy = midY - this._touchState.tapStartPos.y;
+      if (Math.abs(tdx) > 25 || Math.abs(tdy) > 25) {
+        this._touchState.tapCandidate = false;
+      }
     }
 
     this._touchState.lastMidpoint = { x: midX, y: midY };
@@ -1232,11 +1250,19 @@ class MapView {
     e.preventDefault();
 
     const remaining = e.touches.length;
-    
+
     if (remaining === 0) {
+      // Check for tap gesture before clearing state
+      const wasTap = this._touchState.tapCandidate &&
+        this._touchState.startTouches === 1 &&
+        (performance.now() - this._touchState.tapStartTime) < 300;
+      const tapPos = this._touchState.tapStartPos;
+
       // Mark touch as ended
       this._touchActive = false;
-      // Clear pan snapshots so next redraw is full
+      // Clear ALL pan snapshots so next redraw is full (match onMouseUp behavior)
+      this._panSnapshotOverlay = null;
+      this._panSnapshotTiles = null;
       this._panSnapshotCenter = null;
       // All fingers lifted - start inertia if we were pinching
       if (this._pinchZooming) {
@@ -1245,6 +1271,12 @@ class MapView {
         // No pinch inertia - do a full redraw now
         this._requestZoomRedraw();
       }
+
+      // Handle tap for marker selection
+      if (wasTap && tapPos) {
+        this._handleTapSelection(tapPos.x, tapPos.y);
+      }
+
       this._touchState = null;
     } else if (remaining === 1 && this._touchState.startTouches >= 2) {
       // Went from 2+ fingers to 1 - reset pan origin to avoid jump
@@ -1332,6 +1364,8 @@ class MapView {
     this._mouseDragStart = { x: e.clientX, y: e.clientY };
     const cw = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     this._mouseDragCenterStart = { x: cw.x, y: cw.y, ws: cw.ws };
+    // Capture snapshots for fast-path panning (same as touch)
+    this._capturePanSnapshots();
   }
 
   onMouseMove(e) {
@@ -1412,6 +1446,11 @@ class MapView {
     this._mouseDragging = false;
     this._mouseDragStart = null;
     this._mouseDragCenterStart = null;
+    // Clear snapshots and do a clean final redraw
+    this._panSnapshotOverlay = null;
+    this._panSnapshotTiles = null;
+    this._panSnapshotCenter = null;
+    this._redrawViewOnly();
     // click behavior is handled in onClick; we just stop dragging here.
   }
 
@@ -2047,7 +2086,8 @@ class MapView {
 
   _traceTick() {
     this._traceRAF = null;
-    if (!this.traceMode) return;
+    // Don't run trace loop when playback mode is active - playback has its own loop
+    if (!this.traceMode || this.playbackMode) return;
     // Basemap is static; only redraw overlays.
     // Throttle to reduce CPU while remaining smooth.
     const now = performance.now();
@@ -2460,59 +2500,61 @@ class MapView {
 
 
   onWheel(e) {
-    // macOS trackpad:
-    // - two-finger drag -> wheel deltaX/deltaY (pan)
-    // - pinch-to-zoom -> wheel with ctrlKey=true (zoom)
+    // Platform-aware wheel handling:
+    // - Windows: scroll wheel = zoom (no Ctrl needed), trackpad pan = pan
+    // - macOS: trackpad pinch (ctrlKey) = zoom, trackpad pan = pan, mouse wheel = zoom
     e.preventDefault();
-
     this._noteUserInteraction();
 
-    // IMPORTANT: user request: no mouse-wheel zoom and no “ctrl held to zoom”.
-    // In browsers on macOS, *trackpad pinch* typically arrives as wheel events with ctrlKey=true
-    // and deltaMode=0 (pixel scrolling). We treat ONLY that combination as pinch-zoom.
-    const isLikelyTrackpadPinch = (e.ctrlKey === true && e.deltaMode === 0);
-    if (isLikelyTrackpadPinch) {
-      // If Safari gesture events are in play, ignore wheel-based pinch.
+    // deltaMode !== 0 means mouse wheel (line or page scrolling mode)
+    const isMouseWheel = e.deltaMode !== 0;
+
+    // Windows-specific: if no horizontal delta and decent vertical delta, treat as mouse wheel zoom
+    // This handles Windows mouse wheels that may report deltaMode = 0
+    const isWindowsWheelZoom = this._isWindows && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
+
+    // Determine if this should be a zoom event:
+    // 1. True mouse wheel (deltaMode !== 0) → zoom
+    // 2. Ctrl+wheel (trackpad pinch gesture) → zoom
+    // 3. Windows vertical-only scroll (mouse wheel fallback) → zoom
+    const shouldZoom = isMouseWheel || e.ctrlKey || isWindowsWheelZoom;
+
+    if (shouldZoom) {
       if (this._gesture) return;
-      // reset inertia timer; start it shortly after the last wheel-pinch event
+
       if (this._wheelPinchEndTimer) window.clearTimeout(this._wheelPinchEndTimer);
       this._pinchZooming = true;
+
       const rect = this.overlayCanvas.getBoundingClientRect();
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
+      this._pinchAnchorSX = sx;
+      this._pinchAnchorSY = sy;
 
-      // Create / refresh anchor so zoom occurs “where the cursor is”.
-      const now = performance.now();
-      if (!this._pinchAnchor || (now - this._pinchAnchor.lastTs) > 180) {
-        const ll = this._screenPointToLatLon(sx, sy);
-        this._pinchAnchor = { lat: ll.lat, lon: ll.lon, sx, sy, lastTs: now };
-      } else {
-        this._pinchAnchor.sx = sx;
-        this._pinchAnchor.sy = sy;
-        this._pinchAnchor.lastTs = now;
-      }
-
-      // Fallback pinch zoom (Chrome/Firefox): wheel+ctrlKey.
-      // Keep it minimal and direct (no custom inertia).
-      const dy = clamp(e.deltaY, -400, 400);
-      const dir = dy < 0 ? 1 : -1; // dy<0 means "zoom in" on most macOS trackpads
-      const strength = 0.020; // slightly faster for wheel-based pinch
+      const dy = clamp(e.deltaY, -300, 300);
+      const dir = dy < 0 ? 1 : -1;
+      // Adjust zoom sensitivity: mouse wheel uses finer control, trackpad pinch uses coarser
+      const strength = (isMouseWheel || isWindowsWheelZoom) ? 0.006 : 0.020;
       const dz = dir * Math.log1p(Math.abs(dy)) * strength;
       const prevZ = this.zoom;
       const z2 = clamp(this.zoom + dz, this._zoomMin, this._zoomMax);
       this._setZoomAroundScreenPoint(z2, sx, sy);
-
       this._requestZoomRedraw();
       this._notifyViewChanged();
-      this._pinchAnchorSX = sx;
-      this._pinchAnchorSY = sy;
       this._notePinchVelocity(z2 - prevZ, performance.now());
-      // Start inertia shortly after the pinch stream stops; keep the gap small to avoid a hitch.
-      this._wheelPinchEndTimer = window.setTimeout(() => this._startPinchInertia(), 28);
+
+      // Trackpad pinch needs inertia; mouse wheel doesn't
+      if (!isMouseWheel && !isWindowsWheelZoom) {
+        this._wheelPinchEndTimer = window.setTimeout(() => this._startPinchInertia(), 28);
+      } else {
+        this._wheelPinchEndTimer = window.setTimeout(() => {
+          this._pinchZooming = false;
+        }, 150);
+      }
       return;
     }
 
-    // User interaction: immediate two-finger pan (no inertial smoothing).
+    // Trackpad two-finger pan (deltaMode = 0, no ctrlKey, has horizontal component on macOS)
     const scale = 0.65;
     const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     const nx = c.x + e.deltaX * scale;
@@ -2562,6 +2604,43 @@ class MapView {
     }
     if (hit) {
       if (window.__selectSensor) window.__selectSensor(hit, { fitTrail: !!e.metaKey });
+      return;
+    }
+
+    this.setSelected(null);
+    if (window.__selectSensor) window.__selectSensor(null);
+  }
+
+  _handleTapSelection(sx, sy) {
+    // Handle tap on touch devices - same hit testing as onClick
+    const st = this.lastState;
+    const mobiles = st && Array.isArray(st.mobile) ? st.mobile : [];
+    const fixed = st && Array.isArray(st.fixed) ? st.fixed : [];
+
+    let hit = null;
+    const candidates = [
+      ...mobiles.map(m => ({ type: "mobile", ...m })),
+      ...fixed.map(f => ({ type: "fixed", ...f })),
+    ];
+    for (const m of candidates) {
+      let lat = Number(m.lat), lon = Number(m.lon);
+      if (m.type === "mobile") {
+        const pose = this._mobilePoseForRender(m, performance.now());
+        lat = pose.lat;
+        lon = pose.lon;
+      }
+      if (!isFinite(lat) || !isFinite(lon)) continue;
+      const wpt = latLonToWorld(lat, lon, this.zoom);
+      const sp = this.worldToScreen(wpt.x, wpt.y);
+      const dx = sp.x - sx;
+      const dy = sp.y - sy;
+      if ((dx*dx + dy*dy) <= (35*35)) { // Large hit area for iOS touch accuracy
+        hit = keyFor(m.type, m.id);
+        break;
+      }
+    }
+    if (hit) {
+      if (window.__selectSensor) window.__selectSensor(hit, { fitTrail: false });
       return;
     }
 
@@ -3208,6 +3287,9 @@ class MapView {
     const w = this._cssW || 1;
     const h = this._cssH || 1;
     const dpr = this._dpr || (window.devicePixelRatio || 1);
+
+    // Reset transform to canonical dpr-scaled state to prevent scaling bugs
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     const ws = c.ws;
@@ -5562,7 +5644,7 @@ class MapView {
         ctx.arc(sp.x, sp.y, 16, 0, Math.PI * 2);
         ctx.fill();
         // Border matches AQI color (like label pills)
-        ctx.strokeStyle = isSel ? "rgba(108,195,255,0.90)" : safeHex((pr && pr.color) || color);
+        ctx.strokeStyle = safeHex((pr && pr.color) || color);
         ctx.lineWidth = 2.0;
         ctx.stroke();
 
@@ -5811,6 +5893,10 @@ class MapView {
     const h = this._cssH || 1;
     const dpr = this._dpr || (window.devicePixelRatio || 1);
 
+    // CRITICAL: Reset transform to canonical dpr-scaled state at the start of every drawOverlay.
+    // This prevents marker scaling bugs if any code path corrupts the transform and fails to restore.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
     // In playback mode, trails must be redrawn each frame (time-clipped).
     // Static overlay caching is only valid for trace mode without playback.
     const useStaticOverlay = this.traceMode && !this.playbackMode;
@@ -5833,109 +5919,20 @@ class MapView {
     const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
     const fixed = Array.isArray(state.fixed) ? state.fixed : [];
 
-    // Playback-mode trail caching with incremental updates:
-    // - Full redraw when view changes (pan/zoom/resize/selection) or time rewinds
-    // - Incremental extension when playback time advances by >=100ms (draw only new segments)
-    // - No trail update if time advanced <100ms (just blit existing cache)
+    // Playback-mode trail caching:
+    // Cache trails to offscreen canvas; only redraw when view or time changes significantly.
     const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
     const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}`;
-    const viewChanged = !this._trailCacheCanvas || this._trailCacheViewKey !== trailViewKey;
+    const viewChanged = this._trailCacheViewKey !== trailViewKey;
     const timeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? (pbTimeMs - this._trailCacheTimeMs) : 0;
-    const timeRewound = timeDelta < 0;
-    const timeAdvancedEnough = timeDelta >= 100; // Threshold: update trails every 100ms of playback time
-    // Cache valid if view unchanged, time hasn't rewound, and time hasn't advanced enough to need update
-    const trailCacheValid = !viewChanged && !timeRewound && !timeAdvancedEnough;
-    // Incremental mode: draw only new segments when time advances (but view unchanged)
-    const incrementalMinTimeMs = (!viewChanged && !timeRewound && timeAdvancedEnough) ? this._trailCacheTimeMs : null;
+    // Trail fading uses 45-min window; 2-second threshold keeps fading visually smooth while allowing fast scrubbing
+    const timeChanged = Math.abs(timeDelta) > 2000;
 
     // Precompute center world once per frame; avoids repeated center projection in worldToScreen().
     const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     const worldToScreenFast = (wx, wy) => ({ x: wx - centerW.x + w / 2, y: wy - centerW.y + h / 2 });
 
-    // Fixed markers - same interaction model as mobile
-    // In trace mode (without playback), fixed markers are part of the cached static overlay.
-    // In playback underlay mode, fixed markers are already present.
-    // Get playback time for fixed sensors with history
-    const fixedPbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
-    const canUseUnderlay = false; // Underlay mode not currently implemented
-    
-    if (!useStaticOverlay && !canUseUnderlay && this.showFixed) {
-      for (const f of fixed) {
-        const lat = Number(f.lat), lon = Number(f.lon);
-        if (!isFinite(lat) || !isFinite(lon)) continue;
-        const wpt = latLonToWorld(lat, lon, this.zoom);
-        const sp = worldToScreenFast(wpt.x, wpt.y);
-        if (sp.x < -50 || sp.y < -50 || sp.x > w+50 || sp.y > h+50) continue;
-
-        const key = keyFor("fixed", f.id);
-        const isSel = (this.selectedId === key);
-        const emoji = f.emoji || "📍";
-        const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? `${f.id} (${f.name})` : f.id;
-        const color = safeHex(f.color);
-        // Use time-indexed reading in playback mode
-        const pr = primaryReadingForFixedAtTime(f, fixedPbTimeMs);
-
-        // halo
-        ctx.save();
-        ctx.beginPath();
-        // “Dark glass” (not pure black), with strong outline so it’s not ghosty.
-        ctx.fillStyle = isSel ? "rgba(16, 20, 28, 0.78)" : "rgba(16, 20, 28, 0.68)";
-        ctx.arc(sp.x, sp.y, 16, 0, Math.PI*2);
-        ctx.fill();
-        // Border matches AQI color (like label pills)
-        ctx.strokeStyle = isSel ? "rgba(108,195,255,0.90)" : safeHex((pr && pr.color) || color);
-        ctx.lineWidth = 2.0;
-        ctx.stroke();
-
-        // emoji
-        ctx.font = "20px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(emoji, sp.x, sp.y);
-
-        // label pill (2 lines): ID line (white) + reading value line (colored)
-        // Use web-safe font stack that works reliably on iOS Safari
-        ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
-        const line1 = label;
-        const line2Key = pr.key ? String(pr.key) : "";
-        const line2Val = formatTagValue(pr.value);
-        // Ensure we have actual text widths (iOS Safari can return 0 for some fonts)
-        const m1 = ctx.measureText(line1);
-        const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
-        const m2b = ctx.measureText(line2Val);
-        const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
-        const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
-        const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
-        const padX = 8;
-        const bw = Math.max(m1w, (m2aw + m2bw)) + padX*2;
-        const bh = (line2Key || line2Val) ? 30 : 18;
-        const bx = sp.x - bw/2;
-        const by = sp.y + 18;
-        ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
-        ctx.strokeStyle = safeHex((pr && pr.color) || color);
-        ctx.lineWidth = 1.8;
-        roundRect(ctx, bx, by, bw, bh, 9);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = "#e8eef7";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        const padY = 4;
-        const lineH = (bh - padY * 2) / ((line2Key || line2Val) ? 2 : 1);
-        const y1 = by + padY + lineH * 0.5;
-        const y2 = by + padY + lineH * 1.5;
-        ctx.fillText(line1, sp.x, y1);
-        if (line2Key || line2Val) {
-          // draw key in muted, value in pollutant color - use safe widths
-          const x0 = sp.x - (m2aw + m2bw) / 2;
-          ctx.fillStyle = "rgba(232,238,247,0.70)";
-          ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
-          ctx.fillStyle = pr.color || "#ffffff";
-          ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
-        }
-        ctx.restore();
-      }
-    }
+    // Fixed markers are drawn AFTER trails (below)
 
     // Trails:
     // - if none selected: show ALL trails
@@ -6139,17 +6136,25 @@ class MapView {
     // In trace mode (without playback), trails are part of the cached static overlay.
     // In playback mode, use trail caching to avoid redrawing every frame.
     if (!useStaticOverlay) {
-      // Trail cache: full redraw on view change, incremental on time advance (>=100ms threshold)
-      const needsFullRedraw = viewChanged || timeRewound;
-      const needsIncrementalUpdate = !needsFullRedraw && timeAdvancedEnough && incrementalMinTimeMs != null;
+      // Trail cache: full redraw on view change OR any time change.
+      // Time-based fading requires full redraw whenever playback time changes so all
+      // trail segments get redrawn with correct fade alpha relative to current time.
+      const needsFullRedraw = viewChanged || timeChanged;
+      const needsIncrementalUpdate = false; // Disabled: incremental breaks fade animation
+
+      // Ensure trail cache canvas exists and is correctly sized (only resize when dimensions change)
+      const targetW = Math.floor(w * dpr);
+      const targetH = Math.floor(h * dpr);
+      if (!this._trailCacheCanvas) {
+        this._trailCacheCanvas = document.createElement("canvas");
+        this._trailCacheCanvas.width = targetW;
+        this._trailCacheCanvas.height = targetH;
+      } else if (this._trailCacheCanvas.width !== targetW || this._trailCacheCanvas.height !== targetH) {
+        this._trailCacheCanvas.width = targetW;
+        this._trailCacheCanvas.height = targetH;
+      }
 
       if (needsFullRedraw || needsIncrementalUpdate) {
-        // Create or resize the trail cache canvas (only on full redraw)
-        if (needsFullRedraw) {
-          if (!this._trailCacheCanvas) this._trailCacheCanvas = document.createElement("canvas");
-          this._trailCacheCanvas.width = Math.floor(w * dpr);
-          this._trailCacheCanvas.height = Math.floor(h * dpr);
-        }
         const tctx = this._trailCacheCanvas.getContext("2d");
         if (tctx) {
           tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -6309,8 +6314,8 @@ class MapView {
             .slice()
             .sort((a, b) => trailLastMs(a) - trailLastMs(b));
 
-          // Pass incrementalMinTimeMs to skip already-drawn segments in incremental mode
-          const timeFilter = needsIncrementalUpdate ? incrementalMinTimeMs : null;
+          // Incremental mode disabled - always do full redraw for proper fading
+          const timeFilter = null;
           for (const m of nonSelected) {
             drawTrailForCached(m, alphaOther, worldToScreenFast, timeFilter);
           }
@@ -6322,6 +6327,7 @@ class MapView {
         }
         this._trailCacheViewKey = trailViewKey;
         this._trailCacheTimeMs = pbTimeMs;
+        this._lastTrailRedrawPerf = performance.now();
       }
 
       // Blit cached trails to main canvas
@@ -6816,10 +6822,82 @@ class MapView {
       }
     }
 
-    // Emoji markers
+    // Fixed markers - drawn AFTER trails so they appear on top
+    const fixedPbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    if (!useStaticOverlay && this.showFixed) {
+      for (const f of fixed) {
+        const lat = Number(f.lat), lon = Number(f.lon);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+        const wpt = latLonToWorld(lat, lon, this.zoom);
+        const sp = worldToScreenFast(wpt.x, wpt.y);
+        if (sp.x < -50 || sp.y < -50 || sp.x > w+50 || sp.y > h+50) continue;
+
+        const key = keyFor("fixed", f.id);
+        const isSel = (this.selectedId === key);
+        const emoji = f.emoji || "📍";
+        const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? `${f.id} (${f.name})` : f.id;
+        const color = safeHex(f.color);
+        const pr = primaryReadingForFixedAtTime(f, fixedPbTimeMs);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.fillStyle = isSel ? "rgba(16, 20, 28, 0.78)" : "rgba(16, 20, 28, 0.68)";
+        ctx.arc(sp.x, sp.y, 16, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = safeHex((pr && pr.color) || color);
+        ctx.lineWidth = 2.0;
+        ctx.stroke();
+
+        ctx.font = "20px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(emoji, sp.x, sp.y);
+
+        if (this.showFixedLabels || isSel) {
+          ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+          const line1 = label;
+          const line2Key = pr.key ? String(pr.key) : "";
+          const line2Val = formatTagValue(pr.value);
+          const m1 = ctx.measureText(line1);
+          const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
+          const m2b = ctx.measureText(line2Val);
+          const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
+          const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
+          const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
+          const padX = 8;
+          const bw = Math.max(m1w, (m2aw + m2bw)) + padX*2;
+          const bh = (line2Key || line2Val) ? 30 : 18;
+          const bx = sp.x - bw/2;
+          const by = sp.y + 18;
+          ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
+          ctx.strokeStyle = safeHex((pr && pr.color) || color);
+          ctx.lineWidth = 1.8;
+          roundRect(ctx, bx, by, bw, bh, 9);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#e8eef7";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          const padY = 4;
+          const lineH = (bh - padY * 2) / ((line2Key || line2Val) ? 2 : 1);
+          const y1 = by + padY + lineH * 0.5;
+          const y2 = by + padY + lineH * 1.5;
+          ctx.fillText(line1, sp.x, y1);
+          if (line2Key || line2Val) {
+            const x0 = sp.x - (m2aw + m2bw) / 2;
+            ctx.fillStyle = "rgba(232,238,247,0.70)";
+            ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
+            ctx.fillStyle = pr.color || "#ffffff";
+            ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
+          }
+        }
+        ctx.restore();
+      }
+    }
+
+    // Mobile emoji markers
     const nowMs = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
     if (this.traceMode || this.playbackMode) {
-      // Set emoji font once per frame (hot path).
       ctx.font = "22px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
@@ -6909,8 +6987,8 @@ class MapView {
       ctx.fillStyle = (this.selectedId === key) ? "rgba(16, 20, 28, 0.78)" : "rgba(16, 20, 28, 0.68)";
       ctx.arc(spx, spy, 18 * liftScale, 0, Math.PI*2);
       ctx.fill();
-      // Border matches AQI color (like label pills)
-      ctx.strokeStyle = (this.selectedId === key) ? "rgba(108,195,255,0.90)" : safeHex(prColorUse);
+      // Border matches AQI color
+      ctx.strokeStyle = safeHex(prColorUse);
       ctx.lineWidth = 2.2;
       ctx.stroke();
 
@@ -6960,17 +7038,24 @@ class MapView {
         }
       }
 
-      // tiny label pill (hideable via showLabels toggle)
-      if (this.showMobileLabels) {
-        const txt1 = label;
+      // tiny label pill (show for selected marker OR when labels toggle is on)
+      const shouldShowLabel = this.showMobileLabels || isSel;
+      if (shouldShowLabel) {
+        ctx.save();
+        // Reset transform and alpha for label drawing
+        ctx.globalAlpha = 1.0;
+        const txt1 = label || id || "?";
         const txt2Key = pr.key ? String(pr.key) : "";
         const txt2Val = formatTagValue(pr.value);
-        ctx.font = "12px -apple-system, system-ui, sans-serif";
+        ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
         const m1 = ctx.measureText(txt1);
         const m2a = ctx.measureText(txt2Key ? `${txt2Key} ` : "");
         const m2b = ctx.measureText(txt2Val);
+        const m1w = m1.width > 0 ? m1.width : (txt1.length * 7);
+        const m2aw = m2a.width > 0 ? m2a.width : ((txt2Key ? txt2Key.length + 1 : 0) * 7);
+        const m2bw = m2b.width > 0 ? m2b.width : (txt2Val.length * 7);
         const padX = 8;
-        const bw = Math.max(m1.width, (m2a.width + m2b.width)) + padX*2;
+        const bw = Math.max(m1w, (m2aw + m2bw)) + padX*2;
         const bh = (txt2Key || txt2Val) ? 30 : 18;
         const bx = spx - bw/2;
         const by = spy + 18;
@@ -6989,12 +7074,13 @@ class MapView {
         const y2 = by + padY + lineH * 1.5;
         ctx.fillText(txt1, spx, y1);
         if (txt2Key || txt2Val) {
-          const x0 = spx - (m2a.width + m2b.width) / 2;
+          const x0 = spx - (m2aw + m2bw) / 2;
           ctx.fillStyle = "rgba(232,238,247,0.70)";
-          ctx.fillText(txt2Key ? `${txt2Key} ` : "", x0 + m2a.width / 2, y2);
+          ctx.fillText(txt2Key ? `${txt2Key} ` : "", x0 + m2aw / 2, y2);
           ctx.fillStyle = prColorUse;
-          ctx.fillText(txt2Val, x0 + m2a.width + m2b.width / 2, y2);
+          ctx.fillText(txt2Val, x0 + m2aw + m2bw / 2, y2);
         }
+        ctx.restore();
       }
       ctx.restore();
     };
@@ -7407,12 +7493,9 @@ function main() {
   map.showMobile = localStorage.getItem(SHOW_MOBILE_KEY) !== "false";
   map.showFixed = localStorage.getItem(SHOW_FIXED_KEY) !== "false";
   const legacyShowLabels = localStorage.getItem(SHOW_LABELS_LEGACY_KEY);
-  map.showMobileLabels = localStorage.getItem(SHOW_MOBILE_LABELS_KEY) != null
-    ? (localStorage.getItem(SHOW_MOBILE_LABELS_KEY) !== "false")
-    : (legacyShowLabels !== "false");
-  map.showFixedLabels = localStorage.getItem(SHOW_FIXED_LABELS_KEY) != null
-    ? (localStorage.getItem(SHOW_FIXED_LABELS_KEY) !== "false")
-    : (legacyShowLabels !== "false");
+  // Mobile labels default OFF, fixed labels default ON
+  map.showMobileLabels = localStorage.getItem(SHOW_MOBILE_LABELS_KEY) === "true";
+  map.showFixedLabels = localStorage.getItem(SHOW_FIXED_LABELS_KEY) !== "false";
 
   function updateSidebarVisibility() {
     if (sidebarEl) sidebarEl.classList.toggle("hidden", !sidebarOpen);
