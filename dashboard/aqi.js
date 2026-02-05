@@ -2,7 +2,7 @@
 // Notes:
 // - Ozone breakpoints are in ppm; our feed values are typically in ppb (e.g. 28-40).
 // - Truncation rules (EPA): ozone -> 3 decimals ppm, PM2.5 -> 1 decimal, PM10 -> integer.
-const AQI_LEVELS = [
+var AQI_LEVELS = [
   { label: "Good", aqi_hi: 50, color: "#00E400" },
   { label: "Moderate", aqi_hi: 100, color: "#FFFF00" },
   { label: "USG", aqi_hi: 150, color: "#FF7E00" },
@@ -11,7 +11,7 @@ const AQI_LEVELS = [
   { label: "Hazardous", aqi_hi: 500, color: "#7E0023" },
 ];
 
-const AQI_BREAKPOINTS = {
+var AQI_BREAKPOINTS = {
   "pm2.5": [
     { c_low: 0.0, c_high: 9.0, aqi_low: 0, aqi_high: 50 },
     { c_low: 9.1, c_high: 35.4, aqi_low: 51, aqi_high: 100 },

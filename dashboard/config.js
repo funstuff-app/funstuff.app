@@ -6,10 +6,10 @@
  * No map library is used for overlay/projection; we do Web Mercator ourselves.
  */
 
-const TILE_SIZE = 256;
+var TILE_SIZE = 256;
 
 // Basemap is fixed to CARTO Voyager.
-const TILE_THEMES = {
+var TILE_THEMES = {
   carto_voyager: {
     label: "CARTO Voyager",
     template: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
@@ -83,14 +83,14 @@ async function loadConfig() {
   }
 }
 
-const THEME_STORAGE_KEY_DARK = "mobileair.mapTheme.dark";
-const THEME_STORAGE_KEY_LIGHT = "mobileair.mapTheme.light";
-const DIM_STORAGE_PREFIX = "mobileair.mapDim."; // per theme (0..100)
-const SAT_STORAGE_PREFIX = "mobileair.mapSat."; // per theme (0..150 => saturate factor = v/100)
-const VIEW_STORAGE_KEY = "mobileair.mapView"; // {lat, lon, zoom}
-const TRACE_STORAGE_KEY = "mobileair.traceMode"; // "1" or "0"
-const LIVE_MODE_STORAGE_KEY = "mobileair.liveFollow"; // "1" = LIVE follow mode
-const MAX_TRAIL_LEN = 1000;
+var THEME_STORAGE_KEY_DARK = "mobileair.mapTheme.dark";
+var THEME_STORAGE_KEY_LIGHT = "mobileair.mapTheme.light";
+var DIM_STORAGE_PREFIX = "mobileair.mapDim."; // per theme (0..100)
+var SAT_STORAGE_PREFIX = "mobileair.mapSat."; // per theme (0..150 => saturate factor = v/100)
+var VIEW_STORAGE_KEY = "mobileair.mapView"; // {lat, lon, zoom}
+var TRACE_STORAGE_KEY = "mobileair.traceMode"; // "1" or "0"
+var LIVE_MODE_STORAGE_KEY = "mobileair.liveFollow"; // "1" = LIVE follow mode
+var MAX_TRAIL_LEN = 1000;
 
 function applyMapFilterVars({ saturate, brightness, contrast, shadowLift }) {
   const root = document.documentElement;

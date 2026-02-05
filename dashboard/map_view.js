@@ -6494,3 +6494,5 @@ class MapView {
     }
   }
 }
+// Expose on window for cross-script access (class declarations don't auto-create window properties)
+window.MapView = MapView;

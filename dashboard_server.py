@@ -2559,13 +2559,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             # Static HTML - short cache, may change frequently during development
             if path_no_query in ("/", "/index.html"):
                 return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="public, max-age=300")
-            # JavaScript assets - cache for 1 day (use cache-busting query params for updates)
-            if path_no_query == "/app.js":
-                return self._send(200, (static_dir / "app.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
-            if path_no_query == "/map_nav_engine.js":
-                return self._send(200, (static_dir / "map_nav_engine.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
-            if path_no_query == "/camera_fit_logic.js":
-                return self._send(200, (static_dir / "camera_fit_logic.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
+            # JavaScript assets - serve any .js file from dashboard dir
+            # Cache for 1 day (use cache-busting query params like ?v=20260205 for updates)
+            if path_no_query.endswith(".js") and "/" not in path_no_query.lstrip("/"):
+                js_file = static_dir / path_no_query.lstrip("/")
+                if js_file.exists():
+                    return self._send(200, js_file.read_bytes(), "text/javascript", cache_control="public, max-age=86400")
             # CSS - cache for 1 day
             if path_no_query == "/styles.css":
                 return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css", cache_control="public, max-age=86400")
