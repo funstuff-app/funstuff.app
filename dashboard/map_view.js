@@ -48,8 +48,11 @@ class MapView {
     this._cssW = 1;
     this._cssH = 1;
 
-    // OS detection for platform-specific input handling (Windows mouse wheel vs macOS trackpad)
+    // OS detection for platform-specific input handling
+    // macOS: scroll = pan, pinch (ctrlKey) = zoom, mouse wheel (deltaMode≠0) = zoom
+    // Windows/Linux: smooth-scroll mice also zoom (primary pointing device)
     this._isWindows = /Win/.test(navigator.platform || navigator.userAgent);
+    this._isMac = /Mac/.test(navigator.platform || navigator.userAgent);
 
     // Trace-mode optimization: cache static overlay (trails + fixed markers).
     this._overlayStaticCanvas = null; // offscreen canvas in device pixels
@@ -190,6 +193,9 @@ class MapView {
     this._pinchAnchorSY = null;
     this._wheelPinchEndTimer = null;
     this._pinchZooming = false;
+    this._lastWheelPanTime = 0; // debounce pan→zoom from trackpad finger-lift artifacts
+    this._wheelPanning = false; // true during trackpad/keyboard-trackpad wheel-pan streams
+    this._wheelPanEndTimer = null; // debounce timer to exit wheel-pan mode
 
     window.addEventListener("resize", () => this.resize());
     
@@ -212,8 +218,16 @@ class MapView {
   }
 
   _cancelCameraAnimations() {
-    if (this._centerAnimRAF) cancelAnimationFrame(this._centerAnimRAF);
-    this._centerAnimRAF = null;
+    if (this._centerAnimRAF) {
+      cancelAnimationFrame(this._centerAnimRAF);
+      this._centerAnimRAF = null;
+      // Clear animation snapshots so next interaction gets fresh ones
+      this._panSnapshotOverlay = null;
+      this._panSnapshotTiles = null;
+      this._panSnapshotCenter = null;
+    }
+    // Pinch-zoom inertia is NOT cancelled here — it coexists with pan
+    // via the snapshot fast path (both just transform cached canvases).
   }
 
   _suppressAutoCamera({ cooldownMs } = {}) {
@@ -340,9 +354,11 @@ class MapView {
     const state = this.lastState;
     if (!state) return;
 
-    // FAST PATH: During active touch OR mouse drag, just translate/scale cached canvases instead of redrawing.
-    // This avoids expensive path operations on every high-frequency input event.
-    const usingFastPath = (this._touchActive || this._mouseDragging) && this._panSnapshotOverlay && this._panSnapshotTiles && this._panSnapshotCenter;
+    // FAST PATH: During active touch, mouse drag, wheel-pan, or camera animation,
+    // just translate/scale cached canvases instead of redrawing.
+    // This avoids expensive path operations on every high-frequency pan event.
+    // NOT used for zoom — zoom needs live rendering (trails, markers respond to scale).
+    const usingFastPath = (this._touchActive || this._mouseDragging || this._wheelPanning || this._centerAnimRAF) && this._panSnapshotOverlay && this._panSnapshotTiles && this._panSnapshotCenter;
     if (usingFastPath) {
       const dpr = this._dpr || 1;
       const w = this._cssW || 1;
@@ -760,8 +776,9 @@ class MapView {
     this._mouseDragStart = { x: e.clientX, y: e.clientY };
     const cw = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     this._mouseDragCenterStart = { x: cw.x, y: cw.y, ws: cw.ws };
-    // Capture snapshots for fast-path panning (same as touch)
-    this._capturePanSnapshots();
+    // Reuse existing snapshots if zoom inertia already captured them (better quality).
+    // Only capture fresh if no snapshots exist yet.
+    if (!this._panSnapshotOverlay) this._capturePanSnapshots();
   }
 
   onMouseMove(e) {
@@ -822,7 +839,9 @@ class MapView {
     const centerY = clamp(this._mouseDragCenterStart.y - dy, 0, this._mouseDragCenterStart.ws - 1);
     const ll = worldToLatLon(centerX, centerY, this.zoom);
     this.center = { lat: ll.lat, lon: ll.lon };
-    this._requestPanRedraw();
+    // If zoom inertia is running, its RAF already calls draw() which reads this.center —
+    // no separate pan redraw needed (avoids two full draws fighting per frame).
+    if (!this._pinchInertiaRAF) this._requestPanRedraw();
   }
 
   onMouseUp() {
@@ -891,9 +910,23 @@ class MapView {
 
     if (this._centerAnimRAF) cancelAnimationFrame(this._centerAnimRAF);
 
+    // Capture snapshot so intermediate frames use the cheap translate path
+    // (_redrawViewOnly fast path checks _centerAnimRAF).
+    const zoomChanging = Math.abs(z1 - z0) > 0.001;
+    if (!zoomChanging) this._capturePanSnapshots();
+
     // Safety: limit animation frames to prevent runaway loops
     let frameCount = 0;
     const maxFrames = Math.ceil(dur / 8) + 60;
+
+    const finish = () => {
+      this._centerAnimRAF = null;
+      this._panSnapshotOverlay = null;
+      this._panSnapshotTiles = null;
+      this._panSnapshotCenter = null;
+      this.draw(this.lastState);
+      this._notifyViewChanged();
+    };
 
     const step = () => {
       frameCount++;
@@ -901,23 +934,27 @@ class MapView {
         console.warn('_animateTo: exceeded max frames, forcing completion');
         this.zoom = z1;
         this.center = { lat: lat1, lon: lon1 };
-        this.draw(this.lastState);
-        this._notifyViewChanged();
-        this._centerAnimRAF = null;
+        finish();
         return;
       }
 
       const t = clamp((performance.now() - t0) / dur, 0, 1);
-      // “light” ease-out (cubic)
+      // "light" ease-out (cubic)
       const ease = 1 - Math.pow(1 - t, 3);
       this.zoom = z0 + (z1 - z0) * ease;
       this.center = { lat: lat0 + (lat1 - lat0) * ease, lon: lon0 + (lon1 - lon0) * ease };
-      this.draw(this.lastState);
+      if (zoomChanging) {
+        // Zoom is changing — need full redraw for correct scale
+        this.draw(this.lastState);
+      } else {
+        // Pan-only — use fast snapshot translate path
+        this._redrawViewOnly();
+      }
       this._notifyViewChanged();
       if (t < 1) {
         this._centerAnimRAF = requestAnimationFrame(step);
       } else {
-        this._centerAnimRAF = null;
+        finish();
       }
     };
     this._centerAnimRAF = requestAnimationFrame(step);
@@ -1905,18 +1942,30 @@ class MapView {
     // deltaMode !== 0 means mouse wheel (line or page scrolling mode)
     const isMouseWheel = e.deltaMode !== 0;
 
-    // Windows-specific: if no horizontal delta and decent vertical delta, treat as mouse wheel zoom
-    // This handles Windows mouse wheels that may report deltaMode = 0
-    const isWindowsWheelZoom = this._isWindows && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
+    // Smooth-scroll mice (Windows/Linux only): vertical-only with significant delta.
+    // Catches mice that report deltaMode=0 (Logitech, Razer, etc).
+    // NOT applied on macOS — two-finger vertical trackpad pan is indistinguishable,
+    // and macOS convention is scroll=pan, pinch=zoom (like Apple Maps).
+    const isSmoothScrollZoom = !this._isMac && !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
 
     // Determine if this should be a zoom event:
     // 1. True mouse wheel (deltaMode !== 0) → zoom
     // 2. Ctrl+wheel (trackpad pinch gesture) → zoom
-    // 3. Windows vertical-only scroll (mouse wheel fallback) → zoom
-    const shouldZoom = isMouseWheel || e.ctrlKey || isWindowsWheelZoom;
+    // 3. Windows/Linux: vertical smooth-scroll (smooth-scroll mice) → zoom
+    let shouldZoom = isMouseWheel || e.ctrlKey || isSmoothScrollZoom;
+
+    // Debounce pan→zoom transitions: when lifting one finger during a two-finger
+    // trackpad pan, macOS briefly interprets the finger separation as a pinch gesture,
+    // firing ctrlKey=true wheel events. Ignore these artifacts if we were panning
+    // within the last 100ms (a real intentional pinch starts well after pan ends).
+    if (shouldZoom && !isMouseWheel && this._lastWheelPanTime
+        && (performance.now() - this._lastWheelPanTime) < 100) {
+      shouldZoom = false;
+    }
 
     if (shouldZoom) {
       if (this._gesture) return;
+      if (this._mouseDragging) return; // Don't zoom while user is panning
 
       if (this._wheelPinchEndTimer) window.clearTimeout(this._wheelPinchEndTimer);
       this._pinchZooming = true;
@@ -1929,8 +1978,10 @@ class MapView {
 
       const dy = clamp(e.deltaY, -300, 300);
       const dir = dy < 0 ? 1 : -1;
-      // Adjust zoom sensitivity: mouse wheel uses finer control, trackpad pinch uses coarser
-      const strength = (isMouseWheel || isWindowsWheelZoom) ? 0.006 : 0.020;
+      // Adjust zoom sensitivity per input type.
+      // Chrome trackpad pinch reports ~3-5x smaller deltaY than Safari for same gesture.
+      const isChromePinch = e.ctrlKey && !isMouseWheel && /Chrome/.test(navigator.userAgent || "");
+      const strength = (isMouseWheel || isSmoothScrollZoom) ? 0.006 : isChromePinch ? 0.055 : 0.020;
       const dz = dir * Math.log1p(Math.abs(dy)) * strength;
       const prevZ = this.zoom;
       const z2 = clamp(this.zoom + dz, this._zoomMin, this._zoomMax);
@@ -1940,24 +1991,40 @@ class MapView {
       this._notePinchVelocity(z2 - prevZ, performance.now());
 
       // Trackpad pinch needs inertia; mouse wheel doesn't
-      if (!isMouseWheel && !isWindowsWheelZoom) {
+      if (!isMouseWheel && !isSmoothScrollZoom) {
         this._wheelPinchEndTimer = window.setTimeout(() => this._startPinchInertia(), 28);
       } else {
         this._wheelPinchEndTimer = window.setTimeout(() => {
           this._pinchZooming = false;
+          this._requestZoomRedraw(); // Final redraw with crisp tiles at settled zoom
         }, 150);
       }
       return;
     }
 
     // Trackpad two-finger pan (deltaMode = 0, no ctrlKey, has horizontal component on macOS)
+    // Also covers iPad keyboard trackpad which fires wheel events, not touch events.
+    this._lastWheelPanTime = performance.now();
+    if (!this._wheelPanning) {
+      this._wheelPanning = true;
+      this._capturePanSnapshots();
+    }
+    if (this._wheelPanEndTimer) window.clearTimeout(this._wheelPanEndTimer);
+    this._wheelPanEndTimer = window.setTimeout(() => {
+      this._wheelPanning = false;
+      this._wheelPanEndTimer = null;
+      this._panSnapshotOverlay = null;
+      this._panSnapshotTiles = null;
+      this._panSnapshotCenter = null;
+      this._redrawViewOnly();
+    }, 120);
     const scale = 0.65;
     const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     const nx = c.x + e.deltaX * scale;
     const ny = clamp(c.y + e.deltaY * scale, 0, c.ws - 1);
     const ll = worldToLatLon(nx, ny, this.zoom);
     this.center = { lat: ll.lat, lon: ll.lon };
-    this._requestPanRedraw();
+    if (!this._pinchInertiaRAF) this._requestPanRedraw();
   }
 
   onClick(e) {
@@ -2961,11 +3028,23 @@ class MapView {
         pts.push({ lat, lon, tMs, m: p.m, readings: p.readings });
       }
       if (pts.length >= 1) {
-        pts.sort((a, b) => a.tMs - b.tMs);
+        // GPS data almost always arrives chronologically. Verify before
+        // paying for a full O(n log n) sort — a linear O(n) check is cheap.
+        let sorted = true;
+        for (let k = 1; k < pts.length; k++) {
+          if (pts[k].tMs < pts[k - 1].tMs) { sorted = false; break; }
+        }
+        if (!sorted) pts.sort((a, b) => a.tMs - b.tMs);
 
         let filtered = pts;
         if (liveDayStartMs != null && isFinite(liveDayStartMs)) {
-          filtered = pts.filter(p => p.tMs >= liveDayStartMs);
+          // Binary search for liveDayStartMs instead of filter() over entire array
+          let lo = 0, hi = pts.length;
+          while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (pts[mid].tMs < liveDayStartMs) lo = mid + 1; else hi = mid;
+          }
+          filtered = lo > 0 ? pts.slice(lo) : pts;
         }
         if (!Array.isArray(filtered) || filtered.length < 2) {
           continue;
@@ -4054,45 +4133,66 @@ class MapView {
     if (!this._pathDistCache) this._pathDistCache = new Map();
     let cached = this._pathDistCache.get(id);
     if (cached && cached.ptsLen === pts.length) return cached;
-    
+
     const n = pts.length;
-    
-    // Build cumulative distance array: cumDist[i] = distance from pts[0] to pts[i]
-    const cumDist = new Array(n);
-    cumDist[0] = 0;
-    for (let i = 1; i < n; i++) {
-      const segDist = haversineMeters(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
-      cumDist[i] = cumDist[i-1] + segDist;
-    }
-    const totalDist = cumDist[n - 1] || 1;
-    
-    // Compute curvature at each point using angle change between adjacent segments
-    // Curvature[i] is angle change (radians) per meter at point i
-    const curvature = new Array(n).fill(0);
-    if (n >= 3) {
-      for (let i = 1; i < n - 1; i++) {
-        // Vectors for adjacent segments
+    const prevLen = cached ? cached.ptsLen : 0;
+
+    // Incremental: reuse existing arrays and only compute new appended points.
+    // GPS trails only grow by appending — never insert into the middle.
+    let cumDist, curvature;
+    if (cached && prevLen > 0 && n > prevLen) {
+      // Extend existing arrays
+      cumDist = cached.cumDist;
+      curvature = cached.curvature;
+      // Grow arrays to new size
+      cumDist.length = n;
+      curvature.length = n;
+      // Compute distances for new points only
+      for (let i = prevLen; i < n; i++) {
+        const segDist = haversineMeters(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
+        cumDist[i] = cumDist[i-1] + segDist;
+      }
+      // Recompute curvature only at boundary + new points
+      const curvStart = Math.max(1, prevLen - 1);
+      for (let i = curvStart; i < n - 1; i++) {
         const dx1 = pts[i].lon - pts[i-1].lon;
         const dy1 = pts[i].lat - pts[i-1].lat;
         const dx2 = pts[i+1].lon - pts[i].lon;
         const dy2 = pts[i+1].lat - pts[i].lat;
-        
-        // Angles of segments
         const a1 = Math.atan2(dy1, dx1);
         const a2 = Math.atan2(dy2, dx2);
-        
-        // Angle change (absolute, wrapped to [0, π])
         let angleDiff = Math.abs(a2 - a1);
         if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
-        
-        // Distance over which this turn occurs
         const dist = (cumDist[i] - cumDist[i-1] + cumDist[i+1] - cumDist[i]) / 2;
-        
-        // Curvature = angle change per meter
         curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
       }
+      if (n > 0) curvature[n - 1] = 0;
+    } else {
+      // Full rebuild (first call or data replaced)
+      cumDist = new Array(n);
+      cumDist[0] = 0;
+      for (let i = 1; i < n; i++) {
+        const segDist = haversineMeters(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
+        cumDist[i] = cumDist[i-1] + segDist;
+      }
+      curvature = new Array(n).fill(0);
+      if (n >= 3) {
+        for (let i = 1; i < n - 1; i++) {
+          const dx1 = pts[i].lon - pts[i-1].lon;
+          const dy1 = pts[i].lat - pts[i-1].lat;
+          const dx2 = pts[i+1].lon - pts[i].lon;
+          const dy2 = pts[i+1].lat - pts[i].lat;
+          const a1 = Math.atan2(dy1, dx1);
+          const a2 = Math.atan2(dy2, dx2);
+          let angleDiff = Math.abs(a2 - a1);
+          if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+          const dist = (cumDist[i] - cumDist[i-1] + cumDist[i+1] - cumDist[i]) / 2;
+          curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
+        }
+      }
     }
-    
+    const totalDist = cumDist[n - 1] || 1;
+
     cached = { cumDist, totalDist, curvature, ptsLen: n };
     this._pathDistCache.set(id, cached);
     return cached;
@@ -4240,15 +4340,13 @@ class MapView {
     // Use phys.d if initialized, otherwise use targetD (where we WILL be)
     const refD = (phys.d > 0) ? phys.d : targetD;
     
-    // Find index corresponding to reference distance
-    let vehicleIdx = 0;
-    for (let i = 0; i < cumDist.length - 1; i++) {
-      if (cumDist[i + 1] >= refD) {
-        vehicleIdx = i;
-        break;
-      }
-      vehicleIdx = i;
+    // Find index corresponding to reference distance (binary search on sorted cumDist)
+    let _lo = 0, _hi = cumDist.length - 1;
+    while (_lo < _hi) {
+      const _mid = (_lo + _hi + 1) >> 1;
+      if (cumDist[_mid] <= refD) _lo = _mid; else _hi = _mid - 1;
     }
+    const vehicleIdx = _lo;
     
     // Get sliding window of smoothed waypoints around vehicle position
     const playbackSpeed = this._playbackSpeed || 1.0;
@@ -4347,37 +4445,35 @@ class MapView {
     // AUTONOMOUS AGENT PHYSICS (modulated by control scalar)
     // ═══════════════════════════════════════════════════════════════════════════
     
-    // Look ahead for curves and calculate safe approach speed
-    // Instead of just finding max curvature, we find the most restrictive speed limit
-    // based on distance to each curve.
-    // v_safe = sqrt(v_curve^2 + 2 * a_brake * distance)
-    
-    const lookaheadDist = MapView.CURVATURE_LOOKAHEAD * Math.max(1, controlScalar);
-    const curveLookaheadEnd = Math.min(phys.d + lookaheadDist, totalDist);
-    
-    // Start scanning from the vehicle's current segment
-    let safeSpeed = effectiveCruise;
-    
-    for (let i = vehicleIdx; i < curvature.length; i++) {
-      const d = cumDist[i];
-      if (d < phys.d) continue; // Skip points behind us
-      if (d > curveLookaheadEnd) break; // Stop at lookahead horizon
-      
-      const curv = curvature[i];
-      if (curv <= 0.001) continue; // Skip straights
-      
-      // Calculate speed limit for this specific curve point
-      const curvFactor = MapView.CURVATURE_THRESHOLD / (MapView.CURVATURE_THRESHOLD + curv);
-      const allowedSpeedAtCurve = effectiveCurve + (effectiveCruise - effectiveCurve) * curvFactor;
-      
-      // Calculate max speed allowed NOW to safely brake to that speed by distance d
-      // v_now = sqrt(v_target^2 + 2 * a * d)
-      const distToCurve = d - phys.d;
-      const maxApproachSpeed = Math.sqrt(allowedSpeedAtCurve * allowedSpeedAtCurve + 2 * effectiveBrake * distToCurve);
-      
-      if (maxApproachSpeed < safeSpeed) {
-        safeSpeed = maxApproachSpeed;
+    // Look ahead for curves and calculate safe approach speed.
+    // Cached: only re-scan when vehicle moves >5m or control scalar shifts >20%.
+    if (!this._curveLookaheadCache) this._curveLookaheadCache = new Map();
+    let _clc = this._curveLookaheadCache.get(id);
+    let safeSpeed;
+    const _clcStale = !_clc
+      || Math.abs(phys.d - _clc.d) > 5
+      || Math.abs(controlScalar - _clc.ctrl) > 0.2 * (_clc.ctrl || 1)
+      || needsSnap;
+    if (!_clcStale) {
+      // Scale cached result by ratio of current vs cached effective cruise
+      safeSpeed = _clc.safeSpeed * (effectiveCruise / (_clc.cruise || effectiveCruise));
+    } else {
+      const lookaheadDist = MapView.CURVATURE_LOOKAHEAD * Math.max(1, controlScalar);
+      const curveLookaheadEnd = Math.min(phys.d + lookaheadDist, totalDist);
+      safeSpeed = effectiveCruise;
+      for (let i = vehicleIdx; i < curvature.length; i++) {
+        const d = cumDist[i];
+        if (d < phys.d) continue;
+        if (d > curveLookaheadEnd) break;
+        const curv = curvature[i];
+        if (curv <= 0.001) continue;
+        const curvFactor = MapView.CURVATURE_THRESHOLD / (MapView.CURVATURE_THRESHOLD + curv);
+        const allowedSpeedAtCurve = effectiveCurve + (effectiveCruise - effectiveCurve) * curvFactor;
+        const distToCurve = d - phys.d;
+        const maxApproachSpeed = Math.sqrt(allowedSpeedAtCurve * allowedSpeedAtCurve + 2 * effectiveBrake * distToCurve);
+        if (maxApproachSpeed < safeSpeed) safeSpeed = maxApproachSpeed;
       }
+      this._curveLookaheadCache.set(id, { d: phys.d, ctrl: controlScalar, cruise: effectiveCruise, safeSpeed });
     }
     
     // Calculate target speed based on:
@@ -4607,24 +4703,30 @@ class MapView {
       opacity = dimOpacity;
     }
 
-    // Use smooth spline heading (already in lat/lon space, convert to screen space)
-    // The spline gives us dLat/dLon, but screen Y is inverted, so we need atan2(-dLat, dLon)
-    // Actually heading is already atan2(dLat, dLon) from _samplePathAtDistance
-    // We need to convert to screen heading which accounts for Mercator projection
-    const currWorld = latLonToWorld(lat, lon, this.zoom);
-    const epsilon = 0.0001;
-    const aheadWorld = latLonToWorld(
-      lat + Math.sin(heading) * epsilon, 
-      lon + Math.cos(heading) * epsilon, 
-      this.zoom
-    );
-    let dx = aheadWorld.x - currWorld.x;
-    let dy = aheadWorld.y - currWorld.y;
-    if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) {
-      dx = 1e-3;
-      dy = 0;
+    // Convert lat/lon heading to screen heading (Mercator projection).
+    // Cached: skip 2× latLonToWorld + atan2 when position/zoom barely changed.
+    if (!this._screenHeadingCache) this._screenHeadingCache = new Map();
+    let _shc = this._screenHeadingCache.get(id);
+    let screenHeading;
+    const _shcStale = !_shc || needsSnap
+      || Math.abs(lat - _shc.lat) > 1e-6 || Math.abs(lon - _shc.lon) > 1e-6
+      || Math.abs(heading - _shc.heading) > 0.01 || this.zoom !== _shc.zoom;
+    if (!_shcStale) {
+      screenHeading = _shc.screenHeading;
+    } else {
+      const currWorld = latLonToWorld(lat, lon, this.zoom);
+      const epsilon = 0.0001;
+      const aheadWorld = latLonToWorld(
+        lat + Math.sin(heading) * epsilon,
+        lon + Math.cos(heading) * epsilon,
+        this.zoom
+      );
+      let dx = aheadWorld.x - currWorld.x;
+      let dy = aheadWorld.y - currWorld.y;
+      if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) { dx = 1e-3; dy = 0; }
+      screenHeading = Math.atan2(dy, dx);
+      this._screenHeadingCache.set(id, { lat, lon, heading, zoom: this.zoom, screenHeading });
     }
-    const screenHeading = Math.atan2(dy, dx);
 
     const absH = Math.abs(screenHeading);
     const dead = 0.22;
@@ -4928,8 +5030,26 @@ class MapView {
     const shouldClipTrail = revealTimeMs != null && isFinite(revealTimeMs);
     let prevTMs = null;
     let prevU = null, prevV = null;
-    
-    for (let i = 0; i < trail.length; i++) {
+
+    // Skip trail points before the visible window.  Renderers fade out points
+    // older than 45 minutes — no need to iterate hours of invisible data.
+    // Uses cached _tMs (available after first frame); falls back to i=0 otherwise.
+    let startIdx = 0;
+    if (shouldClipTrail && trail.length > 50) {
+      const windowStartMs = revealTimeMs - 50 * 60 * 1000; // 45-min fade + 5-min margin
+      const first = trail[0];
+      if (first && first._tMs !== undefined) {
+        let lo = 0, hi = trail.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          const t = trail[mid]._tMs;
+          if (t != null && t < windowStartMs) lo = mid + 1; else hi = mid;
+        }
+        startIdx = Math.max(0, lo - 1); // -1 for segment continuity
+      }
+    }
+
+    for (let i = startIdx; i < trail.length; i++) {
       const p = trail[i];
       
       // Get normalized world coordinates (cached on point)
@@ -5445,7 +5565,20 @@ class MapView {
       // Pre-compute fade threshold: points newer than this don't need fade calculation
       const fadeStartAgeMs = FADE_TIME_MS * FADE_START_FRAC;
 
-      for (let i = 1; i < pts.length; i++) {
+      // Binary search: skip old points outside the fade window entirely.
+      // times[] is chronological (ascending). Find first index where age < FADE_TIME_MS.
+      let _fadeStart = 1;
+      if (times.length > 20 && isFinite(refNowMs)) {
+        const cutoffT = refNowMs - FADE_TIME_MS;
+        let _fl = 1, _fh = times.length - 1;
+        while (_fl < _fh) {
+          const _fm = (_fl + _fh) >> 1;
+          if ((times[_fm] || 0) < cutoffT) _fl = _fm + 1; else _fh = _fm;
+        }
+        _fadeStart = Math.max(1, _fl);
+      }
+
+      for (let i = _fadeStart; i < pts.length; i++) {
         const ptPrev = pts[i-1];
         const ptCurr = pts[i];
         

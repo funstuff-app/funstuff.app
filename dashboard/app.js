@@ -2286,6 +2286,7 @@ function main() {
       if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
       applyScrub();
     });
+    var _scrubRAF = 0;
     pbScrubEl.addEventListener("input", () => {
       const now = performance.now();
       const pos = Number(pbScrubEl.value);
@@ -2296,7 +2297,14 @@ function main() {
       _pbLastScrubTime = now;
 
       map.setPlaybackPlaying(false);
-      applyScrub();
+      // Coalesce rapid input events into a single rAF to avoid
+      // overwhelming iPad Safari with drawOverlay() calls
+      if (!_scrubRAF) {
+        _scrubRAF = requestAnimationFrame(() => {
+          _scrubRAF = 0;
+          applyScrub();
+        });
+      }
     });
     pbScrubEl.addEventListener("change", () => {
       // 'change' fires on release - only handle clicks here
