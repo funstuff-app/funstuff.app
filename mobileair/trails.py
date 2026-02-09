@@ -92,8 +92,9 @@ def extract_mobile_tracks(
                     s_map[key]["lon"] = lon_f
 
                 if v is not None:
-                    # Compute AQI color if not provided by API
-                    color = c if c else color_for_value(pollutant_key, v)
+                    # Always compute color from value using our EPA 2024 scale.
+                    # API ValueColor uses Utah AQ's own scale which differs.
+                    color = color_for_value(pollutant_key, v)
                     s_map[key]["readings"][str(pollutant_key)] = {"value": v, "color": color}
 
     out: dict[str, list[dict[str, Any]]] = {}

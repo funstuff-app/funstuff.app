@@ -33,10 +33,16 @@ rsync -avz --progress \
     "$PI_TARGET:$REMOTE_TMP/"
 
 rsync -avz --progress \
+    --exclude='__pycache__' \
+    --exclude='*.pyc' \
     "$SCRIPT_DIR/mobileair/" \
     "$PI_TARGET:$REMOTE_TMP/mobileair/"
 
 rsync -avz --progress \
+    --exclude='__pycache__' \
+    --exclude='*.pyc' \
+    --exclude='tests/' \
+    --exclude='build/' \
     "$SCRIPT_DIR/dashboard/" \
     "$PI_TARGET:$REMOTE_TMP/dashboard/"
 

@@ -26,6 +26,7 @@ HANDOFF_SCREENSHOTS/
 
 # Deployment staging
 deploy/*/.staging/
+deploy/*/.minify_cache/
 
 # Deployment
 deploy/

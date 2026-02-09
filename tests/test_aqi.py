@@ -146,7 +146,7 @@ class TestAqiLevel(unittest.TestCase):
     def test_usg_level(self):
         """AQI 101-150 is USG."""
         level = aqi_level(125)
-        self.assertEqual(level["label"], "USG")
+        self.assertEqual(level["label"], "Sensitive Groups")
 
     def test_unhealthy_level(self):
         """AQI 151-200 is Unhealthy."""
@@ -182,22 +182,27 @@ class TestAqiLevel(unittest.TestCase):
 
 
 class TestColorForValue(unittest.TestCase):
-    """Test color mapping for pollutant values."""
+    """Test color mapping for pollutant values (EPA AQI scale with clean sub-gradients)."""
 
     def test_pm25_good_color(self):
-        """Good PM2.5 returns green."""
+        """Low PM2.5 returns light blue (clean sub-gradient within Good)."""
         color = color_for_value("PM25", 5.0)
-        self.assertEqual(color, "#00E400")
+        self.assertEqual(color, "#00CCFF")
 
     def test_pm25_moderate_color(self):
-        """Moderate PM2.5 returns yellow."""
-        color = color_for_value("PM25", 20.0)
+        """PM2.5 10 returns yellow (EPA 2024 Moderate starts at 9.1)."""
+        color = color_for_value("PM25", 10.0)
         self.assertEqual(color, "#FFFF00")
+
+    def test_pm25_unhealthy_boundary(self):
+        """PM2.5 126 returns purple (EPA 2024 Very Unhealthy starts at 125.5)."""
+        color = color_for_value("PM25", 126.0)
+        self.assertEqual(color, "#8F3F97")
 
     def test_unknown_pollutant_color(self):
         """Unknown pollutant returns gray."""
         color = color_for_value("UNKNOWN", 50)
-        self.assertEqual(color, "#AAAAAA")
+        self.assertEqual(color, "#cccccc")
 
 
 class TestTrendThreshold(unittest.TestCase):

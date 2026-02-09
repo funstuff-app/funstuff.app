@@ -36,7 +36,7 @@ class MapView {
     this.showMobile = true;
     // Label visibility is per-sensor-type (mobile vs fixed)
     this.showMobileLabels = false;
-    this.showFixedLabels = true;
+    this.showFixedLabels = false;
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
     this._traceRAF = null;
@@ -672,6 +672,11 @@ class MapView {
 
       // Mark touch as ended
       this._touchActive = false;
+      // Flush any tile redraws that were deferred during touch
+      if (this._tileRedrawPending) {
+        this._tileRedrawPending = false;
+        this._scheduleTileRedraw();
+      }
       // Clear ALL pan snapshots so next redraw is full (match onMouseUp behavior)
       this._panSnapshotOverlay = null;
       this._panSnapshotTiles = null;
@@ -1236,8 +1241,14 @@ class MapView {
     const next = id || null;
     if (this.selectedId === next) return;
     this.selectedId = next;
+    if (!next) this._selectedPollutantKey = null;
     this._invalidateOverlayStatic();
     this.drawOverlay(this.lastState);
+  }
+
+  /** Returns the pollutant key currently displayed on the selected marker (e.g. "PM25", "PM10", "OZNE"). */
+  getSelectedPollutantKey() {
+    return this._selectedPollutantKey || null;
   }
 
   setShowFixed(v) {
@@ -1556,7 +1567,8 @@ class MapView {
       this._traceAngleById.set(id, angle);
       this._traceAngleLastMsById.set(id, nowMs);
       
-      const key = keyFor("mobile", m.id);
+      if (!m._key) m._key = keyFor("mobile", m.id);
+      const key = m._key;
       const isSel = (this.selectedId === key);
       const dimOpacity = 0.25;
       const opacity = (this._pbDebugPath || isSel) ? 1 : dimOpacity;
@@ -2058,6 +2070,12 @@ class MapView {
       if (!isFinite(lat) || !isFinite(lon)) continue;
       const wpt = latLonToWorld(lat, lon, this.zoom);
       const sp = this.worldToScreen(wpt.x, wpt.y);
+      // Apply fixed marker overlap offsets to hit test positions
+      // if (m.type === "fixed" && this._fixedOffsets) {
+      //   const fKey = m._key || keyFor("fixed", m.id);
+      //   const off = this._fixedOffsets.get(fKey);
+      //   if (off) { sp.x += off.dx; sp.y += off.dy; }
+      // }
       const dx = sp.x - sx;
       const dy = sp.y - sy;
       if ((dx*dx + dy*dy) <= (20*20)) {
@@ -2095,6 +2113,12 @@ class MapView {
       if (!isFinite(lat) || !isFinite(lon)) continue;
       const wpt = latLonToWorld(lat, lon, this.zoom);
       const sp = this.worldToScreen(wpt.x, wpt.y);
+      // Apply fixed marker overlap offsets to hit test positions
+      if (m.type === "fixed" && this._fixedOffsets) {
+        const fKey = m._key || keyFor("fixed", m.id);
+        const off = this._fixedOffsets.get(fKey);
+        if (off) { sp.x += off.dx; sp.y += off.dy; }
+      }
       const dx = sp.x - sx;
       const dy = sp.y - sy;
       if ((dx*dx + dy*dy) <= (35*35)) { // Large hit area for iOS touch accuracy
@@ -2937,13 +2961,16 @@ class MapView {
   _scheduleTileRedraw() {
     // Debounce tile-load redraws: wait a short time for more tiles to finish loading
     // before redrawing, to avoid N separate redraws when N tiles load in quick succession.
+    if (this._touchActive) {
+      // Mark pending so tiles redraw when touch ends
+      this._tileRedrawPending = true;
+      return;
+    }
     if (this._tileLoadRedrawTimer) return; // already scheduled
     this._tileLoadRedrawTimer = setTimeout(() => {
       this._tileLoadRedrawTimer = null;
-      // Skip if touch is active - will redraw when touch ends
-      if (this._touchActive) return;
       this.drawTiles();
-    }, 50); // 50ms debounce - batches tiles that load within this window
+    }, 50);
   }
 
   _tracePointsKeyForState(state) {
@@ -4692,7 +4719,8 @@ class MapView {
     let opacity = 1.0;
     const dimOpacity = 0.25;
     const movingFlag = !!(nextPoint && (nextPoint.m === 1 || nextPoint.m === "1" || nextPoint.m === true));
-    const key = keyFor("mobile", m.id);
+    if (!m._key) m._key = keyFor("mobile", m.id);
+    const key = m._key;
     const isSel = (this.selectedId === key);
 
     if (!movingFlag && !this._pbDebugPath && !isSel) {
@@ -4994,7 +5022,11 @@ class MapView {
     const revKey = this._tracePointsKeyForState(state);
     // Include persisted trail rev so cached overlay updates even when the server drops history.
     const persistKey = `persist:${this._persistedTrailRev}`;
-    return `${revKey}|${persistKey}|w:${w}|h:${h}|z:${z.toFixed(4)}|c:${clat.toFixed(6)},${clon.toFixed(6)}|sel:${sel}|fixed:${fixed}`;
+    const fl = this.showFixedLabels ? 1 : 0;
+    // Include playback time (rounded to 1s) so fixed sensor dots update when scrubbing
+    const pbT = this.getPlaybackTimeMs();
+    const pbKey = (pbT != null && isFinite(pbT)) ? Math.round(pbT / 1000) : "live";
+    return `${revKey}|${persistKey}|w:${w}|h:${h}|z:${z.toFixed(4)}|c:${clat.toFixed(6)},${clon.toFixed(6)}|sel:${sel}|fixed:${fixed}|fl:${fl}|pb:${pbKey}`;
   }
 
   /**
@@ -5077,9 +5109,14 @@ class MapView {
         try { p._tMs = tMs; } catch {}
       }
       
-      // Get color from point's recorded readings ONLY (immutable historical data)
-      const pr = primaryReadingFromPoint(p);
-      const base = safeHex(pr?.color);
+      // Get color from point's recorded readings ONLY (immutable historical data).
+      // Cache on the point object — readings never change after data load.
+      let base = p._cachedColor;
+      if (base === undefined) {
+        const pr = primaryReadingFromPoint(p);
+        base = safeHex(pr?.color);
+        try { p._cachedColor = base; } catch {}
+      }
       
       // Calculate screen position
       const sp = getSp(u * ws, v * ws);
@@ -5137,81 +5174,120 @@ class MapView {
     const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     const worldToScreenFast = (wx, wy) => ({ x: wx - centerW.x + cssW / 2, y: wy - centerW.y + cssH / 2 });
 
-    // Fixed markers - same interaction model as mobile
+    // Fixed markers - render PurpleAir first (so they don't draw over others), then other markers
     if (this.showFixed) {
-    for (const f of fixed) {
+      // Helper to render a single fixed marker
+      const renderFixedMarker = (f) => {
         const lat = Number(f.lat), lon = Number(f.lon);
-        if (!isFinite(lat) || !isFinite(lon)) continue;
+        if (!isFinite(lat) || !isFinite(lon)) return;
         const wpt = latLonToWorld(lat, lon, this.zoom);
         const sp = worldToScreenFast(wpt.x, wpt.y);
-        if (sp.x < -50 || sp.y < -50 || sp.x > cssW + 50 || sp.y > cssH + 50) continue;
+        if (sp.x < -50 || sp.y < -50 || sp.x > cssW + 50 || sp.y > cssH + 50) return;
 
-        const keyF = keyFor("fixed", f.id);
+        if (!f._key) f._key = keyFor("fixed", f.id);
+        const keyF = f._key;
         const isSel = (this.selectedId === keyF);
-        const emoji = f.emoji || "📍";
-        const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? `${f.id} (${f.name})` : f.id;
+        const emoji = f.purpleair ? "" : (f.emoji || "📍");
+        const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id;
         const color = safeHex(f.color);
-        const pr = primaryReadingForSensor(f);
+        const pr = primaryReadingForFixedAtTime(f, this.getPlaybackTimeMs());
 
-        // halo
         ctx.save();
-        ctx.beginPath();
-        ctx.fillStyle = isSel ? "rgba(16, 20, 28, 0.78)" : "rgba(16, 20, 28, 0.68)";
-        ctx.arc(sp.x, sp.y, 16, 0, Math.PI * 2);
-        ctx.fill();
-        // Border matches AQI color (like label pills)
-        ctx.strokeStyle = safeHex((pr && pr.color) || color);
-        ctx.lineWidth = 2.0;
-        ctx.stroke();
+        const isPurpleAir = !!f.purpleair;
+        if (isPurpleAir) {
+          const dotR = isSel ? 8 : 6;
+          const dotColor = safeHex((pr && pr.color) || color);
+          if (isSel) {
+            ctx.beginPath();
+            ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
+            ctx.arc(sp.x, sp.y, dotR + 4, 0, Math.PI*2);
+            ctx.fill();
+          }
+          ctx.beginPath();
+          // When not selected: make PurpleAir subtle but still visible
+          if (!isSel) {
+            const darkened = darkenHex(dotColor, 0.85);
+            ctx.fillStyle = hexToRgba(darkened, 0.45);
+          } else {
+            ctx.fillStyle = dotColor;
+          }
+          ctx.arc(sp.x, sp.y, dotR, 0, Math.PI*2);
+          ctx.fill();
+          ctx.strokeStyle = isSel ? "#5bb8f5" : darkenHex(dotColor, 0.7);
+          ctx.globalAlpha = isSel ? 1 : 0.5;
+          ctx.lineWidth = isSel ? 1.8 : 1.2;
+          ctx.stroke();
+        } else {
+          if (isSel) {
+            ctx.beginPath();
+            ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
+            ctx.arc(sp.x, sp.y, 20, 0, Math.PI*2);
+            ctx.fill();
+          }
+          ctx.beginPath();
+          ctx.fillStyle = "rgba(16, 20, 28, 0.68)";
+          ctx.arc(sp.x, sp.y, 16, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = isSel ? "#5bb8f5" : safeHex((pr && pr.color) || color);
+          ctx.lineWidth = isSel ? 2.4 : 2.0;
+          ctx.stroke();
 
-        // emoji
-        ctx.font = "20px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(emoji, sp.x, sp.y);
+          ctx.font = "24px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText(emoji, sp.x, sp.y);
+        }
 
-        // label pill (2 lines): ID line (white) + reading value line (colored)
-        // Use web-safe font stack that works reliably on iOS Safari
-        ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
-        const line1 = label;
-        const line2Key = pr.key ? String(pr.key) : "";
-        const line2Val = formatTagValue(pr.value);
-        // Ensure we have actual text widths (iOS Safari can return 0 for some fonts)
-        const m1 = ctx.measureText(line1);
-        const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
-        const m2b = ctx.measureText(line2Val);
-        const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
-        const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
-        const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
-        const padX = 8;
-        const bw = Math.max(m1w, (m2aw + m2bw)) + padX * 2;
-        const bh = (line2Key || line2Val) ? 30 : 18;
-        const bx = sp.x - bw / 2;
-        const by = sp.y + 18;
-        ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
-        ctx.strokeStyle = safeHex((pr && pr.color) || color);
-        ctx.lineWidth = 1.8;
-        roundRect(ctx, bx, by, bw, bh, 9);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = "#e8eef7";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        const padY = 4;
-        const lineH = (bh - padY * 2) / ((line2Key || line2Val) ? 2 : 1);
-        const y1 = by + padY + lineH * 0.5;
-        const y2 = by + padY + lineH * 1.5;
-        ctx.fillText(line1, sp.x, y1);
-        if (line2Key || line2Val) {
-          // draw key in muted, value in pollutant color - use safe widths
-          const x0 = sp.x - (m2aw + m2bw) / 2;
-          ctx.fillStyle = "rgba(232,238,247,0.70)";
-          ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
-          ctx.fillStyle = pr.color || "#ffffff";
-          ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
+        if ((this.showFixedLabels && !isPurpleAir) || isSel || f.pinned || String(f.id) === "Home") {
+          ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+          const line1 = label;
+          const line2Key = pr.key ? String(pr.key) : "";
+          const line2Val = formatTagValue(pr.value);
+          const m1 = ctx.measureText(line1);
+          const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
+          const m2b = ctx.measureText(line2Val);
+          const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
+          const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
+          const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
+          const padX = 8;
+          const bw = Math.max(m1w, (m2aw + m2bw)) + padX * 2;
+          const bh = (line2Key || line2Val) ? 30 : 18;
+          const bx = sp.x - bw / 2;
+          const by = sp.y + 18;
+          ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
+          ctx.strokeStyle = safeHex((pr && pr.color) || color);
+          ctx.lineWidth = 1.8;
+          roundRect(ctx, bx, by, bw, bh, 9);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#e8eef7";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          const padY = 4;
+          const lineH = (bh - padY * 2) / ((line2Key || line2Val) ? 2 : 1);
+          const y1 = by + padY + lineH * 0.5;
+          const y2 = by + padY + lineH * 1.5;
+          ctx.fillText(line1, sp.x, y1);
+          if (line2Key || line2Val) {
+            const x0 = sp.x - (m2aw + m2bw) / 2;
+            ctx.fillStyle = "rgba(232,238,247,0.70)";
+            ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
+            ctx.fillStyle = pr.color || "#ffffff";
+            ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
+          }
         }
         ctx.restore();
-    }
+      };
+
+      // First pass: render PurpleAir markers (drawn first, so they appear behind)
+      for (const f of fixed) {
+        if (f.purpleair) renderFixedMarker(f);
+      }
+      
+      // Second pass: render non-PurpleAir markers
+      for (const f of fixed) {
+        if (!f.purpleair) renderFixedMarker(f);
+      }
     } // end if showFixed
 
     // Trails:
@@ -5279,15 +5355,38 @@ class MapView {
         : (boundsMaxMs != null ? boundsMaxMs 
         : this._dataNowMs()));
 
-      for (let i = 1; i < pts.length; i++) {
-        if (!pts[i - 1] || !pts[i]) continue;
+      // Batched trail rendering: collect segments with same color/alpha,
+      // stroke in a single beginPath() to avoid per-segment save/restore.
+      ctx.lineWidth = lw;
+      ctx.setLineDash(dash);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
 
-        // Use the 'm' (moving) flag from the server point to determine if
-        // this segment should be hidden/faded (jitter) or bright (historical data).
+      let sBatchColor = null;
+      let sBatchAlpha = null;
+      let sBatchPts = [];
+
+      const sFlushBatch = () => {
+        if (sBatchPts.length < 2) { sBatchPts = []; return; }
+        ctx.globalAlpha = sBatchAlpha;
+        ctx.strokeStyle = sBatchColor;
+        ctx.beginPath();
+        for (let k = 0; k < sBatchPts.length; k += 2) {
+          ctx.moveTo(sBatchPts[k].x, sBatchPts[k].y);
+          ctx.lineTo(sBatchPts[k+1].x, sBatchPts[k+1].y);
+        }
+        ctx.stroke();
+        sBatchPts = [];
+      };
+
+      const fadeStartAgeMs = FADE_TIME_MS * FADE_START_FRAC;
+
+      for (let i = 1; i < pts.length; i++) {
+        if (!pts[i - 1] || !pts[i]) { sFlushBatch(); continue; }
+
         const trailPt = trail[i];
-        // IMPORTANT: "moving" must be explicit. Missing/undefined m is treated as idle.
         const isMoving = !!(trailPt && (trailPt.m === 1 || trailPt.m === "1" || trailPt.m === true));
-        
+
         const segColor0 = cols[i] || cols[i - 1] || "#ffffff";
         let segColor = segColor0;
         let alphaMul2 = 1.0;
@@ -5296,63 +5395,39 @@ class MapView {
           if (this._pbDebugPath) {
             segColor = dimHex(segColor0, 0.25);
           } else {
-            // Previously hidden: keep visible, but fade + desaturate.
             segColor = desatHex(dimHex(segColor0, 0.35), 0.30);
             alphaMul2 = 0.5;
           }
         } else if (isGhost && isLive) {
-          segColor = desatHex(dimHex(segColor0, 0.65), 0.25); // Dim + slight desat for offline sensors
+          segColor = desatHex(dimHex(segColor0, 0.65), 0.25);
           alphaMul2 = 0.5;
         }
 
-        // colored segment
-        ctx.save();
         const t1 = times[i];
-        if (!(t1 != null && isFinite(t1) && isFinite(refNowMs))) {
-          ctx.restore();
-          continue;
-        }
-
-        // Hide leading trail: skip points ahead of the vehicle's time position (unless debug)
-        // (Trail is already clipped during collection, but this handles edge cases)
+        if (!(t1 != null && isFinite(t1) && isFinite(refNowMs))) { sFlushBatch(); continue; }
 
         const ageMs = Math.max(0, Number(refNowMs) - Number(t1));
-        const fTime = clamp(ageMs / Math.max(1, FADE_TIME_MS), 0, 1);
+        if (ageMs >= FADE_TIME_MS) { sFlushBatch(); continue; }
 
-        // Fully expired => don't render (keep in data).
-        if (fTime >= 1) {
-          ctx.restore();
-          continue;
-        }
-
-        // Fade only in the last 20% of the decay window.
         let tailAlpha = 1.0;
-        if (fTime > FADE_START_FRAC) {
-          const u = clamp((fTime - FADE_START_FRAC) / Math.max(1e-6, FADE_TAIL_FRAC), 0, 1);
-          // Keep the head bright; push the very tail toward invisible.
-          tailAlpha = Math.pow(1 - u, 2);
+        if (ageMs > fadeStartAgeMs) {
+          const u = (ageMs - fadeStartAgeMs) / (FADE_TIME_MS - fadeStartAgeMs);
+          tailAlpha = (1 - u) * (1 - u);
+          if (tailAlpha <= 0.01) { sFlushBatch(); continue; }
         }
 
-        if (tailAlpha <= 0.01) {
-          ctx.restore();
-          continue;
+        const finalAlpha = alpha * tailAlpha * alphaMul2;
+        if (segColor !== sBatchColor || Math.abs(finalAlpha - (sBatchAlpha || 0)) > 0.01) {
+          sFlushBatch();
+          sBatchColor = segColor;
+          sBatchAlpha = finalAlpha;
         }
-
-        ctx.globalAlpha = alpha * tailAlpha * alphaMul2;
-        ctx.strokeStyle = segColor;
-        ctx.lineWidth = lw;
-        ctx.setLineDash(dash);
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.beginPath();
-        
-        const p0 = pts[i - 1];
-        const p1 = pts[i];
-        ctx.moveTo(p0.x, p0.y);
-        ctx.lineTo(p1.x, p1.y);
-        ctx.stroke();
-        ctx.restore();
+        sBatchPts.push(pts[i - 1]);
+        sBatchPts.push(pts[i]);
       }
+      sFlushBatch();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1.0;
 
       return true;
     };
@@ -5405,6 +5480,8 @@ class MapView {
   drawOverlay(state, opts = {}) {
     const ctx = this.octx;
     if (!ctx) return;
+    // Reset per-frame: will be set by whichever marker is selected
+    this._selectedPollutantKey = null;
     const w = this._cssW || 1;
     const h = this._cssH || 1;
     const dpr = this._dpr || (window.devicePixelRatio || 1);
@@ -5435,9 +5512,64 @@ class MapView {
     const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
     const fixed = Array.isArray(state.fixed) ? state.fixed : [];
 
+    // --- Per-frame caches (reset each drawOverlay call) ---
+    // Emoji pre-render cache: drawImage of a cached canvas is far cheaper than
+    // fillText with color-emoji fonts on iOS Safari (~1-3ms per fillText avoided).
+    if (!this._emojiCanvasCache) this._emojiCanvasCache = new Map();
+    const getEmojiCanvas = (emoji, size) => {
+      const key = `${emoji}|${size}`;
+      let c = this._emojiCanvasCache.get(key);
+      if (c) return c;
+      const px = size * 2; // 2x for clarity at retina
+      c = document.createElement("canvas");
+      c.width = px; c.height = px;
+      const ec = c.getContext("2d");
+      // Render at native canvas pixels so downscaling preserves the intended size.
+      ec.font = `${px}px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif`;
+      ec.textAlign = "center";
+      ec.textBaseline = "middle";
+      ec.fillText(emoji, px / 2, px / 2);
+      this._emojiCanvasCache.set(key, c);
+      return c;
+    };
+
+    // measureText cache: avoids repeated glyph layout for identical strings.
+    if (!this._textWidthCache) this._textWidthCache = new Map();
+    const measureTextCached = (text, font) => {
+      const key = `${font}|${text}`;
+      let width = this._textWidthCache.get(key);
+      if (width !== undefined) return width;
+      ctx.font = font;
+      width = ctx.measureText(text).width;
+      if (!(width > 0)) width = text.length * 7; // iOS fallback
+      this._textWidthCache.set(key, width);
+      return width;
+    };
+
+    // dimHex/desatHex color cache: these do regex + parseInt + Math.round per call.
+    const _colorXformCache = new Map();
+    const colorXform = (baseColor, dimAmt, desatAmt) => {
+      const key = `${baseColor}|${dimAmt}|${desatAmt}`;
+      let r = _colorXformCache.get(key);
+      if (r !== undefined) return r;
+      r = desatAmt > 0 ? desatHex(dimHex(baseColor, dimAmt), desatAmt) : dimHex(baseColor, dimAmt);
+      _colorXformCache.set(key, r);
+      return r;
+    };
+
+    // Fixed sensor interpolation cache: avoids re-parsing history timestamps every frame.
+    if (!this._fixedInterpCache) this._fixedInterpCache = { timeKey: null, map: new Map() };
+
+    // Hoist values called redundantly per-mobile inside closures.
+    const _framePbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    const _framePbBounds = this.playbackMode ? this.getPlaybackBounds() : null;
+    const _frameSel = parseKey(this.selectedId);
+    const _frameHasSelectedMobile = (_frameSel && _frameSel.type === "mobile" && _frameSel.id);
+    const _frameSelectedId = _frameHasSelectedMobile ? _frameSel.id : null;
+
     // Playback-mode trail caching:
     // Cache trails to offscreen canvas; only redraw when view or time changes significantly.
-    const pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    const pbTimeMs = _framePbTimeMs;
     const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}`;
     const viewChanged = this._trailCacheViewKey !== trailViewKey;
     const timeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? (pbTimeMs - this._trailCacheTimeMs) : 0;
@@ -5453,14 +5585,14 @@ class MapView {
     // Trails:
     // - if none selected: show ALL trails
     // - if selected: show ALL trails, but dim others and draw selected last on top
-    const sel = parseKey(this.selectedId);
-    const hasSelectedMobile = (sel && sel.type === "mobile" && sel.id);
-    const selectedId = hasSelectedMobile ? sel.id : null;
+    const sel = _frameSel;
+    const hasSelectedMobile = _frameHasSelectedMobile;
+    const selectedId = _frameSelectedId;
 
     // Reveal trail up to playback time (works in both DVR and LIVE modes).
     // LIVE mode uses playback time at the live edge.
     const isLive = !this.playbackMode;
-    const trailRevealTimeMs = this.getPlaybackTimeMs();
+    const trailRevealTimeMs = _framePbTimeMs;
 
     const drawTrailFor = (m, alphaMul, toScreen) => {
       const id = m && m.id != null ? String(m.id) : "";
@@ -5509,13 +5641,12 @@ class MapView {
       const FADE_TAIL_FRAC = 0.20;
       const FADE_START_FRAC = 1.0 - FADE_TAIL_FRAC;
       // Reference time: use playback time, trail's max time, or playback bounds (NOT wall clock)
-      const livePlaybackTimeMs = this.getPlaybackTimeMs();
+      const livePlaybackTimeMs = _framePbTimeMs;
       const hasPlaybackTime = livePlaybackTimeMs != null && isFinite(livePlaybackTimeMs);
-      const pbBounds = this.getPlaybackBounds();
-      const boundsMaxMs = (pbBounds.maxMs != null && isFinite(pbBounds.maxMs)) ? pbBounds.maxMs : null;
-      const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) 
-        : (isFinite(visMaxT) ? visMaxT 
-        : (boundsMaxMs != null ? boundsMaxMs 
+      const boundsMaxMs = (_framePbBounds && _framePbBounds.maxMs != null && isFinite(_framePbBounds.maxMs)) ? _framePbBounds.maxMs : null;
+      const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs)
+        : (isFinite(visMaxT) ? visMaxT
+        : (boundsMaxMs != null ? boundsMaxMs
         : this._dataNowMs()));
 
       // Calculate pixels per meter at the trail's location (approximate using first point).
@@ -5598,14 +5729,14 @@ class MapView {
 
         if (!isMoving) {
           if (this._pbDebugPath) {
-            segColor = dimHex(segColor0, 0.25);
+            segColor = colorXform(segColor0, 0.25, 0);
           } else {
             // Previously hidden: keep visible, but fade + desaturate.
-            segColor = desatHex(dimHex(segColor0, 0.35), 0.30);
+            segColor = colorXform(segColor0, 0.35, 0.30);
             alphaMul2 = 0.5;
           }
         } else if (isGhost && isLive) {
-          segColor = desatHex(dimHex(segColor0, 0.65), 0.25); // Dim + slight desat for offline sensors
+          segColor = colorXform(segColor0, 0.65, 0.25); // Dim + slight desat for offline sensors
           alphaMul2 = 0.5;
         }
 
@@ -5749,10 +5880,9 @@ class MapView {
             const FADE_TIME_MS = 45 * 60 * 1000;
             const FADE_TAIL_FRAC = 0.20;
             const FADE_START_FRAC = 1.0 - FADE_TAIL_FRAC;
-            const livePlaybackTimeMs = this.getPlaybackTimeMs();
+            const livePlaybackTimeMs = _framePbTimeMs;
             const hasPlaybackTime = livePlaybackTimeMs != null && isFinite(livePlaybackTimeMs);
-            const pbBounds = this.getPlaybackBounds();
-            const boundsMaxMs = (pbBounds.maxMs != null && isFinite(pbBounds.maxMs)) ? pbBounds.maxMs : null;
+            const boundsMaxMs = (_framePbBounds && _framePbBounds.maxMs != null && isFinite(_framePbBounds.maxMs)) ? _framePbBounds.maxMs : null;
             const refNowMs = hasPlaybackTime ? Number(livePlaybackTimeMs) 
               : (isFinite(visMaxT) ? visMaxT 
               : (boundsMaxMs != null ? boundsMaxMs 
@@ -5796,13 +5926,13 @@ class MapView {
 
               if (!isMoving) {
                 if (this._pbDebugPath) {
-                  segColor = dimHex(segColor0, 0.25);
+                  segColor = colorXform(segColor0, 0.25, 0);
                 } else {
-                  segColor = desatHex(dimHex(segColor0, 0.35), 0.30);
+                  segColor = colorXform(segColor0, 0.35, 0.30);
                   alphaMul2 = 0.5;
                 }
               } else if (isGhost && isLive) {
-                segColor = desatHex(dimHex(segColor0, 0.65), 0.25);
+                segColor = colorXform(segColor0, 0.65, 0.25);
               }
 
               const t1 = times[i];
@@ -5874,14 +6004,13 @@ class MapView {
     // road-matching optimization is applied.
     // ═══════════════════════════════════════════════════════════════════════════
     if (this._pbDebugPath && this._pbDebugRawGps && this.playbackMode) {
-      const sel = parseKey(this.selectedId);
-      const selId = (sel && sel.type === "mobile" && sel.id) ? sel.id : null;
+      const selId = _frameSelectedId;
       if (selId) {
         const rawGps = this._rawGpsById.get(String(selId));
         if (rawGps && rawGps.length >= 2) {
           const ws = worldSizeForZoom(this.zoom);
-          const pbTimeMs = this.getPlaybackTimeMs();
-          
+          const pbTimeMs = _framePbTimeMs;
+
           ctx.save();
           ctx.strokeStyle = "#ff8800"; // Orange for raw GPS
           ctx.lineWidth = 2;
@@ -6047,8 +6176,7 @@ class MapView {
     // steering toward lookahead points on the raw GPS path.
     // ═══════════════════════════════════════════════════════════════════════════
     if (this._pbDebugPath && this.playbackMode) {
-      const sel = parseKey(this.selectedId);
-      const selId = (sel && sel.type === "mobile" && sel.id) ? sel.id : null;
+      const selId = _frameSelectedId;
       if (selId) {
         const ws = worldSizeForZoom(this.zoom);
         const mid = String(selId);
@@ -6351,48 +6479,144 @@ class MapView {
       }
     }
 
+    // Fixed marker overlap separation: compute position offsets so overlapping fixed markers spread apart.
+    // Only applies to fixed markers (not mobile) to preserve GPS-accurate vehicle positions.
+    // Store on `this` so hit testing can apply the same offsets.
+    // if (!this._fixedOffsets) this._fixedOffsets = new Map();
+    // this._fixedOffsets.clear();
+    // const _fixedOffsets = this._fixedOffsets;
+    // if (!useStaticOverlay && this.showFixed) {
+    //   const MIN_DIST = 40; // minimum pixel distance between fixed marker centers
+    //   const fixedPos = []; // {key, x, y}
+    //   for (const f of fixed) {
+    //     const lat = Number(f.lat), lon = Number(f.lon);
+    //     if (!isFinite(lat) || !isFinite(lon)) continue;
+    //     const wpt = latLonToWorld(lat, lon, this.zoom);
+    //     const sp = worldToScreenFast(wpt.x, wpt.y);
+    //     if (sp.x < -50 || sp.y < -50 || sp.x > w+50 || sp.y > h+50) continue;
+    //     if (!f._key) f._key = keyFor("fixed", f.id);
+    //     fixedPos.push({key: f._key, x: sp.x, y: sp.y});
+    //   }
+    //   // Simple O(n^2) pairwise push-apart (n is small, typically <30 fixed markers)
+    //   for (let i = 0; i < fixedPos.length; i++) {
+    //     for (let j = i + 1; j < fixedPos.length; j++) {
+    //       const a = fixedPos[i], b = fixedPos[j];
+    //       const oA = _fixedOffsets.get(a.key) || {dx:0, dy:0};
+    //       const oB = _fixedOffsets.get(b.key) || {dx:0, dy:0};
+    //       const ax = a.x + oA.dx, ay = a.y + oA.dy;
+    //       const bx = b.x + oB.dx, by = b.y + oB.dy;
+    //       const ddx = bx - ax, ddy = by - ay;
+    //       const dist = Math.sqrt(ddx*ddx + ddy*ddy);
+    //       if (dist < MIN_DIST && dist > 0.01) {
+    //         const push = (MIN_DIST - dist) / 2;
+    //         const nx = ddx / dist, ny = ddy / dist;
+    //         oA.dx -= nx * push; oA.dy -= ny * push;
+    //         oB.dx += nx * push; oB.dy += ny * push;
+    //         _fixedOffsets.set(a.key, oA);
+    //         _fixedOffsets.set(b.key, oB);
+    //       } else if (dist <= 0.01) {
+    //         // Exactly overlapping: push apart vertically
+    //         const oA2 = _fixedOffsets.get(a.key) || {dx:0, dy:0};
+    //         const oB2 = _fixedOffsets.get(b.key) || {dx:0, dy:0};
+    //         oA2.dy -= MIN_DIST / 2;
+    //         oB2.dy += MIN_DIST / 2;
+    //         _fixedOffsets.set(a.key, oA2);
+    //         _fixedOffsets.set(b.key, oB2);
+    //       }
+    //     }
+    //   }
+    // }
+
     // Fixed markers - drawn AFTER trails so they appear on top
-    const fixedPbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    // Render PurpleAir first (so they don't draw over other markers), then others
+    const fixedPbTimeMs = _framePbTimeMs;
     if (!useStaticOverlay && this.showFixed) {
-      for (const f of fixed) {
+      const renderPbFixedMarker = (f) => {
         const lat = Number(f.lat), lon = Number(f.lon);
-        if (!isFinite(lat) || !isFinite(lon)) continue;
+        if (!isFinite(lat) || !isFinite(lon)) return;
         const wpt = latLonToWorld(lat, lon, this.zoom);
         const sp = worldToScreenFast(wpt.x, wpt.y);
-        if (sp.x < -50 || sp.y < -50 || sp.x > w+50 || sp.y > h+50) continue;
+        if (sp.x < -50 || sp.y < -50 || sp.x > w+50 || sp.y > h+50) return;
 
-        const key = keyFor("fixed", f.id);
+        if (!f._key) f._key = keyFor("fixed", f.id);
+        const key = f._key;
         const isSel = (this.selectedId === key);
-        const emoji = f.emoji || "📍";
-        const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? `${f.id} (${f.name})` : f.id;
+        const emoji = f.purpleair ? "" : (f.emoji || "📍");
+        const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id;
         const color = safeHex(f.color);
-        const pr = primaryReadingForFixedAtTime(f, fixedPbTimeMs);
+        let pr;
+        const interpCacheKey = (fixedPbTimeMs != null && isFinite(fixedPbTimeMs))
+          ? `${f.id}|${Math.round(fixedPbTimeMs / 1000)}`
+          : null;
+        if (interpCacheKey) {
+          const timeKey = Math.round(fixedPbTimeMs / 1000);
+          if (this._fixedInterpCache.timeKey !== timeKey) {
+            this._fixedInterpCache.timeKey = timeKey;
+            this._fixedInterpCache.map.clear();
+          }
+          pr = this._fixedInterpCache.map.get(f.id);
+          if (!pr) {
+            pr = primaryReadingForFixedAtTime(f, fixedPbTimeMs);
+            this._fixedInterpCache.map.set(f.id, pr);
+          }
+        } else {
+          pr = primaryReadingForFixedAtTime(f, fixedPbTimeMs);
+        }
+
+        // Expose the selected sensor's displayed pollutant key for legend sync
+        if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
         ctx.save();
-        ctx.beginPath();
-        ctx.fillStyle = isSel ? "rgba(16, 20, 28, 0.78)" : "rgba(16, 20, 28, 0.68)";
-        ctx.arc(sp.x, sp.y, 16, 0, Math.PI*2);
-        ctx.fill();
-        ctx.strokeStyle = safeHex((pr && pr.color) || color);
-        ctx.lineWidth = 2.0;
-        ctx.stroke();
+        const isPurpleAir = !!f.purpleair;
+        if (isPurpleAir) {
+          const dotR = isSel ? 8 : 6;
+          const dotColor = safeHex((pr && pr.color) || color);
+          if (isSel) {
+            ctx.beginPath();
+            ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
+            ctx.arc(sp.x, sp.y, dotR + 4, 0, Math.PI*2);
+            ctx.fill();
+          }
+          ctx.beginPath();
+          if (!isSel) {
+            const darkened = darkenHex(dotColor, 0.85);
+            ctx.fillStyle = hexToRgba(darkened, 0.45);
+          } else {
+            ctx.fillStyle = dotColor;
+          }
+          ctx.arc(sp.x, sp.y, dotR, 0, Math.PI*2);
+          ctx.fill();
+          ctx.strokeStyle = isSel ? "#5bb8f5" : darkenHex(dotColor, 0.7);
+          ctx.globalAlpha = isSel ? 1 : 0.5;
+          ctx.lineWidth = isSel ? 1.8 : 1.2;
+          ctx.stroke();
+        } else {
+          if (isSel) {
+            ctx.beginPath();
+            ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
+            ctx.arc(sp.x, sp.y, 20, 0, Math.PI*2);
+            ctx.fill();
+          }
+          ctx.beginPath();
+          ctx.fillStyle = "rgba(16, 20, 28, 0.68)";
+          ctx.arc(sp.x, sp.y, 16, 0, Math.PI*2);
+          ctx.fill();
+          ctx.strokeStyle = isSel ? "#5bb8f5" : safeHex((pr && pr.color) || color);
+          ctx.lineWidth = isSel ? 2.4 : 2.0;
+          ctx.stroke();
 
-        ctx.font = "20px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(emoji, sp.x, sp.y);
+          const fixedEmojiC = getEmojiCanvas(emoji, 24);
+          ctx.drawImage(fixedEmojiC, sp.x - 14, sp.y - 14, 28, 28);
+        }
 
-        if (this.showFixedLabels || isSel) {
-          ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+        if ((this.showFixedLabels && !isPurpleAir) || isSel || f.pinned || String(f.id) === "Home") {
+          const labelFont = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
           const line1 = label;
           const line2Key = pr.key ? String(pr.key) : "";
           const line2Val = formatTagValue(pr.value);
-          const m1 = ctx.measureText(line1);
-          const m2a = ctx.measureText(line2Key ? `${line2Key} ` : "");
-          const m2b = ctx.measureText(line2Val);
-          const m1w = m1.width > 0 ? m1.width : (line1.length * 7);
-          const m2aw = m2a.width > 0 ? m2a.width : ((line2Key ? line2Key.length + 1 : 0) * 7);
-          const m2bw = m2b.width > 0 ? m2b.width : (line2Val.length * 7);
+          const m1w = measureTextCached(line1, labelFont);
+          const m2aw = measureTextCached(line2Key ? `${line2Key} ` : "", labelFont);
+          const m2bw = measureTextCached(line2Val, labelFont);
           const padX = 8;
           const bw = Math.max(m1w, (m2aw + m2bw)) + padX*2;
           const bh = (line2Key || line2Val) ? 30 : 18;
@@ -6404,6 +6628,7 @@ class MapView {
           roundRect(ctx, bx, by, bw, bh, 9);
           ctx.fill();
           ctx.stroke();
+          ctx.font = labelFont;
           ctx.fillStyle = "#e8eef7";
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
@@ -6421,13 +6646,22 @@ class MapView {
           }
         }
         ctx.restore();
+      };
+
+      // First pass: PurpleAir
+      for (const f of fixed) {
+        if (f.purpleair) renderPbFixedMarker(f);
+      }
+      // Second pass: others
+      for (const f of fixed) {
+        if (!f.purpleair) renderPbFixedMarker(f);
       }
     }
 
     // Mobile emoji markers
     const nowMs = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
     if (this.traceMode || this.playbackMode) {
-      ctx.font = "22px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
+      ctx.font = "26px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
     }
@@ -6447,7 +6681,8 @@ class MapView {
       let flipX = pose.flipX;
       let speedMps = pose.speedMps;
       const opacity = (typeof pose.opacity === "number" && isFinite(pose.opacity)) ? pose.opacity : 1;
-      const key = keyFor("mobile", m.id);
+      if (!m._key) m._key = keyFor("mobile", m.id);
+      const key = m._key;
       const isSel = (this.selectedId === key);
       const debug = !!this._pbDebugPath;
       // In playback mode, show ghosted sensors if they have trail data (they were active in the past).
@@ -6465,7 +6700,7 @@ class MapView {
       const id = (m && m.id != null) ? String(m.id) : "";
 
       const emoji = m.emoji || "🚌";
-      const label = (m.name && m.name.length && String(m.name) !== String(m.id)) ? `${m.id} (${m.name})` : m.id;
+      const label = (m.name && m.name.length && String(m.name) !== String(m.id)) ? m.name : m.id;
       const color0 = safeHex(m.color);
       const color = isParked ? dimHex(color0, 0.65) : color0;
       // Base reading: worst AQI from the *full* sensor readings snapshot.
@@ -6498,6 +6733,9 @@ class MapView {
       const colorUse = dimmed ? desatHex(color, 0.25) : color;
       const prColorUse = dimmed ? desatHex(prColor, 0.25) : prColor;
 
+      // Expose the selected sensor's displayed pollutant key for legend sync
+      if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
+
       ctx.save();
       const baseAlpha = clamp(opacity, 0, 1);
       if (baseAlpha < 1) ctx.globalAlpha = ctx.globalAlpha * baseAlpha;
@@ -6513,27 +6751,34 @@ class MapView {
 
       // halo
       ctx.beginPath();
-      ctx.fillStyle = (this.selectedId === key) ? "rgba(16, 20, 28, 0.78)" : "rgba(16, 20, 28, 0.68)";
+      if (this.selectedId === key) {
+        ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
+        ctx.arc(spx, spy, 22 * liftScale, 0, Math.PI*2);
+        ctx.fill();
+        ctx.beginPath();
+      }
+      ctx.fillStyle = "rgba(16, 20, 28, 0.68)";
       ctx.arc(spx, spy, 18 * liftScale, 0, Math.PI*2);
       ctx.fill();
-      // Border matches AQI color
-      ctx.strokeStyle = safeHex(prColorUse);
-      ctx.lineWidth = 2.2;
+      // Border matches AQI color (selected gets brighter ring)
+      ctx.strokeStyle = (this.selectedId === key) ? "#5bb8f5" : safeHex(prColorUse);
+      ctx.lineWidth = (this.selectedId === key) ? 2.8 : 2.2;
       ctx.stroke();
 
-      // emoji
+      // emoji (pre-rendered to offscreen canvas; drawImage is ~10x faster than
+      // fillText with color-emoji fonts on iOS Safari)
+      const emojiC = getEmojiCanvas(emoji, 26);
+      const emojiDraw = 32; // draw larger than cache size to match native emoji glyph rendering
+      const emojiHalf = emojiDraw / 2;
       ctx.save();
-      ctx.font = "22px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
       if (this.traceMode || this.playbackMode) {
         ctx.translate(spx, spy);
         if (liftScale !== 1.0) ctx.scale(liftScale, liftScale);
         if (flipX) ctx.scale(-1, 1);
         ctx.rotate(angle);
-        ctx.fillText(emoji, 0, 0);
+        ctx.drawImage(emojiC, -emojiHalf, -emojiHalf, emojiDraw, emojiDraw);
       } else {
-        ctx.fillText(emoji, spx, spy);
+        ctx.drawImage(emojiC, spx - emojiHalf, spy - emojiHalf, emojiDraw, emojiDraw);
       }
       ctx.restore();
 
@@ -6546,8 +6791,9 @@ class MapView {
           const mph = Math.max(0, Math.round((isFinite(speedMps) ? speedMps : 0) * 2.236936));
           const txt = `${mph} mph`;
           ctx.save();
-          ctx.font = "10px -apple-system, system-ui, sans-serif";
-          const tw = ctx.measureText(txt).width;
+          const speedFont = "10px -apple-system, system-ui, sans-serif";
+          ctx.font = speedFont;
+          const tw = measureTextCached(txt, speedFont);
           const padX = 6;
           const bw = tw + padX * 2;
           const bh = 14;
@@ -6567,8 +6813,8 @@ class MapView {
         }
       }
 
-      // tiny label pill (show for selected marker OR when labels toggle is on)
-      const shouldShowLabel = this.showMobileLabels || isSel;
+      // tiny label pill (show for selected, pinned, or when labels toggle is on)
+      const shouldShowLabel = this.showMobileLabels || isSel || !!m.pinned;
       if (shouldShowLabel) {
         ctx.save();
         // Reset transform and alpha for label drawing
@@ -6576,13 +6822,10 @@ class MapView {
         const txt1 = label || id || "?";
         const txt2Key = pr.key ? String(pr.key) : "";
         const txt2Val = formatTagValue(pr.value);
-        ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
-        const m1 = ctx.measureText(txt1);
-        const m2a = ctx.measureText(txt2Key ? `${txt2Key} ` : "");
-        const m2b = ctx.measureText(txt2Val);
-        const m1w = m1.width > 0 ? m1.width : (txt1.length * 7);
-        const m2aw = m2a.width > 0 ? m2a.width : ((txt2Key ? txt2Key.length + 1 : 0) * 7);
-        const m2bw = m2b.width > 0 ? m2b.width : (txt2Val.length * 7);
+        const mobileLabelFont = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+        const m1w = measureTextCached(txt1, mobileLabelFont);
+        const m2aw = measureTextCached(txt2Key ? `${txt2Key} ` : "", mobileLabelFont);
+        const m2bw = measureTextCached(txt2Val, mobileLabelFont);
         const padX = 8;
         const bw = Math.max(m1w, (m2aw + m2bw)) + padX*2;
         const bh = (txt2Key || txt2Val) ? 30 : 18;
@@ -6594,6 +6837,7 @@ class MapView {
         roundRect(ctx, bx, by, bw, bh, 9);
         ctx.fill();
         ctx.stroke();
+        ctx.font = mobileLabelFont;
         ctx.fillStyle = "#e8eef7";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";

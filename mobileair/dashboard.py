@@ -13,6 +13,7 @@ from typing import Any
 from .aqi import (
     value_to_aqi,
     aqi_level,
+    color_for_value,
     filter_history_outliers,
     normalize_pollutant_key,
 )
@@ -372,9 +373,9 @@ def normalize_state_for_dashboard(
                         )
                     readings[str(pollutant_key)] = {
                         "value": v,
-                        "color": c or "#ffffff",
+                        "color": color_for_value(str(pollutant_key), v),
                         "history": filtered_vals,
-                        "history_colors": filtered_cols,
+                        "history_colors": [color_for_value(str(pollutant_key), hv) for hv in filtered_vals],
                         "scrubbed": len(removed_vals),
                     }
 
@@ -429,7 +430,7 @@ def normalize_state_for_dashboard(
                 if lat_f is None or lon_f is None:
                     continue
                 entry = fixed_by_sensor.setdefault(sensor_id, {"id": sensor_id, "lat": lat_f, "lon": lon_f, "readings": {}})
-                entry["readings"][str(pollutant_key)] = {"value": s_data.get("Value"), "color": s_data.get("ValueColor", "#cccccc")}
+                entry["readings"][str(pollutant_key)] = {"value": s_data.get("Value"), "color": color_for_value(str(pollutant_key), s_data.get("Value"))}
         
         for s_id, entry in fixed_by_sensor.items():
             name = custom_names.get(s_id) or ""

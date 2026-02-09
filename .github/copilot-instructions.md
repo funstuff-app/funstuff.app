@@ -44,6 +44,41 @@
 - Python-only:
   - `python -m unittest discover -s tests -p "test_*.py"`
 
+## Building & deploying
+
+### macOS native binary (PyInstaller)
+- Build: `python build_binary.py`
+  - **Incremental** — hashes all source files and skips the build if nothing changed since last successful build.
+  - `--force` rebuilds even if hashes match.
+  - `--clean` does a full clean rebuild (wipes PyInstaller cache).
+- Deploy locally: `./deploy_local_safe.sh`
+  - Copies `dist/mobileair_bundle/` to `~/.local/mobileair` via staging + atomic swap.
+  - Does **not** delete the target directory (safe for repeated runs).
+  - `--in-place` mode uses rsync without staging/swap.
+
+### Raspberry Pi (Python source deploy)
+No binary build needed — deploys Python source directly.
+
+- **Dusty Trails (primary Pi deploy):** `deploy/dustytrails/deploy_to_pi.sh`
+  - Stages files locally, patches for subpath, minifies JS (cached — only re-minifies changed files), then rsyncs to the Pi.
+  - `--files-only` syncs files without restarting the service.
+  - `--data-only` syncs only `~/.mobileair` data.
+  - `--skip-data` skips data sync for code-only updates.
+  - `--force` re-stages and re-minifies everything.
+- **Generic Pi deploy:** `copy_to_pi.sh <user@host>` + `sudo ./deploy_raspberry_pi.sh`
+  - `deploy_raspberry_pi.sh` auto-detects first run vs update — skips system package install, venv creation, and pip install on subsequent runs if nothing changed.
+  - `--files-only` syncs without restarting the service.
+  - `--restart-only` just restarts the service.
+  - `--setup` forces the first-time setup steps.
+
+### When do I need to rebuild?
+| What changed | Pi deploy | Local macOS binary |
+|---|---|---|
+| Python code | Just re-deploy | `python build_binary.py` + `./deploy_local_safe.sh` |
+| Dashboard JS/CSS/HTML | Just re-deploy | `python build_binary.py` + `./deploy_local_safe.sh` |
+| `requirements.txt` | Re-deploy (pip auto-skipped if unchanged) | `python build_binary.py --clean` + `./deploy_local_safe.sh` |
+| Nothing | No-ops / skips | No-ops |
+
 ## Frontend conventions
 - The dashboard is **framework-free**; do not introduce a bundler.
 - Map overlay/projection is implemented in JS (no map overlay library):

@@ -40,32 +40,34 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
   bottom: 0;
   left: 0;
   right: 0;
-  height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  padding-left: 14px;
+  padding: 4px 14px;
   background: rgba(11, 15, 20, 0.7);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   border-top: 1px solid rgba(255,255,255,0.04);
   z-index: 100;
+  font-size: 11px;
+  color: rgba(147,164,186,0.45);
+  text-align: center;
+  line-height: 1.3;
+  word-spacing: 1px;
+}
+
+.footerDisclaimer {
+  color: rgba(147,164,186,0.45);
 }
 
 .footerContent {
-  font-size: 11px;
   color: rgba(232, 238, 247, 0.35);
-  letter-spacing: 0.3px;
-  text-align: left;
 }
 
-.footerContent .contactLink {
+#appFooter .contactLink {
   color: rgba(232, 238, 247, 0.5);
   text-decoration: underline;
-  margin-left: 8px;
+  margin: 0 8px;
 }
 
-.footerContent .contactLink:hover {
+#appFooter .contactLink:hover {
   color: rgba(232, 238, 247, 0.7);
 }
 
@@ -312,7 +314,7 @@ aside, section { min-height: 0; }
 .playbackBar {
   position: absolute;
   left: 50%;
-  bottom: 42px;  /* 28px footer + 14px spacing */
+  bottom: 48px;  /* Footer height + spacing */
   transform: translateX(-50%);
   z-index: 12;
   display: flex;
@@ -765,6 +767,240 @@ button#pbPlay.isLive {
 /* Basemap */
 #tilesCanvas {
   filter: saturate(var(--map-saturate)) brightness(var(--map-brightness)) contrast(var(--map-contrast));
+}
+
+/* Legend panel (top-right overlay) */
+.legendPanel {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 20;
+  width: 280px;
+  background: rgba(12, 18, 28, 0.92);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 12px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transform: translateX(0);
+  opacity: 1;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+.legendPanel.hidden {
+  transform: translateX(20px);
+  opacity: 0;
+  pointer-events: none;
+}
+.legendHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px 6px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  flex-shrink: 0;
+}
+.legendTabs {
+  display: flex;
+  gap: 2px;
+}
+.legendTab {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 3px 7px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.legendTab:hover {
+  background: rgba(255,255,255,0.06);
+}
+.legendTab.active {
+  color: var(--text);
+  background: rgba(255,255,255,0.08);
+  border-color: rgba(255,255,255,0.12);
+}
+.legendUnit {
+  font-size: 10px;
+  color: rgba(147,164,186,0.7);
+  padding: 4px 12px 0 0;
+  text-align: right;
+  letter-spacing: 0.2px;
+}
+.legendBody {
+  padding: 4px 6px 8px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.legendRow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 22px;
+  padding: 0;
+}
+/* Left zone: narrow anchor for pill origin. Pills overflow to the right. */
+.legendLeftZone {
+  position: relative;
+  width: 60px;
+  flex-shrink: 0;
+  height: 18px;
+  overflow: visible;
+}
+/* Pill-shaped bar: absolutely positioned, overflows leftZone */
+.legendPill {
+  position: absolute;
+  left: 0;
+  top: 1px;
+  height: 16px;
+  min-width: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(0,0,0,0.3);
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset;
+}
+/* Range text: sits on top of pills */
+.legendRange {
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+  width: 68px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 4px;
+}
+.legendRangeBg {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  color: rgba(220,228,240,0.95);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  text-shadow: 0 0 4px rgba(12,18,28,0.9), 0 0 2px rgba(12,18,28,1);
+}
+.legendLo {
+  display: inline-block;
+  min-width: 22px;
+  text-align: right;
+}
+.legendDash {
+  display: inline-block;
+  width: 14px;
+  text-align: center;
+  color: rgba(147,164,186,0.5);
+}
+.legendHi {
+  display: inline-block;
+  min-width: 22px;
+  text-align: left;
+}
+/* Bracket column: sits on top of pills */
+.legendBracket {
+  position: relative;
+  z-index: 1;
+  width: 110px;
+  flex-shrink: 0;
+  min-height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-left: 6px;
+}
+.legendBracketTop,
+.legendBracketMid,
+.legendBracketBot,
+.legendBracketOnly {
+  position: relative;
+  z-index: 1;
+  width: 110px;
+  flex-shrink: 0;
+  min-height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-left: 6px;
+}
+/* Vertical line */
+.legendBracketTop::before,
+.legendBracketMid::before,
+.legendBracketBot::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  width: 1px;
+  background: rgba(147,164,186,0.28);
+}
+.legendBracketTop::before {
+  top: 50%;
+  bottom: 0;
+}
+.legendBracketMid::before {
+  top: 0;
+  bottom: 0;
+}
+.legendBracketBot::before {
+  top: 0;
+  bottom: 50%;
+}
+/* Horizontal serif ticks */
+.legendBracketTop::after,
+.legendBracketBot::after,
+.legendBracketOnly::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  width: 7px;
+  height: 1px;
+  background: rgba(147,164,186,0.28);
+  top: 50%;
+}
+/* Category label text */
+.legendCatLabel {
+  font-size: 9px;
+  color: rgba(147,164,186,0.7);
+  white-space: nowrap;
+  text-align: right;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  padding-right: 2px;
+  text-shadow: 0 0 4px rgba(12,18,28,0.9), 0 0 2px rgba(12,18,28,1);
+}
+.legendToggleBtn {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 19;
+  width: 32px;
+  height: 32px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(12, 18, 28, 0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: var(--muted);
+  font-size: 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, opacity 0.2s;
+  opacity: 1;
+}
+.legendToggleBtn:hover {
+  background: rgba(30, 40, 55, 0.95);
+}
+.legendToggleBtn.hidden {
+  opacity: 0;
+  pointer-events: none;
 }
 
 /* Sidebar panel (integrated, overlays full-bleed map) */
