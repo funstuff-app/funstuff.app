@@ -60,6 +60,8 @@ function parseUtcMs(t) {
 function formatTagValue(v) {
   if (v == null) return "";
   if (typeof v === "number" && isFinite(v)) {
+    // If the value is already an integer, display without decimals
+    if (Number.isInteger(v)) return String(v);
     // Show 1 decimal place for values < 10, integers for larger values
     if (v < 10) return v.toFixed(1);
     return String(Math.round(v));
@@ -68,6 +70,7 @@ function formatTagValue(v) {
   if (!s) return "";
   const n = Number(s);
   if (isFinite(n)) {
+    if (Number.isInteger(n)) return String(n);
     if (n < 10) return n.toFixed(1);
     return String(Math.round(n));
   }

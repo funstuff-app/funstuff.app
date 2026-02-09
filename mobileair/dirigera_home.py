@@ -39,10 +39,13 @@ def get_home_sensor_entry() -> dict[str, Any] | None:
     """Get the home sensor as a fixed sensor entry."""
     pm25 = get_pm25()
     
-    from .aqi import value_to_aqi, aqi_level
+    from .aqi import value_to_aqi, color_for_value
     
     aqi = value_to_aqi("pm2.5", pm25)
-    color = aqi_level(aqi)["color"]
+    color = color_for_value("pm2.5", pm25)
+    
+    # Format value: integers without decimals, floats with decimals
+    display_val = int(pm25) if pm25 == int(pm25) else pm25
     
     return {
         "id": "Home",
@@ -53,13 +56,13 @@ def get_home_sensor_entry() -> dict[str, Any] | None:
         "lon": HOME_LON,
         "readings": {
             "PM25": {
-                "value": pm25,
+                "value": display_val,
                 "color": color,
             }
         },
         "color": color,
         "primary_key": "PM25",
-        "primary_value": pm25,
+        "primary_value": display_val,
         "primary_color": color,
         "primary_aqi": aqi,
     }

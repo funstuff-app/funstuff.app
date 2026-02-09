@@ -62,7 +62,7 @@ function main() {
   const legacyShowLabels = localStorage.getItem(SHOW_LABELS_LEGACY_KEY);
   // Mobile labels default OFF, fixed labels default ON
   map.showMobileLabels = localStorage.getItem(SHOW_MOBILE_LABELS_KEY) === "true";
-  map.showFixedLabels = localStorage.getItem(SHOW_FIXED_LABELS_KEY) !== "false";
+  map.showFixedLabels = localStorage.getItem(SHOW_FIXED_LABELS_KEY) === "true";
 
   function updateSidebarVisibility() {
     if (sidebarEl) sidebarEl.classList.toggle("hidden", !sidebarOpen);
@@ -112,6 +112,218 @@ function main() {
     sidebarCloseEl.addEventListener("click", () => {
       sidebarOpen = false;
       updateSidebarVisibility();
+    });
+  }
+
+  // ── Color legend panel ──────────────────────────────────────────
+  const legendEl = document.getElementById("legend");
+  const legendCloseEl = document.getElementById("legendClose");
+  const legendToggleEl = document.getElementById("legendToggle");
+  const legendBodyEl = document.getElementById("legendBody");
+  const legendUnitEl = document.getElementById("legendUnit");
+  const LEGEND_OPEN_KEY = "dusty_legend_open";
+  const LEGEND_TAB_KEY = "dusty_legend_tab";
+  let legendOpen = localStorage.getItem(LEGEND_OPEN_KEY) !== "false";
+  let legendTab = localStorage.getItem(LEGEND_TAB_KEY) || "pm25";
+  let userLegendTab = legendTab; // what the user manually chose (restored on deselect)
+  let legendUserOverride = false; // true when user manually changed tab while marker selected
+
+  /** Map a pollutant key (PM25, PM10, OZNE, O3, etc.) to a legend tab id. */
+  function pollutantToLegendTab(key) {
+    if (!key) return null;
+    const k = key.toUpperCase();
+    if (k === "PM25" || k === "PM2.5") return "pm25";
+    if (k === "PM10") return "pm10";
+    if (k === "OZNE" || k === "OZONE" || k === "O3") return "o3";
+    return null;
+  }
+
+  /** Switch legend tab to match a selected sensor's primary reading. */
+  function syncLegendToSensor(sensor) {
+    if (!sensor) return;
+    const pr = primaryReadingForSensor(sensor);
+    const tab = pollutantToLegendTab(pr && pr.key);
+    if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
+      legendTab = tab;
+      buildLegend();
+    }
+  }
+
+  /** Sync legend tab to whatever pollutant the map is currently showing on the selected marker. */
+  function syncLegendToMapSelection() {
+    if (!map || !selectedId || legendUserOverride) return;
+    const key = map.getSelectedPollutantKey();
+    const tab = pollutantToLegendTab(key);
+    if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
+      legendTab = tab;
+      buildLegend();
+    }
+  }
+
+  /** Revert legend tab to the user's manual choice. */
+  function revertLegendTab() {
+    if (legendTab !== userLegendTab && LEGEND_DATA[userLegendTab]) {
+      legendTab = userLegendTab;
+      buildLegend();
+    }
+  }
+
+  const LEGEND_DATA = {
+    pm25: {
+      unit: "\u00b5g/m\u00b3",
+      // EPA AQI standard – colors match server _get_aqi_color
+      // Sub-gradients within Good match Utah AQ API trail colors
+      // EPA 2024 PM2.5 (24-hr) breakpoints with clean sub-gradients within Good.
+      // Good: 0–9.0, Moderate: 9.1–35.4, USG: 35.5–55.4, Unhealthy: 55.5–125.4,
+      // V.Unhealthy: 125.5–225.4, Hazardous: 225.5+
+      entries: [
+        { color: "#00FFFF", lo: 0,   hi: 2,   w: 12 },
+        { color: "#00CCFF", lo: 2,   hi: 5,   w: 12 },
+        { color: "#00E400", lo: 5,   hi: 9,   w: 12,  label: "Good" },
+        { color: "#FFFF00", lo: 9,   hi: 35,  w: 18,  label: "Moderate" },
+        { color: "#FF7E00", lo: 35,  hi: 55,  w: 29,  label: "Sensitive Groups" },
+        { color: "#FF0000", lo: 55,  hi: 125, w: 65,  label: "Unhealthy" },
+        { color: "#8F3F97", lo: 125, hi: 225, w: 117, label: "Very Unhealthy" },
+        { color: "#7E0023", lo: 225, hi: null, w: 260, label: "Hazardous" },
+      ],
+    },
+    pm10: {
+      unit: "\u00b5g/m\u00b3",
+      // Pill widths proportional to concentration within PM10's own scale
+      // (~600 µg/m³ max, 260px). PM10 harm rises more steadily than PM2.5.
+      entries: [
+        { color: "#00FFFF", lo: 0,   hi: 15,  w: 12 },
+        { color: "#00CCFF", lo: 15,  hi: 30,  w: 13 },
+        { color: "#0099FF", lo: 30,  hi: 40,  w: 17 },
+        { color: "#00E400", lo: 40,  hi: 54,  w: 23,  label: "Good" },
+        { color: "#FFFF00", lo: 54,  hi: 154, w: 66,  label: "Moderate" },
+        { color: "#FF7E00", lo: 154, hi: 254, w: 110, label: "Sensitive Groups" },
+        { color: "#FF0000", lo: 254, hi: 354, w: 153, label: "Unhealthy" },
+        { color: "#8F3F97", lo: 354, hi: 424, w: 183, label: "Very Unhealthy" },
+        { color: "#7E0023", lo: 424, hi: null, w: 260, label: "Hazardous" },
+      ],
+    },
+    o3: {
+      unit: "ppb",
+      entries: [
+        // Pill widths proportional to concentration within O3's own scale
+        // (~400 ppb max, 260px). Ozone climbs gradually then jumps.
+        { color: "#00CCFF", lo: 0,   hi: 15,  w: 12 },
+        { color: "#0099FF", lo: 15,  hi: 25,  w: 16 },
+        { color: "#009900", lo: 25,  hi: 35,  w: 23 },
+        { color: "#006600", lo: 35,  hi: 54,  w: 35,  label: "Good" },
+        { color: "#FFFF00", lo: 54,  hi: 70,  w: 46,  label: "Moderate" },
+        { color: "#FF7E00", lo: 70,  hi: 85,  w: 55,  label: "Sensitive Groups" },
+        { color: "#FF0000", lo: 85,  hi: 105, w: 68,  label: "Unhealthy" },
+        { color: "#8F3F97", lo: 105, hi: 200, w: 130, label: "Very Unhealthy" },
+        { color: "#7E0023", lo: 200, hi: null, w: 260, label: "Hazardous" },
+      ],
+    },
+  };
+
+  function buildLegend() {
+    if (!legendBodyEl) return;
+    const data = LEGEND_DATA[legendTab] || LEGEND_DATA.pm25;
+    if (legendUnitEl) legendUnitEl.textContent = data.unit;
+    legendBodyEl.innerHTML = "";
+
+    const entries = data.entries;
+
+    // Assign bracket category: walk backwards from labeled entries
+    const catAssign = new Array(entries.length).fill("");
+    let currentCat = "";
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].label) currentCat = entries[i].label;
+      catAssign[i] = currentCat;
+    }
+
+    // Build dimension-line groups
+    const dimGroups = [];
+    let groupStart = 0;
+    for (let i = 0; i < entries.length; i++) {
+      if (i === entries.length - 1 || catAssign[i] !== catAssign[i + 1]) {
+        if (catAssign[i]) {
+          dimGroups.push({ name: catAssign[i], startIdx: groupStart, endIdx: i });
+        }
+        groupStart = i + 1;
+      }
+    }
+
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      const barW = e.w;
+      const loText = e.hi != null ? `${e.lo}` : `${e.lo}+`;
+      const hiText = e.hi != null ? `${e.hi}` : "";
+
+      const row = document.createElement("div");
+      row.className = "legendRow";
+
+      const pillHtml = `<div class="legendPill" style="width:${barW}px;background:${e.color};border-color:${darkenHex(e.color,0.55)}"></div>`;
+      const rangeInner = `<span class="legendLo">${loText}</span>` +
+        (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
+      const leftZone = `<div class="legendLeftZone">${pillHtml}</div><div class="legendRange"><div class="legendRangeBg">${rangeInner}</div></div>`;
+
+      // Bracket
+      let bracketHtml;
+      const g = dimGroups.find(g => i >= g.startIdx && i <= g.endIdx);
+      if (g) {
+        const isFirst = (i === g.startIdx);
+        const isLast = (i === g.endIdx);
+        const isOnly = (g.startIdx === g.endIdx);
+        let cls = "legendBracket";
+        if (isOnly) cls += " legendBracketOnly";
+        else if (isFirst) cls += " legendBracketTop";
+        else if (isLast) cls += " legendBracketBot";
+        else cls += " legendBracketMid";
+        const midIdx = Math.floor((g.startIdx + g.endIdx) / 2);
+        const lbl = (i === midIdx) ? `<span class="legendCatLabel">${g.name}</span>` : "";
+        bracketHtml = `<div class="${cls}">${lbl}</div>`;
+      } else {
+        bracketHtml = `<div class="legendBracket"></div>`;
+      }
+
+      row.innerHTML = leftZone + bracketHtml;
+      legendBodyEl.appendChild(row);
+    }
+
+    const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
+    for (const t of tabs) {
+      t.classList.toggle("active", t.dataset.legend === legendTab);
+    }
+  }
+
+  function updateLegendVisibility() {
+    if (legendEl) legendEl.classList.toggle("hidden", !legendOpen);
+    if (legendToggleEl) legendToggleEl.classList.toggle("hidden", legendOpen);
+    localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
+  }
+
+  buildLegend();
+  updateLegendVisibility();
+
+  // Legend tab clicks
+  if (legendEl) {
+    for (const tab of legendEl.querySelectorAll(".legendTab")) {
+      tab.addEventListener("click", () => {
+        legendTab = tab.dataset.legend || "pm25";
+        userLegendTab = legendTab;
+        legendUserOverride = !!selectedId; // override auto-sync while a marker is selected
+        localStorage.setItem(LEGEND_TAB_KEY, legendTab);
+        buildLegend();
+      });
+    }
+  }
+
+  if (legendCloseEl) {
+    legendCloseEl.addEventListener("click", () => {
+      legendOpen = false;
+      updateLegendVisibility();
+    });
+  }
+  if (legendToggleEl) {
+    legendToggleEl.addEventListener("click", () => {
+      legendOpen = true;
+      updateLegendVisibility();
     });
   }
 
@@ -324,10 +536,20 @@ function main() {
     const isDark = isThemeDark(themeKey);
     const key = isDark ? THEME_STORAGE_KEY_DARK : THEME_STORAGE_KEY_LIGHT;
     localStorage.setItem(key, themeKey);
+    // Also save as the last-active theme so launch doesn't override user choice
+    localStorage.setItem("mobileair.mapTheme.last", themeKey);
+  }
+
+  function getInitialTheme() {
+    // On launch, prefer the last theme the user actively selected.
+    // Only fall back to system-mode default if user never chose a theme.
+    const last = localStorage.getItem("mobileair.mapTheme.last");
+    if (last && TILE_THEMES[last]) return last;
+    return getSavedThemeForCurrentMode();
   }
 
   // Track current theme for menu updates
-  let _currentThemeKey = getSavedThemeForCurrentMode();
+  let _currentThemeKey = getInitialTheme();
 
   function applyTheme(themeKey, skipSubmenuUpdate) {
     _currentThemeKey = themeKey;
@@ -350,8 +572,8 @@ function main() {
       themeEl.appendChild(opt);
     }
 
-    // Load saved theme for current system mode
-    const initialTheme = getSavedThemeForCurrentMode();
+    // Load saved theme (prefers last user selection over system mode)
+    const initialTheme = getInitialTheme();
     applyTheme(initialTheme, true); // skip submenu update on init (not created yet)
 
     themeEl.addEventListener("change", () => {
@@ -366,8 +588,8 @@ function main() {
       updateThemeSubmenu();
     });
   } else {
-    // Fallback (no UI) - use system preference
-    const fallbackTheme = getSavedThemeForCurrentMode();
+    // Fallback (no UI) - prefer last user selection
+    const fallbackTheme = getInitialTheme();
     _currentThemeKey = fallbackTheme;
     const fallbackT = TILE_THEMES[fallbackTheme];
     applyThemeAndFilters(fallbackTheme, fallbackT.defaultDim ?? 70, Math.round(100 * (fallbackT.filter?.saturate ?? 1.30)));
@@ -416,17 +638,29 @@ function main() {
 
   window.__selectSensor = (id, opts = {}) => {
     const fitTrail = !!opts.fitTrail;
+    const fromPanel = !!opts.fromPanel;  // True only when selected from sidebar, not from map
+    
     // Toggle: clicking the selected sensor again deselects.
     if (id && selectedId === id) {
       selectedId = null;
+      legendUserOverride = false;
       if (map && typeof map.cancelSelectionOrchestration === "function") map.cancelSelectionOrchestration();
       map.setSelected(null);
+      legendTab = "pm25";
+      userLegendTab = "pm25";
+      buildLegend();
       renderLists(window.__lastState || { mobile: [], fixed: [] }, selectedId);
       renderDetails(window.__lastState || { mobile: [] }, selectedId);
       return;
     }
 
     selectedId = id || null;
+    legendUserOverride = false; // reset override on new selection
+    if (!selectedId) {
+      legendTab = "pm25";
+      userLegendTab = "pm25";
+      buildLegend();
+    }
     map.setSelected(selectedId);
 
     const st = window.__lastState || { mobile: [], fixed: [] };
@@ -434,25 +668,34 @@ function main() {
     let item = null;
     if (sel && sel.type === "mobile") item = (Array.isArray(st.mobile) ? st.mobile : []).find(x => x.id === sel.id) || null;
     if (sel && sel.type === "fixed") item = (Array.isArray(st.fixed) ? st.fixed : []).find(x => x.id === sel.id) || null;
+
+    // Sync legend tab to selected marker's displayed pollutant
+    // Use map's render-resolved key (set during drawOverlay) which matches the label
+    syncLegendToMapSelection();
+    
+    // Center camera when selected from sidebar (any sensor type), or for mobile from map click with cmd+click for fit
     if (item && isFinite(Number(item.lat)) && isFinite(Number(item.lon))) {
-      // Default: center on the marker.
-      // Cmd+click: fit to breadcrumb path bbox (mobile only).
-      if (fitTrail && sel?.type === "mobile" && Array.isArray(item.trail) && item.trail.length >= 2) {
-        map.fitTrailBounds(item.trail, { animate: true });
-      } else if (sel?.type === "mobile" && map.playbackMode) {
-        const pose = map._mobilePoseForRender(item, performance.now());
-        if (pose && isFinite(Number(pose.lat)) && isFinite(Number(pose.lon))) {
-          map.centerOn(Number(pose.lat), Number(pose.lon), { animate: true });
+      const shouldCenter = fromPanel || (sel?.type === "mobile");
+      if (shouldCenter) {
+        // Default: center on the marker.
+        // Cmd+click: fit to breadcrumb path bbox (mobile only).
+        if (fitTrail && sel?.type === "mobile" && Array.isArray(item.trail) && item.trail.length >= 2) {
+          map.fitTrailBounds(item.trail, { animate: true });
+        } else if (map.playbackMode) {
+          const pose = map._mobilePoseForRender(item, performance.now());
+          if (pose && isFinite(Number(pose.lat)) && isFinite(Number(pose.lon))) {
+            map.centerOn(Number(pose.lat), Number(pose.lon), { animate: true });
+          } else {
+            map.centerOn(Number(item.lat), Number(item.lon), { animate: true });
+          }
+        } else if (sel?.type === "mobile" && typeof map.orchestrateSelectionToLatest === "function") {
+          // Polished selection: focus camera on latest data location and keep trace marker in sync.
+          map.orchestrateSelectionToLatest(item, { fitTrail: false });
         } else {
           map.centerOn(Number(item.lat), Number(item.lon), { animate: true });
         }
-      } else if (sel?.type === "mobile" && typeof map.orchestrateSelectionToLatest === "function") {
-        // Polished selection: focus camera on latest data location and keep trace marker in sync.
-        map.orchestrateSelectionToLatest(item, { fitTrail: false });
-      } else {
-        map.centerOn(Number(item.lat), Number(item.lon), { animate: true });
+        saveViewSoon();
       }
-      saveViewSoon();
     }
     renderLists(st, selectedId);
     renderDetails(st, selectedId);
@@ -461,7 +704,11 @@ function main() {
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       selectedId = null;
+      legendUserOverride = false;
       map.setSelected(null);
+      legendTab = "pm25";
+      userLegendTab = "pm25";
+      buildLegend();
       renderLists(window.__lastState || { mobile: [], fixed: [] }, selectedId);
       renderDetails(window.__lastState || { mobile: [] }, selectedId);
     }
@@ -1336,6 +1583,9 @@ function main() {
       updateSidebarPlaybackValues();
       _pbLastUiPerf = now;
     }
+
+    // Sync legend tab to selected marker's displayed pollutant (changes during scrub)
+    syncLegendToMapSelection();
 
     // Keep loop running if there's any motion or pending state
     const markerInertiaActive = (typeof map._hasPbMarkerInertia === "function") ? !!map._hasPbMarkerInertia() : false;
@@ -2545,6 +2795,9 @@ function main() {
 
       renderLists(st, selectedId);
       renderDetails(st, selectedId);
+
+      // Sync legend tab to selected marker's current pollutant
+      syncLegendToMapSelection();
 
       // Keep DVR UI in sync even when the RAF loop is idle.
       if (map.playbackMode) {

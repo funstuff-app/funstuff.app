@@ -89,6 +89,21 @@
           <canvas id="tilesCanvas"></canvas>
           <canvas id="overlayCanvas"></canvas>
 
+          <!-- Legend panel (top-right, overlays map) -->
+          <aside id="legend" class="legendPanel">
+            <div class="legendHeader">
+              <div class="legendTabs" role="tablist">
+                <button class="legendTab active" data-legend="pm25" type="button">PM2.5</button>
+                <button class="legendTab" data-legend="pm10" type="button">PM10</button>
+                <button class="legendTab" data-legend="o3" type="button">O₃</button>
+              </div>
+              <button id="legendClose" class="sidebarClose" type="button" title="Close legend" aria-label="Close legend">✕</button>
+            </div>
+            <div class="legendUnit" id="legendUnit">µg/m³</div>
+            <div class="legendBody" id="legendBody"></div>
+          </aside>
+          <button id="legendToggle" class="legendToggleBtn" type="button" title="Show color legend" aria-label="Show color legend">📊</button>
+
           <!-- Sidebar panel (integrated, overlays map) -->
           <aside id="sidebar" class="sidebarPanel">
             <div class="sidebarHeader">
@@ -130,9 +145,10 @@
         </div>
       </section>
     </main>
-    
     <footer id="appFooter">
-      <div class="footerContent">©2026 Funstuff.wtf <a href="mailto:matt@funstuff.app" class="contactLink">Contact Me</a></div>
+      <span class="footerContent">©2026 Funstuff.wtf</span>
+      <a href="mailto:matt@funstuff.app" class="contactLink">Contact Me</a>
+      <span class="footerDisclaimer">Not quality-assured, as-is without warranty. Not for medical/regulatory use. No university affiliation.</span>
     </footer>
   </div>
 

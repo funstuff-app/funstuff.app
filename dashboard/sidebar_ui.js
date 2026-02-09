@@ -12,8 +12,8 @@ function roundRect(ctx, x, y, w, h, r) {
 function generateItemHTML(item, type, order) {
   const isGhost = !!item.ghosted;
   const isParked = !!item.parked;
-  const emoji = item.emoji || (type === "mobile" ? "🚌" : "📍");
-  const nameText = item.name ? `${item.id} (${item.name})` : item.id;
+  const emoji = item.purpleair ? "🟣" : (item.emoji || (type === "mobile" ? "🚌" : "📍"));
+  const nameText = (item.name && String(item.name) !== String(item.id)) ? item.name : item.id;
   
   let pinText = "";
   if (type === "mobile") {
@@ -72,7 +72,7 @@ function reconcileList(container, items, type, selectedId, order) {
       el.dataset.id = id;
       el.addEventListener("click", (e) => {
         const isMobile = (type === "mobile");
-        window.__selectSensor(k, { fitTrail: isMobile && !!e.metaKey });
+        window.__selectSensor(k, { fitTrail: isMobile && !!e.metaKey, fromPanel: true });
       });
       container.appendChild(el);
     } else {
@@ -96,39 +96,62 @@ function reconcileList(container, items, type, selectedId, order) {
  * Update sidebar reading values during playback without full re-render.
  * This is called from the playback loop to show interpolated values at current playback time.
  */
+// Cached DOM element map — avoids ~90 querySelector calls per update.
+// Invalidated when sidebar re-renders (see renderLists).
+var _sidebarElCache = null;
+
+function _buildSidebarCache() {
+  const listMobileEl = document.getElementById("sensorListMobile");
+  if (!listMobileEl) return null;
+  const cache = new Map();
+  for (const itemEl of listMobileEl.querySelectorAll("[data-id]")) {
+    const id = itemEl.getAttribute("data-id");
+    const row2 = itemEl.querySelector(".row2");
+    if (!row2) continue;
+    const readings = [];
+    for (const rEl of row2.querySelectorAll(".reading")) {
+      const kEl = rEl.querySelector(".k");
+      const vEl = rEl.querySelector(".v");
+      if (kEl && vEl) readings.push({ k: kEl.textContent, vEl });
+    }
+    cache.set(id, { itemEl, readings });
+  }
+  return cache;
+}
+
 function updateSidebarPlaybackValues() {
   const map = window.__map;
   if (!map || !map.playbackMode) return;
-  
-  const listMobileEl = document.getElementById("sensorListMobile");
-  if (!listMobileEl) return;
-  
+
   const state = map._historicalMode ? window._historicalState : window.__lastState;
   if (!state || !Array.isArray(state.mobile)) return;
-  
+
   const t = map.getPlaybackTimeMs();
   if (t == null || !isFinite(t)) return;
-  
+
   // At the live edge, use live values - don't update readings
   const atEnd = map.isPlaybackAtEnd(100);
   if (atEnd) return;
-  
+
+  // Build or reuse cached DOM references
+  if (!_sidebarElCache) _sidebarElCache = _buildSidebarCache();
+  if (!_sidebarElCache) return;
+
   for (const m of state.mobile) {
     if (!m || m.id == null) continue;
-    
-    // Find the DOM element for this sensor
-    const itemEl = listMobileEl.querySelector(`[data-id="${m.id}"]`);
-    if (!itemEl) continue;
-    
+
+    const cached = _sidebarElCache.get(String(m.id));
+    if (!cached) continue;
+
     // Always show sensor - never hide
-    if (itemEl.classList.contains("hidden")) {
-      itemEl.classList.remove("hidden");
+    if (cached.itemEl.classList.contains("hidden")) {
+      cached.itemEl.classList.remove("hidden");
     }
-    
+
     // Get playback points for this sensor
     const pts = map._playbackPtsById.get(String(m.id));
     if (!pts || !pts.length) continue;
-    
+
     // Binary search for current point
     let idxHi = 1;
     const tMin = pts[0].tMs;
@@ -144,21 +167,12 @@ function updateSidebarPlaybackValues() {
       }
       idxHi = lo;
     }
-    
+
     const currentPt = pts[idxHi];
     if (!currentPt || !currentPt.readings) continue;
-    
-    // Update the reading values in the DOM
-    const row2 = itemEl.querySelector(".row2");
-    if (!row2) continue;
-    
-    const readingEls = row2.querySelectorAll(".reading");
-    for (const rEl of readingEls) {
-      const kEl = rEl.querySelector(".k");
-      const vEl = rEl.querySelector(".v");
-      if (!kEl || !vEl) continue;
-      
-      const k = kEl.textContent;
+
+    // Update the reading values in the DOM using cached element references
+    for (const { k, vEl } of cached.readings) {
       const r = currentPt.readings[k];
       if (r && r.value != null) {
         const newVal = String(r.value);
@@ -175,6 +189,7 @@ function updateSidebarPlaybackValues() {
 }
 
 function renderLists(state, selectedId) {
+  _sidebarElCache = null; // Invalidate cached DOM refs — list is about to be rebuilt
   const listMobileEl = document.getElementById("sensorListMobile");
   const listFixedEl = document.getElementById("sensorListFixed");
 

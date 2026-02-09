@@ -381,6 +381,10 @@ class AppState:
     # Wind/weather data from AirNow
     wind_data: dict[str, Any] = field(default_factory=dict)
 
+    # PurpleAir cached data
+    purpleair_sensors: list[dict[str, Any]] = field(default_factory=list)
+    purpleair_last_fetch: float = 0.0
+
     # Optional offline road graph cache for map-matching.
     road_graph: Any | None = None
     
@@ -698,7 +702,7 @@ def _accumulate_fixed_history_from_raw(app_state: AppState, fixed_raw: dict[str,
                 continue
             
             value = s_data.get("Value")
-            color = s_data.get("ValueColor", "#cccccc")
+            color = _get_aqi_color(str(pollutant_key), value)
             time_utc = s_data.get("TimeUTC")
             
             if value is not None:
@@ -724,7 +728,8 @@ def _accumulate_home_sensor_reading(app_state: AppState, st: dict[str, Any]) -> 
             return
         
         value = pm25.get("value")
-        color = pm25.get("color", "#cccccc")
+        # Always recompute color from value (don't trust stored color)
+        color = _get_aqi_color("PM25", value) if value is not None else "#cccccc"
         time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         
         if value is not None:
@@ -766,15 +771,18 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
             
             for entry in hist_entries:
                 val = entry.get("val")
-                col = entry.get("col", "#cccccc")
                 t = entry.get("time")
                 
-                # Try to parse value as float for consistency
+                # Parse value; preserve integer-ness (e.g. Home sensor reports ints)
                 try:
-                    history_values.append(float(val) if val is not None else None)
+                    fval = float(val) if val is not None else None
+                    if fval is not None and fval == int(fval):
+                        fval = int(fval)
                 except (ValueError, TypeError):
-                    history_values.append(val)
-                history_colors.append(col)
+                    fval = None
+                history_values.append(fval)
+                # Recompute color from value (stored colors may be stale)
+                history_colors.append(_get_aqi_color(pollutant, fval) if fval is not None else "#cccccc")
                 history_times.append(t)
             
             reading["history"] = history_values
@@ -1105,31 +1113,43 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
                 for entry in filtered_hist:
                     val = entry.get("val")
                     try:
-                        history_values.append(float(val) if val is not None else None)
+                        fval = float(val) if val is not None else None
+                        if fval is not None and fval == int(fval):
+                            fval = int(fval)
                     except (ValueError, TypeError):
-                        history_values.append(None)
-                    history_colors.append(entry.get("col", "#cccccc"))
+                        fval = None
+                    history_values.append(fval)
+                    # Recompute color from value (stored colors may be stale)
+                    history_colors.append(_get_aqi_color("PM25", fval) if fval is not None else "#cccccc")
                     history_times.append(entry.get("time"))
                 
                 # Use last historical value as display value (not current)
                 last_val = history_values[-1] if history_values else None
-                last_col = history_colors[-1] if history_colors else "#cccccc"
+                last_col = _get_aqi_color("PM25", last_val) if last_val is not None else "#cccccc"
+                # Format value: integers without decimals, floats with decimals
+                display_val = int(last_val) if last_val is not None and last_val == int(last_val) else last_val
                 
                 home_entry = {
                     "id": "Home",
                     "name": "Home",
                     "pinned": True,
+                    "emoji": "\U0001f3f0",
                     "lat": 40.7608,  # Default SLC coords
                     "lon": -111.891,
                     "readings": {
                         "PM25": {
-                            "value": last_val,
+                            "value": display_val,
                             "color": last_col,
                             "history": history_values,
                             "history_colors": history_colors,
                             "history_times": history_times,
                         }
                     },
+                    "color": last_col,
+                    "primary_key": "PM25",
+                    "primary_value": display_val,
+                    "primary_color": last_col,
+                    "primary_aqi": None,
                 }
     
     # If no data from fixed_history, try loading from a saved snapshot
@@ -1149,6 +1169,94 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
         if "fixed" not in result:
             result["fixed"] = []
         result["fixed"].insert(0, home_entry)
+    
+    # Reconstruct PurpleAir sensors from fixed_history for the requested date
+    # (NOT from live data — that would show current readings while scrubbing the past)
+    if app_state:
+        if "fixed" not in result:
+            result["fixed"] = []
+        fixed_list = result["fixed"]
+        # Remove any stale PurpleAir entries
+        fixed_list = [f for f in fixed_list if not f.get("purpleair")]
+        
+        for sensor_id, pollutants in app_state.fixed_history.items():
+            if not sensor_id.startswith("PA_"):
+                continue
+            pm25_hist = pollutants.get("PM25", [])
+            if not pm25_hist:
+                continue
+            # Filter to requested date
+            day_entries = [e for e in pm25_hist if e.get("time") and e["time"].startswith(date_str)]
+            if not day_entries:
+                continue
+            # Use last entry for this date as the display value
+            last = day_entries[-1]
+            val_str = last.get("val")
+            try:
+                pm25_val = float(val_str) if val_str is not None else None
+            except (TypeError, ValueError):
+                pm25_val = None
+            if pm25_val is None:
+                continue
+            color = _get_aqi_color("PM25", pm25_val)
+            # Find lat/lon from current purpleair_sensors (positions don't change)
+            lat, lon = None, None
+            sensor_idx = sensor_id[3:]  # strip "PA_"
+            for s in app_state.purpleair_sensors:
+                if str(s.get("sensor_index", "")) == sensor_idx:
+                    lat = s.get("latitude")
+                    lon = s.get("longitude")
+                    break
+            if lat is None or lon is None:
+                continue
+            # Build history arrays
+            history_values = []
+            history_colors = []
+            history_times = []
+            for entry in day_entries:
+                v = entry.get("val")
+                try:
+                    fv = float(v) if v is not None else None
+                    if fv is not None and fv == int(fv):
+                        fv = int(fv)
+                except (TypeError, ValueError):
+                    fv = None
+                history_values.append(fv)
+                history_colors.append(_get_aqi_color("PM25", fv) if fv is not None else "#cccccc")
+                history_times.append(entry.get("time"))
+            display_val = round(pm25_val, 1)
+            # Find name from current sensors
+            name = sensor_id
+            for s in app_state.purpleair_sensors:
+                if str(s.get("sensor_index", "")) == sensor_idx:
+                    name = s.get("name", sensor_id)
+                    name = re.sub(r'\s+powered by UTOPIA(?:\s+Fiber)?', '', name).strip()
+                    break
+            fixed_list.append({
+                "id": sensor_id,
+                "name": name,
+                "pinned": False,
+                "emoji": "",
+                "lat": lat,
+                "lon": lon,
+                "readings": {
+                    "PM25": {
+                        "value": display_val,
+                        "color": color,
+                        "key": "PM2.5",
+                        "history": history_values,
+                        "history_colors": history_colors,
+                        "history_times": history_times,
+                    }
+                },
+                "color": color,
+                "purpleair": True,
+                "primary_key": "PM25",
+                "primary_value": display_val,
+                "primary_color": color,
+                "primary_aqi": None,
+            })
+        result["fixed"] = fixed_list
     
     return result
 
@@ -1494,6 +1602,29 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
         if app_state.airnow_readings:
             _merge_airnow_into_fixed(st, app_state)
 
+        # Merge PurpleAir sensors into fixed sensors
+        if app_state.purpleair_sensors:
+            # Accumulate current PA values into history so history stays
+            # in sync with live readings (PA fetch loop runs on its own
+            # 2-min cycle, but the main fetch loop can run more often).
+            time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for s in app_state.purpleair_sensors:
+                pm25 = s.get("pm2.5")
+                if pm25 is None:
+                    continue
+                sid = f"PA_{s.get('sensor_index', '')}"
+                try:
+                    pm25_val = float(pm25)
+                except (TypeError, ValueError):
+                    continue
+                color = _get_aqi_color("PM25", pm25_val)
+                accumulate_fixed_reading(app_state, sid, "PM25", round(pm25_val, 1), color, time_utc)
+
+            _merge_purpleair_into_fixed(st, app_state)
+            # Inject history into PurpleAir sensors (they were added after the
+            # earlier _inject_fixed_history call, so they missed it)
+            _inject_fixed_history(app_state, st)
+
         prev_meta = app_state.state.get("meta", {}) if isinstance(app_state.state, dict) else {}
         if "server_start_ts" in prev_meta: meta["server_start_ts"] = prev_meta["server_start_ts"]
 
@@ -1601,6 +1732,218 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
     meta["airnow_last_fetch"] = app_state.airnow_last_fetch
     meta["airnow_sites_count"] = len(app_state.airnow_sites)
     meta["airnow_readings_count"] = len(app_state.airnow_readings)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PurpleAir Integration
+# ─────────────────────────────────────────────────────────────────────────────
+
+PURPLEAIR_API_KEY = "C2922794-0519-11F1-B596-4201AC1DC123"
+PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
+
+
+def _fetch_purpleair_sensors() -> list[dict[str, Any]]:
+    """Fetch PurpleAir sensors in the SLC bounding box."""
+    params = {
+        "fields": "name,latitude,longitude,pm2.5,pm2.5_10minute,humidity,temperature,last_seen",
+        "nwlng": str(SLC_BOUNDS["lon_min"]),
+        "nwlat": str(SLC_BOUNDS["lat_max"]),
+        "selng": str(SLC_BOUNDS["lon_max"]),
+        "selat": str(SLC_BOUNDS["lat_min"]),
+        "location_type": "0",  # outdoor only
+    }
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    url = f"{PURPLEAIR_API_URL}?{qs}"
+    try:
+        resp = stdlib_get(url, timeout=10, headers={
+            "X-API-Key": PURPLEAIR_API_KEY,
+            "Accept": "application/json",
+        })
+        resp.raise_for_status()
+        data = resp.json()
+        fields = data.get("fields", [])
+        results = []
+        for row in data.get("data", []):
+            sensor = dict(zip(fields, row))
+            sensor["sensor_index"] = row[0] if row else None
+            results.append(sensor)
+        return results
+    except Exception as e:
+        _log(f"[PurpleAir] Fetch error: {type(e).__name__}: {e}")
+        return []
+
+
+def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
+    """Merge PurpleAir sensors into fixed list as dot markers."""
+    sensors = app_state.purpleair_sensors
+    if not sensors:
+        return
+
+    fixed_list = st.get("fixed", [])
+    if not isinstance(fixed_list, list):
+        return
+
+    # Remove any existing PurpleAir sensors to avoid duplicates on re-merge
+    fixed_list = [f for f in fixed_list if not f.get("purpleair")]
+
+    # ── Outlier detection: compare each sensor against peers ─────────
+    # Collect all valid PM2.5 values in-bounds
+    valid_values: list[float] = []
+    for s in sensors:
+        lat = s.get("latitude")
+        lon = s.get("longitude")
+        if lat is None or lon is None:
+            continue
+        if not (SLC_BOUNDS["lat_min"] <= lat <= SLC_BOUNDS["lat_max"] and
+                SLC_BOUNDS["lon_min"] <= lon <= SLC_BOUNDS["lon_max"]):
+            continue
+        pm25 = s.get("pm2.5")
+        if pm25 is None:
+            continue
+        try:
+            valid_values.append(float(pm25))
+        except (TypeError, ValueError):
+            pass
+
+    # Compute outlier threshold from peer readings using IQR method
+    # Only filters truly broken hardware (e.g., 3000+ when median is 2).
+    # Must NOT filter legitimate hotspots near highways, construction,
+    # or during dust storms/inversions (200+ is realistic).
+    outlier_threshold = float("inf")
+    if len(valid_values) >= 3:
+        sv = sorted(valid_values)
+        n = len(sv)
+        q1 = sv[n // 4]
+        q3 = sv[(3 * n) // 4]
+        iqr = q3 - q1
+        # Floor of 500 µg/m³: never filter readings below 500.
+        # Above 500, must exceed Q3 + 10× IQR to be considered broken.
+        outlier_threshold = max(500.0, q3 + iqr * 10.0)
+    # ─────────────────────────────────────────────────────────────────
+
+    for s in sensors:
+        lat = s.get("latitude")
+        lon = s.get("longitude")
+        if lat is None or lon is None:
+            continue
+        if not (SLC_BOUNDS["lat_min"] <= lat <= SLC_BOUNDS["lat_max"] and
+                SLC_BOUNDS["lon_min"] <= lon <= SLC_BOUNDS["lon_max"]):
+            continue
+
+        pm25 = s.get("pm2.5")
+        if pm25 is None:
+            continue
+        try:
+            pm25_val = float(pm25)
+        except (TypeError, ValueError):
+            continue
+
+        # Skip outlier sensors (broken hardware reporting wildly wrong values)
+        if pm25_val < 0 or pm25_val > outlier_threshold:
+            continue
+
+        sid = f"PA_{s.get('sensor_index', '')}"
+        name = s.get("name", sid)
+        # Strip branding from name
+        name = re.sub(r'\s+powered by UTOPIA(?:\s+Fiber)?', '', name).strip()
+        color = _get_aqi_color("PM25", pm25_val)
+        readings = {
+            "PM25": {
+                "value": round(pm25_val, 1),
+                "color": color,
+                "key": "PM2.5",
+            }
+        }
+        # Add humidity/temperature if available
+        humidity = s.get("humidity")
+        if humidity is not None:
+            try:
+                readings["Humidity"] = {"value": round(float(humidity), 0), "color": "#88bbdd", "key": "RH%"}
+            except (TypeError, ValueError):
+                pass
+        temp = s.get("temperature")
+        if temp is not None:
+            try:
+                readings["Temp"] = {"value": round(float(temp), 0), "color": "#ddaa66", "key": "°F"}
+            except (TypeError, ValueError):
+                pass
+
+        fixed_list.append({
+            "id": sid,
+            "name": name,
+            "pinned": False,
+            "emoji": "",  # empty = render as dot, not emoji
+            "lat": lat,
+            "lon": lon,
+            "readings": readings,
+            "color": color,
+            "purpleair": True,
+            "primary_key": "PM25",
+            "primary_value": round(pm25_val, 1),
+            "primary_color": color,
+            "primary_aqi": None,
+        })
+
+    st["fixed"] = fixed_list
+
+
+def purpleair_fetch_loop(
+    *,
+    app_state: AppState,
+    interval_s: float = 300.0,  # 5 minutes
+    stop_event: threading.Event,
+) -> None:
+    """Background loop to fetch PurpleAir sensor data."""
+    # Wait for main fetch loop to start
+    stop_event.wait(20.0)
+
+    while not stop_event.is_set():
+        try:
+            sensors = _fetch_purpleair_sensors()
+            if sensors:
+                with app_state.lock:
+                    app_state.purpleair_sensors = sensors
+                    app_state.purpleair_last_fetch = time.time()
+                    # Accumulate PurpleAir readings into fixed_history for playback
+                    for s in sensors:
+                        pm25 = s.get("pm2.5")
+                        if pm25 is None:
+                            continue
+                        sid = f"PA_{s.get('sensor_index', '')}"
+                        try:
+                            pm25_val = float(pm25)
+                        except (TypeError, ValueError):
+                            continue
+                        # Use sensor's last_seen timestamp instead of poll time
+                        last_seen = s.get("last_seen")
+                        if last_seen is not None:
+                            try:
+                                last_seen_int = int(last_seen)
+                                dt = datetime.fromtimestamp(last_seen_int, tz=timezone.utc)
+                                time_utc = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except (TypeError, ValueError):
+                                time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        else:
+                            time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        color = _get_aqi_color("PM25", pm25_val)
+                        accumulate_fixed_reading(app_state, sid, "PM25", round(pm25_val, 1), color, time_utc)
+                    # Merge into current state immediately
+                    if isinstance(app_state.state, dict):
+                        _merge_purpleair_into_fixed(app_state.state, app_state)
+                        _inject_fixed_history(app_state, app_state.state)
+                        app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
+                _log(f"[PurpleAir] Updated {len(sensors)} sensors")
+        except Exception as e:
+            _log(f"[PurpleAir] Error: {type(e).__name__}: {e}")
+
+        # Determine wait interval: 10 minutes (1am-8am MST), otherwise 5 minutes
+        mst_tz = timezone(timedelta(hours=-7))
+        now_mst = datetime.now(timezone.utc).astimezone(mst_tz)
+        if 1 <= now_mst.hour < 8:
+            wait_interval_s = 600.0  # 10 minutes off-peak
+        else:
+            wait_interval_s = 300.0  # 5 minutes peak hours
+        stop_event.wait(wait_interval_s)
 
 
 def _get_mobile_time_range(mobile_list: list[dict[str, Any]]) -> tuple[datetime, datetime] | None:
@@ -1762,32 +2105,45 @@ def _airnow_to_readings_dict(
 
 
 def _get_aqi_color(pollutant: str, value: Any) -> str:
-    """Get AQI color for a pollutant value."""
+    """Get AQI color for a pollutant value.
+
+    PM2.5 uses EPA AQI standard colors and breakpoints.
+    PM10 and O3 use the Utah AQ / CHPC color scale.
+    """
     try:
         v = float(value)
     except (TypeError, ValueError):
         return "#cccccc"
     
-    # Simplified AQI breakpoints for coloring
+    # EPA 2024 PM2.5 (24-hr) with clean sub-gradients within Good
     if pollutant in ("PM25", "PM2.5"):
-        if v <= 12.0: return "#00E400"  # Good
-        if v <= 35.4: return "#FFFF00"  # Moderate
-        if v <= 55.4: return "#FF7E00"  # USG
-        if v <= 150.4: return "#FF0000"  # Unhealthy
-        if v <= 250.4: return "#8F3F97"  # Very Unhealthy
-        return "#7E0023"  # Hazardous
+        if v <= 2.0:  return "#00FFFF"   # cyan   – Good (very low)
+        if v <= 5.0:  return "#00CCFF"   # lt blue – Good
+        if v <= 9.0:  return "#00E400"   # green  – Good
+        if v <= 35.4: return "#FFFF00"   # yellow – Moderate
+        if v <= 55.4: return "#FF7E00"   # orange – USG
+        if v <= 125.4: return "#FF0000"  # red    – Unhealthy
+        if v <= 225.4: return "#8F3F97"  # purple – Very Unhealthy
+        return "#7E0023"                 # maroon – Hazardous
     elif pollutant in ("PM10",):
-        if v <= 54: return "#00E400"
-        if v <= 154: return "#FFFF00"
-        if v <= 254: return "#FF7E00"
-        if v <= 354: return "#FF0000"
-        if v <= 424: return "#8F3F97"
-        return "#7E0023"
+        # EPA AQI with clean sub-gradients
+        if v <= 15.0:  return "#00FFFF"   # cyan   – Good (very low)
+        if v <= 30.0:  return "#00CCFF"   # lt blue – Good
+        if v <= 40.0:  return "#0099FF"   # blue   – Good
+        if v <= 54:    return "#00E400"   # green  – Good
+        if v <= 154:   return "#FFFF00"   # yellow – Moderate
+        if v <= 254:   return "#FF7E00"   # orange – USG
+        if v <= 354:   return "#FF0000"   # red    – Unhealthy
+        if v <= 424:   return "#8F3F97"   # purple – Very Unhealthy
+        return "#7E0023"                  # maroon – Hazardous
     elif pollutant in ("OZNE", "OZONE", "O3"):
         # ppb values
-        if v <= 54: return "#00E400"
-        if v <= 70: return "#FFFF00"
-        if v <= 85: return "#FF7E00"
+        if v <= 15:  return "#00CCFF"
+        if v <= 25:  return "#0099FF"
+        if v <= 35:  return "#009900"
+        if v <= 54:  return "#006600"
+        if v <= 70:  return "#FFFF00"
+        if v <= 85:  return "#FF7E00"
         if v <= 105: return "#FF0000"
         if v <= 200: return "#8F3F97"
         return "#7E0023"
@@ -3002,6 +3358,14 @@ def main() -> int:
     else:
         _log("[AirNow] Integration not available (airnow_slc.py not found)")
 
+    # Start PurpleAir fetch loop (5-minute interval)
+    threading.Thread(
+        target=purpleair_fetch_loop,
+        kwargs=dict(app_state=app_state, interval_s=300.0, stop_event=stop_event),
+        daemon=True
+    ).start()
+    _log("[PurpleAir] SLC sensor integration enabled (5-min refresh)")
+
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir, server_config=server_config))
     # Timeout for individual requests - helps with Safari/iOS connection issues
     httpd.timeout = 30
@@ -3094,6 +3458,12 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             kwargs=dict(app_state=app_state, interval_s=1200.0, stop_event=stop_event),
             daemon=True
         ).start()
+
+    threading.Thread(
+        target=purpleair_fetch_loop,
+        kwargs=dict(app_state=app_state, interval_s=120.0, stop_event=stop_event),
+        daemon=True
+    ).start()
 
     # Default config for in-process server (TUI mode)
     server_config = {

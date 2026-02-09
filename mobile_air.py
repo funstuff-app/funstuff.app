@@ -971,7 +971,7 @@ class AirQualityApp(App):
         
         level_info = self._aqi_level(avg_aqi)
         level = level_info.get("label", "Good") if isinstance(level_info, dict) else str(level_info)
-        level_colors = {"Good": "#b8bb26", "Moderate": "#fabd2f", "USG": "#fe8019", 
+        level_colors = {"Good": "#b8bb26", "Moderate": "#fabd2f", "Sensitive Groups": "#fe8019", 
                         "Unhealthy": "#fb4934", "Very Unhealthy": "#d3869b", "Hazardous": "#cc241d"}
         avg_color = level_colors.get(level, "#928374")
         
@@ -1026,7 +1026,7 @@ class AirQualityApp(App):
                             # Alert if USG or worse (AQI > 100)
                             if aqi and aqi > 100:
                                 level_info = self._aqi_level(aqi)
-                                level = level_info.get("label", "USG") if isinstance(level_info, dict) else "USG"
+                                level = level_info.get("label", "Sensitive Groups") if isinstance(level_info, dict) else "Sensitive Groups"
                                 name = self.custom_names.get(s_key, s_key)
                                 alerts.append((aqi, name, p_key, level, s_key))
         
@@ -1091,7 +1091,7 @@ class AirQualityApp(App):
         avg_aqi = self._value_to_aqi("PM2_5", avg_val) or 0
         level_info = self._aqi_level(avg_aqi)
         level = level_info.get("label", "Good") if isinstance(level_info, dict) else "Good"
-        level_colors = {"Good": "#b8bb26", "Moderate": "#fabd2f", "USG": "#fe8019", 
+        level_colors = {"Good": "#b8bb26", "Moderate": "#fabd2f", "Sensitive Groups": "#fe8019", 
                         "Unhealthy": "#fb4934", "Very Unhealthy": "#d3869b", "Hazardous": "#cc241d"}
         spark_color = level_colors.get(level, "#83a598")
         
@@ -1156,7 +1156,7 @@ class AirQualityApp(App):
         avg_aqi = self._value_to_aqi("PM10", avg_val) or 0
         level_info = self._aqi_level(avg_aqi)
         level = level_info.get("label", "Good") if isinstance(level_info, dict) else "Good"
-        level_colors = {"Good": "#b8bb26", "Moderate": "#fabd2f", "USG": "#fe8019", 
+        level_colors = {"Good": "#b8bb26", "Moderate": "#fabd2f", "Sensitive Groups": "#fe8019", 
                         "Unhealthy": "#fb4934", "Very Unhealthy": "#d3869b", "Hazardous": "#cc241d"}
         spark_color = level_colors.get(level, "#83a598")
         

@@ -52,7 +52,7 @@ STALE_DATA_THRESHOLD_MINUTES = 30
 AQI_LEVELS = [
     {"label": "Good", "aqi_hi": 50, "color": "#00E400"},
     {"label": "Moderate", "aqi_hi": 100, "color": "#FFFF00"},
-    {"label": "USG", "aqi_hi": 150, "color": "#FF7E00"},
+    {"label": "Sensitive Groups", "aqi_hi": 150, "color": "#FF7E00"},
     {"label": "Unhealthy", "aqi_hi": 200, "color": "#FF0000"},
     {"label": "Very Unhealthy", "aqi_hi": 300, "color": "#8F3F97"},
     {"label": "Hazardous", "aqi_hi": 500, "color": "#7E0023"},

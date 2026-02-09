@@ -95,15 +95,14 @@ a = Analysis(
     pathex=[spec_dir],
     binaries=[],
     datas=[
-        # Dashboard static files (browser UI)
-        ('dashboard/index.html', 'dashboard'),
-        ('dashboard/app.js', 'dashboard'),
-        ('dashboard/camera_fit_logic.js', 'dashboard'),
-        ('dashboard/map_nav_engine.js', 'dashboard'),
-        ('dashboard/styles.css', 'dashboard'),
-        ('dashboard/tui.html', 'dashboard'),
-        ('dashboard/tui.css', 'dashboard'),
-        ('dashboard/tui.js', 'dashboard'),
+        # Dashboard static files (browser UI) — glob all web assets so new
+        # modules don't cause 404s after the app.js modularization.
+        *[(str(p), 'dashboard') for p in Path(spec_dir, 'dashboard').glob('*.js')],
+        *[(str(p), 'dashboard') for p in Path(spec_dir, 'dashboard').glob('*.css')],
+        *[(str(p), 'dashboard') for p in Path(spec_dir, 'dashboard').glob('*.html')],
+        *[(str(p), 'dashboard') for p in Path(spec_dir, 'dashboard').glob('*.json')],
+        *[(str(p), 'dashboard') for p in Path(spec_dir, 'dashboard').glob('*.png')],
+        *[(str(p), 'dashboard') for p in Path(spec_dir, 'dashboard').glob('*.svg')],
         # Data files
         ('aqi_breakpoints.csv', '.'),
         # Additional Python modules that need to be found

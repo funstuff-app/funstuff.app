@@ -58,3 +58,27 @@ function desatHex(hex, amt = 0.25) {
   const bb = Math.round(b * (1 - a) + gb * a);
   return `#${((1 << 24) + (rr << 16) + (gg2 << 8) + bb).toString(16).slice(1)}`;
 }
+
+function darkenHex(hex, factor = 0.75) {
+  // Darken a hex color by multiplying RGB by factor (0 = black, 1 = original).
+  const h = safeHex(hex);
+  const m = /^#([0-9a-f]{6})$/i.exec(h);
+  if (!m) return "#3388ff";
+  const n = parseInt(m[1], 16);
+  const r = Math.round(((n >> 16) & 255) * factor);
+  const g = Math.round(((n >> 8) & 255) * factor);
+  const b = Math.round((n & 255) * factor);
+  return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
+}
+
+function hexToRgba(hex, alpha = 1) {
+  // Convert a hex color to rgba format with specified alpha (0-1).
+  const h = safeHex(hex);
+  const m = /^#([0-9a-f]{6})$/i.exec(h);
+  if (!m) return `rgba(51, 136, 255, ${alpha})`;
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}

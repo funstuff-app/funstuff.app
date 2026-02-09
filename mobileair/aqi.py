@@ -80,8 +80,50 @@ def aqi_level(aqi: float | None) -> dict[str, Any]:
 
 
 def color_for_value(pollutant_key: str, value: float | str | None) -> str:
-    """Get the AQI-based color for a pollutant value."""
-    return aqi_level(value_to_aqi(pollutant_key, value))["color"]
+    """Get AQI color for a pollutant value using EPA 2024 breakpoints."""
+    try:
+        v = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return "#cccccc"
+    
+    if v is None:
+        return "#cccccc"
+    
+    key = normalize_pollutant_key(pollutant_key)
+    
+    # EPA 2024 PM2.5 (24-hr) with clean sub-gradients within Good
+    if key == "pm2.5":
+        if v <= 2.0:  return "#00FFFF"   # cyan   – Good (very low)
+        if v <= 5.0:  return "#00CCFF"   # lt blue – Good
+        if v <= 9.0:  return "#00E400"   # green  – Good
+        if v <= 35.4: return "#FFFF00"   # yellow – Moderate
+        if v <= 55.4: return "#FF7E00"   # orange – USG
+        if v <= 125.4: return "#FF0000"  # red    – Unhealthy
+        if v <= 225.4: return "#8F3F97"  # purple – Very Unhealthy
+        return "#7E0023"                 # maroon – Hazardous
+    elif key == "pm10":
+        if v <= 15.0:  return "#00FFFF"   # cyan   – Good (very low)
+        if v <= 30.0:  return "#00CCFF"   # lt blue – Good
+        if v <= 40.0:  return "#0099FF"   # blue   – Good
+        if v <= 54:    return "#00E400"   # green  – Good
+        if v <= 154:   return "#FFFF00"   # yellow – Moderate
+        if v <= 254:   return "#FF7E00"   # orange – USG
+        if v <= 354:   return "#FF0000"   # red    – Unhealthy
+        if v <= 424:   return "#8F3F97"   # purple – Very Unhealthy
+        return "#7E0023"                  # maroon – Hazardous
+    elif key == "ozone":
+        # ppb values
+        if v <= 15:  return "#00CCFF"
+        if v <= 25:  return "#0099FF"
+        if v <= 35:  return "#009900"
+        if v <= 54:  return "#006600"
+        if v <= 70:  return "#FFFF00"
+        if v <= 85:  return "#FF7E00"
+        if v <= 105: return "#FF0000"
+        if v <= 200: return "#8F3F97"
+        return "#7E0023"
+    
+    return "#cccccc"
 
 
 def trend_threshold(pollutant_key: str) -> float:
