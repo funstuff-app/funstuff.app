@@ -813,7 +813,7 @@ class MapView {
 
     if (this._centerAnimRAF) cancelAnimationFrame(this._centerAnimRAF);
 
-
+    const zoomChanging = Math.abs(z1 - z0) > 1e-6;
 
     // Safety: limit animation frames to prevent runaway loops
     let frameCount = 0;

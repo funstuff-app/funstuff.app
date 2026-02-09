@@ -152,6 +152,8 @@ function main() {
     if (k === "PM25" || k === "PM2.5") return "pm25";
     if (k === "PM10") return "pm10";
     if (k === "OZNE" || k === "OZONE" || k === "O3") return "o3";
+    if (k === "NO2") return "no2";
+    if (k === "CO") return "co";
     return null;
   }
 
@@ -234,6 +236,38 @@ function main() {
         { color: "#FF0000", lo: 85,  hi: 105, w: 68,  label: "Unhealthy" },
         { color: "#8F3F97", lo: 105, hi: 200, w: 130, label: "Very Unhealthy" },
         { color: "#7E0023", lo: 200, hi: null, w: 260, label: "Hazardous" },
+      ],
+    },
+    no2: {
+      unit: "ppb",
+      // EPA NO2 1-hour breakpoints (ppb).
+      // Good: 0–53, Moderate: 54–100, USG: 101–360, Unhealthy: 361–649,
+      // V.Unhealthy: 650–1249, Hazardous: 1250+
+      entries: [
+        { color: "#00CCFF", lo: 0,   hi: 20,  w: 12 },
+        { color: "#0099FF", lo: 20,  hi: 35,  w: 15 },
+        { color: "#00E400", lo: 35,  hi: 53,  w: 21,  label: "Good" },
+        { color: "#FFFF00", lo: 53,  hi: 100, w: 35,  label: "Moderate" },
+        { color: "#FF7E00", lo: 100, hi: 360, w: 75,  label: "Sensitive Groups" },
+        { color: "#FF0000", lo: 360, hi: 649, w: 130, label: "Unhealthy" },
+        { color: "#8F3F97", lo: 649, hi: 1249, w: 195, label: "Very Unhealthy" },
+        { color: "#7E0023", lo: 1249, hi: null, w: 260, label: "Hazardous" },
+      ],
+    },
+    co: {
+      unit: "ppm",
+      // EPA CO 8-hour breakpoints (ppm).
+      // Good: 0–4.4, Moderate: 4.5–9.4, USG: 9.5–12.4, Unhealthy: 12.5–15.4,
+      // V.Unhealthy: 15.5–30.4, Hazardous: 30.5+
+      entries: [
+        { color: "#00CCFF", lo: 0,    hi: 1.5,  w: 12 },
+        { color: "#0099FF", lo: 1.5,  hi: 3,    w: 15 },
+        { color: "#00E400", lo: 3,    hi: 4.4,  w: 21,  label: "Good" },
+        { color: "#FFFF00", lo: 4.4,  hi: 9.4,  w: 46,  label: "Moderate" },
+        { color: "#FF7E00", lo: 9.4,  hi: 12.4, w: 60,  label: "Sensitive Groups" },
+        { color: "#FF0000", lo: 12.4, hi: 15.4, w: 75,  label: "Unhealthy" },
+        { color: "#8F3F97", lo: 15.4, hi: 30.4, w: 148, label: "Very Unhealthy" },
+        { color: "#7E0023", lo: 30.4, hi: null,  w: 260, label: "Hazardous" },
       ],
     },
   };
@@ -709,7 +743,9 @@ function main() {
     if (sel && sel.type === "fixed") item = (Array.isArray(st.fixed) ? st.fixed : []).find(x => x.id === sel.id) || null;
 
     // Sync legend tab to selected marker's displayed pollutant
-    // Use map's render-resolved key (set during drawOverlay) which matches the label
+    // Use item data directly (map render state may not be updated yet)
+    if (item) syncLegendToSensor(item);
+    // Also try map's render-resolved key as a fallback
     syncLegendToMapSelection();
     
     // Center camera when selected from sidebar (any sensor type), or for mobile from map click with cmd+click for fit
@@ -736,8 +772,27 @@ function main() {
         saveViewSoon();
       }
     }
+    // Switch sidebar tab to match selected sensor type (when selected from map)
+    if (sel && !fromPanel) {
+      let targetTab = sel.type === "mobile" ? "mobile" : (item && item.purpleair ? "public" : "fixed");
+      if (activeTab !== targetTab) {
+        activeTab = targetTab;
+        applySidebarTab();
+      }
+    }
+
     renderLists(st, selectedId);
     renderDetails(st, selectedId);
+
+    // Scroll the selected item into view in the sidebar (only when selected from map)
+    if (sel && !fromPanel) {
+      const listEl = sel.type === "mobile" ? listMobileEl
+        : (item && item.purpleair ? listPublicEl : listFixedEl);
+      if (listEl) {
+        const selEl = listEl.querySelector(`[data-id="${CSS.escape(sel.id)}"]`);
+        if (selEl) selEl.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+    }
   };
 
   window.addEventListener("keydown", (e) => {
@@ -2674,6 +2729,7 @@ function main() {
       if (!isFinite(relMs)) return;
       const tMs = pr.minMs + relMs;
       const clampedT = clamp(tMs, b.minMs, b.maxMs);
+
       map.setPlaybackTimeMs(clampedT);
 
       // Don't auto-enable LIVE mode when dragging - user must click the Live button.
@@ -2704,9 +2760,31 @@ function main() {
       updatePlaybackUi();
     });
     pbScrubEl.addEventListener("pointerup", () => {
+      // On iOS Safari, pointerup fires BEFORE touchend during touch interactions.
+      // Let touchend handle all cleanup/page-back to avoid double-fire issues
+      // (e.g. pointerup pages back, then touchend undoes it via auto-follow).
+      if (_scrubTouchStartX != null) return;
+
       _pbScrubbing = false;
       _pbVelocity = 0;
       _pbPageAutoFollow = true; // resume auto-following after manual scrub
+
+      // Page back if slider is near the left edge (1% threshold for reduced-sensitivity touch)
+      if (_pbPagingActive() && Number(pbScrubEl.value) <= Number(pbScrubEl.max) * 0.01 && _pbPageIndex > 0) {
+        _pbSetPage(_pbPageIndex - 1);
+        const prev = _pbGetPageRange();
+        map.setPlaybackTimeMs(prev.maxMs);
+        _pbLoopStartMs = prev.maxMs;
+        pbScrubEl.max = String(prev.maxMs - prev.minMs);
+        pbScrubEl.value = pbScrubEl.max;
+        map.setPlaybackPlaying(true);
+        _pbLastPerf = performance.now();
+        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        updatePlaybackUi();
+        map.drawOverlay(map.lastState);
+        return;
+      }
+
       // Don't auto-enable LIVE mode when released at end - user must click Live button.
       map.setPlaybackPlaying(true);
       _pbLastPerf = performance.now();
@@ -2782,7 +2860,8 @@ function main() {
     // the default 1:1 tracking, and apply a 4× sensitivity reduction.
     let _scrubTouchStartX = null;
     let _scrubTouchStartVal = null;
-    const _scrubTouchSensitivity = 0.0625;
+    let _scrubTouchRawTarget = null;
+    const _scrubTouchSensitivity = 0.3;
 
     pbScrubEl.addEventListener("touchstart", (e) => {
       e.preventDefault();  // stop native 1:1 range tracking
@@ -2816,7 +2895,8 @@ function main() {
       const rect = pbScrubEl.getBoundingClientRect();
       const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
       const delta = (dx / rect.width) * range * _scrubTouchSensitivity;
-      pbScrubEl.value = String(clamp(_scrubTouchStartVal + delta, Number(pbScrubEl.min), Number(pbScrubEl.max)));
+      _scrubTouchRawTarget = _scrubTouchStartVal + delta;
+      pbScrubEl.value = String(clamp(_scrubTouchRawTarget, Number(pbScrubEl.min), Number(pbScrubEl.max)));
       _pbDidDrag = true;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
@@ -2829,12 +2909,32 @@ function main() {
     }, { passive: false });
 
     pbScrubEl.addEventListener("touchend", () => {
+      const rawTarget = _scrubTouchRawTarget;
       _scrubTouchStartX = null;
       _scrubTouchStartVal = null;
-      // Same teardown as pointerup
+      _scrubTouchRawTarget = null;
+      // Cancel any pending applyScrub rAF so it doesn't overwrite page-back
+      if (_scrubRAF) { cancelAnimationFrame(_scrubRAF); _scrubRAF = 0; }
       _pbScrubbing = false;
       _pbVelocity = 0;
       _pbPageAutoFollow = true;
+
+      // Page back if user dragged past the left edge
+      if (_pbPagingActive() && rawTarget != null && rawTarget < 0 && _pbPageIndex > 0) {
+        _pbSetPage(_pbPageIndex - 1);
+        const prev = _pbGetPageRange();
+        map.setPlaybackTimeMs(prev.maxMs);
+        _pbLoopStartMs = prev.maxMs;
+        pbScrubEl.max = String(prev.maxMs - prev.minMs);
+        pbScrubEl.value = pbScrubEl.max;
+        map.setPlaybackPlaying(true);
+        _pbLastPerf = performance.now();
+        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        updatePlaybackUi();
+        map.drawOverlay(map.lastState);
+        return;
+      }
+
       map.setPlaybackPlaying(true);
       _pbLastPerf = performance.now();
       if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);

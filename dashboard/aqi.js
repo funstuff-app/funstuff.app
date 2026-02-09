@@ -35,6 +35,24 @@ var AQI_BREAKPOINTS = {
     { c_low: 0.086, c_high: 0.105, aqi_low: 151, aqi_high: 200 },
     { c_low: 0.106, c_high: 0.2, aqi_low: 201, aqi_high: 300 },
   ],
+  no2: [
+    // NO2 1-hour (ppb)
+    { c_low: 0.0, c_high: 53.0, aqi_low: 0, aqi_high: 50 },
+    { c_low: 54.0, c_high: 100.0, aqi_low: 51, aqi_high: 100 },
+    { c_low: 101.0, c_high: 360.0, aqi_low: 101, aqi_high: 150 },
+    { c_low: 361.0, c_high: 649.0, aqi_low: 151, aqi_high: 200 },
+    { c_low: 650.0, c_high: 1249.0, aqi_low: 201, aqi_high: 300 },
+    { c_low: 1250.0, c_high: 2049.0, aqi_low: 301, aqi_high: 500 },
+  ],
+  co: [
+    // CO 8-hour (ppm)
+    { c_low: 0.0, c_high: 4.4, aqi_low: 0, aqi_high: 50 },
+    { c_low: 4.5, c_high: 9.4, aqi_low: 51, aqi_high: 100 },
+    { c_low: 9.5, c_high: 12.4, aqi_low: 101, aqi_high: 150 },
+    { c_low: 12.5, c_high: 15.4, aqi_low: 151, aqi_high: 200 },
+    { c_low: 15.5, c_high: 30.4, aqi_low: 201, aqi_high: 300 },
+    { c_low: 30.5, c_high: 50.4, aqi_low: 301, aqi_high: 500 },
+  ],
 };
 
 function _normalizePollutantKeyForAqi(k) {
@@ -42,6 +60,8 @@ function _normalizePollutantKeyForAqi(k) {
   if (kk === "pm25" || kk === "pm2.5" || kk === "pm2_5" || kk === "pm2-5" || kk === "pm 2.5") return "pm2.5";
   if (kk === "pm10" || kk === "pm 10") return "pm10";
   if (kk === "ozne" || kk === "ozone" || kk === "o3") return "ozone";
+  if (kk === "no2" || kk === "nitrogen dioxide") return "no2";
+  if (kk === "co" || kk === "carbon monoxide") return "co";
   return kk;
 }
 
@@ -61,6 +81,10 @@ function valueToAqi(pollutantKey, value) {
     v = Math.floor(v * 10) / 10; // 1 decimal
   } else if (k === "pm10") {
     v = Math.floor(v); // integer
+  } else if (k === "no2") {
+    v = Math.floor(v); // integer (ppb)
+  } else if (k === "co") {
+    v = Math.floor(v * 10) / 10; // 1 decimal (ppm)
   }
 
   const bps = AQI_BREAKPOINTS[k];
