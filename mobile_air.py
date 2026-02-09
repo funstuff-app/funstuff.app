@@ -717,6 +717,7 @@ class AirQualityApp(App):
         now = datetime.now()
         self.call_from_thread(self.update_status, f"Fetching data at {now.strftime('%H:%M:%S')}...")
 
+        dashboard_fixed = []  # Enriched fixed sensors from /api/state (AirNow, Home, etc.)
         if _REMOTE_CONFIG["url"]:
             # Remote mode: fetch from server's /api/raw endpoint
             try:
@@ -731,6 +732,23 @@ class AirQualityApp(App):
             except Exception:
                 mobile_data = None
                 fixed_data = None
+            # Fetch enriched fixed sensors (AirNow, Home) from lightweight /api/fixed
+            # Falls back to /api/state if the server hasn't been updated yet
+            try:
+                resp2 = stdlib_get(f"{_REMOTE_CONFIG['url']}/api/fixed", timeout=10)
+                if resp2.status_code == 200:
+                    dashboard_fixed = resp2.json()
+                    if not isinstance(dashboard_fixed, list):
+                        dashboard_fixed = []
+            except Exception:
+                # /api/fixed not available (404 or network error) — fall back to /api/state
+                try:
+                    resp2 = stdlib_get(f"{_REMOTE_CONFIG['url']}/api/state", timeout=15)
+                    if resp2.status_code == 200:
+                        state = resp2.json()
+                        dashboard_fixed = state.get("fixed", [])
+                except Exception:
+                    pass
         else:
             mobile_data = self.fetch_data(MOBILE_URL)
             fixed_data = self.fetch_data(FIXED_URL)
@@ -745,6 +763,7 @@ class AirQualityApp(App):
             combined_data = {
                 "mobile": mobile_data or {},
                 "fixed": fixed_data or {},
+                "dashboard_fixed": dashboard_fixed,
             }
             update_history = True
             status_msg = f"Last updated: {now.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -1344,7 +1363,7 @@ class AirQualityApp(App):
                     col = color_for_value(p_key, val)
                     
                     # Filter Fixed Sensors for SLC area only
-                    # Approx Salt Lake Valley: Lat 40.4 to 41.0, Lon -112.2 to -111.7
+                    # Approx Salt Lake Valley: Lat 40.4 to 41.0, Lon -112.25 to -111.7
                     try:
                         if lat is None or lon is None:
                             continue
@@ -1403,6 +1422,54 @@ class AirQualityApp(App):
         if history_updated:
             self.save_fixed_history()
 
+        # ── Merge enriched fixed sensors from dashboard server (AirNow, Home, etc.) ──
+        # These are NOT in the raw Utah AQ data but the dashboard server provides them.
+        # Skip known weather/meteorological params — everything else passes through
+        _WEATHER_KEYS = {"BARPR", "DEWPOINT", "TEMP", "WD", "WS", "RHUM", "SOLAR", "PRECIP", "CEIL", "VSBY", "BC_LC", "BC_DC"}
+        dashboard_fixed = data.get("dashboard_fixed", [])
+        for df in dashboard_fixed:
+            if not isinstance(df, dict):
+                continue
+            s_key = df.get("id", "")
+            if not s_key or s_key in unified_sensors:
+                continue  # Already have this sensor from raw data
+            # Skip PurpleAir sensors — not wanted in TUI
+            if s_key.startswith("PA_"):
+                continue
+            # Only include SLC-area sensors
+            try:
+                flat = float(df.get("lat", 0))
+                flon = float(df.get("lon", 0))
+                if not (40.4 <= flat <= 41.1 and -112.25 <= flon <= -111.7):
+                    continue
+            except (ValueError, TypeError):
+                continue
+            readings = df.get("readings", {})
+            if not readings:
+                continue
+            sensor_entry = {'type': 'fixed', 'readings': {}}
+            display_name = df.get("name", "")
+            if display_name and display_name != s_key:
+                sensor_entry['display_name'] = display_name
+            for p_key, r_data in readings.items():
+                # Skip known weather/met params
+                if p_key in _WEATHER_KEYS:
+                    continue
+                if not isinstance(r_data, dict):
+                    continue
+                val = r_data.get("value")
+                if val is None:
+                    continue
+                val_str = str(val)
+                col = color_for_value(p_key, val_str)
+                history = r_data.get("history", [])
+                history_strs = [str(v) if v is not None else None for v in history]
+                history_cols = [color_for_value(p_key, str(v)) if v is not None else '#000000' for v in history]
+                unit = r_data.get("unit", "")
+                sensor_entry['readings'][p_key] = (val_str, col, str(flat), str(flon), unit, history_strs, history_cols)
+            if sensor_entry['readings']:
+                unified_sensors[s_key] = sensor_entry
+
         # Sort Logic
         # Desired order: PM2.5, PM10, Ozone
         priority_map = {"pm2.5": 0, "pm25": 0, "pm10": 1, "ozone": 2, "ozne": 2}
@@ -1420,39 +1487,24 @@ class AirQualityApp(App):
             is_idle = is_mobile and is_immobile and not is_forced_active
             is_pinned = s_name in self.pinned_sensors
 
-            base_score = 0.0
+            # Priority Tiers (lower = listed first):
+            # 0. Pinned Sensors
+            # 1. Active Mobile Sensors
+            # 2. Fixed Sensors
+            # 3. Idle/Ghost Mobile Sensors
             
-            # Priority Tiers:
-            # 1. Idle Mobile Sensors (Highest)
-            # 2. Pinned Sensors
-            # 3. Active Mobile Sensors
-            # 4. Fixed Sensors
-            
-            if is_idle:
-                base_score = 4000000.0
-            elif is_pinned:
-                base_score = 3000000.0
+            if is_pinned:
+                tier = 0
+            elif is_idle:
+                tier = 3
             elif is_mobile:
-                base_score = 2000000.0
+                tier = 1
             else:
-                base_score = 0.0
+                tier = 2
 
-            readings = data['readings']
-            lat_score = -90.0 # Default min latitude
-            
-            # Find a valid latitude from any reading
-            for r_data in readings.values():
-                # r_data: (val, col, lat, lon, ...)
-                if len(r_data) > 2:
-                    lat = r_data[2]
-                    if lat is not None:
-                        try:
-                            lat_score = float(lat)
-                            break # Use first valid lat found
-                        except (ValueError, TypeError):
-                            pass
-            
-            return base_score + lat_score
+            # Within each tier, sort alphabetically by display name
+            display_name = self.custom_names.get(s_name, "") or data.get('display_name', "") or s_name
+            return (tier, display_name.lower())
 
         # Filter fixed-site spatial outliers using neighbor-consensus (not absolute thresholds).
         # Example: a single station reporting PM25 900+ while nearby stations remain normal.
@@ -1503,7 +1555,7 @@ class AirQualityApp(App):
 
             filtered_sensors.append((s_name, s_info))
 
-        sorted_sensors = sorted(filtered_sensors, key=get_sensor_score, reverse=True)
+        sorted_sensors = sorted(filtered_sensors, key=get_sensor_score)
 
         # Build List Items
         for s_name, s_info in sorted_sensors:
@@ -1555,7 +1607,7 @@ class AirQualityApp(App):
                         pass
             
             if readings_list:
-                c_name = self.custom_names.get(s_name, "")
+                c_name = self.custom_names.get(s_name, "") or s_info.get('display_name', "")
                 list_view.append(
                     SensorItem(
                         s_name,

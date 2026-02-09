@@ -21,6 +21,10 @@ def normalize_pollutant_key(key: str) -> str:
         return "pm10"
     if kk in ("ozne", "ozone", "o3"):
         return "ozone"
+    if kk in ("no2", "nitrogen dioxide"):
+        return "no2"
+    if kk in ("co", "carbon monoxide"):
+        return "co"
     return kk
 
 
@@ -45,6 +49,12 @@ def value_to_aqi(pollutant_key: str, value: float | str | None) -> float | None:
     elif key == "pm10":
         # truncate to integer
         val = float(math.floor(val))
+    elif key == "no2":
+        # NO2 1-hour: truncate to integer (ppb)
+        val = float(math.floor(val))
+    elif key == "co":
+        # CO 8-hour: truncate to 1 decimal (ppm)
+        val = math.floor(val * 10.0) / 10.0
 
     breakpoints = POLLUTANT_BREAKPOINTS.get(key, [])
     if not breakpoints:
@@ -122,6 +132,26 @@ def color_for_value(pollutant_key: str, value: float | str | None) -> str:
         if v <= 105: return "#FF0000"
         if v <= 200: return "#8F3F97"
         return "#7E0023"
+    elif key == "no2":
+        # NO2 ppb – EPA 1-hour breakpoints
+        if v <= 20:   return "#00CCFF"
+        if v <= 35:   return "#0099FF"
+        if v <= 53:   return "#00E400"
+        if v <= 100:  return "#FFFF00"
+        if v <= 360:  return "#FF7E00"
+        if v <= 649:  return "#FF0000"
+        if v <= 1249: return "#8F3F97"
+        return "#7E0023"
+    elif key == "co":
+        # CO ppm – EPA 8-hour breakpoints
+        if v <= 1.5:  return "#00CCFF"
+        if v <= 3.0:  return "#0099FF"
+        if v <= 4.4:  return "#00E400"
+        if v <= 9.4:  return "#FFFF00"
+        if v <= 12.4: return "#FF7E00"
+        if v <= 15.4: return "#FF0000"
+        if v <= 30.4: return "#8F3F97"
+        return "#7E0023"
     
     return "#cccccc"
 
@@ -156,6 +186,10 @@ def filter_history_outliers(
         "pm10": (0.0, 2000.0),
         # ozone is typically ppb in our feeds; allow up to 600ppb (extreme) before dropping
         "ozone": (0.0, 600.0),
+        # NO2 ppb; allow up to 2100 ppb (beyond max AQI bracket)
+        "no2": (0.0, 2100.0),
+        # CO ppm; allow up to 60 ppm (beyond max AQI bracket)
+        "co": (0.0, 60.0),
     }.get(key)
 
     out_vals: list[Any] = []

@@ -395,6 +395,10 @@ class AppState:
     fixed_history_path: Path | None = None
     fixed_history_dirty: bool = False
 
+    # Cached fixed sensor locations so offline sensors can still be rendered.
+    # Structure: { sensor_id: { "lat": float, "lon": float, "name": str } }
+    fixed_sensor_locations: dict[str, dict[str, Any]] = field(default_factory=dict)
+
     # Bumped on-demand (e.g., from the TUI) to force the web client to treat the
     # next /api/state poll as a "new data" event even if timestamps/trails are unchanged.
     force_refresh_seq: int = 0
@@ -469,6 +473,10 @@ def _ensure_force_refresh_seq_cached(app_state: AppState) -> None:
             pass
 
 
+# Skip known weather/meteorological parameters — everything else passes through
+_WEATHER_KEYS = {"BARPR", "DEWPOINT", "TEMP", "WD", "WS", "RHUM", "SOLAR", "PRECIP", "CEIL", "VSBY", "BC_LC", "BC_DC"}
+
+
 def load_fixed_history(app_state: AppState, data_dir: Path) -> None:
     """Load fixed sensor history from disk."""
     path = data_dir / "fixed_history.json"
@@ -476,6 +484,22 @@ def load_fixed_history(app_state: AppState, data_dir: Path) -> None:
     app_state.fixed_history = load_json_file(path, {})
     if not isinstance(app_state.fixed_history, dict):
         app_state.fixed_history = {}
+    # Purge any weather/met keys that were persisted before filtering was added
+    _ALLOWED_AQ_KEYS = set(AIRNOW_PARAM_MAP.values()) | set(AIRNOW_PARAM_MAP.keys()) | {"PM25", "PM2.5", "PM10", "OZNE"}
+    for sensor_id in list(app_state.fixed_history):
+        pols = app_state.fixed_history[sensor_id]
+        if isinstance(pols, dict):
+            if sensor_id.startswith("AIRNOW_"):
+                # AirNow sensors: only keep mapped AQ params
+                for k in list(pols):
+                    if k not in _ALLOWED_AQ_KEYS:
+                        del pols[k]
+            else:
+                # Raw Utah AQ sensors: just remove known weather keys
+                for wk in _WEATHER_KEYS:
+                    pols.pop(wk, None)
+    # Mark dirty so the cleaned history gets saved back to disk
+    app_state.fixed_history_dirty = True
 
 
 def save_fixed_history(app_state: AppState) -> None:
@@ -693,6 +717,8 @@ def _accumulate_fixed_history_from_raw(app_state: AppState, fixed_raw: dict[str,
         return
     
     for pollutant_key, sensors in fixed_raw.items():
+        if str(pollutant_key) in _WEATHER_KEYS:
+            continue
         if not isinstance(sensors, dict):
             continue
         for sensor_id, s_data in sensors.items():
@@ -701,6 +727,14 @@ def _accumulate_fixed_history_from_raw(app_state: AppState, fixed_raw: dict[str,
                 continue
             if not isinstance(s_data, dict):
                 continue
+            
+            # Cache sensor location so we can reconstruct offline sensors
+            lat_f = coerce_float(s_data.get("Latitude"))
+            lon_f = coerce_float(s_data.get("Longitude"))
+            if lat_f is not None and lon_f is not None:
+                app_state.fixed_sensor_locations[sensor_id] = {
+                    "lat": lat_f, "lon": lon_f, "name": "",
+                }
             
             value = s_data.get("Value")
             color = _get_aqi_color(str(pollutant_key), value)
@@ -760,6 +794,8 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
         for pollutant, reading in readings.items():
             if not isinstance(reading, dict):
                 continue
+            if pollutant in _WEATHER_KEYS:
+                continue
             
             hist_entries = hist_for_sensor.get(pollutant, [])
             if not hist_entries:
@@ -789,6 +825,97 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
             reading["history"] = history_values
             reading["history_colors"] = history_colors
             reading["history_times"] = history_times
+
+
+def _reinject_offline_fixed_sensors(app_state: AppState, st: dict[str, Any]) -> None:
+    """Re-inject fixed sensors that have accumulated history but are missing from the live API.
+
+    When an upstream sensor goes offline (maintenance, etc.), its raw data disappears
+    from FixedSiteMapData.json.  We still have its history in ``fixed_history`` and its
+    location in ``fixed_sensor_locations``, so we can keep showing it with its last-known
+    readings and full sparkline history.
+    """
+    fixed_list = st.get("fixed", [])
+    if not isinstance(fixed_list, list):
+        fixed_list = []
+        st["fixed"] = fixed_list
+
+    already_present = {f.get("id") for f in fixed_list if isinstance(f, dict)}
+
+    for sensor_id, pollutants in app_state.fixed_history.items():
+        # Skip sensors already in the live state, Home, PurpleAir
+        if sensor_id in already_present:
+            continue
+        if sensor_id == "Home" or sensor_id.startswith("PA_"):
+            continue
+        # Skip AirNow-derived sensors — the AirNow merge recreates them each poll
+        if sensor_id.startswith("AIRNOW_"):
+            continue
+            continue
+        if not isinstance(pollutants, dict) or not pollutants:
+            continue
+
+        # Need a cached location to render
+        loc = app_state.fixed_sensor_locations.get(sensor_id)
+        if not loc:
+            continue
+        lat = coerce_float(loc.get("lat"))
+        lon = coerce_float(loc.get("lon"))
+        if lat is None or lon is None:
+            continue
+
+        # Build readings from history (use most recent value per pollutant)
+        readings: dict[str, Any] = {}
+        for pollutant, hist_entries in pollutants.items():
+            if not hist_entries:
+                continue
+            if pollutant in _WEATHER_KEYS:
+                continue
+            history_values = []
+            history_colors = []
+            history_times = []
+            for entry in hist_entries:
+                v = entry.get("val")
+                try:
+                    fv = float(v) if v is not None else None
+                    if fv is not None and fv == int(fv):
+                        fv = int(fv)
+                except (TypeError, ValueError):
+                    fv = None
+                history_values.append(fv)
+                history_colors.append(_get_aqi_color(pollutant, fv) if fv is not None else "#cccccc")
+                history_times.append(entry.get("time"))
+            last_val = history_values[-1] if history_values else None
+            last_col = _get_aqi_color(pollutant, last_val) if last_val is not None else "#cccccc"
+            display_val = last_val
+            if display_val is not None:
+                try:
+                    if float(display_val) == int(float(display_val)):
+                        display_val = int(float(display_val))
+                except (ValueError, TypeError):
+                    pass
+            readings[pollutant] = {
+                "value": display_val, "color": last_col,
+                "history": history_values, "history_colors": history_colors,
+                "history_times": history_times,
+            }
+
+        if not readings:
+            continue
+
+        worst = _pick_worst_reading_by_aqi(readings)
+        name = loc.get("name") or ""
+        fixed_list.append({
+            "id": sensor_id, "name": name, "pinned": False, "emoji": "📍",
+            "lat": lat, "lon": lon,
+            "readings": readings,
+            "color": worst.get("color") or "#cccccc",
+            "primary_key": worst.get("key"),
+            "primary_value": worst.get("value"),
+            "primary_color": worst.get("color"),
+            "primary_aqi": worst.get("aqi"),
+            "offline": True,  # marker for UI: sensor is offline from upstream
+        })
 
 
 def build_state(
@@ -1826,6 +1953,27 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
         prev_meta = app_state.state.get("meta", {}) if isinstance(app_state.state, dict) else {}
         if "server_start_ts" in prev_meta: meta["server_start_ts"] = prev_meta["server_start_ts"]
 
+        # Cache locations from live fixed sensors so we can reconstruct offline ones
+        for fs in (st.get("fixed") or []):
+            if isinstance(fs, dict) and fs.get("id"):
+                sid = fs["id"]
+                if sid == "Home" or sid.startswith("PA_"):
+                    continue
+                lat = coerce_float(fs.get("lat"))
+                lon = coerce_float(fs.get("lon"))
+                if lat is not None and lon is not None and sid not in app_state.fixed_sensor_locations:
+                    app_state.fixed_sensor_locations[sid] = {
+                        "lat": lat, "lon": lon, "name": fs.get("name") or "",
+                    }
+
+        # Re-apply custom sensor names after AirNow/PurpleAir merges
+        # (those merges add sensors with their upstream names, overriding any
+        # custom names that normalize_state_for_dashboard applied earlier)
+        _dd = app_state.fixed_history_path.parent if app_state.fixed_history_path else default_data_dir()
+        names = load_json_file(_dd / "sensor_names.json", {})
+        if isinstance(names, dict):
+            apply_sensor_names_inplace(st, names)
+
         # CPU Optimization: Bake JSON bytes once here
         app_state.state = st
         app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
@@ -1896,13 +2044,23 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
             if not isinstance(existing_readings, dict):
                 existing_readings = {}
             
-            # Add AirNow readings that don't already exist
+            # Add AirNow readings that don't already exist.
+            # Check canonical equivalents (e.g. PM25 ≡ PM2.5, OZNE ≡ OZONE/O3)
+            _EQUIV = {"PM25": {"PM2.5"}, "PM2.5": {"PM25"}, "OZNE": {"OZONE", "O3"}, "OZONE": {"OZNE", "O3"}, "O3": {"OZNE", "OZONE"}}
             for param, data in airnow_readings_dict.items():
-                if param not in existing_readings:
-                    existing_readings[param] = data
+                if param in existing_readings:
+                    continue
+                # Also skip if an equivalent key already exists
+                if any(eq in existing_readings for eq in _EQUIV.get(param, ())):
+                    continue
+                existing_readings[param] = data
             
             existing["readings"] = existing_readings
             existing["airnow_source"] = True
+            # Update name/emoji from AirNow if existing sensor has no name
+            if not existing.get("name") and site_name:
+                existing["name"] = site_name
+            existing["emoji"] = "🏛️"
         else:
             # Add as new AirNow-only sensor
             if site_id not in added_airnow_sites:
@@ -2230,7 +2388,7 @@ def _build_airnow_history(
             
             param = r.get("parameter")
             value = r.get("value")
-            if param and value is not None:
+            if param and value is not None and param in AIRNOW_PARAM_MAP:
                 if param not in param_history:
                     param_history[param] = []
                 param_history[param].append((dt, float(value)))
@@ -2288,10 +2446,10 @@ def _airnow_to_readings_dict(
     # Fallback: just current values (no history)
     result = {}
     for param, value in readings.items():
-        if param in ("datetime", "time", "date", "site_id", "site_name", "unit", "agency"):
+        if param not in AIRNOW_PARAM_MAP:
             continue
         
-        mapped_key = AIRNOW_PARAM_MAP.get(param, param)
+        mapped_key = AIRNOW_PARAM_MAP[param]
         color = _get_aqi_color(mapped_key, value)
         
         result[mapped_key] = {
@@ -2345,13 +2503,33 @@ def _get_aqi_color(pollutant: str, value: Any) -> str:
         if v <= 105: return "#FF0000"
         if v <= 200: return "#8F3F97"
         return "#7E0023"
+    elif pollutant in ("NO2",):
+        # NO2 ppb – EPA 1-hour breakpoints
+        if v <= 20:   return "#00CCFF"
+        if v <= 35:   return "#0099FF"
+        if v <= 53:   return "#00E400"
+        if v <= 100:  return "#FFFF00"
+        if v <= 360:  return "#FF7E00"
+        if v <= 649:  return "#FF0000"
+        if v <= 1249: return "#8F3F97"
+        return "#7E0023"
+    elif pollutant in ("CO",):
+        # CO ppm – EPA 8-hour breakpoints
+        if v <= 1.5:  return "#00CCFF"
+        if v <= 3.0:  return "#0099FF"
+        if v <= 4.4:  return "#00E400"
+        if v <= 9.4:  return "#FFFF00"
+        if v <= 12.4: return "#FF7E00"
+        if v <= 15.4: return "#FF0000"
+        if v <= 30.4: return "#8F3F97"
+        return "#7E0023"
     
     return "#cccccc"
 
 
 def _pick_color_from_readings(readings: dict[str, dict[str, Any]]) -> str:
     """Pick the primary color from readings."""
-    priority = ["PM25", "PM2.5", "PM10", "OZNE"]
+    priority = ["PM25", "PM2.5", "PM10", "OZNE", "NO2", "CO"]
     for k in priority:
         if k in readings and isinstance(readings[k], dict):
             return readings[k].get("color", "#3388ff")
@@ -2363,7 +2541,7 @@ def _pick_color_from_readings(readings: dict[str, dict[str, Any]]) -> str:
 
 def _pick_primary_key(readings: dict[str, dict[str, Any]]) -> str | None:
     """Pick the primary pollutant key."""
-    priority = ["PM25", "PM2.5", "PM10", "OZNE"]
+    priority = ["PM25", "PM2.5", "PM10", "OZNE", "NO2", "CO"]
     for k in priority:
         if k in readings:
             return k
@@ -2656,6 +2834,9 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             # Inject history arrays into fixed sensors
             _inject_fixed_history(app_state, st)
             
+            # Re-inject offline sensors that have history but are missing from the live API
+            _reinject_offline_fixed_sensors(app_state, st)
+            
             revision += 1
             meta = st.setdefault("meta", {})
             meta.update({"last_fetch_attempt_ts": attempt_ts, "last_fetch_ok_ts": attempt_ts, "server_revision": revision})
@@ -2733,8 +2914,8 @@ def airnow_fetch_loop(
     if not AIRNOW_AVAILABLE:
         return
     
-    # Wait for main fetch loop to complete at least once (Utah AQ has 10s timeout)
-    stop_event.wait(15.0)
+    # First iteration waits the full interval (initial fetch already done at startup)
+    stop_event.wait(interval_s)
     
     while not stop_event.is_set():
         try:
@@ -2866,14 +3047,16 @@ def _fetch_airnow_data(app_state: AppState) -> None:
                         if param and val is not None:
                             all_readings[site_id][param] = val
                         
-                        # Also accumulate into persistent history
-                        dt = r.get("datetime")
-                        time_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
-                        sensor_key = f"AIRNOW_{site_id}"
-                        accumulate_fixed_reading(
-                            app_state, sensor_key, param, val,
-                            _get_aqi_color(param, val), time_str
-                        )
+                        # Also accumulate into persistent history (AQ params only)
+                        if param in AIRNOW_PARAM_MAP:
+                            dt = r.get("datetime")
+                            time_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
+                            sensor_key = f"AIRNOW_{site_id}"
+                            mapped = AIRNOW_PARAM_MAP[param]
+                            accumulate_fixed_reading(
+                                app_state, sensor_key, mapped, val,
+                                _get_aqi_color(mapped, val), time_str
+                            )
                 
             except Exception as e:
                 # File might not exist yet, that's OK
@@ -2936,7 +3119,9 @@ def apply_sensor_names_inplace(state: dict[str, Any], custom_names: dict[str, An
     for key in ("mobile", "fixed"):
         for it in state.get(key, []):
             sid = it.get("id")
-            new_name = custom_names.get(sid) or ""
+            new_name = custom_names.get(sid)
+            if not new_name:
+                continue  # No custom name for this sensor — keep existing name
             if it.get("name") != new_name:
                 it["name"] = new_name
                 changed = True
@@ -3168,6 +3353,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 with app_state.lock:
                     _ensure_force_refresh_seq_cached(app_state)
                     return self._send(200, app_state.cached_json_bytes, "application/json", cache_control="public, max-age=15, s-maxage=30")
+            if self.path.startswith("/api/fixed"):
+                # Return just the fixed sensor array (lightweight for TUI remote mode)
+                with app_state.lock:
+                    fixed = app_state.state.get("fixed", []) if isinstance(app_state.state, dict) else []
+                body = json.dumps(fixed).encode("utf-8")
+                return self._send(200, body, "application/json", cache_control="public, max-age=15")
             if self.path.startswith("/api/raw"):
                 # Return raw Utah AQ data for TUI remote mode
                 with app_state.lock:
@@ -3559,6 +3750,13 @@ def main() -> int:
     
     # Start AirNow hourly data fetch loop (20-minute interval)
     if AIRNOW_AVAILABLE:
+        # Eager initial fetch so AirNow sensor names/data are available on first poll
+        try:
+            _log("[AirNow] Performing initial fetch...")
+            _fetch_airnow_data(app_state)
+            _log(f"[AirNow] Initial fetch complete ({len(app_state.airnow_sites)} sites, {len(app_state.airnow_readings)} readings)")
+        except Exception as e:
+            _log(f"[AirNow] Initial fetch error (will retry in background): {e}")
         threading.Thread(
             target=airnow_fetch_loop,
             kwargs=dict(app_state=app_state, interval_s=1200.0, stop_event=stop_event),
@@ -3671,6 +3869,10 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
     threading.Thread(target=watch_sensor_names_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event), daemon=True).start()
     
     if AIRNOW_AVAILABLE:
+        try:
+            _fetch_airnow_data(app_state)
+        except Exception:
+            pass
         threading.Thread(
             target=airnow_fetch_loop,
             kwargs=dict(app_state=app_state, interval_s=1200.0, stop_event=stop_event),

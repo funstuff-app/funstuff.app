@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 def _pick_primary_reading_color(readings: dict[str, Any]) -> str:
     """Pick a color from readings, preferring PM25, then PM10, then OZNE."""
-    priority = ["PM25", "PM2.5", "PM10", "OZNE", "Ozone"]
+    priority = ["PM25", "PM2.5", "PM10", "OZNE", "Ozone", "NO2", "CO"]
     for k in priority:
         v = readings.get(k)
         if isinstance(v, dict) and isinstance(v.get("color"), str):
@@ -45,7 +45,7 @@ def _pick_primary_reading_color(readings: dict[str, Any]) -> str:
 
 def _pick_primary_pollutant_key(readings: dict[str, Any]) -> str | None:
     """Pick the primary pollutant key from readings."""
-    priority = ["PM25", "PM2.5", "PM10", "OZNE", "Ozone"]
+    priority = ["PM25", "PM2.5", "PM10", "OZNE", "Ozone", "NO2", "CO"]
     for k in priority:
         if k in readings:
             return k
@@ -62,7 +62,7 @@ def _is_plausible_value(pollutant_key: str, value: Any) -> bool:
     if not math.isfinite(fv):
         return False
     key = normalize_pollutant_key(pollutant_key)
-    bounds = {"pm2.5": (0.0, 999.0), "pm10": (0.0, 2000.0), "ozone": (0.0, 600.0)}.get(key)
+    bounds = {"pm2.5": (0.0, 999.0), "pm10": (0.0, 2000.0), "ozone": (0.0, 600.0), "no2": (0.0, 2100.0), "co": (0.0, 60.0)}.get(key)
     if bounds and not (bounds[0] <= fv <= bounds[1]):
         return False
     return True
@@ -412,10 +412,14 @@ def normalize_state_for_dashboard(
         )
 
     # Fixed sensors
+    # Skip known weather/meteorological parameters — everything else passes through
+    _WEATHER_KEYS = {"BARPR", "DEWPOINT", "TEMP", "WD", "WS", "RHUM", "SOLAR", "PRECIP", "CEIL", "VSBY", "BC_LC", "BC_DC"}
     fixed_sensors: list[dict[str, Any]] = []
     if isinstance(fixed_json, dict):
         fixed_by_sensor: dict[str, dict[str, Any]] = {}
         for pollutant_key, details in fixed_json.items():
+            if str(pollutant_key) in _WEATHER_KEYS:
+                continue
             if not isinstance(details, dict):
                 continue
             for sensor_id, s_data in details.items():

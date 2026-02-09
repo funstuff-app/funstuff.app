@@ -22,7 +22,12 @@ function generateItemHTML(item, type, order) {
 
   const readings = item.readings || {};
   const keys = Object.keys(readings);
+  // Sort by AQI descending so the 3 most concerning pollutants are shown
   keys.sort((a, b) => {
+    const aqiA = typeof valueToAqi === "function" ? (valueToAqi(a, readings[a]?.value) ?? -1) : -1;
+    const aqiB = typeof valueToAqi === "function" ? (valueToAqi(b, readings[b]?.value) ?? -1) : -1;
+    if (aqiB !== aqiA) return aqiB - aqiA;
+    // tie-break by preferred display order
     const ia = order.indexOf(a);
     const ib = order.indexOf(b);
     return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
@@ -231,7 +236,11 @@ function renderLists(state, selectedId) {
     .map((x) => x.f);
 
   const fixed = sortByDistance(fixedOnly);
-  const publicSensors = sortByDistance(publicOnly);
+  const publicSensors = [...publicOnly].sort((a, b) => {
+    const na = String(a.name || a.id || "").toLowerCase();
+    const nb = String(b.name || b.id || "").toLowerCase();
+    return na.localeCompare(nb);
+  });
 
   // prefer a stable pollutant order like the TUI
   const order = ["PM25", "PM2.5", "PM10", "OZNE", "Ozone"];
