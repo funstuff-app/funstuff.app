@@ -192,11 +192,16 @@ function renderLists(state, selectedId) {
   _sidebarElCache = null; // Invalidate cached DOM refs — list is about to be rebuilt
   const listMobileEl = document.getElementById("sensorListMobile");
   const listFixedEl = document.getElementById("sensorListFixed");
+  const listPublicEl = document.getElementById("sensorListPublic");
 
   const DOWNTOWN_SLC = { lat: 40.7608, lon: -111.8910 };
 
   const mobilesRaw = Array.isArray(state.mobile) ? state.mobile : [];
   const fixedRaw = Array.isArray(state.fixed) ? state.fixed : [];
+
+  // Split fixed into non-purpleair (fixed) and purpleair (public)
+  const fixedOnly = fixedRaw.filter(f => !f.purpleair);
+  const publicOnly = fixedRaw.filter(f => !!f.purpleair);
 
   // Sorting is based on latest reported lat/lon, not animated marker positions.
   const mobiles = mobilesRaw.slice().sort((a, b) => {
@@ -210,7 +215,7 @@ function renderLists(state, selectedId) {
     return String(a?.id || "").localeCompare(String(b?.id || ""));
   });
 
-  const fixed = fixedRaw
+  const sortByDistance = (arr) => arr
     .map((f) => {
       const lat = Number(f?.lat);
       const lon = Number(f?.lon);
@@ -225,11 +230,15 @@ function renderLists(state, selectedId) {
     })
     .map((x) => x.f);
 
+  const fixed = sortByDistance(fixedOnly);
+  const publicSensors = sortByDistance(publicOnly);
+
   // prefer a stable pollutant order like the TUI
   const order = ["PM25", "PM2.5", "PM10", "OZNE", "Ozone"];
 
   if (listMobileEl) reconcileList(listMobileEl, mobiles, "mobile", selectedId, order);
   if (listFixedEl) reconcileList(listFixedEl, fixed, "fixed", selectedId, order);
+  if (listPublicEl) reconcileList(listPublicEl, publicSensors, "fixed", selectedId, order);
 }
 
 function renderDetails(state, selectedId) {

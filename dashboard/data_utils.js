@@ -101,24 +101,27 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
     const values = r.history;
     const colors = r.history_colors || [];
 
-    // Some feeds include null/invalid times (and sometimes null values) as padding.
-    // Those break monotonic ordering and make binary search return wrong indices
-    // (often yielding a null value), which makes fixed-marker labels show key-only.
-    // Build a filtered, monotonic timeline for indexing, but keep original arrays
-    // for sparklines.
-    const timesMs = [];
-    const valuesF = [];
-    const colorsF = [];
-    const n = Math.min(times.length, values.length);
-    for (let i = 0; i < n; i++) {
-      const tMs = parseUtcMs(times[i]);
-      if (!(tMs != null && isFinite(tMs))) continue;
-      const v = values[i];
-      if (v == null) continue;
-      timesMs.push(tMs);
-      valuesF.push(v);
-      colorsF.push(colors[i] || r.color || "#cccccc");
+    // Cache parsed/filtered timeline on the reading object to avoid re-parsing
+    // parseUtcMs + filtering on every frame. The source arrays are immutable
+    // between server fetches, so this is safe.
+    if (!r._parsedTimeline || r._parsedTimeline._srcLen !== times.length) {
+      const timesMs = [];
+      const valuesF = [];
+      const colorsF = [];
+      const n = Math.min(times.length, values.length);
+      for (let i = 0; i < n; i++) {
+        const tMs = parseUtcMs(times[i]);
+        if (!(tMs != null && isFinite(tMs))) continue;
+        const v = values[i];
+        if (v == null) continue;
+        timesMs.push(tMs);
+        valuesF.push(v);
+        colorsF.push(colors[i] || r.color || "#cccccc");
+      }
+      r._parsedTimeline = { timesMs, valuesF, colorsF, _srcLen: times.length };
     }
+
+    const { timesMs, valuesF, colorsF } = r._parsedTimeline;
     if (timesMs.length < 1) {
       result[key] = r;
       continue;

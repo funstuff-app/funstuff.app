@@ -40,29 +40,37 @@ function main() {
   const SIDEBAR_OPEN_KEY = "mobileair.sidebarOpen";
   const SHOW_MOBILE_KEY = "mobileair.showMobile";
   const SHOW_FIXED_KEY = "mobileair.showFixed";
+  const SHOW_PUBLIC_KEY = "mobileair.showPublic";
   // Labels are now per-type; keep legacy key as a migration fallback.
   const SHOW_LABELS_LEGACY_KEY = "mobileair.showLabels";
   const SHOW_MOBILE_LABELS_KEY = "mobileair.showMobileLabels";
   const SHOW_FIXED_LABELS_KEY = "mobileair.showFixedLabels";
+  const SHOW_PUBLIC_LABELS_KEY = "mobileair.showPublicLabels";
   const tabMobileEl = document.getElementById("tabMobile");
   const tabFixedEl = document.getElementById("tabFixed");
+  const tabPublicEl = document.getElementById("tabPublic");
   const tabLabelsEl = document.getElementById("tabLabels");
   const listMobileEl = document.getElementById("sensorListMobile");
   const listFixedEl = document.getElementById("sensorListFixed");
+  const listPublicEl = document.getElementById("sensorListPublic");
   const sidebarEl = document.getElementById("sidebar");
   const menuBtnEl = document.getElementById("menuBtn");
   const sidebarCloseEl = document.getElementById("sidebarClose");
   
-  let activeTab = (localStorage.getItem(TAB_STORAGE_KEY) === "fixed") ? "fixed" : "mobile";
+  const validTabs = ["mobile", "fixed", "public"];
+  const savedTab = localStorage.getItem(TAB_STORAGE_KEY);
+  let activeTab = validTabs.includes(savedTab) ? savedTab : "mobile";
   let sidebarOpen = localStorage.getItem(SIDEBAR_OPEN_KEY) !== "false"; // Default open
   
   // Restore visibility states
   map.showMobile = localStorage.getItem(SHOW_MOBILE_KEY) !== "false";
   map.showFixed = localStorage.getItem(SHOW_FIXED_KEY) !== "false";
+  map.showPublic = localStorage.getItem(SHOW_PUBLIC_KEY) !== "false";
   const legacyShowLabels = localStorage.getItem(SHOW_LABELS_LEGACY_KEY);
   // Mobile labels default OFF, fixed labels default ON
   map.showMobileLabels = localStorage.getItem(SHOW_MOBILE_LABELS_KEY) === "true";
   map.showFixedLabels = localStorage.getItem(SHOW_FIXED_LABELS_KEY) === "true";
+  map.showPublicLabels = localStorage.getItem(SHOW_PUBLIC_LABELS_KEY) === "true";
 
   function updateSidebarVisibility() {
     if (sidebarEl) sidebarEl.classList.toggle("hidden", !sidebarOpen);
@@ -75,31 +83,40 @@ function main() {
   }
 
   function applySidebarTab() {
-    const isMobile = (activeTab === "mobile");
-    const labelsOn = isMobile ? map.showMobileLabels : map.showFixedLabels;
+    const labelsOn = activeTab === "mobile" ? map.showMobileLabels
+      : activeTab === "public" ? map.showPublicLabels
+      : map.showFixedLabels;
     // "active" = which list is shown in sidebar
     // "disabled" = markers hidden on map (dimmed look)
     if (tabMobileEl) {
-      tabMobileEl.classList.toggle("active", isMobile);
+      tabMobileEl.classList.toggle("active", activeTab === "mobile");
       tabMobileEl.classList.toggle("disabled", !map.showMobile);
-      tabMobileEl.setAttribute("aria-selected", isMobile ? "true" : "false");
+      tabMobileEl.setAttribute("aria-selected", activeTab === "mobile" ? "true" : "false");
     }
     if (tabFixedEl) {
-      tabFixedEl.classList.toggle("active", !isMobile);
+      tabFixedEl.classList.toggle("active", activeTab === "fixed");
       tabFixedEl.classList.toggle("disabled", !map.showFixed);
-      tabFixedEl.setAttribute("aria-selected", !isMobile ? "true" : "false");
+      tabFixedEl.setAttribute("aria-selected", activeTab === "fixed" ? "true" : "false");
+    }
+    if (tabPublicEl) {
+      tabPublicEl.classList.toggle("active", activeTab === "public");
+      tabPublicEl.classList.toggle("disabled", !map.showPublic);
+      tabPublicEl.setAttribute("aria-selected", activeTab === "public" ? "true" : "false");
     }
     if (tabLabelsEl) {
       tabLabelsEl.classList.toggle("active", labelsOn);
       tabLabelsEl.classList.toggle("disabled", !labelsOn);
     }
-    if (listMobileEl) listMobileEl.classList.toggle("hidden", !isMobile);
-    if (listFixedEl) listFixedEl.classList.toggle("hidden", isMobile);
-    localStorage.setItem(TAB_STORAGE_KEY, isMobile ? "mobile" : "fixed");
+    if (listMobileEl) listMobileEl.classList.toggle("hidden", activeTab !== "mobile");
+    if (listFixedEl) listFixedEl.classList.toggle("hidden", activeTab !== "fixed");
+    if (listPublicEl) listPublicEl.classList.toggle("hidden", activeTab !== "public");
+    localStorage.setItem(TAB_STORAGE_KEY, activeTab);
     localStorage.setItem(SHOW_MOBILE_KEY, map.showMobile ? "true" : "false");
     localStorage.setItem(SHOW_FIXED_KEY, map.showFixed ? "true" : "false");
+    localStorage.setItem(SHOW_PUBLIC_KEY, map.showPublic ? "true" : "false");
     localStorage.setItem(SHOW_MOBILE_LABELS_KEY, map.showMobileLabels ? "true" : "false");
     localStorage.setItem(SHOW_FIXED_LABELS_KEY, map.showFixedLabels ? "true" : "false");
+    localStorage.setItem(SHOW_PUBLIC_LABELS_KEY, map.showPublicLabels ? "true" : "false");
   }
 
   // Hamburger menu button toggles sidebar
@@ -363,11 +380,27 @@ function main() {
       map.drawOverlay(map.lastState);
     });
   }
+
+  if (tabPublicEl) {
+    tabPublicEl.addEventListener("click", () => {
+      if (activeTab === "public") {
+        map.showPublic = !map.showPublic;
+      } else {
+        activeTab = "public";
+        if (!map.showPublic) map.showPublic = true;
+      }
+      applySidebarTab();
+      map._invalidateOverlayStatic();
+      map.drawOverlay(map.lastState);
+    });
+  }
   
   if (tabLabelsEl) {
     tabLabelsEl.addEventListener("click", () => {
       if (activeTab === "mobile") {
         map.showMobileLabels = !map.showMobileLabels;
+      } else if (activeTab === "public") {
+        map.showPublicLabels = !map.showPublicLabels;
       } else {
         map.showFixedLabels = !map.showFixedLabels;
       }

@@ -44,6 +44,7 @@ from mobileair import (
     default_cache_path,
     normalize_state_for_dashboard,
     stdlib_get,
+    coerce_float,
     MOBILE_URL,
     FIXED_URL,
     HEADERS,
@@ -926,7 +927,7 @@ def _save_cached_historical_day(data_dir: Path, date_str: str, result: dict[str,
 
 def _apply_fixed_sensors_to_history(result: dict[str, Any], date_str: str,
                                      app_state: AppState | None, data_dir: Path) -> None:
-    """Add Home + PurpleAir fixed sensors to a historical day result.
+    """Add Home + DEQ + PurpleAir fixed sensors to a historical day result.
     
     Called both for freshly-fetched days and for disk-cached days.
     Reconstructs fixed sensors from fixed_history (which accumulates over time)
@@ -1044,6 +1045,104 @@ def _apply_fixed_sensors_to_history(result: dict[str, Any], date_str: str,
                                       "history_times": history_times}},
                 "color": color, "purpleair": True, "primary_key": "PM25",
                 "primary_value": display_val, "primary_color": color, "primary_aqi": None,
+            })
+    
+    # ── DEQ / Utah AQ fixed stations from fixed_history ──
+    # These are the stationary government sensors (Hawthorne, Rose Park, etc.)
+    # accumulated from live FixedSiteMapData.json polls.
+    # Get lat/lon from the current live state (locations are static).
+    if app_state:
+        # Build a lookup of lat/lon/name from the current live fixed sensor state
+        live_fixed_lookup: dict[str, dict[str, Any]] = {}
+        live_state = app_state.state if isinstance(app_state.state, dict) else {}
+        for f in (live_state.get("fixed") or []):
+            if isinstance(f, dict) and f.get("id"):
+                live_fixed_lookup[f["id"]] = f
+        
+        # Also check raw_fixed for lat/lon (more reliable source)
+        if isinstance(app_state.raw_fixed, dict):
+            for _pollutant_key, sensors in app_state.raw_fixed.items():
+                if not isinstance(sensors, dict):
+                    continue
+                for sid, s_data in sensors.items():
+                    if sid in ("LastUpdateUTC", "LastUpdateLocal", "APITimeStart", "APITimeEnd", "VarName", "VarUnit"):
+                        continue
+                    if not isinstance(s_data, dict):
+                        continue
+                    lat_f = coerce_float(s_data.get("Latitude"))
+                    lon_f = coerce_float(s_data.get("Longitude"))
+                    if lat_f is not None and lon_f is not None and sid not in live_fixed_lookup:
+                        live_fixed_lookup[sid] = {"id": sid, "lat": lat_f, "lon": lon_f, "name": ""}
+        
+        # IDs already in result (Home, PurpleAir) — skip these
+        already_added = {f.get("id") for f in result["fixed"]}
+        
+        for sensor_id, pollutants in app_state.fixed_history.items():
+            # Skip Home, PurpleAir (already handled above), and anything already added
+            if sensor_id == "Home" or sensor_id.startswith("PA_") or sensor_id in already_added:
+                continue
+            
+            # Need lat/lon from live state
+            live_info = live_fixed_lookup.get(sensor_id)
+            if not live_info:
+                continue
+            lat = coerce_float(live_info.get("lat"))
+            lon = coerce_float(live_info.get("lon"))
+            if lat is None or lon is None:
+                continue
+            
+            # Build readings for each pollutant that has history for this day
+            readings: dict[str, Any] = {}
+            for pollutant, hist_entries in pollutants.items():
+                if not hist_entries:
+                    continue
+                day_entries = [e for e in hist_entries if e.get("time") and e["time"].startswith(date_str)]
+                if not day_entries:
+                    continue
+                history_values = []
+                history_colors = []
+                history_times = []
+                for entry in day_entries:
+                    v = entry.get("val")
+                    try:
+                        fv = float(v) if v is not None else None
+                        if fv is not None and fv == int(fv):
+                            fv = int(fv)
+                    except (TypeError, ValueError):
+                        fv = None
+                    history_values.append(fv)
+                    history_colors.append(_get_aqi_color(pollutant, fv) if fv is not None else "#cccccc")
+                    history_times.append(entry.get("time"))
+                last_val = history_values[-1] if history_values else None
+                last_col = _get_aqi_color(pollutant, last_val) if last_val is not None else "#cccccc"
+                display_val = last_val
+                if display_val is not None:
+                    try:
+                        if float(display_val) == int(float(display_val)):
+                            display_val = int(float(display_val))
+                    except (ValueError, TypeError):
+                        pass
+                readings[pollutant] = {
+                    "value": display_val, "color": last_col,
+                    "history": history_values, "history_colors": history_colors,
+                    "history_times": history_times,
+                }
+            
+            if not readings:
+                continue
+            
+            worst = _pick_worst_reading_by_aqi(readings)
+            name = live_info.get("name") or ""
+            pinned = bool(live_info.get("pinned"))
+            result["fixed"].append({
+                "id": sensor_id, "name": name, "pinned": pinned, "emoji": "📍",
+                "lat": lat, "lon": lon,
+                "readings": readings,
+                "color": worst.get("color") or "#cccccc",
+                "primary_key": worst.get("key"),
+                "primary_value": worst.get("value"),
+                "primary_color": worst.get("color"),
+                "primary_aqi": worst.get("aqi"),
             })
 
 
