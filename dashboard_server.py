@@ -885,16 +885,185 @@ def _fetch_history_file(sensor: str, var: str) -> list:
         return []
 
 
-def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_dir: Path | None = None) -> dict[str, Any]:
+def _get_history_cache_dir(data_dir: Path) -> Path:
+    """Return the directory for cached historical day results."""
+    cache_dir = data_dir / "history_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _load_cached_historical_day(data_dir: Path, date_str: str) -> dict[str, Any] | None:
+    """Load a cached historical day result from disk. Returns None if not cached."""
+    cache_dir = _get_history_cache_dir(data_dir)
+    safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
+    if not safe_date or len(safe_date) > 20:
+        return None
+    cache_file = cache_dir / f"{safe_date}.json"
+    if not cache_file.exists():
+        return None
+    try:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("mobile"), list):
+            return data
+    except Exception as e:
+        _log(f"[History] Failed to load cache for {date_str}: {e}")
+    return None
+
+
+def _save_cached_historical_day(data_dir: Path, date_str: str, result: dict[str, Any]) -> None:
+    """Save a processed historical day result to disk cache."""
+    cache_dir = _get_history_cache_dir(data_dir)
+    safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
+    if not safe_date or len(safe_date) > 20:
+        return
+    cache_file = cache_dir / f"{safe_date}.json"
+    try:
+        cache_file.write_text(json.dumps(result, separators=(",", ":")), encoding="utf-8")
+        _log(f"[History] Cached day {date_str} ({cache_file.stat().st_size} bytes)")
+    except Exception as e:
+        _log(f"[History] Failed to cache {date_str}: {e}")
+
+
+def _apply_fixed_sensors_to_history(result: dict[str, Any], date_str: str,
+                                     app_state: AppState | None, data_dir: Path) -> None:
+    """Add Home + PurpleAir fixed sensors to a historical day result.
+    
+    Called both for freshly-fetched days and for disk-cached days.
+    Reconstructs fixed sensors from fixed_history (which accumulates over time)
+    and saved snapshots, so cached mobile-only results still get fixed sensors.
+    """
+    if "fixed" not in result:
+        result["fixed"] = []
+    
+    # Remove any stale fixed entries so we rebuild fresh
+    existing_fixed_ids = {f.get("id") for f in result["fixed"] if not f.get("purpleair") and f.get("id") != "Home"}
+    result["fixed"] = [f for f in result["fixed"] if f.get("id") not in {"Home"} and not f.get("purpleair")]
+    
+    # ── Home sensor ──
+    home_entry = None
+    if app_state:
+        home_hist = app_state.fixed_history.get("Home", {}).get("PM25", [])
+        if home_hist:
+            filtered_hist = [
+                e for e in home_hist
+                if e.get("time") and e["time"].startswith(date_str)
+            ]
+            if filtered_hist:
+                history_values = []
+                history_colors = []
+                history_times = []
+                for entry in filtered_hist:
+                    val = entry.get("val")
+                    try:
+                        fval = float(val) if val is not None else None
+                        if fval is not None and fval == int(fval):
+                            fval = int(fval)
+                    except (ValueError, TypeError):
+                        fval = None
+                    history_values.append(fval)
+                    history_colors.append(_get_aqi_color("PM25", fval) if fval is not None else "#cccccc")
+                    history_times.append(entry.get("time"))
+                last_val = history_values[-1] if history_values else None
+                last_col = _get_aqi_color("PM25", last_val) if last_val is not None else "#cccccc"
+                display_val = int(last_val) if last_val is not None and last_val == int(last_val) else last_val
+                home_entry = {
+                    "id": "Home", "name": "Home", "pinned": True, "emoji": "\U0001f3f0",
+                    "lat": 40.7608, "lon": -111.891,
+                    "readings": {"PM25": {"value": display_val, "color": last_col,
+                                          "history": history_values, "history_colors": history_colors,
+                                          "history_times": history_times}},
+                    "color": last_col, "primary_key": "PM25", "primary_value": display_val,
+                    "primary_color": last_col, "primary_aqi": None,
+                }
+    if not home_entry:
+        try:
+            snapshot = load_snapshot(data_dir, date_str)
+            if snapshot and isinstance(snapshot.get("fixed"), list):
+                for sensor in snapshot["fixed"]:
+                    if sensor.get("id") == "Home":
+                        home_entry = sensor
+                        break
+        except Exception:
+            pass
+    if home_entry:
+        result["fixed"].insert(0, home_entry)
+    
+    # ── PurpleAir sensors from fixed_history ──
+    if app_state:
+        for sensor_id, pollutants in app_state.fixed_history.items():
+            if not sensor_id.startswith("PA_"):
+                continue
+            pm25_hist = pollutants.get("PM25", [])
+            if not pm25_hist:
+                continue
+            day_entries = [e for e in pm25_hist if e.get("time") and e["time"].startswith(date_str)]
+            if not day_entries:
+                continue
+            last = day_entries[-1]
+            val_str = last.get("val")
+            try:
+                pm25_val = float(val_str) if val_str is not None else None
+            except (TypeError, ValueError):
+                pm25_val = None
+            if pm25_val is None:
+                continue
+            color = _get_aqi_color("PM25", pm25_val)
+            lat, lon = None, None
+            sensor_idx = sensor_id[3:]
+            for s in app_state.purpleair_sensors:
+                if str(s.get("sensor_index", "")) == sensor_idx:
+                    lat = s.get("latitude")
+                    lon = s.get("longitude")
+                    break
+            if lat is None or lon is None:
+                continue
+            history_values, history_colors, history_times = [], [], []
+            for entry in day_entries:
+                v = entry.get("val")
+                try:
+                    fv = float(v) if v is not None else None
+                    if fv is not None and fv == int(fv):
+                        fv = int(fv)
+                except (TypeError, ValueError):
+                    fv = None
+                history_values.append(fv)
+                history_colors.append(_get_aqi_color("PM25", fv) if fv is not None else "#cccccc")
+                history_times.append(entry.get("time"))
+            display_val = round(pm25_val, 1)
+            name = sensor_id
+            for s in app_state.purpleair_sensors:
+                if str(s.get("sensor_index", "")) == sensor_idx:
+                    name = s.get("name", sensor_id)
+                    name = re.sub(r'(?:\s*-\s*|\s+)power(?:ed)?\s+by\s+uto[pi]{2}a(?:\s+fiber)?', '', name, flags=re.IGNORECASE).strip()
+                    break
+            result["fixed"].append({
+                "id": sensor_id, "name": name, "pinned": False, "emoji": "",
+                "lat": lat, "lon": lon,
+                "readings": {"PM25": {"value": display_val, "color": color, "key": "PM2.5",
+                                      "history": history_values, "history_colors": history_colors,
+                                      "history_times": history_times}},
+                "color": color, "purpleair": True, "primary_key": "PM25",
+                "primary_value": display_val, "primary_color": color, "primary_aqi": None,
+            })
+
+
+def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_dir: Path | None = None, start_ms: int | None = None, end_ms: int | None = None) -> dict[str, Any]:
     """Fetch week-long data and filter to a specific day.
+    
+    Day boundaries are 4 AM local time to 4 AM the next day.
+    If start_ms/end_ms are provided (from client), use them directly.
+    Otherwise fall back to server-side computation (MST, UTC-7).
+    Past days are cached on disk so upstream data is only fetched once.
     
     Returns data in RAW API FORMAT so it can be processed by 
     normalize_state_for_dashboard like live data.
     
     Args:
-        date_str: Date in YYYY-MM-DD format (UTC)
+        date_str: Date in YYYY-MM-DD format
         app_state: Optional AppState for accessing Home sensor history
         data_dir: Data directory for loading snapshots (defaults to ~/.mobileair)
+        start_ms: Optional day-start epoch ms from client (4 AM local)
+        end_ms: Optional day-end epoch ms from client (next 4 AM local)
     
     Returns:
         Dict with 'mobile' in raw API format (same as MobileMapData.json)
@@ -905,20 +1074,40 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
     from datetime import datetime, timezone, timedelta
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
+    # Use client-provided boundaries if available, else compute server-side.
+    if start_ms is not None and end_ms is not None:
+        day_start = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+        day_end = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
+    else:
+        # Fallback: Parse date and compute day boundaries at 4 AM local (MST = UTC-7).
+        # 4 AM MST = 11:00 UTC, so add 11 hours to midnight UTC of the selected date.
+        try:
+            day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise ValueError(f"Invalid date format: {date_str}. Use YYYY-MM-DD.")
+        day_start = day_start + timedelta(hours=11)  # 4 AM MST = 11:00 UTC
+        day_end = day_start + timedelta(days=1)
+        start_ms = int(day_start.timestamp() * 1000)
+        end_ms = int(day_end.timestamp() * 1000)
+    
+    # For past days (not today), check disk cache first.
+    # Past days are immutable once complete — no need to re-fetch.
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    is_past_day = (date_str < today_str)
+    
+    if is_past_day:
+        cached = _load_cached_historical_day(data_dir, date_str)
+        if cached is not None:
+            _log(f"[History] Serving {date_str} from disk cache")
+            # Always reconstruct fixed sensors from current fixed_history
+            # (cache only stores mobile data; fixed history accumulates over time)
+            _apply_fixed_sensors_to_history(cached, date_str, app_state, data_dir)
+            return cached
+    
     # Check if history server is reachable (will use AirNow-only if not)
     utah_aq_available = _is_history_server_reachable()
     if not utah_aq_available:
         _log(f"[History] Utah AQ server unreachable, will use AirNow-only for {date_str}")
-    
-    # Parse date and compute day boundaries (UTC)
-    try:
-        day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except ValueError:
-        raise ValueError(f"Invalid date format: {date_str}. Use YYYY-MM-DD.")
-    
-    day_end = day_start + timedelta(days=1)
-    start_ms = int(day_start.timestamp() * 1000)
-    end_ms = int(day_end.timestamp() * 1000)
     
     # Fetch data for all sensors in parallel (using cached week files)
     # Skip if Utah AQ is unavailable - we'll still have Home sensor + AirNow
@@ -1064,8 +1253,6 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
     # Override: MOBILEAIR_FORCE_ROAD_SNAP_HISTORICAL=1 forces snapping for all dates (testing)
     combined = {"mobile": mobile_raw, "fixed": {}}
     
-    # Check if this is today's data - if so, use road graph like live data
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     force_snap = os.environ.get("MOBILEAIR_FORCE_ROAD_SNAP_HISTORICAL", "").strip() == "1"
     use_road_graph = (date_str == today_str) or force_snap
     
@@ -1092,173 +1279,85 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
         if mobile_count == 0:
             result["meta"]["mobile_data_unavailable"] = True
     
-    # Add Home sensor with historical data
-    # Priority: 1) fixed_history (recent data), 2) saved snapshot for that day
-    home_entry = None
+    # Add fixed sensors (Home + PurpleAir) from fixed_history / snapshots
+    _apply_fixed_sensors_to_history(result, date_str, app_state, data_dir)
     
-    if app_state:
-        home_hist = app_state.fixed_history.get("Home", {}).get("PM25", [])
-        if home_hist:
-            # Filter history to requested day
-            filtered_hist = [
-                e for e in home_hist
-                if e.get("time") and e["time"].startswith(date_str)
-            ]
-            
-            if filtered_hist:
-                # Build history arrays from fixed_history
-                history_values = []
-                history_colors = []
-                history_times = []
-                for entry in filtered_hist:
-                    val = entry.get("val")
-                    try:
-                        fval = float(val) if val is not None else None
-                        if fval is not None and fval == int(fval):
-                            fval = int(fval)
-                    except (ValueError, TypeError):
-                        fval = None
-                    history_values.append(fval)
-                    # Recompute color from value (stored colors may be stale)
-                    history_colors.append(_get_aqi_color("PM25", fval) if fval is not None else "#cccccc")
-                    history_times.append(entry.get("time"))
-                
-                # Use last historical value as display value (not current)
-                last_val = history_values[-1] if history_values else None
-                last_col = _get_aqi_color("PM25", last_val) if last_val is not None else "#cccccc"
-                # Format value: integers without decimals, floats with decimals
-                display_val = int(last_val) if last_val is not None and last_val == int(last_val) else last_val
-                
-                home_entry = {
-                    "id": "Home",
-                    "name": "Home",
-                    "pinned": True,
-                    "emoji": "\U0001f3f0",
-                    "lat": 40.7608,  # Default SLC coords
-                    "lon": -111.891,
-                    "readings": {
-                        "PM25": {
-                            "value": display_val,
-                            "color": last_col,
-                            "history": history_values,
-                            "history_colors": history_colors,
-                            "history_times": history_times,
-                        }
-                    },
-                    "color": last_col,
-                    "primary_key": "PM25",
-                    "primary_value": display_val,
-                    "primary_color": last_col,
-                    "primary_aqi": None,
-                }
-    
-    # If no data from fixed_history, try loading from a saved snapshot
-    if not home_entry:
-        try:
-            snapshot = load_snapshot(data_dir, date_str)
-            if snapshot and isinstance(snapshot.get("fixed"), list):
-                for sensor in snapshot["fixed"]:
-                    if sensor.get("id") == "Home":
-                        home_entry = sensor
-                        break
-        except Exception:
-            pass
-    
-    # Insert Home sensor at beginning of fixed list
-    if home_entry:
-        if "fixed" not in result:
-            result["fixed"] = []
-        result["fixed"].insert(0, home_entry)
-    
-    # Reconstruct PurpleAir sensors from fixed_history for the requested date
-    # (NOT from live data — that would show current readings while scrubbing the past)
-    if app_state:
-        if "fixed" not in result:
-            result["fixed"] = []
-        fixed_list = result["fixed"]
-        # Remove any stale PurpleAir entries
-        fixed_list = [f for f in fixed_list if not f.get("purpleair")]
-        
-        for sensor_id, pollutants in app_state.fixed_history.items():
-            if not sensor_id.startswith("PA_"):
-                continue
-            pm25_hist = pollutants.get("PM25", [])
-            if not pm25_hist:
-                continue
-            # Filter to requested date
-            day_entries = [e for e in pm25_hist if e.get("time") and e["time"].startswith(date_str)]
-            if not day_entries:
-                continue
-            # Use last entry for this date as the display value
-            last = day_entries[-1]
-            val_str = last.get("val")
-            try:
-                pm25_val = float(val_str) if val_str is not None else None
-            except (TypeError, ValueError):
-                pm25_val = None
-            if pm25_val is None:
-                continue
-            color = _get_aqi_color("PM25", pm25_val)
-            # Find lat/lon from current purpleair_sensors (positions don't change)
-            lat, lon = None, None
-            sensor_idx = sensor_id[3:]  # strip "PA_"
-            for s in app_state.purpleair_sensors:
-                if str(s.get("sensor_index", "")) == sensor_idx:
-                    lat = s.get("latitude")
-                    lon = s.get("longitude")
-                    break
-            if lat is None or lon is None:
-                continue
-            # Build history arrays
-            history_values = []
-            history_colors = []
-            history_times = []
-            for entry in day_entries:
-                v = entry.get("val")
-                try:
-                    fv = float(v) if v is not None else None
-                    if fv is not None and fv == int(fv):
-                        fv = int(fv)
-                except (TypeError, ValueError):
-                    fv = None
-                history_values.append(fv)
-                history_colors.append(_get_aqi_color("PM25", fv) if fv is not None else "#cccccc")
-                history_times.append(entry.get("time"))
-            display_val = round(pm25_val, 1)
-            # Find name from current sensors
-            name = sensor_id
-            for s in app_state.purpleair_sensors:
-                if str(s.get("sensor_index", "")) == sensor_idx:
-                    name = s.get("name", sensor_id)
-                    name = re.sub(r'\s+powered by UTOPIA(?:\s+Fiber)?', '', name).strip()
-                    break
-            fixed_list.append({
-                "id": sensor_id,
-                "name": name,
-                "pinned": False,
-                "emoji": "",
-                "lat": lat,
-                "lon": lon,
-                "readings": {
-                    "PM25": {
-                        "value": display_val,
-                        "color": color,
-                        "key": "PM2.5",
-                        "history": history_values,
-                        "history_colors": history_colors,
-                        "history_times": history_times,
-                    }
-                },
-                "color": color,
-                "purpleair": True,
-                "primary_key": "PM25",
-                "primary_value": display_val,
-                "primary_color": color,
-                "primary_aqi": None,
-            })
-        result["fixed"] = fixed_list
+    # Cache past days to disk for instant future loads
+    # Only cache mobile data — fixed sensors are reconstructed on serve
+    # Only cache if Utah AQ was reachable and we got actual mobile data
+    if is_past_day:
+        if utah_aq_available and mobile_count > 0:
+            _save_cached_historical_day(data_dir, date_str, result)
+        else:
+            _log(f"[History] Skipping cache for {date_str} (utah_aq_available={utah_aq_available}, mobile_count={mobile_count})")
     
     return result
+
+
+def history_prefetch_loop(app_state: AppState, data_dir: Path, stop_event: threading.Event) -> None:
+    """Background thread that pre-fetches and caches past 6 days of history.
+    
+    Runs once on startup (after a short delay). Skips days already cached
+    on disk. Past days are immutable so there's no reason to re-run.
+    Retries once if CHPC is initially unreachable.
+    """
+    from datetime import datetime, timezone, timedelta
+    
+    # Initial delay to let the server finish starting up
+    if stop_event.wait(10):
+        return
+    
+    # Wait for CHPC to be reachable before starting (up to ~60s)
+    for attempt in range(6):
+        if stop_event.is_set():
+            return
+        if _is_history_server_reachable():
+            break
+        _log(f"[HistoryPrefetch] CHPC not reachable, retrying in 10s (attempt {attempt + 1}/6)")
+        # Clear the 60s fast-fail so we can retry sooner
+        global _history_server_down_until
+        _history_server_down_until = 0
+        if stop_event.wait(10):
+            return
+    else:
+        _log("[HistoryPrefetch] CHPC unreachable after 6 attempts, giving up")
+        return
+    
+    try:
+        today = datetime.now(timezone.utc).date()
+        fetched = 0
+        for days_ago in range(1, 7):  # 1..6 days ago
+            if stop_event.is_set():
+                return
+            target = today - timedelta(days=days_ago)
+            date_str = target.strftime("%Y-%m-%d")
+            
+            try:
+                # Skip if already cached on disk
+                cached = _load_cached_historical_day(data_dir, date_str)
+                if cached is not None:
+                    _log(f"[HistoryPrefetch] {date_str} already cached, skipping")
+                    continue
+                
+                _log(f"[HistoryPrefetch] Pre-fetching {date_str}")
+                fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir)
+                
+                # Verify it actually got cached
+                cached_after = _load_cached_historical_day(data_dir, date_str) 
+                if cached_after is not None:
+                    _log(f"[HistoryPrefetch] Cached {date_str}")
+                    fetched += 1
+                else:
+                    _log(f"[HistoryPrefetch] {date_str} fetched but NOT cached (empty data?)")
+            except Exception as day_error:
+                _log(f"[HistoryPrefetch] Failed {date_str}: {day_error}")
+            
+            # 5s gap between days to avoid hammering CHPC
+            if stop_event.wait(5):
+                return
+        _log(f"[HistoryPrefetch] Done ({fetched} days fetched)")
+    except Exception as e:
+        _log(f"[HistoryPrefetch] Error: {e}")
 
 
 def _first_last_ts(trail: list[dict[str, Any]]) -> tuple[float | None, float | None]:
@@ -1308,10 +1407,10 @@ def _point_ms(p: Any) -> int | None:
     return int(dt.timestamp() * 1000)
 
 
-def _day_start_5am_local_ms(anchor_ms: int) -> int | None:
+def _day_start_4am_local_ms(anchor_ms: int) -> int | None:
     try:
         d = datetime.fromtimestamp(anchor_ms / 1000.0, tz=timezone.utc).astimezone()
-        d = d.replace(hour=5, minute=0, second=0, microsecond=0)
+        d = d.replace(hour=4, minute=0, second=0, microsecond=0)
         return int(d.timestamp() * 1000)
     except Exception:
         return None
@@ -1351,7 +1450,7 @@ def _lazy_backfill_road_matching_today(
     if newest_ms is None:
         return
 
-    day_start_ms = _day_start_5am_local_ms(newest_ms)
+    day_start_ms = _day_start_4am_local_ms(newest_ms)
     if day_start_ms is None:
         return
 
@@ -1845,7 +1944,7 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
         sid = f"PA_{s.get('sensor_index', '')}"
         name = s.get("name", sid)
         # Strip branding from name
-        name = re.sub(r'\s+powered by UTOPIA(?:\s+Fiber)?', '', name).strip()
+        name = re.sub(r'(?:\s*-\s*|\s+)power(?:ed)?\s+by\s+uto[pi]{2}a(?:\s+fiber)?', '', name, flags=re.IGNORECASE).strip()
         color = _get_aqi_color("PM25", pm25_val)
         readings = {
             "PM25": {
@@ -3078,8 +3177,20 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             if not date_str:
                 return self._send(400, b'{"error": "date parameter required"}', "application/json")
             
+            # Parse optional client-provided day boundaries (4 AM local → next 4 AM local)
+            client_start_ms = None
+            client_end_ms = None
             try:
-                result = fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir)
+                s = query.get("start_ms", [None])[0]
+                e = query.get("end_ms", [None])[0]
+                if s is not None and e is not None:
+                    client_start_ms = int(s)
+                    client_end_ms = int(e)
+            except (ValueError, TypeError):
+                pass
+            
+            try:
+                result = fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir, start_ms=client_start_ms, end_ms=client_end_ms)
                 body = json.dumps(result).encode("utf-8")
                 return self._send(200, body, "application/json")
             except Exception as e:
@@ -3365,6 +3476,14 @@ def main() -> int:
         daemon=True
     ).start()
     _log("[PurpleAir] SLC sensor integration enabled (5-min refresh)")
+
+    # Start background history pre-fetch (caches past 6 days for instant playback)
+    threading.Thread(
+        target=history_prefetch_loop,
+        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+        daemon=True
+    ).start()
+    _log("[HistoryPrefetch] Background pre-fetch enabled (past 6 days, once on startup)")
 
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir, server_config=server_config))
     # Timeout for individual requests - helps with Safari/iOS connection issues
