@@ -221,12 +221,8 @@ class MapView {
     if (this._centerAnimRAF) {
       cancelAnimationFrame(this._centerAnimRAF);
       this._centerAnimRAF = null;
-      // Clear animation snapshots so next interaction gets fresh ones
-      this._panSnapshotOverlay = null;
-      this._panSnapshotCenter = null;
     }
-    // Pinch-zoom inertia is NOT cancelled here — it coexists with pan
-    // via the snapshot fast path (both just transform cached canvases).
+    // Pinch-zoom inertia is NOT cancelled here.
   }
 
   _suppressAutoCamera({ cooldownMs } = {}) {
@@ -352,59 +348,6 @@ class MapView {
     // reprocessing state-derived caches. Used to throttle high-frequency pan events.
     const state = this.lastState;
     if (!state) return;
-
-    // FAST PATH: During active interaction, use cached overlay snapshot (expensive
-    // path operations) but always draw real tiles so new tiles load and appear
-    // continuously while panning/zooming instead of vanishing at the edges.
-    const usingOverlayFastPath = (this._touchActive || this._mouseDragging || this._wheelPanning || this._centerAnimRAF) && this._panSnapshotOverlay && this._panSnapshotCenter;
-    if (usingOverlayFastPath) {
-      const dpr = this._dpr || 1;
-      const w = this._cssW || 1;
-      const h = this._cssH || 1;
-      
-      // Compute scale factor if zoom changed (pinch-zoom)
-      const sZoom = Math.pow(2, this.zoom - this._panSnapshotZoom);
-      
-      // Compute pixel offset from snapshot center to current center (at snapshot zoom level)
-      const prevC = latLonToWorld(this._panSnapshotCenter.lat, this._panSnapshotCenter.lon, this._panSnapshotZoom);
-      const currC = latLonToWorld(this.center.lat, this.center.lon, this._panSnapshotZoom);
-      const txPan = (prevC.x - currC.x) * sZoom;
-      const tyPan = (prevC.y - currC.y) * sZoom;
-
-      // If the snapshot has drifted too far from the current view, do a full redraw
-      // and re-capture so overlay items don't disappear at the edges.
-      const bleed = this._panSnapshotBleed || 0.5;
-      const driftLimit = Math.min(w, h) * bleed;
-      if (Math.abs(txPan) > driftLimit || Math.abs(tyPan) > driftLimit) {
-        this.drawTiles();
-        this.drawOverlay(state, { cacheUnderlay: true });
-        this._capturePanSnapshots();
-        return;
-      }
-      
-      // Tiles: draw real tiles so new tiles load and cached tiles render immediately.
-      // drawTiles() already uses its own snapshot backdrop for flicker-free panning.
-      this.drawTiles();
-      
-      // Overlay: translate + scale the bleed snapshot.
-      // The snapshot is (1 + 2*bleed) times the viewport; center region maps to the viewport.
-      if (this.octx) {
-        const snapW = w * (1 + 2 * bleed);
-        const snapH = h * (1 + 2 * bleed);
-        this.octx.save();
-        this.octx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        this.octx.clearRect(0, 0, w, h);
-        // The snapshot center corresponds to the viewport center.
-        // We need to offset by: bleed padding + pan translation.
-        const offsetX = -w * bleed + txPan;
-        const offsetY = -h * bleed + tyPan;
-        this.octx.translate(offsetX, offsetY);
-        this.octx.scale(sZoom, sZoom);
-        this.octx.drawImage(this._panSnapshotOverlay, 0, 0, snapW, snapH);
-        this.octx.restore();
-      }
-      return;
-    }
 
     const viewSig = (() => {
       const z = Number(this.zoom);
@@ -556,59 +499,6 @@ class MapView {
     this._pinchAnchorSX = midX;
     this._pinchAnchorSY = midY;
     
-    // Capture pan snapshots for fast-path translation during touch
-    // This avoids expensive redraw operations on every touch move
-    this._capturePanSnapshots();
-  }
-  
-  _capturePanSnapshots() {
-    const dpr = this._dpr || 1;
-    const w = this._cssW || 1;
-    const h = this._cssH || 1;
-
-    // Render overlay with extra bleed (0.5x viewport padding on each side) so that
-    // panning doesn't reveal blank edges. We temporarily shift the map center to
-    // render a wider area, then restore it.
-    const bleed = 0.5; // fraction of viewport to pad on each side
-    const snapW = Math.ceil(w * (1 + 2 * bleed));
-    const snapH = Math.ceil(h * (1 + 2 * bleed));
-    const pw = Math.floor(snapW * dpr);
-    const ph = Math.floor(snapH * dpr);
-
-    // Capture current center and zoom for offset/scale calculation
-    this._panSnapshotCenter = { lat: this.center.lat, lon: this.center.lon };
-    this._panSnapshotZoom = this.zoom;
-    this._panSnapshotBleed = bleed;
-
-    // Create/resize the bleed overlay canvas
-    if (!this._panSnapshotOverlay || this._panSnapshotOverlay.width !== pw || this._panSnapshotOverlay.height !== ph) {
-      this._panSnapshotOverlay = document.createElement("canvas");
-      this._panSnapshotOverlay.width = pw;
-      this._panSnapshotOverlay.height = ph;
-    }
-
-    // Render overlay to the larger canvas by temporarily swapping canvas/context/dimensions
-    const origCanvas = this.overlayCanvas;
-    const origCtx = this.octx;
-    const origW = this._cssW;
-    const origH = this._cssH;
-
-    this.overlayCanvas = this._panSnapshotOverlay;
-    this.octx = this._panSnapshotOverlay.getContext("2d");
-    this._cssW = snapW;
-    this._cssH = snapH;
-
-    // Draw overlay at expanded viewport size
-    const state = this.lastState;
-    if (state) {
-      this.drawOverlay(state, { cacheUnderlay: true });
-    }
-
-    // Restore original canvas/context/dimensions
-    this.overlayCanvas = origCanvas;
-    this.octx = origCtx;
-    this._cssW = origW;
-    this._cssH = origH;
   }
 
   onTouchMove(e) {
@@ -698,9 +588,6 @@ class MapView {
         this._tileRedrawPending = false;
         this._scheduleTileRedraw();
       }
-      // Clear ALL pan snapshots so next redraw is full (match onMouseUp behavior)
-      this._panSnapshotOverlay = null;
-      this._panSnapshotCenter = null;
       // All fingers lifted - start inertia if we were pinching
       if (this._pinchZooming) {
         this._startPinchInertia();
@@ -717,8 +604,6 @@ class MapView {
       this._touchState = null;
     } else if (remaining === 1 && this._touchState.startTouches >= 2) {
       // Went from 2+ fingers to 1 - reset pan origin to avoid jump
-      // Also re-capture snapshots from current state for continued pan
-      this._capturePanSnapshots();
       const rect = this.overlayCanvas.getBoundingClientRect();
       const t = e.touches[0];
       const mx = t.clientX - rect.left;
@@ -801,9 +686,6 @@ class MapView {
     this._mouseDragStart = { x: e.clientX, y: e.clientY };
     const cw = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     this._mouseDragCenterStart = { x: cw.x, y: cw.y, ws: cw.ws };
-    // Reuse existing snapshots if zoom inertia already captured them (better quality).
-    // Only capture fresh if no snapshots exist yet.
-    if (!this._panSnapshotOverlay) this._capturePanSnapshots();
   }
 
   onMouseMove(e) {
@@ -886,9 +768,6 @@ class MapView {
     this._mouseDragging = false;
     this._mouseDragStart = null;
     this._mouseDragCenterStart = null;
-    // Clear snapshots and do a clean final redraw
-    this._panSnapshotOverlay = null;
-    this._panSnapshotCenter = null;
     this._redrawViewOnly();
     // click behavior is handled in onClick; we just stop dragging here.
   }
@@ -934,10 +813,7 @@ class MapView {
 
     if (this._centerAnimRAF) cancelAnimationFrame(this._centerAnimRAF);
 
-    // Capture snapshot so intermediate frames use the cheap translate path
-    // (_redrawViewOnly fast path checks _centerAnimRAF).
-    const zoomChanging = Math.abs(z1 - z0) > 0.001;
-    if (!zoomChanging) this._capturePanSnapshots();
+
 
     // Safety: limit animation frames to prevent runaway loops
     let frameCount = 0;
@@ -945,8 +821,6 @@ class MapView {
 
     const finish = () => {
       this._centerAnimRAF = null;
-      this._panSnapshotOverlay = null;
-      this._panSnapshotCenter = null;
       this.draw(this.lastState);
       this._notifyViewChanged();
     };
@@ -2037,14 +1911,11 @@ class MapView {
     this._lastWheelPanTime = performance.now();
     if (!this._wheelPanning) {
       this._wheelPanning = true;
-      this._capturePanSnapshots();
     }
     if (this._wheelPanEndTimer) window.clearTimeout(this._wheelPanEndTimer);
     this._wheelPanEndTimer = window.setTimeout(() => {
       this._wheelPanning = false;
       this._wheelPanEndTimer = null;
-      this._panSnapshotOverlay = null;
-      this._panSnapshotCenter = null;
       this._redrawViewOnly();
     }, 120);
     const scale = 0.65;
@@ -6564,9 +6435,9 @@ class MapView {
     // }
 
     // Fixed markers - drawn AFTER trails so they appear on top
-    // Render PurpleAir first (so they don't draw over other markers), then others
+    // Render PurpleAir (public) first (so they don't draw over other markers), then others
     const fixedPbTimeMs = _framePbTimeMs;
-    if (!useStaticOverlay && this.showFixed) {
+    if (!useStaticOverlay) {
       const renderPbFixedMarker = (f) => {
         const lat = Number(f.lat), lon = Number(f.lon);
         if (!isFinite(lat) || !isFinite(lon)) return;
@@ -6645,7 +6516,8 @@ class MapView {
           ctx.drawImage(fixedEmojiC, sp.x - 10, sp.y - 10, 20, 20);
         }
 
-        if ((this.showFixedLabels && !isPurpleAir) || isSel || f.pinned || String(f.id) === "Home") {
+        const showLabel = isPurpleAir ? this.showPublicLabels : this.showFixedLabels;
+        if (showLabel || isSel || f.pinned || String(f.id) === "Home") {
           const labelFont = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
           const line1 = label;
           const line2Key = pr.key ? String(pr.key) : "";
@@ -6684,13 +6556,17 @@ class MapView {
         ctx.restore();
       };
 
-      // First pass: PurpleAir
-      for (const f of fixed) {
-        if (f.purpleair) renderPbFixedMarker(f);
+      // First pass: PurpleAir (public)
+      if (this.showPublic) {
+        for (const f of fixed) {
+          if (f.purpleair) renderPbFixedMarker(f);
+        }
       }
-      // Second pass: others
-      for (const f of fixed) {
-        if (!f.purpleair) renderPbFixedMarker(f);
+      // Second pass: others (fixed)
+      if (this.showFixed) {
+        for (const f of fixed) {
+          if (!f.purpleair) renderPbFixedMarker(f);
+        }
       }
     }
 
