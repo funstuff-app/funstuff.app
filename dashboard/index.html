@@ -112,11 +112,11 @@
             </div>
             <div class="tabBar" role="tablist" aria-label="Sensor lists">
               <button id="tabMobile" class="tab active" role="tab" aria-selected="true" type="button">Mobile</button>
-              <button id="tabPermanent" class="tab" role="tab" aria-selected="false" type="button">Permanent</button>
+              <button id="tabFixed" class="tab" role="tab" aria-selected="false" type="button">Fixed</button>
               <button id="tabLabels" class="tab mini active" role="button" type="button" title="Toggle marker labels">🏷️</button>
             </div>
             <div id="sensorListMobile" class="list" role="tabpanel" aria-labelledby="tabMobile"></div>
-            <div id="sensorListFixed" class="list hidden" role="tabpanel" aria-labelledby="tabPermanent"></div>
+            <div id="sensorListFixed" class="list hidden" role="tabpanel" aria-labelledby="tabFixed"></div>
           </aside>
         </div>
 
@@ -136,11 +136,13 @@
             </label>
           </div>
           <div class="pbRow2">
+            <button id="pbPagePrev" type="button" class="pbPageBtn" title="Previous hour" aria-label="Previous hour">◂</button>
             <span id="pbLeft">—</span>
             <span class="sep">•</span>
             <span id="pbNow">—</span>
             <span class="sep">•</span>
             <span id="pbRight">—</span>
+            <button id="pbPageNext" type="button" class="pbPageBtn" title="Next hour" aria-label="Next hour">▸</button>
           </div>
         </div>
       </section>

@@ -45,7 +45,7 @@ function main() {
   const SHOW_MOBILE_LABELS_KEY = "mobileair.showMobileLabels";
   const SHOW_FIXED_LABELS_KEY = "mobileair.showFixedLabels";
   const tabMobileEl = document.getElementById("tabMobile");
-  const tabFixedEl = document.getElementById("tabPermanent");
+  const tabFixedEl = document.getElementById("tabFixed");
   const tabLabelsEl = document.getElementById("tabLabels");
   const listMobileEl = document.getElementById("sensorListMobile");
   const listFixedEl = document.getElementById("sensorListFixed");
@@ -636,6 +636,12 @@ function main() {
     });
   }
 
+  /** Return the correct state object for the current mode (historical or live). */
+  function _currentState() {
+    if (map._historicalMode && window._historicalState) return window._historicalState;
+    return window.__lastState || { mobile: [], fixed: [] };
+  }
+
   window.__selectSensor = (id, opts = {}) => {
     const fitTrail = !!opts.fitTrail;
     const fromPanel = !!opts.fromPanel;  // True only when selected from sidebar, not from map
@@ -649,8 +655,8 @@ function main() {
       legendTab = "pm25";
       userLegendTab = "pm25";
       buildLegend();
-      renderLists(window.__lastState || { mobile: [], fixed: [] }, selectedId);
-      renderDetails(window.__lastState || { mobile: [] }, selectedId);
+      renderLists(_currentState(), selectedId);
+      renderDetails(_currentState(), selectedId);
       return;
     }
 
@@ -663,7 +669,7 @@ function main() {
     }
     map.setSelected(selectedId);
 
-    const st = window.__lastState || { mobile: [], fixed: [] };
+    const st = _currentState();
     const sel = parseKey(selectedId);
     let item = null;
     if (sel && sel.type === "mobile") item = (Array.isArray(st.mobile) ? st.mobile : []).find(x => x.id === sel.id) || null;
@@ -709,8 +715,8 @@ function main() {
       legendTab = "pm25";
       userLegendTab = "pm25";
       buildLegend();
-      renderLists(window.__lastState || { mobile: [], fixed: [] }, selectedId);
-      renderDetails(window.__lastState || { mobile: [] }, selectedId);
+      renderLists(_currentState(), selectedId);
+      renderDetails(_currentState(), selectedId);
     }
   });
 
@@ -727,6 +733,8 @@ function main() {
   const pbLeftEl = document.getElementById("pbLeft");
   const pbNowEl = document.getElementById("pbNow");
   const pbRightEl = document.getElementById("pbRight");
+  const pbPagePrevEl = document.getElementById("pbPagePrev");
+  const pbPageNextEl = document.getElementById("pbPageNext");
 
   let _pbRAF = null;
   let _pbLastPerf = 0;
@@ -1112,6 +1120,60 @@ function main() {
   let _pbIsWheelCoasting = false;     // is current coast from wheel scroll?
   let _pbCommitLoopStartOnCoastEnd = false;
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PAGING: Slider maps to an 8-hour page instead of the full day.
+  // Keeps scrub resolution constant as data accumulates.
+  // ─────────────────────────────────────────────────────────────────────────────
+  const _pbPageSizeMs = 14400000;         // 4 hours in ms
+  const _pbPageMinDurationMs = 0;          // paging always active
+  let _pbPageIndex = -1;                  // -1 = "all" (no paging), 0..N = page index
+  let _pbPageAutoFollow = true;           // auto-advance page to follow playhead
+
+  /** Compute total page count for current bounds. */
+  function _pbPageCount() {
+    const b = map.getPlaybackBounds();
+    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return 0;
+    return Math.ceil((b.maxMs - b.minMs) / _pbPageSizeMs);
+  }
+
+  /** Get the time range for the current page (or full range if paging disabled). */
+  function _pbGetPageRange() {
+    const b = map.getPlaybackBounds();
+    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return b;
+    if (_pbPageIndex < 0) return b; // "all" mode
+    const total = _pbPageCount();
+    const idx = clamp(_pbPageIndex, 0, total - 1);
+    const pageStart = b.minMs + idx * _pbPageSizeMs;
+    const pageEnd = Math.min(pageStart + _pbPageSizeMs, b.maxMs);
+    return { minMs: pageStart, maxMs: pageEnd };
+  }
+
+  /** Navigate to a specific page index, clamping to valid range. */
+  function _pbSetPage(idx) {
+    const total = _pbPageCount();
+    if (total <= 0) { _pbPageIndex = -1; return; }
+    _pbPageIndex = clamp(idx, 0, total - 1);
+    _pbPageAutoFollow = false; // user explicitly chose a page
+    updatePlaybackUi();
+  }
+
+  /** Enable paging and jump to the page containing the given time. */
+  function _pbPageForTime(tMs) {
+    const b = map.getPlaybackBounds();
+    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;
+    const total = _pbPageCount();
+    if (total <= 0) return;
+    const idx = Math.floor((tMs - b.minMs) / _pbPageSizeMs);
+    _pbPageIndex = clamp(idx, 0, total - 1);
+  }
+
+  /** Check if paging should be active based on data duration. */
+  function _pbPagingActive() {
+    const b = map.getPlaybackBounds();
+    if (!isFinite(b.minMs) || !isFinite(b.maxMs)) return false;
+    return (b.maxMs - b.minMs) >= _pbPageMinDurationMs;
+  }
+
   const fmtTime = (ms) => {
     if (ms == null || !isFinite(ms)) return "—";
     try { return new Date(ms).toLocaleTimeString(); } catch { return "—"; }
@@ -1120,19 +1182,44 @@ function main() {
   const updatePlaybackUi = () => {
     const b = map.getPlaybackBounds();
     const tMs = map.getPlaybackTimeMs();
-    if (pbLeftEl) pbLeftEl.textContent = fmtTime(b.minMs);
-    if (pbRightEl) pbRightEl.textContent = fmtTime(b.maxMs);
+    const paging = _pbPagingActive();
+
+    // Auto-enable paging when duration crosses threshold.
+    // Initialize page index to the page containing the playhead.
+    if (paging && _pbPageIndex < 0) {
+      const t = (tMs != null && isFinite(tMs)) ? tMs : b.maxMs;
+      _pbPageForTime(t);
+      _pbPageAutoFollow = true; // started automatically, follow playhead
+    } else if (!paging) {
+      _pbPageIndex = -1; // disable paging when duration shrinks
+    }
+
+    // Auto-advance page to follow playhead during normal playback
+    if (paging && _pbPageAutoFollow && tMs != null && isFinite(tMs) && !_pbScrubbing) {
+      const pr = _pbGetPageRange();
+      if (tMs >= pr.maxMs || tMs < pr.minMs) {
+        _pbPageForTime(tMs);
+        _pbPageAutoFollow = true; // keep following
+      }
+    }
+
+    // Use page range for slider when paging is active
+    const pr = paging ? _pbGetPageRange() : b;
+    const sliderMinMs = pr.minMs;
+    const sliderMaxMs = pr.maxMs;
+
+    if (pbLeftEl) pbLeftEl.textContent = fmtTime(sliderMinMs);
+    if (pbRightEl) pbRightEl.textContent = fmtTime(sliderMaxMs);
     if (pbNowEl) pbNowEl.textContent = fmtTime(tMs);
 
-    if (pbScrubEl && isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
-      const durMs = Math.max(1, b.maxMs - b.minMs);
-      const tRelMs = (tMs != null && isFinite(tMs)) ? (tMs - b.minMs) : durMs;
+    if (pbScrubEl && isFinite(sliderMinMs) && isFinite(sliderMaxMs) && sliderMaxMs > sliderMinMs) {
+      const durMs = Math.max(1, sliderMaxMs - sliderMinMs);
+      const tRelMs = (tMs != null && isFinite(tMs)) ? (tMs - sliderMinMs) : durMs;
       pbScrubEl.min = "0";
       pbScrubEl.max = String(durMs);
       pbScrubEl.step = "100"; // 100ms steps for smoother scrubbing
       pbScrubEl.disabled = false;
       if (!_pbScrubbing) {
-        // Show actual playhead position (don't force to end in LIVE mode)
         pbScrubEl.value = String(clamp(tRelMs, 0, durMs));
       }
     } else if (pbScrubEl) {
@@ -1140,6 +1227,16 @@ function main() {
       pbScrubEl.min = "0";
       pbScrubEl.max = "1";
       pbScrubEl.value = "0";
+    }
+
+    // Page arrow visibility & disabled state
+    if (pbPagePrevEl) {
+      pbPagePrevEl.classList.toggle("hidden", !paging);
+      pbPagePrevEl.disabled = _pbPageIndex <= 0;
+    }
+    if (pbPageNextEl) {
+      pbPageNextEl.classList.toggle("hidden", !paging);
+      pbPageNextEl.disabled = _pbPageIndex >= _pbPageCount() - 1;
     }
 
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
@@ -1722,6 +1819,7 @@ function main() {
       // If at end and paused (button shows "Live" but not highlighted), enable LIVE mode
       if (atEnd && !map.getPlaybackPlaying()) {
         map._playbackLiveFollow = true;
+        _pbPageAutoFollow = true; // resume page tracking in LIVE mode
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
         _pbVelocity = 0;
         _pbAtEndSincePerf = null;
@@ -1839,7 +1937,29 @@ function main() {
       map._historicalMode = false;
       // Clear persisted trails so old data doesn't linger
       map._persistedTrailById = new Map();
+      // Reset playback state so stale historical data doesn't render
+      map._playbackPtsById = new Map();
+      map._playbackPtsKey = null;
+      map._playbackNowMs = null;
+      map._playbackInitialized = false;
+      map._playbackLiveFollow = true;
+      // Restore live state to the map immediately
+      const liveSt = window.__lastState || { mobile: [], fixed: [] };
+      map.lastState = liveSt;
+      map._ensurePlaybackPoints(liveSt);
+      map.drawOverlay(liveSt);
+      renderLists(liveSt, selectedId);
+      renderDetails(liveSt, selectedId);
+      // Update status bar
+      const statusEl = document.getElementById("statusText");
+      if (statusEl) {
+        statusEl.textContent = "Live";
+        statusEl.classList.add("live");
+        statusEl.classList.remove("offline");
+      }
       updateSaveButtonState();
+      // Trigger an immediate live poll to get fresh data
+      setTimeout(tick, 100);
       return;
     }
     
@@ -1854,7 +1974,13 @@ function main() {
     updateSaveButtonState();
     
     try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/history?date=${encodeURIComponent(dateStr)}`);
+      // Compute 4 AM local → next 4 AM local as epoch ms for accurate day boundaries
+      const [y, mo, d] = dateStr.split("-").map(Number);
+      const dayStartLocal = new Date(y, mo - 1, d, 4, 0, 0, 0);  // 4 AM local
+      const dayEndLocal = new Date(y, mo - 1, d + 1, 4, 0, 0, 0);  // next 4 AM local
+      const startMs = dayStartLocal.getTime();
+      const endMs = dayEndLocal.getTime();
+      const resp = await fetch(`${appConfig.apiBaseUrl}/history?date=${encodeURIComponent(dateStr)}&start_ms=${startMs}&end_ms=${endMs}`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const loadedState = await resp.json();
       
@@ -1890,6 +2016,8 @@ function main() {
       map._playbackPtsKey = null;
       map._persistedTrailById = new Map();  // Clear persisted trails
       map._playbackNowMs = null;  // Reset playback time
+      _pbPageIndex = -1;  // Reset paging for new data
+      _pbPageAutoFollow = true;
       
       // Enable DVR/playback mode for historical data
       // NOTE: setPlaybackMode(true) sets _playbackLiveFollow=true and draws overlay,
@@ -1899,11 +2027,15 @@ function main() {
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
       
-      // Build playback points and set time to START
+      // Build playback points and set time to 5AM
       map._ensurePlaybackPoints(window._historicalState);
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
-        map.setPlaybackTimeMs(b.minMs);
+        // Set playhead to 5AM local on the loaded day
+        const [_y, _mo, _d] = dateStr.split("-").map(Number);
+        const fiveAM = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
+        const initMs = clamp(fiveAM, b.minMs, b.maxMs);
+        map.setPlaybackTimeMs(initMs);
       }
       
       // Store state, render sidebar, draw ONLY tiles (no overlay yet)
@@ -1926,9 +2058,12 @@ function main() {
         map._fetchRoadEdgesForViewport();
       }
       
-      // Start playback loop
+      // Start playback loop (auto-play)
       _pbLastPerf = 0;
       _pbLastUiPerf = 0;
+      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      map.setPlaybackPlaying(true);
+      updatePlaybackUi();
       _pbRAF = requestAnimationFrame(playbackLoop);
     } catch (e) {
       console.error("Failed to load historical data:", e);
@@ -2137,6 +2272,8 @@ function main() {
       map._playbackPtsKey = null;
       map._persistedTrailById = new Map();
       map._playbackNowMs = null;
+      _pbPageIndex = -1;  // Reset paging for new data
+      _pbPageAutoFollow = true;
       
       // Enable DVR/playback mode
       map.playbackMode = true;
@@ -2317,7 +2454,11 @@ function main() {
     for (let i = 1; i <= 6; i++) {
       const d = new Date(now);
       d.setDate(d.getDate() - i);
-      const dateStr = d.toISOString().split("T")[0];
+      // Use local date components to avoid UTC day-shift mismatch
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      const dateStr = `${yyyy}-${mm}-${dd}`;
       const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
       const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
       const label = i === 1 ? `Yesterday (${monthDay})` : `${dayName} ${monthDay}`;
@@ -2494,9 +2635,11 @@ function main() {
     const applyScrub = () => {
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
+      // When paging is active, slider is relative to the page range
+      const pr = _pbPagingActive() ? _pbGetPageRange() : b;
       const relMs = Number(pbScrubEl.value);
       if (!isFinite(relMs)) return;
-      const tMs = b.minMs + relMs;
+      const tMs = pr.minMs + relMs;
       const clampedT = clamp(tMs, b.minMs, b.maxMs);
       map.setPlaybackTimeMs(clampedT);
 
@@ -2530,6 +2673,7 @@ function main() {
     pbScrubEl.addEventListener("pointerup", () => {
       _pbScrubbing = false;
       _pbVelocity = 0;
+      _pbPageAutoFollow = true; // resume auto-following after manual scrub
       // Don't auto-enable LIVE mode when released at end - user must click Live button.
       map.setPlaybackPlaying(true);
       _pbLastPerf = performance.now();
@@ -2579,6 +2723,7 @@ function main() {
       _pbAtEndSincePerf = null;
       _pbArrivedAtEndViaPlayback = false; // user is scrolling, not playing
       _pbIsRewinding = false;
+      _pbPageAutoFollow = true; // resume page tracking when scrolling
       map.setPlaybackPlaying(false); // Let wheel nudge control velocity
       // Exit LIVE mode on scroll
       map._playbackLiveFollow = false;
@@ -2589,7 +2734,7 @@ function main() {
       // Scale by timeline duration for proportional movement, reduced sensitivity
       const b = map.getPlaybackBounds();
       const durMs = (b.maxMs - b.minMs) || 1;
-      const nudge = (e.deltaX / 1000) * (durMs / 30); // ~0.3% of timeline per scroll tick
+      const nudge = (e.deltaX / 1000) * (durMs / 480); // ~0.02% of timeline per scroll tick
       _pbVelocity -= nudge;
       // Ensure loop is running
       if (!_pbRAF) {
@@ -2597,6 +2742,71 @@ function main() {
         _pbRAF = requestAnimationFrame(playbackLoop);
       }
     }, { passive: false });
+
+    // ─── Touch drag override: reduce scrub sensitivity on mobile ───────────
+    // Native range inputs track the finger 1:1, making long timelines
+    // impossible to scrub precisely.  We intercept touch events, prevent
+    // the default 1:1 tracking, and apply a 4× sensitivity reduction.
+    let _scrubTouchStartX = null;
+    let _scrubTouchStartVal = null;
+    const _scrubTouchSensitivity = 0.0625;
+
+    pbScrubEl.addEventListener("touchstart", (e) => {
+      e.preventDefault();  // stop native 1:1 range tracking
+      const touch = e.touches[0];
+      _scrubTouchStartX = touch.clientX;
+      _scrubTouchStartVal = Number(pbScrubEl.value);
+      // Run the same setup as pointerdown (which won't fire since we prevented default)
+      _pbVelocity = 0;
+      _pbWheelAccum = 0;
+      _pbAtEndSincePerf = null;
+      _pbArrivedAtEndViaPlayback = false;
+      _pbIsRewinding = false;
+      _pbEaseStartPerf = null;
+      _pbIsWheelCoasting = false;
+      _pbScrubbing = true;
+      _pbDidDrag = false;
+      _pbLastScrubPos = Number(pbScrubEl.value);
+      _pbLastScrubTime = performance.now();
+      map.setPlaybackPlaying(false);
+      map._playbackLiveFollow = false;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
+      _resetLiveTracking();
+      updatePlaybackUi();
+    }, { passive: false });
+
+    pbScrubEl.addEventListener("touchmove", (e) => {
+      if (_scrubTouchStartX == null) return;
+      e.preventDefault();
+      const touch = e.touches[0];
+      const dx = touch.clientX - _scrubTouchStartX;
+      const rect = pbScrubEl.getBoundingClientRect();
+      const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
+      const delta = (dx / rect.width) * range * _scrubTouchSensitivity;
+      pbScrubEl.value = String(clamp(_scrubTouchStartVal + delta, Number(pbScrubEl.min), Number(pbScrubEl.max)));
+      _pbDidDrag = true;
+      _pbLastScrubPos = Number(pbScrubEl.value);
+      _pbLastScrubTime = performance.now();
+      if (!_scrubRAF) {
+        _scrubRAF = requestAnimationFrame(() => {
+          _scrubRAF = 0;
+          applyScrub();
+        });
+      }
+    }, { passive: false });
+
+    pbScrubEl.addEventListener("touchend", () => {
+      _scrubTouchStartX = null;
+      _scrubTouchStartVal = null;
+      // Same teardown as pointerup
+      _pbScrubbing = false;
+      _pbVelocity = 0;
+      _pbPageAutoFollow = true;
+      map.setPlaybackPlaying(true);
+      _pbLastPerf = performance.now();
+      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+      applyScrub();
+    });
   }
 
   if (pbDebugEl) {
@@ -2611,6 +2821,33 @@ function main() {
       if (map._pbDebugPath && map._pbDebugRoadLines) {
         map._fetchRoadEdgesForViewport();
       }
+      map.drawOverlay(map.lastState);
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PAGE NAVIGATION BUTTONS
+  // ─────────────────────────────────────────────────────────────────────────────
+  if (pbPagePrevEl) {
+    pbPagePrevEl.addEventListener("click", () => {
+      if (_pbPageIndex <= 0) return;
+      _pbSetPage(_pbPageIndex - 1);
+      // Jump playhead to start of new page
+      const pr = _pbGetPageRange();
+      map.setPlaybackTimeMs(pr.minMs);
+      _pbLoopStartMs = pr.minMs;
+      map.drawOverlay(map.lastState);
+    });
+  }
+  if (pbPageNextEl) {
+    pbPageNextEl.addEventListener("click", () => {
+      const total = _pbPageCount();
+      if (_pbPageIndex >= total - 1) return;
+      _pbSetPage(_pbPageIndex + 1);
+      // Jump playhead to start of new page
+      const pr = _pbGetPageRange();
+      map.setPlaybackTimeMs(pr.minMs);
+      _pbLoopStartMs = pr.minMs;
       map.drawOverlay(map.lastState);
     });
   }

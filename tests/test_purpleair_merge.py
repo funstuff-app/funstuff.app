@@ -155,6 +155,32 @@ class TestPurpleAirMerge(unittest.TestCase):
         _merge_purpleair_into_fixed(st, app)
         self.assertEqual(st["fixed"][0]["name"], "Murray 4500 S Triton Blvd")
 
+    def test_utopia_fiber_capitalized_stripped(self):
+        """'Powered by' with capital P must also be stripped."""
+        app = self._make_app_state([
+            self._make_sensor(name="Murray Horizon Elementary Powered by UTOPIA Fiber"),
+        ])
+        st = {"fixed": [], "mobile": []}
+        _merge_purpleair_into_fixed(st, app)
+        self.assertEqual(st["fixed"][0]["name"], "Murray Horizon Elementary")
+
+    def test_utopia_power_no_d_stripped(self):
+        """All branding variants must be stripped."""
+        for raw, expected in [
+            ("Murray Cottonwood Presbyterian Church power by UTOPIA Fiber",
+             "Murray Cottonwood Presbyterian Church"),
+            ("Murray 1300E Jeanne ave. Power by UTOPIA Fiber",
+             "Murray 1300E Jeanne ave."),
+            ("Mueller Park West - Powered by Utoipa Fiber",
+             "Mueller Park West"),
+            ("Midvale St.Theresa Catholic Church power by UTOPIA Fiber",
+             "Midvale St.Theresa Catholic Church"),
+        ]:
+            app = self._make_app_state([self._make_sensor(name=raw)])
+            st = {"fixed": [], "mobile": []}
+            _merge_purpleair_into_fixed(st, app)
+            self.assertEqual(st["fixed"][0]["name"], expected, f"Failed for: {raw}")
+
     def test_name_without_branding_unchanged(self):
         app = self._make_app_state([self._make_sensor(name="Clark Planetarium")])
         st = {"fixed": [], "mobile": []}

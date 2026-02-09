@@ -348,7 +348,8 @@ aside, section { min-height: 0; }
   color: rgba(147,164,186,0.92);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
-  padding: 0 calc(64px + 10px) 0 calc(64px + 10px); /* Match Live button width + gap on both sides */
+  padding: 0 calc(64px + 10px - 28px) 0 calc(64px + 10px - 28px); /* Shrink for page arrows */
+  gap: 2px;
 }
 
 .pbRow2 .sep {
@@ -364,6 +365,34 @@ aside, section { min-height: 0; }
 #pbLeft { text-align: left; }
 #pbNow { text-align: center; }
 #pbRight { text-align: right; }
+
+/* Hourly page navigation arrows */
+.pbPageBtn {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: rgba(147,164,186,0.92);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+  cursor: pointer;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: rgba(0,0,0,0);
+  touch-action: manipulation;
+  transition: color 0.15s, border-color 0.15s;
+  flex-shrink: 0;
+}
+.pbPageBtn:hover:not(:disabled) {
+  color: rgba(232,238,247,0.92);
+  border-color: rgba(255,255,255,0.12);
+}
+.pbPageBtn:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+.pbPageBtn.hidden {
+  display: none;
+}
 
 button#pbPlay {
   height: 30px;
@@ -1097,6 +1126,12 @@ button#pbPlay.isLive {
 @media (max-width: 768px) {
   .sidebarPanel {
     width: 280px;
+  }
+  
+  #appFooter {
+    padding: 2px 8px;
+    font-size: 9px;
+    line-height: 1.2;
   }
 }
 

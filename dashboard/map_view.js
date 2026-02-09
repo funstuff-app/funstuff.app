@@ -223,7 +223,6 @@ class MapView {
       this._centerAnimRAF = null;
       // Clear animation snapshots so next interaction gets fresh ones
       this._panSnapshotOverlay = null;
-      this._panSnapshotTiles = null;
       this._panSnapshotCenter = null;
     }
     // Pinch-zoom inertia is NOT cancelled here — it coexists with pan
@@ -354,12 +353,11 @@ class MapView {
     const state = this.lastState;
     if (!state) return;
 
-    // FAST PATH: During active touch, mouse drag, wheel-pan, or camera animation,
-    // just translate/scale cached canvases instead of redrawing.
-    // This avoids expensive path operations on every high-frequency pan event.
-    // NOT used for zoom — zoom needs live rendering (trails, markers respond to scale).
-    const usingFastPath = (this._touchActive || this._mouseDragging || this._wheelPanning || this._centerAnimRAF) && this._panSnapshotOverlay && this._panSnapshotTiles && this._panSnapshotCenter;
-    if (usingFastPath) {
+    // FAST PATH: During active interaction, use cached overlay snapshot (expensive
+    // path operations) but always draw real tiles so new tiles load and appear
+    // continuously while panning/zooming instead of vanishing at the edges.
+    const usingOverlayFastPath = (this._touchActive || this._mouseDragging || this._wheelPanning || this._centerAnimRAF) && this._panSnapshotOverlay && this._panSnapshotCenter;
+    if (usingOverlayFastPath) {
       const dpr = this._dpr || 1;
       const w = this._cssW || 1;
       const h = this._cssH || 1;
@@ -372,28 +370,37 @@ class MapView {
       const currC = latLonToWorld(this.center.lat, this.center.lon, this._panSnapshotZoom);
       const txPan = (prevC.x - currC.x) * sZoom;
       const tyPan = (prevC.y - currC.y) * sZoom;
-      
-      // Tiles: translate + scale snapshot
-      if (this.tctx) {
-        this.tctx.save();
-        this.tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        this.tctx.clearRect(0, 0, w, h);
-        this.tctx.translate(w / 2, h / 2);
-        this.tctx.scale(sZoom, sZoom);
-        this.tctx.translate(-w / 2 + txPan / sZoom, -h / 2 + tyPan / sZoom);
-        this.tctx.drawImage(this._panSnapshotTiles, 0, 0, w, h);
-        this.tctx.restore();
+
+      // If the snapshot has drifted too far from the current view, do a full redraw
+      // and re-capture so overlay items don't disappear at the edges.
+      const bleed = this._panSnapshotBleed || 0.5;
+      const driftLimit = Math.min(w, h) * bleed;
+      if (Math.abs(txPan) > driftLimit || Math.abs(tyPan) > driftLimit) {
+        this.drawTiles();
+        this.drawOverlay(state, { cacheUnderlay: true });
+        this._capturePanSnapshots();
+        return;
       }
       
-      // Overlay: translate + scale snapshot  
+      // Tiles: draw real tiles so new tiles load and cached tiles render immediately.
+      // drawTiles() already uses its own snapshot backdrop for flicker-free panning.
+      this.drawTiles();
+      
+      // Overlay: translate + scale the bleed snapshot.
+      // The snapshot is (1 + 2*bleed) times the viewport; center region maps to the viewport.
       if (this.octx) {
+        const snapW = w * (1 + 2 * bleed);
+        const snapH = h * (1 + 2 * bleed);
         this.octx.save();
         this.octx.setTransform(dpr, 0, 0, dpr, 0, 0);
         this.octx.clearRect(0, 0, w, h);
-        this.octx.translate(w / 2, h / 2);
+        // The snapshot center corresponds to the viewport center.
+        // We need to offset by: bleed padding + pan translation.
+        const offsetX = -w * bleed + txPan;
+        const offsetY = -h * bleed + tyPan;
+        this.octx.translate(offsetX, offsetY);
         this.octx.scale(sZoom, sZoom);
-        this.octx.translate(-w / 2 + txPan / sZoom, -h / 2 + tyPan / sZoom);
-        this.octx.drawImage(this._panSnapshotOverlay, 0, 0, w, h);
+        this.octx.drawImage(this._panSnapshotOverlay, 0, 0, snapW, snapH);
         this.octx.restore();
       }
       return;
@@ -558,36 +565,50 @@ class MapView {
     const dpr = this._dpr || 1;
     const w = this._cssW || 1;
     const h = this._cssH || 1;
-    const pw = Math.floor(w * dpr);
-    const ph = Math.floor(h * dpr);
-    
+
+    // Render overlay with extra bleed (0.5x viewport padding on each side) so that
+    // panning doesn't reveal blank edges. We temporarily shift the map center to
+    // render a wider area, then restore it.
+    const bleed = 0.5; // fraction of viewport to pad on each side
+    const snapW = Math.ceil(w * (1 + 2 * bleed));
+    const snapH = Math.ceil(h * (1 + 2 * bleed));
+    const pw = Math.floor(snapW * dpr);
+    const ph = Math.floor(snapH * dpr);
+
     // Capture current center and zoom for offset/scale calculation
     this._panSnapshotCenter = { lat: this.center.lat, lon: this.center.lon };
     this._panSnapshotZoom = this.zoom;
-    
-    // Snapshot tiles canvas
-    if (!this._panSnapshotTiles || this._panSnapshotTiles.width !== pw || this._panSnapshotTiles.height !== ph) {
-      this._panSnapshotTiles = document.createElement("canvas");
-      this._panSnapshotTiles.width = pw;
-      this._panSnapshotTiles.height = ph;
-    }
-    const tCtx = this._panSnapshotTiles.getContext("2d");
-    if (tCtx && this.tilesCanvas) {
-      tCtx.clearRect(0, 0, pw, ph);
-      tCtx.drawImage(this.tilesCanvas, 0, 0);
-    }
-    
-    // Snapshot overlay canvas
+    this._panSnapshotBleed = bleed;
+
+    // Create/resize the bleed overlay canvas
     if (!this._panSnapshotOverlay || this._panSnapshotOverlay.width !== pw || this._panSnapshotOverlay.height !== ph) {
       this._panSnapshotOverlay = document.createElement("canvas");
       this._panSnapshotOverlay.width = pw;
       this._panSnapshotOverlay.height = ph;
     }
-    const oCtx = this._panSnapshotOverlay.getContext("2d");
-    if (oCtx && this.overlayCanvas) {
-      oCtx.clearRect(0, 0, pw, ph);
-      oCtx.drawImage(this.overlayCanvas, 0, 0);
+
+    // Render overlay to the larger canvas by temporarily swapping canvas/context/dimensions
+    const origCanvas = this.overlayCanvas;
+    const origCtx = this.octx;
+    const origW = this._cssW;
+    const origH = this._cssH;
+
+    this.overlayCanvas = this._panSnapshotOverlay;
+    this.octx = this._panSnapshotOverlay.getContext("2d");
+    this._cssW = snapW;
+    this._cssH = snapH;
+
+    // Draw overlay at expanded viewport size
+    const state = this.lastState;
+    if (state) {
+      this.drawOverlay(state, { cacheUnderlay: true });
     }
+
+    // Restore original canvas/context/dimensions
+    this.overlayCanvas = origCanvas;
+    this.octx = origCtx;
+    this._cssW = origW;
+    this._cssH = origH;
   }
 
   onTouchMove(e) {
@@ -679,7 +700,6 @@ class MapView {
       }
       // Clear ALL pan snapshots so next redraw is full (match onMouseUp behavior)
       this._panSnapshotOverlay = null;
-      this._panSnapshotTiles = null;
       this._panSnapshotCenter = null;
       // All fingers lifted - start inertia if we were pinching
       if (this._pinchZooming) {
@@ -868,7 +888,6 @@ class MapView {
     this._mouseDragCenterStart = null;
     // Clear snapshots and do a clean final redraw
     this._panSnapshotOverlay = null;
-    this._panSnapshotTiles = null;
     this._panSnapshotCenter = null;
     this._redrawViewOnly();
     // click behavior is handled in onClick; we just stop dragging here.
@@ -927,7 +946,6 @@ class MapView {
     const finish = () => {
       this._centerAnimRAF = null;
       this._panSnapshotOverlay = null;
-      this._panSnapshotTiles = null;
       this._panSnapshotCenter = null;
       this.draw(this.lastState);
       this._notifyViewChanged();
@@ -2026,7 +2044,6 @@ class MapView {
       this._wheelPanning = false;
       this._wheelPanEndTimer = null;
       this._panSnapshotOverlay = null;
-      this._panSnapshotTiles = null;
       this._panSnapshotCenter = null;
       this._redrawViewOnly();
     }, 120);
@@ -2915,7 +2932,6 @@ class MapView {
     const cached = this._tileCacheGet(key);
     if (cached && cached.ok) {
       const sz = TILE_SIZE * scale;
-      // Ensure canvas state isn't applying any accidental filter/desaturation.
       ctx.filter = "none";
       ctx.drawImage(cached.img, Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
       return;
@@ -2924,13 +2940,10 @@ class MapView {
     if (!cached) {
       const img = new Image();
       const epoch = this._tileEpoch;
-      // crossOrigin is best-effort; tiles may not set CORS, but drawing is fine unless you read pixels.
       img.crossOrigin = "anonymous";
       img.onload = () => {
-        // Ignore late loads from a previous theme.
         if (epoch !== this._tileEpoch) return;
         this._tileCacheSet(key, { img, ok: true });
-        // Debounce tile-load redraws to avoid cascading redraws when many tiles load at once
         this._scheduleTileRedraw();
       };
       img.onerror = () => {
@@ -2944,11 +2957,34 @@ class MapView {
         .replace("{z}", z)
         .replace("{x}", x)
         .replace("{y}", y);
-      // Only track this request if it's for the current theme epoch.
       if (epoch === this._tileEpoch) this._tileCacheSet(key, { img, ok: false });
     }
 
-    // Placeholder only when we don't have a prior snapshot (prevents flicker/grid flashes).
+    // Tile not ready yet — try to draw a parent tile (lower zoom) scaled up as fallback.
+    // Walk up zoom levels to find a cached ancestor tile covering this area.
+    for (let pz = z - 1; pz >= Math.max(z - 4, this._zoomMin); pz--) {
+      const diff = z - pz;
+      const parentX = x >> diff;
+      const parentY = y >> diff;
+      const parentKey = `${this.themeKey}:${pz}/${parentX}/${parentY}`;
+      const parentCached = this._tileCacheGet(parentKey);
+      if (parentCached && parentCached.ok) {
+        // Draw the sub-region of the parent tile that corresponds to this tile.
+        const subScale = 1 << diff;
+        const subX = x - (parentX << diff);
+        const subY = y - (parentY << diff);
+        const srcSize = TILE_SIZE / subScale;
+        const srcX = subX * srcSize;
+        const srcY = subY * srcSize;
+        const sz = TILE_SIZE * scale;
+        ctx.filter = "none";
+        ctx.drawImage(parentCached.img, srcX, srcY, srcSize, srcSize,
+          Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
+        return;
+      }
+    }
+
+    // No parent available — only draw placeholder if there's no snapshot backdrop.
     if (!hasSnapshot) {
       const sz = TILE_SIZE * scale;
       ctx.fillStyle = "rgba(255,255,255,0.03)";
@@ -5232,7 +5268,7 @@ class MapView {
           ctx.lineWidth = isSel ? 2.4 : 2.0;
           ctx.stroke();
 
-          ctx.font = "24px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
+          ctx.font = "20px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
           ctx.fillText(emoji, sp.x, sp.y);
@@ -6605,8 +6641,8 @@ class MapView {
           ctx.lineWidth = isSel ? 2.4 : 2.0;
           ctx.stroke();
 
-          const fixedEmojiC = getEmojiCanvas(emoji, 24);
-          ctx.drawImage(fixedEmojiC, sp.x - 14, sp.y - 14, 28, 28);
+          const fixedEmojiC = getEmojiCanvas(emoji, 20);
+          ctx.drawImage(fixedEmojiC, sp.x - 10, sp.y - 10, 20, 20);
         }
 
         if ((this.showFixedLabels && !isPurpleAir) || isSel || f.pinned || String(f.id) === "Home") {
@@ -6661,7 +6697,7 @@ class MapView {
     // Mobile emoji markers
     const nowMs = (opts && typeof opts.nowMs === "number" && isFinite(opts.nowMs)) ? opts.nowMs : performance.now();
     if (this.traceMode || this.playbackMode) {
-      ctx.font = "26px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
+      ctx.font = "22px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
     }
@@ -6767,18 +6803,17 @@ class MapView {
 
       // emoji (pre-rendered to offscreen canvas; drawImage is ~10x faster than
       // fillText with color-emoji fonts on iOS Safari)
-      const emojiC = getEmojiCanvas(emoji, 26);
-      const emojiDraw = 32; // draw larger than cache size to match native emoji glyph rendering
-      const emojiHalf = emojiDraw / 2;
+      const emojiC = getEmojiCanvas(emoji, 22);
+      const emojiHalf = 11; // 22px / 2
       ctx.save();
       if (this.traceMode || this.playbackMode) {
         ctx.translate(spx, spy);
         if (liftScale !== 1.0) ctx.scale(liftScale, liftScale);
         if (flipX) ctx.scale(-1, 1);
         ctx.rotate(angle);
-        ctx.drawImage(emojiC, -emojiHalf, -emojiHalf, emojiDraw, emojiDraw);
+        ctx.drawImage(emojiC, -emojiHalf, -emojiHalf, 22, 22);
       } else {
-        ctx.drawImage(emojiC, spx - emojiHalf, spy - emojiHalf, emojiDraw, emojiDraw);
+        ctx.drawImage(emojiC, spx - emojiHalf, spy - emojiHalf, 22, 22);
       }
       ctx.restore();
 
