@@ -40,10 +40,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
   bottom: 0;
   left: 0;
   right: 0;
-  padding: 4px 14px calc(4px + env(safe-area-inset-bottom, 0px)) 14px;
-  background: rgba(11, 15, 20, 0.7);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  padding: 4px 14px;
+  background: var(--bg);
   border-top: 1px solid rgba(255,255,255,0.04);
   z-index: 100;
   font-size: 11px;
@@ -72,8 +70,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
 }
 
 #topbar {
-  height: calc(52px + env(safe-area-inset-top, 0px));
-  padding-top: calc(10px + env(safe-area-inset-top, 0px));
+  height: 52px;
+  padding-top: 10px;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -314,7 +312,7 @@ aside, section { min-height: 0; }
 .playbackBar {
   position: absolute;
   left: 50%;
-  bottom: calc(48px + env(safe-area-inset-bottom, 0px));  /* Footer height + spacing + safe area */
+  bottom: 48px;
   transform: translateX(-50%);
   z-index: 12;
   display: flex;
@@ -1135,7 +1133,21 @@ button#pbPlay.isLive {
   }
 
   .footerDisclaimer {
-    display: none;
+    display: block;
+    font-size: 8px;
+  }
+}
+
+/* PWA standalone mode */
+@media (display-mode: standalone) {
+  #appFooter {
+    padding: 2px 8px;
+    font-size: 9px;
+    line-height: 1.2;
+  }
+
+  .footerDisclaimer {
+    font-size: 8px;
   }
 }
 

@@ -2527,7 +2527,7 @@ def _get_aqi_color(pollutant: str, value: Any) -> str:
     if pollutant in ("PM25", "PM2.5"):
         if v <= 2.0:  return "#00FFFF"   # cyan   – Good (very low)
         if v <= 5.0:  return "#00CCFF"   # lt blue – Good
-        if v <= 9.0:  return "#00E400"   # green  – Good
+        if v <= 9.0:  return "#0099FF"   # blue   – Good
         if v <= 35.4: return "#FFFF00"   # yellow – Moderate
         if v <= 55.4: return "#FF7E00"   # orange – USG
         if v <= 125.4: return "#FF0000"  # red    – Unhealthy
