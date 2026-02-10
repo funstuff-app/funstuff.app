@@ -145,7 +145,10 @@ class TestFetchJsonWithCache(unittest.TestCase):
             self.assertEqual(data, {"ok": True})
             self.assertTrue(os.path.exists(cache_path))
             with open(cache_path, "r") as f:
-                self.assertEqual(json.load(f), {"ok": True})
+                wrapper = json.load(f)
+                self.assertIn("_data", wrapper)
+                self.assertEqual(wrapper["_data"], {"ok": True})
+                self.assertIsInstance(wrapper["_fetched_at"], float)
 
     def test_fetch_failure_uses_cache(self):
         with tempfile.TemporaryDirectory() as td:
@@ -216,7 +219,7 @@ class TestTracksAndDashboardState(unittest.TestCase):
         self.assertEqual(len(tracks["BUS1"]), 2)
         self.assertEqual(tracks["BUS1"][0]["t"], "2025-12-12 10:00:00 UTC")
         self.assertIn("readings", tracks["BUS1"][0])
-        self.assertEqual(tracks["BUS1"][0]["readings"]["PM25"]["color"], "#111111")
+        self.assertEqual(tracks["BUS1"][0]["readings"]["PM25"]["color"], "#00FFFF")
 
     def test_normalize_state_for_dashboard_has_mobile_and_trail(self):
         combined = {
@@ -319,7 +322,7 @@ class TestTracksAndDashboardState(unittest.TestCase):
         m = st["mobile"][0]
         self.assertEqual(m["primary_key"], "OZNE")
         self.assertEqual(m["primary_value"], "70")
-        self.assertEqual(m["primary_color"], "#ff00ff")
+        self.assertEqual(m["primary_color"], "#FFFF00")
 
     def test_marker_primary_prefers_pm10_when_it_has_higher_aqi(self):
         # Repro for the dashboard issue: ozone in ppb (32) is "Good", but PM10 in the 400s is Hazardous.

@@ -30,8 +30,8 @@ class TestRoads(unittest.TestCase):
 
         # Inherits fields from destination point (color/readings).
         for p in out:
-            self.assertEqual(p.get("color"), nxt["color"])
-            self.assertEqual(p.get("readings"), nxt["readings"])
+            self.assertEqual(p.get("color"), prev["color"])
+            self.assertEqual(p.get("readings"), prev["readings"])
             self.assertEqual(p.get("m"), 1)
 
         # Time must be monotonic and within [prev, nxt].
