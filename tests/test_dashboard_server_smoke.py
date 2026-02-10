@@ -53,7 +53,7 @@ class TestDashboardServerSmoke(unittest.TestCase):
                 resp = conn.getresponse()
                 self.assertEqual(resp.status, 200)
                 cc = resp.getheader("Cache-Control") or ""
-                self.assertIn("no-store", cc)
+                self.assertIn("max-age=", cc)
                 payload = resp.read().decode("utf-8")
                 data = json.loads(payload)
                 self.assertIn("mobile", data)
