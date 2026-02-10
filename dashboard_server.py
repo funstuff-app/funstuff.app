@@ -2795,6 +2795,79 @@ def _update_home_sensor_in_state(app_state: AppState) -> None:
         _log(f"[HomeSensor] Update error: {e}")
 
 
+def _do_one_fetch(app_state: AppState, data_dir: Path) -> tuple:
+    """Perform one data-fetch cycle: pull mobile/fixed JSON, build state, enrich it.
+
+    Does NOT call ``update_app_state_with_new_data`` — the caller is responsible
+    for adding any extra meta fields and calling that itself.
+
+    Returns ``(mobile_raw, fixed_raw, state_dict)``.
+    """
+    mobile_cache = default_cache_path(MOBILE_URL, mobile_url=MOBILE_URL, fixed_url=FIXED_URL, data_dir=str(data_dir))
+    fixed_cache = default_cache_path(FIXED_URL, mobile_url=MOBILE_URL, fixed_url=FIXED_URL, data_dir=str(data_dir))
+    mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=stdlib_get, cache_path=mobile_cache)
+    fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=stdlib_get, cache_path=fixed_cache)
+
+    mobile = _clamp_impossible_values(mobile)
+
+    if isinstance(mobile, dict):
+        mobile.pop("_cache_age_s", None)
+    if isinstance(fixed_raw, dict):
+        fixed_raw.pop("_cache_age_s", None)
+
+    # --- data-age / staleness ------------------------------------------------
+    def _get_data_age_s(data: dict | None) -> int | None:
+        if not isinstance(data, dict):
+            return None
+        pm25 = data.get("PM25", {})
+        if isinstance(pm25, dict):
+            last_update = pm25.get("LastUpdateUTC")
+            if last_update:
+                try:
+                    dt = datetime.strptime(last_update.replace(" UTC", ""), "%Y-%m-%d %H:%M")
+                    dt = dt.replace(tzinfo=timezone.utc)
+                    age = int(time.time() - dt.timestamp())
+                    return max(0, age)
+                except Exception:
+                    pass
+        return None
+
+    mobile_data_age = _get_data_age_s(mobile)
+    fixed_data_age = _get_data_age_s(fixed_raw)
+    data_stale = (mobile_data_age is not None and mobile_data_age > 1800) or \
+                 (fixed_data_age is not None and fixed_data_age > 1800)
+    data_age_s = max(mobile_data_age or 0, fixed_data_age or 0) if data_stale else None
+
+    # --- accumulate history & raw storage ------------------------------------
+    _accumulate_fixed_history_from_raw(app_state, fixed_raw)
+
+    with app_state.lock:
+        app_state.raw_mobile = mobile if isinstance(mobile, dict) else {}
+        app_state.raw_fixed = fixed_raw if isinstance(fixed_raw, dict) else {}
+
+    st = build_state(data_dir=data_dir, mobile_json=mobile, fixed_json=fixed_raw, max_points=5000)
+
+    _accumulate_home_sensor_reading(app_state, st)
+    _inject_fixed_history(app_state, st)
+    _reinject_offline_fixed_sensors(app_state, st)
+
+    # --- core meta -----------------------------------------------------------
+    now = time.time()
+    meta = st.setdefault("meta", {})
+    meta["last_fetch_attempt_ts"] = now
+    meta["last_fetch_ok_ts"] = now
+    if data_stale:
+        meta["data_stale"] = True
+        meta["data_age_s"] = data_age_s
+    if mobile_data_age is not None:
+        meta["mobile_data_age_s"] = mobile_data_age
+    if fixed_data_age is not None:
+        meta["fixed_data_age_s"] = fixed_data_age
+    meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
+
+    return mobile, fixed_raw, st
+
+
 def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_event: threading.Event) -> None:
     revision = 0
     poller = AdaptivePoller()
@@ -2824,88 +2897,20 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
         
         try:
             _log(f"[FetchLoop] Fetching data...")
-            mobile_cache = default_cache_path(MOBILE_URL, mobile_url=MOBILE_URL, fixed_url=FIXED_URL, data_dir=str(data_dir))
-            fixed_cache = default_cache_path(FIXED_URL, mobile_url=MOBILE_URL, fixed_url=FIXED_URL, data_dir=str(data_dir))
-            # Uses 6s timeout when cache exists (see fetch_json_with_cache), falls back to cache on failure
-            mobile = fetch_json_with_cache(MOBILE_URL, headers=HEADERS, timeout=10, request_get=stdlib_get, cache_path=mobile_cache)
-            fixed_raw = fetch_json_with_cache(FIXED_URL, headers=HEADERS, timeout=10, request_get=stdlib_get, cache_path=fixed_cache)
+            mobile, fixed_raw, st = _do_one_fetch(app_state, data_dir)
 
-            # Clamp impossible sensor values at the source
-            mobile = _clamp_impossible_values(mobile)
-
-            # Remove any cache tracking metadata (we use the data's own timestamps now)
-            if isinstance(mobile, dict):
-                mobile.pop("_cache_age_s", None)
-            if isinstance(fixed_raw, dict):
-                fixed_raw.pop("_cache_age_s", None)
-            
             # Check if upstream data changed (for adaptive polling)
             data_changed = poller.check_for_change(mobile, fixed_raw)
             if data_changed:
                 _log(f"[FetchLoop] Upstream data changed!")
-            
-            # Get data age from the actual LastUpdateUTC in the data
-            def get_data_age_s(data: dict | None) -> int | None:
-                if not isinstance(data, dict):
-                    return None
-                # Check PM25 section for LastUpdateUTC
-                pm25 = data.get("PM25", {})
-                if isinstance(pm25, dict):
-                    last_update = pm25.get("LastUpdateUTC")
-                    if last_update:
-                        try:
-                            # Parse "2026-01-25 05:08 UTC" format
-                            dt = datetime.strptime(last_update.replace(" UTC", ""), "%Y-%m-%d %H:%M")
-                            dt = dt.replace(tzinfo=timezone.utc)
-                            age = int(time.time() - dt.timestamp())
-                            return max(0, age)
-                        except Exception:
-                            pass
-                return None
-            
-            mobile_data_age = get_data_age_s(mobile)
-            fixed_data_age = get_data_age_s(fixed_raw)
-            # Data is stale if older than 30 minutes
-            data_stale = (mobile_data_age is not None and mobile_data_age > 1800) or \
-                         (fixed_data_age is not None and fixed_data_age > 1800)
-            data_age_s = max(mobile_data_age or 0, fixed_data_age or 0) if data_stale else None
 
-            # Accumulate fixed sensor history from raw data
-            _accumulate_fixed_history_from_raw(app_state, fixed_raw)
-
-            # Store raw data for TUI remote mode
-            with app_state.lock:
-                app_state.raw_mobile = mobile if isinstance(mobile, dict) else {}
-                app_state.raw_fixed = fixed_raw if isinstance(fixed_raw, dict) else {}
-            
-            st = build_state(data_dir=data_dir, mobile_json=mobile, fixed_json=fixed_raw, max_points=5000)
-            
-            # Accumulate home sensor reading into history (uses same mechanism as other fixed sensors)
-            _accumulate_home_sensor_reading(app_state, st)
-            
-            # Inject history arrays into fixed sensors
-            _inject_fixed_history(app_state, st)
-            
-            # Re-inject offline sensors that have history but are missing from the live API
-            _reinject_offline_fixed_sensors(app_state, st)
-            
             revision += 1
             meta = st.setdefault("meta", {})
-            meta.update({"last_fetch_attempt_ts": attempt_ts, "last_fetch_ok_ts": attempt_ts, "server_revision": revision})
-            # Use actual data timestamps to determine staleness
-            if data_stale:
-                meta["data_stale"] = True
-                meta["data_age_s"] = data_age_s
-            if mobile_data_age is not None:
-                meta["mobile_data_age_s"] = mobile_data_age
-            if fixed_data_age is not None:
-                meta["fixed_data_age_s"] = fixed_data_age
+            meta["server_revision"] = revision
             # Include adaptive polling info in meta
             meta["polling_predicted_interval_s"] = poller.predicted_interval
             if poller.last_change_ts:
                 meta["polling_time_since_change_s"] = int(time.time() - poller.last_change_ts)
-            # Preserve the force-refresh sequence across rebuild_state() calls.
-            meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
             update_app_state_with_new_data(app_state, st)
             _log(f"[FetchLoop] Revision {revision} updated")
 
@@ -3801,6 +3806,15 @@ def main() -> int:
     
     stop_event = threading.Event()
 
+    # Synchronous initial fetch so cached_json_bytes has real data before clients connect
+    try:
+        _log("[InitialFetch] Performing initial data fetch...")
+        _, _, init_st = _do_one_fetch(app_state, data_dir)
+        update_app_state_with_new_data(app_state, init_st)
+        _log("[InitialFetch] Initial data loaded")
+    except Exception as e:
+        _log(f"[InitialFetch] Error (will retry in fetch_loop): {e}")
+
     threading.Thread(target=fetch_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=args.interval, stop_event=stop_event), daemon=True).start()
     threading.Thread(target=watch_sensor_names_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event), daemon=True).start()
     
@@ -3913,6 +3927,15 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
     # Load today's snapshot to restore trail history on restart
     load_today_snapshot(app_state, data_dir)
     
+    # Synchronous initial fetch so cached_json_bytes has real data before clients connect
+    try:
+        _log("[InitialFetch] Performing initial data fetch...")
+        _, _, init_st = _do_one_fetch(app_state, data_dir)
+        update_app_state_with_new_data(app_state, init_st)
+        _log("[InitialFetch] Initial data loaded")
+    except Exception as e:
+        _log(f"[InitialFetch] Error (will retry in fetch_loop): {e}")
+
     stop_event = threading.Event()
 
     threading.Thread(target=fetch_loop, kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=interval, stop_event=stop_event), daemon=True).start()
