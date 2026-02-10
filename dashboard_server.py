@@ -485,21 +485,11 @@ def load_fixed_history(app_state: AppState, data_dir: Path) -> None:
     if not isinstance(app_state.fixed_history, dict):
         app_state.fixed_history = {}
     # Purge any weather/met keys that were persisted before filtering was added
-    _ALLOWED_AQ_KEYS = set(AIRNOW_PARAM_MAP.values()) | set(AIRNOW_PARAM_MAP.keys()) | {"PM25", "PM2.5", "PM10", "OZNE"}
     for sensor_id in list(app_state.fixed_history):
         pols = app_state.fixed_history[sensor_id]
         if isinstance(pols, dict):
-            if sensor_id.startswith("AIRNOW_"):
-                # AirNow sensors: only keep mapped AQ params
-                for k in list(pols):
-                    if k not in _ALLOWED_AQ_KEYS:
-                        del pols[k]
-            else:
-                # Raw Utah AQ sensors: just remove known weather keys
-                for wk in _WEATHER_KEYS:
-                    pols.pop(wk, None)
-    # Mark dirty so the cleaned history gets saved back to disk
-    app_state.fixed_history_dirty = True
+            for wk in _WEATHER_KEYS:
+                pols.pop(wk, None)
 
 
 def save_fixed_history(app_state: AppState) -> None:
@@ -3047,16 +3037,14 @@ def _fetch_airnow_data(app_state: AppState) -> None:
                         if param and val is not None:
                             all_readings[site_id][param] = val
                         
-                        # Also accumulate into persistent history (AQ params only)
-                        if param in AIRNOW_PARAM_MAP:
-                            dt = r.get("datetime")
-                            time_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
-                            sensor_key = f"AIRNOW_{site_id}"
-                            mapped = AIRNOW_PARAM_MAP[param]
-                            accumulate_fixed_reading(
-                                app_state, sensor_key, mapped, val,
-                                _get_aqi_color(mapped, val), time_str
-                            )
+                        # Also accumulate into persistent history
+                        dt = r.get("datetime")
+                        time_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
+                        sensor_key = f"AIRNOW_{site_id}"
+                        accumulate_fixed_reading(
+                            app_state, sensor_key, param, val,
+                            _get_aqi_color(param, val), time_str
+                        )
                 
             except Exception as e:
                 # File might not exist yet, that's OK

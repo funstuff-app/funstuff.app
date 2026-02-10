@@ -1217,11 +1217,13 @@ function main() {
   let _pbPageIndex = -1;                  // -1 = "all" (no paging), 0..N = page index
   let _pbPageAutoFollow = true;           // auto-advance page to follow playhead
 
-  /** Compute total page count for current bounds. */
+  /** Compute total page count for current bounds.
+   *  Uses floor so the last page absorbs any remainder < pageSize,
+   *  keeping scrub resolution reasonable instead of creating a tiny final page. */
   function _pbPageCount() {
     const b = map.getPlaybackBounds();
     if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return 0;
-    return Math.ceil((b.maxMs - b.minMs) / _pbPageSizeMs);
+    return Math.max(1, Math.floor((b.maxMs - b.minMs) / _pbPageSizeMs));
   }
 
   /** Get the time range for the current page (or full range if paging disabled). */
@@ -1232,7 +1234,8 @@ function main() {
     const total = _pbPageCount();
     const idx = clamp(_pbPageIndex, 0, total - 1);
     const pageStart = b.minMs + idx * _pbPageSizeMs;
-    const pageEnd = Math.min(pageStart + _pbPageSizeMs, b.maxMs);
+    // Last page extends to cover all remaining time (no short final page)
+    const pageEnd = (idx === total - 1) ? b.maxMs : pageStart + _pbPageSizeMs;
     return { minMs: pageStart, maxMs: pageEnd };
   }
 

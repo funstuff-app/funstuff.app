@@ -1955,15 +1955,14 @@ class MapView {
         lat = pose.lat;
         lon = pose.lon;
       }
+      if (m.type === "fixed" && this._fixedGeoOffsets) {
+        const fKey = m._key || keyFor("fixed", m.id);
+        const geo = this._fixedGeoOffsets.get(fKey);
+        if (geo) { lat += geo.dlat; lon += geo.dlon; }
+      }
       if (!isFinite(lat) || !isFinite(lon)) continue;
       const wpt = latLonToWorld(lat, lon, this.zoom);
       const sp = this.worldToScreen(wpt.x, wpt.y);
-      // Apply fixed marker overlap offsets to hit test positions
-      // if (m.type === "fixed" && this._fixedOffsets) {
-      //   const fKey = m._key || keyFor("fixed", m.id);
-      //   const off = this._fixedOffsets.get(fKey);
-      //   if (off) { sp.x += off.dx; sp.y += off.dy; }
-      // }
       const dx = sp.x - sx;
       const dy = sp.y - sy;
       if ((dx*dx + dy*dy) <= (20*20)) {
@@ -1998,15 +1997,14 @@ class MapView {
         lat = pose.lat;
         lon = pose.lon;
       }
+      if (m.type === "fixed" && this._fixedGeoOffsets) {
+        const fKey = m._key || keyFor("fixed", m.id);
+        const geo = this._fixedGeoOffsets.get(fKey);
+        if (geo) { lat += geo.dlat; lon += geo.dlon; }
+      }
       if (!isFinite(lat) || !isFinite(lon)) continue;
       const wpt = latLonToWorld(lat, lon, this.zoom);
       const sp = this.worldToScreen(wpt.x, wpt.y);
-      // Apply fixed marker overlap offsets to hit test positions
-      if (m.type === "fixed" && this._fixedOffsets) {
-        const fKey = m._key || keyFor("fixed", m.id);
-        const off = this._fixedOffsets.get(fKey);
-        if (off) { sp.x += off.dx; sp.y += off.dy; }
-      }
       const dx = sp.x - sx;
       const dy = sp.y - sy;
       if ((dx*dx + dy*dy) <= (35*35)) { // Large hit area for iOS touch accuracy
@@ -5083,10 +5081,48 @@ class MapView {
 
     // Fixed markers - render PurpleAir first (so they don't draw over others), then other markers
     if (this.showFixed) {
+      // Declutter: nudge co-located non-PurpleAir fixed markers apart.
+      // Offsets are in lat/lon so the bearing is geographic and zoom-independent.
+      this._fixedGeoOffsets = new Map();
+      {
+        const nudgeDeg = 0.0003; // ~33m — enough to separate at high zoom, subtle at low zoom
+        const colocThresh = 0.002; // ~200m
+        const ents = [];
+        for (const f of fixed) {
+          if (f.purpleair) continue;
+          const lat = Number(f.lat), lon = Number(f.lon);
+          if (!isFinite(lat) || !isFinite(lon)) continue;
+          if (!f._key) f._key = keyFor("fixed", f.id);
+          ents.push({ f, lat, lon, dlat: 0, dlon: 0 });
+        }
+        for (let i = 0; i < ents.length; i++) {
+          for (let j = i + 1; j < ents.length; j++) {
+            const a = ents[i], b = ents[j];
+            if (Math.abs(a.lat - b.lat) + Math.abs(a.lon - b.lon) < colocThresh) {
+              // Bearing from a→b in geographic coords; default NE when coincident
+              const dl = b.lat - a.lat, dn = b.lon - a.lon;
+              const ang = (Math.abs(dl) + Math.abs(dn) > 1e-7)
+                ? Math.atan2(dn, dl)
+                : Math.PI / 4; // 45° NE default
+              a.dlat -= Math.cos(ang) * nudgeDeg;
+              a.dlon -= Math.sin(ang) * nudgeDeg;
+              b.dlat += Math.cos(ang) * nudgeDeg;
+              b.dlon += Math.sin(ang) * nudgeDeg;
+            }
+          }
+        }
+        for (const e of ents) {
+          if (e.dlat || e.dlon) this._fixedGeoOffsets.set(e.f._key, { dlat: e.dlat, dlon: e.dlon });
+        }
+      }
+
       // Helper to render a single fixed marker
       const renderFixedMarker = (f) => {
-        const lat = Number(f.lat), lon = Number(f.lon);
+        let lat = Number(f.lat), lon = Number(f.lon);
         if (!isFinite(lat) || !isFinite(lon)) return;
+        if (!f._key) f._key = keyFor("fixed", f.id);
+        const geo = this._fixedGeoOffsets && this._fixedGeoOffsets.get(f._key);
+        if (geo) { lat += geo.dlat; lon += geo.dlon; }
         const wpt = latLonToWorld(lat, lon, this.zoom);
         const sp = worldToScreenFast(wpt.x, wpt.y);
         if (sp.x < -50 || sp.y < -50 || sp.x > cssW + 50 || sp.y > cssH + 50) return;
@@ -6386,66 +6422,54 @@ class MapView {
       }
     }
 
-    // Fixed marker overlap separation: compute position offsets so overlapping fixed markers spread apart.
-    // Only applies to fixed markers (not mobile) to preserve GPS-accurate vehicle positions.
-    // Store on `this` so hit testing can apply the same offsets.
-    // if (!this._fixedOffsets) this._fixedOffsets = new Map();
-    // this._fixedOffsets.clear();
-    // const _fixedOffsets = this._fixedOffsets;
-    // if (!useStaticOverlay && this.showFixed) {
-    //   const MIN_DIST = 40; // minimum pixel distance between fixed marker centers
-    //   const fixedPos = []; // {key, x, y}
-    //   for (const f of fixed) {
-    //     const lat = Number(f.lat), lon = Number(f.lon);
-    //     if (!isFinite(lat) || !isFinite(lon)) continue;
-    //     const wpt = latLonToWorld(lat, lon, this.zoom);
-    //     const sp = worldToScreenFast(wpt.x, wpt.y);
-    //     if (sp.x < -50 || sp.y < -50 || sp.x > w+50 || sp.y > h+50) continue;
-    //     if (!f._key) f._key = keyFor("fixed", f.id);
-    //     fixedPos.push({key: f._key, x: sp.x, y: sp.y});
-    //   }
-    //   // Simple O(n^2) pairwise push-apart (n is small, typically <30 fixed markers)
-    //   for (let i = 0; i < fixedPos.length; i++) {
-    //     for (let j = i + 1; j < fixedPos.length; j++) {
-    //       const a = fixedPos[i], b = fixedPos[j];
-    //       const oA = _fixedOffsets.get(a.key) || {dx:0, dy:0};
-    //       const oB = _fixedOffsets.get(b.key) || {dx:0, dy:0};
-    //       const ax = a.x + oA.dx, ay = a.y + oA.dy;
-    //       const bx = b.x + oB.dx, by = b.y + oB.dy;
-    //       const ddx = bx - ax, ddy = by - ay;
-    //       const dist = Math.sqrt(ddx*ddx + ddy*ddy);
-    //       if (dist < MIN_DIST && dist > 0.01) {
-    //         const push = (MIN_DIST - dist) / 2;
-    //         const nx = ddx / dist, ny = ddy / dist;
-    //         oA.dx -= nx * push; oA.dy -= ny * push;
-    //         oB.dx += nx * push; oB.dy += ny * push;
-    //         _fixedOffsets.set(a.key, oA);
-    //         _fixedOffsets.set(b.key, oB);
-    //       } else if (dist <= 0.01) {
-    //         // Exactly overlapping: push apart vertically
-    //         const oA2 = _fixedOffsets.get(a.key) || {dx:0, dy:0};
-    //         const oB2 = _fixedOffsets.get(b.key) || {dx:0, dy:0};
-    //         oA2.dy -= MIN_DIST / 2;
-    //         oB2.dy += MIN_DIST / 2;
-    //         _fixedOffsets.set(a.key, oA2);
-    //         _fixedOffsets.set(b.key, oB2);
-    //       }
-    //     }
-    //   }
-    // }
-
     // Fixed markers - drawn AFTER trails so they appear on top
     // Render PurpleAir (public) first (so they don't draw over other markers), then others
     const fixedPbTimeMs = _framePbTimeMs;
     if (!useStaticOverlay) {
+      // Recompute declutter offsets (needed in non-trace mode where _drawStaticOverlay doesn't run).
+      // Uses lat/lon proximity so only truly co-located stations get nudged.
+      {
+        const nudgeDeg = 0.0003;
+        const colocThresh = 0.002;
+        this._fixedGeoOffsets = new Map();
+        const ents = [];
+        for (const f of fixed) {
+          if (f.purpleair) continue;
+          const lat = Number(f.lat), lon = Number(f.lon);
+          if (!isFinite(lat) || !isFinite(lon)) continue;
+          if (!f._key) f._key = keyFor("fixed", f.id);
+          ents.push({ key: f._key, lat, lon, dlat: 0, dlon: 0 });
+        }
+        for (let i = 0; i < ents.length; i++) {
+          for (let j = i + 1; j < ents.length; j++) {
+            const a = ents[i], b = ents[j];
+            if (Math.abs(a.lat - b.lat) + Math.abs(a.lon - b.lon) < colocThresh) {
+              const dl = b.lat - a.lat, dn = b.lon - a.lon;
+              const ang = (Math.abs(dl) + Math.abs(dn) > 1e-7)
+                ? Math.atan2(dn, dl)
+                : Math.PI / 4;
+              a.dlat -= Math.cos(ang) * nudgeDeg;
+              a.dlon -= Math.sin(ang) * nudgeDeg;
+              b.dlat += Math.cos(ang) * nudgeDeg;
+              b.dlon += Math.sin(ang) * nudgeDeg;
+            }
+          }
+        }
+        for (const e of ents) {
+          if (e.dlat || e.dlon) this._fixedGeoOffsets.set(e.key, { dlat: e.dlat, dlon: e.dlon });
+        }
+      }
+
       const renderPbFixedMarker = (f) => {
-        const lat = Number(f.lat), lon = Number(f.lon);
+        let lat = Number(f.lat), lon = Number(f.lon);
         if (!isFinite(lat) || !isFinite(lon)) return;
+        if (!f._key) f._key = keyFor("fixed", f.id);
+        const geo = this._fixedGeoOffsets && this._fixedGeoOffsets.get(f._key);
+        if (geo) { lat += geo.dlat; lon += geo.dlon; }
         const wpt = latLonToWorld(lat, lon, this.zoom);
         const sp = worldToScreenFast(wpt.x, wpt.y);
         if (sp.x < -50 || sp.y < -50 || sp.x > w+50 || sp.y > h+50) return;
 
-        if (!f._key) f._key = keyFor("fixed", f.id);
         const key = f._key;
         const isSel = (this.selectedId === key);
         const emoji = f.purpleair ? "" : (f.emoji || "📍");
