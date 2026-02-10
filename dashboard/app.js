@@ -496,7 +496,12 @@ function main() {
   }
 
   // Called from MapView on any pan/zoom change (gesture/wheel/drag/buttons/animations).
-  window.__onMapViewChanged = () => saveViewSoon();
+  // Skip localStorage persistence during auto-camera animations so the user's
+  // manually-chosen view is preserved as the fallback.
+  window.__onMapViewChanged = () => {
+    if (map && map._isAutoCameraAnimating) return;
+    saveViewSoon();
+  };
 
   function restoreViewIfAny() {
     try {
@@ -551,7 +556,7 @@ function main() {
     const settingsKey = getThemeSettingsKey(themeKey);
     const raw = localStorage.getItem(SAT_STORAGE_PREFIX + settingsKey);
     const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
-    const def = Math.round(100 * (t.filter?.saturate ?? 0.55));
+    const def = t.defaultSat ?? Math.round(100 * (t.filter?.saturate ?? 0.55));
     const v = raw == null ? def : Number(raw);
     const clamped = Math.max(0, Math.min(150, isFinite(v) ? v : def));
     return clamped;
@@ -885,6 +890,7 @@ function main() {
     _pbLiveStartWallMs = null;
     _pbLiveStartDataMs = null;
     _pbLiveStallCount = 0;
+    _deferredCameraFit = null;
   }
   map._resetLiveTracking = _resetLiveTracking;
   
@@ -892,16 +898,68 @@ function main() {
   const _pbLiveFollowDurationMs = 2000; // animation duration for camera follow (slow, smooth)
   const _pbLiveFollowPadding = 0.15;    // extra padding around bounds (15%)
 
+  // Deferred camera fit: when new data arrives while the user is panning/zooming
+  // (or during post-interaction easing), we stash the intended camera fit here.
+  // The playback loop drains it once _canRunAutoCamera() returns true.
+  let _deferredCameraFit = null; // { type: "bounds", bb, durationMs } | { type: "storedView", durationMs }
+
+  // Minimum geographic extent (in degrees) for bounds to be considered "meaningful" movement.
+  // ~0.005° lat ≈ 550m. Below this the vehicles are just jittering in place (depot, parking lot).
+  const _pbMinBoundsExtentDeg = 0.005;
+
+  // Smoothly animate back to the user's stored view (from localStorage) when no
+  // meaningful vehicle movement is detected. Acts as a screensaver-like idle return.
+  function _animateToStoredView(durationMs) {
+    if (!map || typeof map._canRunAutoCamera !== "function") return;
+    if (!map._canRunAutoCamera()) {
+      // User is interacting — defer until interaction + easing finishes.
+      _deferredCameraFit = { type: "storedView", durationMs: durationMs || _pbLiveFollowDurationMs };
+      return;
+    }
+    try {
+      const raw = localStorage.getItem(VIEW_STORAGE_KEY);
+      if (!raw) return;
+      const v = JSON.parse(raw);
+      const lat = Number(v?.lat);
+      const lon = Number(v?.lon);
+      const zoom = Number(v?.zoom);
+      if (!isFinite(lat) || !isFinite(lon) || !isFinite(zoom)) return;
+
+      // Already there? Skip.
+      const curr = map.center;
+      if (curr && Math.abs(Number(curr.lat) - lat) < 1e-5 && Math.abs(Number(curr.lon) - lon) < 1e-5
+          && Math.abs(Number(map.zoom) - zoom) < 1e-3) return;
+
+      map._animateTo(
+        { centerLat: lat, centerLon: lon, zoom },
+        { durationMs, isAutoCamera: true }
+      );
+    } catch {
+      // ignore
+    }
+  }
+
   function _animateFitBoundsLatLon({ minLat, minLon, maxLat, maxLon }, { durationMs = _pbLiveFollowDurationMs } = {}) {
     if (!isFinite(minLat) || !isFinite(maxLat) || !isFinite(minLon) || !isFinite(maxLon)) return;
 
     // User interaction always wins: do not start/continue auto camera fits while the user
     // is actively panning/zooming, or during the post-interaction cooldown.
-    if (map && typeof map._canRunAutoCamera === "function" && !map._canRunAutoCamera()) return;
+    if (map && typeof map._canRunAutoCamera === "function" && !map._canRunAutoCamera()) {
+      // Defer: replay this fit once the user stops interacting.
+      _deferredCameraFit = { type: "bounds", bb: { minLat, minLon, maxLat, maxLon }, durationMs };
+      return;
+    }
 
-    // Add padding
+    // If the bounds are too small (depot jitter, parked vehicles shuffling), don't zoom
+    // into that tiny area — fall back to the user's stored view instead.
     const latRange = maxLat - minLat;
     const lonRange = maxLon - minLon;
+    if (latRange < _pbMinBoundsExtentDeg && lonRange < _pbMinBoundsExtentDeg) {
+      _animateToStoredView(durationMs);
+      return;
+    }
+
+    // Add padding
     const latPad = Math.max(latRange * _pbLiveFollowPadding, 0.01); // minimum ~1km
     const lonPad = Math.max(lonRange * _pbLiveFollowPadding, 0.01);
 
@@ -964,8 +1022,49 @@ function main() {
 
     map._animateTo(
       { centerLat: finalCenter.lat, centerLon: finalCenter.lon, zoom: targetZoom },
-      { durationMs }
+      { durationMs, isAutoCamera: true }
     );
+  }
+
+  // Collect a bounding box from just the latest (head) position of each active,
+  // non-ghosted vehicle whose trail meets the minimum length threshold.
+  // Used for LIVE camera follow so the camera frames where vehicles ARE, not the
+  // full extent of their historical trails.
+  function _collectHeadPositionBounds(mobiles) {
+    let minLat = Infinity, maxLat = -Infinity;
+    let minLon = Infinity, maxLon = -Infinity;
+    let visibleVehicleCount = 0;
+    let visiblePointCount = 0;
+
+    for (const m of mobiles) {
+      if (!m || m.ghosted) continue;
+      const trail = Array.isArray(m.trail) ? m.trail : [];
+      if (trail.length === 0) continue;
+
+      // Find the latest point with valid coordinates
+      let headLat = NaN, headLon = NaN;
+      for (let i = trail.length - 1; i >= 0; i--) {
+        const p = trail[i];
+        if (!p) continue;
+        const lat = Number(p.lat);
+        const lon = Number(p.lon);
+        if (isFinite(lat) && isFinite(lon)) {
+          headLat = lat;
+          headLon = lon;
+          break;
+        }
+      }
+      if (!isFinite(headLat) || !isFinite(headLon)) continue;
+
+      minLat = Math.min(minLat, headLat);
+      maxLat = Math.max(maxLat, headLat);
+      minLon = Math.min(minLon, headLon);
+      maxLon = Math.max(maxLon, headLon);
+      visibleVehicleCount++;
+      visiblePointCount++;
+    }
+
+    return { minLat, minLon, maxLat, maxLon, visibleVehicleCount, visiblePointCount };
   }
 
   function _collectBoundsForMobilesNewSegment(mobiles, windowStartMs, windowEndMs) {
@@ -981,6 +1080,7 @@ function main() {
           minVisibleSegmentStraightness: MapView.MIN_CAMERA_FIT_SEGMENT_STRAIGHTNESS,
           minVisibleSegmentLengthM2: MapView.MIN_CAMERA_FIT_SEGMENT_LENGTH_M_2PT,
           minVisibleSegmentDisplacementM2: MapView.MIN_CAMERA_FIT_SEGMENT_DISPLACEMENT_M_2PT,
+          maxSegmentLengthM: MapView.MAX_CAMERA_FIT_SEGMENT_LENGTH_M,
         });
       }
     } catch {
@@ -1444,38 +1544,15 @@ function main() {
       // ignore
     }
 
-    // When new server data arrives (or TUI forces a refresh), rewind the playhead so the
-    // newest segment gets replayed.
-    //
-    // Important: scale the rewind by the current playback speed.
-    // If the server updates every ~10 minutes and playback speed is 5x, the client will
-    // have consumed ~50 minutes of data-time between updates; we must rewind ~50 minutes
-    // of data-time to replay what happened since the last update.
-    // When new data arrives, rewind playback to give runway for animation
-    // We just got fresh data, so time until next update is the full predicted interval
-    // Account for playback speed: at 5x, we consume data 5x faster, so need 5x runway
-    // Check both playing AND liveFollow since LIVE mode at end has playing=false
-    if (hasBounds && (newDataArrived || forceCameraFit) && (map.getPlaybackPlaying() || map._playbackLiveFollow)) {
-      const meta = map.lastState?.meta;
-      const predictedIntervalS = Number(meta?.polling_predicted_interval_s) || 600;
-      const timeSinceChangeS = Number(meta?.polling_time_since_change_s) || 0;
-      const timeUntilNextMs = Math.max(60000, (predictedIntervalS - timeSinceChangeS) * 1000);
+    // When new data arrives in LIVE mode and playback is paused at the end,
+    // resume playing so the new segment animates. Don't rewind the playhead —
+    // let normal forward playback consume the new data naturally.
+    if (hasBounds && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && !map.getPlaybackPlaying()) {
       const speed = map.getPlaybackSpeed() || 1.0;
-      const offsetMs = timeUntilNextMs * speed;
-      
-      const targetMs = b.maxMs - offsetMs;
-      const nextMs = clamp(targetMs, b.minMs, b.maxMs);
-      
-      if (tMs == null || !isFinite(tMs) || Math.abs(nextMs - tMs) > 200) {
-        tMs = nextMs;
-        map.setPlaybackTimeMs(tMs);
-        _pbLoopStartMs = tMs;
-        // Start playback if we were waiting in LIVE mode
-        if (map._playbackLiveFollow && !map.getPlaybackPlaying()) {
-          _pbVelocity = _pbPlaybackSpeed * speed;
-          map.setPlaybackPlaying(true);
-        }
-      }
+      _pbVelocity = _pbPlaybackSpeed * speed;
+      map.setPlaybackPlaying(true);
+      _pbLastPerf = 0;
+      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
     }
     
     // ─────────────────────────────────────────────────────────────────────────
@@ -1518,20 +1595,36 @@ function main() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // LIVE CAMERA FOLLOW: Smooth pan/zoom to fit the *newly updated* visible trail.
-    // The server is authoritative for the update window (meta.trail_update_*_ms).
+    // LIVE CAMERA FOLLOW: Frame the current vehicle positions (head positions).
+    // Uses head-position bounds so long trails don't pull the camera away from
+    // where the vehicles actually are.
     // ─────────────────────────────────────────────────────────────────────────
     {
-      const state = map.lastState;
-      const meta = state?.meta;
-      const sMs = (meta && typeof meta.trail_update_start_ms === "number" && isFinite(meta.trail_update_start_ms)) ? meta.trail_update_start_ms : null;
-      const eMs = (meta && typeof meta.trail_update_end_ms === "number" && isFinite(meta.trail_update_end_ms)) ? meta.trail_update_end_ms : null;
-      if ((newDataArrived || forceCameraFit) && map._playbackLiveFollow && state && sMs != null && eMs != null) {
-        const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
-        const bb = _collectBoundsForMobilesNewSegment(mobiles, sMs, eMs);
-        if (bb && bb.visibleVehicleCount > 0 && bb.visiblePointCount > 0 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
+      if ((newDataArrived || forceCameraFit) && map._playbackLiveFollow) {
+        const state = map.lastState;
+        const mobiles = state && Array.isArray(state.mobile) ? state.mobile : [];
+        const bb = _collectHeadPositionBounds(mobiles);
+        if (bb && bb.visibleVehicleCount > 0 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
           _animateFitBoundsLatLon(bb, { durationMs: _pbLiveFollowDurationMs });
+        } else {
+          // No active vehicles — fall back to the user's stored view.
+          _animateToStoredView(_pbLiveFollowDurationMs);
         }
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DEFERRED CAMERA FIT: If a live camera fit was blocked by user interaction,
+    // replay it now that the interaction + easing has settled.
+    // ─────────────────────────────────────────────────────────────────────────
+    if (_deferredCameraFit && map._playbackLiveFollow
+        && typeof map._canRunAutoCamera === "function" && map._canRunAutoCamera()) {
+      const d = _deferredCameraFit;
+      _deferredCameraFit = null;
+      if (d.type === "bounds" && d.bb) {
+        _animateFitBoundsLatLon(d.bb, { durationMs: d.durationMs || _pbLiveFollowDurationMs });
+      } else if (d.type === "storedView") {
+        _animateToStoredView(d.durationMs || _pbLiveFollowDurationMs);
       }
     }
 
@@ -1818,13 +1911,6 @@ function main() {
     traceEl.checked = (saved == null) ? true : (saved === "1");
     if (saved == null) localStorage.setItem(TRACE_STORAGE_KEY, "1");
     map.setPlaybackMode(traceEl.checked);
-    // Restore LIVE mode state from localStorage (default to LIVE=true)
-    try {
-      const savedLive = localStorage.getItem(LIVE_MODE_STORAGE_KEY);
-      if (savedLive === "0") {
-        map._playbackLiveFollow = false;
-      }
-    } catch {}
     if (pbBarEl) pbBarEl.classList.toggle("hidden", !traceEl.checked);
     if (traceEl.checked) {
       map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
@@ -1858,13 +1944,6 @@ function main() {
   } else {
     // DVR toggle hidden - default to playback mode always ON
     map.setPlaybackMode(true);
-    // Restore LIVE mode state from localStorage (default to LIVE=true)
-    try {
-      const savedLive = localStorage.getItem(LIVE_MODE_STORAGE_KEY);
-      if (savedLive === "0") {
-        map._playbackLiveFollow = false;
-      }
-    } catch {}
     if (pbBarEl) pbBarEl.classList.remove("hidden");
     map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
     map.setPlaybackPlaying(false);
@@ -3133,30 +3212,8 @@ function main() {
           const sMs = (typeof meta?.trail_update_start_ms === "number" && isFinite(meta.trail_update_start_ms)) ? meta.trail_update_start_ms : null;
           const eMs = (typeof meta?.trail_update_end_ms === "number" && isFinite(meta.trail_update_end_ms)) ? meta.trail_update_end_ms : null;
           if (sMs != null && eMs != null) {
-            // Also rewind playback time to replay the newest segment.
-            // Must account for playback speed (data-time consumed between server updates).
-            // Respect active scrub/drag so user interaction wins.
-            try {
-              if (!_pbScrubbing && !(typeof map?._hasPbMarkerInertia === "function" && map._hasPbMarkerInertia())) {
-                const bounds = map.getPlaybackBounds();
-                const hasPbBounds = isFinite(bounds?.minMs) && isFinite(bounds?.maxMs) && Number(bounds.maxMs) > Number(bounds.minMs);
-                if (hasPbBounds) {
-                  const updateIntervalMs = Number(eMs) - Number(sMs);
-                  const speedMult = map.getPlaybackSpeed() || 1.0;
-                  if (isFinite(updateIntervalMs) && updateIntervalMs > 0 && isFinite(speedMult) && speedMult > 0) {
-                    const targetMs = Number(bounds.maxMs) - updateIntervalMs * speedMult;
-                    const nextMs = clamp(targetMs, Number(bounds.minMs), Number(bounds.maxMs));
-                    const cur = map.getPlaybackTimeMs();
-                    if (cur == null || !isFinite(Number(cur)) || Math.abs(nextMs - Number(cur)) > 200) {
-                      map.setPlaybackTimeMs(nextMs);
-                    }
-                  }
-                }
-              }
-            } catch {}
-
-            const bb = _collectBoundsForMobilesNewSegment(mobiles, sMs, eMs);
-            if (bb && bb.visibleVehicleCount > 0 && bb.visiblePointCount > 0 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
+            const bb = _collectHeadPositionBounds(mobiles);
+            if (bb && bb.visibleVehicleCount > 0 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
               // Respect user interaction: if the user is panning/zooming, defer until after cooldown.
               if (typeof map?._canRunAutoCamera === "function" && !map._canRunAutoCamera()) {
                 map._pendingForcedFit = { bounds: bb, durationMs: _pbLiveFollowDurationMs };
@@ -3214,6 +3271,8 @@ function main() {
   // Load server config before starting data polling
   // This allows the server to control CDN/caching behavior
   loadConfig().then(() => {
+    // Re-apply theme in case config pushed new localStorage defaults
+    applyTheme(_currentThemeKey, true);
     tick();
     setInterval(tick, POLL_MS);
   });
