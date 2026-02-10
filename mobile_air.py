@@ -311,6 +311,7 @@ class AirQualityApp(App):
         width: 100%;
         height: auto;
         max-height: 50%;
+        min-height: 14;
         padding: 0;
         border-bottom: solid #458588;
         scrollbar-gutter: stable;
@@ -432,6 +433,7 @@ class AirQualityApp(App):
     pinned_sensors = set()
     fixed_history = {}
     _refresh_token = 0
+    _max_readings_count = 3  # minimum pad for details table
 
     def __init__(self, *, dashboard_handle=None, **kwargs):
         super().__init__(**kwargs)
@@ -1279,12 +1281,23 @@ class AirQualityApp(App):
     def update_list(self, data, update_history: bool = False):
         list_view = self.query_one(ListView)
         
-        # Capture current selection
+        # Capture current selection and scroll position
         selected_sensor_name = None
+        saved_scroll_y = list_view.scroll_y
         if list_view.index is not None and list_view.index < len(list_view.children):
             item = list_view.children[list_view.index]
             if isinstance(item, SensorItem):
                 selected_sensor_name = item.sensor_name
+        
+        # Suppress Textual's internal scroll_to_widget during rebuild.
+        # Setting list_view.index triggers watch_index which queues
+        # call_after_refresh(scroll_to_widget, ...) that would yank the
+        # scroll position to the top. By replacing the method with a no-op
+        # before clear/rebuild, both the direct call and the queued
+        # callback become harmless.
+        _orig_scroll_to_widget = list_view.scroll_to_widget
+        if selected_sensor_name is not None:
+            list_view.scroll_to_widget = lambda *a, **k: True  # type: ignore[assignment]
         
         list_view.clear()
 
@@ -1385,33 +1398,39 @@ class AirQualityApp(App):
                     
                     hist_list = self.fixed_history[s_key][p_key]
                     
-                    # Append to history on every poll (update_history=True) to maintain consistent time axis
+                    # Append to history only when the API timestamp advances
+                    # (the fixed API returns the same value/timestamp on every poll until it updates)
                     if update_history:
                         now_ts = datetime.now().timestamp()
                         
-                        # Check for gaps since last update
-                        if hist_list:
-                            last_entry = hist_list[-1]
-                            last_ts = last_entry.get('recorded_at', now_ts)
-                            
-                            # If gap > 90s (interval is 60s), insert None for missing intervals
-                            # We use 90s to allow some jitter/latency
-                            gap = now_ts - last_ts
-                            if gap > 90:
-                                # Insert empty slots. One slot per ~60s
-                                num_missing = int(gap // 60) - 1
-                                # Cap missing at say 10 to avoid flooding
-                                num_missing = min(num_missing, 10)
-                                for _ in range(num_missing):
-                                    hist_list.append({'val': None, 'col': '#000000', 'time': None, 'recorded_at': last_ts + 60})
-                                    last_ts += 60
+                        # Deduplicate: skip if the API timestamp hasn't changed
+                        last_api_time = hist_list[-1].get('time') if hist_list else None
+                        if time_utc is not None and time_utc == last_api_time:
+                            pass  # same reading, don't append
+                        else:
+                            # Check for gaps since last update
+                            if hist_list:
+                                last_entry = hist_list[-1]
+                                last_ts = last_entry.get('recorded_at', now_ts)
+                                
+                                # If gap > 90s (interval is 60s), insert None for missing intervals
+                                # We use 90s to allow some jitter/latency
+                                gap = now_ts - last_ts
+                                if gap > 90:
+                                    # Insert empty slots. One slot per ~60s
+                                    num_missing = int(gap // 60) - 1
+                                    # Cap missing at say 10 to avoid flooding
+                                    num_missing = min(num_missing, 10)
+                                    for _ in range(num_missing):
+                                        hist_list.append({'val': None, 'col': '#000000', 'time': None, 'recorded_at': last_ts + 60})
+                                        last_ts += 60
 
-                        # Ensure val is string format for consistency
-                        hist_list.append({'val': str(val), 'col': col, 'time': time_utc, 'recorded_at': now_ts})
-                        # Keep last 50
-                        if len(hist_list) > 50:
-                            self.fixed_history[s_key][p_key] = hist_list[-50:]
-                        history_updated = True
+                            # Ensure val is string format for consistency
+                            hist_list.append({'val': str(val), 'col': col, 'time': time_utc, 'recorded_at': now_ts})
+                            # Keep last 50
+                            if len(hist_list) > 50:
+                                self.fixed_history[s_key][p_key] = hist_list[-50:]
+                            history_updated = True
                         
                     current_history = [x['val'] for x in self.fixed_history[s_key][p_key]]
                     # Recalculate history colors based on values for consistency
@@ -1557,6 +1576,10 @@ class AirQualityApp(App):
 
         sorted_sensors = sorted(filtered_sensors, key=get_sensor_score)
 
+        # Track the max readings count across all sensors for stable details panel height
+        max_r = max((len(s_info.get('readings', {})) for _, s_info in sorted_sensors), default=3)
+        self._max_readings_count = max(max_r, 3)
+
         # Build List Items
         for s_name, s_info in sorted_sensors:
             readings_list = []
@@ -1643,6 +1666,18 @@ class AirQualityApp(App):
                 
         if new_index is not None:
             list_view.index = new_index
+            
+        # Restore scroll_to_widget and scroll position
+        list_view.scroll_to_widget = _orig_scroll_to_widget
+        if selected_sensor_name is not None:
+            # Restore scroll position after layout so virtual size is valid
+            _sy = saved_scroll_y
+            def _restore_scroll():
+                try:
+                    list_view.scroll_y = _sy
+                except Exception:
+                    pass
+            self.call_after_refresh(_restore_scroll)
             
         # Ensure list has focus on first load (when we auto-selected)
         if selected_sensor_name is None:
@@ -1823,9 +1858,10 @@ class AirQualityApp(App):
                 Text.from_markup(spark)
             )
 
-        # Pad table to always have 3 rows for consistent height
+        # Pad table to the max observed reading count for consistent height
         rows_added = len(item.sensor_readings)
-        for _ in range(3 - rows_added):
+        pad_to = max(self._max_readings_count, 3)
+        for _ in range(pad_to - rows_added):
             table.add_row("", "", "", "")
 
         sensor_type_label = "(Fixed Station)" if item.is_fixed else "(Mobile Sensor)"
