@@ -30,3 +30,4 @@ deploy/*/.minify_cache/
 
 # Deployment
 deploy/
+.github/prompts/plan-fixDashboardStuckAfterRestart.prompt.md

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import ssl
@@ -50,6 +51,7 @@ from mobileair import (
     HEADERS,
 )
 from mobileair.dashboard import _pick_worst_reading_by_aqi
+from mobileair.trails import clean_trail
 
 # Optional offline road map-matching (see ROAD_DATA.md)
 from mobileair.roads import RoadGraph, match_trail_segment_offline
@@ -612,6 +614,94 @@ def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
     except Exception as e:
         _log(f"[Snapshot] Failed to save today's snapshot: {e}")
         return False
+
+
+def _scrub_broken_mobile_sensors(
+    mobiles: list[dict[str, Any]],
+    *,
+    min_peers: int = 3,
+    ratio_thresh: float = 8.0,
+    abs_floor: dict[str, float] | None = None,
+) -> set[str]:
+    """Detect mobile sensors with hardware-broken readings and remove them.
+
+    A sensor is considered broken only when *uncorrelated* pollutants are all
+    wildly elevated vs peers.  Specifically, ozone (O3) is a secondary
+    photochemical pollutant — it is NOT emitted by local particle sources like
+    freight trains, construction, or dust.  So:
+
+    - PM25 + PM10 high, OZNE normal → legitimate local particle source.  Keep.
+    - OZNE high alone → also broken (ozone doesn't spike from local sources).  Remove.
+    - PM + OZNE all wildly elevated → hardware is broken.  Remove.
+
+    Removes broken sensors from *mobiles* in-place.
+    Returns the set of sensor IDs that were removed.
+    """
+    if abs_floor is None:
+        abs_floor = {"PM25": 50.0, "PM10": 100.0, "OZNE": 100.0}
+
+    _POLLUTANTS = ("PM25", "PM10", "OZNE")
+    _PARTICLE_KEYS = ("PM25", "PM10")
+
+    # 1. Collect per-pollutant values from non-ghosted sensors
+    per_poll: dict[str, list[tuple[str, float]]] = {k: [] for k in _POLLUTANTS}
+    for m in mobiles:
+        if not isinstance(m, dict) or m.get("ghosted"):
+            continue
+        sid = m.get("id")
+        readings = m.get("readings")
+        if not isinstance(readings, dict) or not sid:
+            continue
+        for pk in _POLLUTANTS:
+            r = readings.get(pk)
+            if not isinstance(r, dict):
+                continue
+            v = r.get("value")
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+                if fv >= 0 and math.isfinite(fv):
+                    per_poll[pk].append((sid, fv))
+            except (TypeError, ValueError):
+                pass
+
+    # 2. Per-pollutant: compute median and identify which sensors are flagged
+    flagged_polls: dict[str, set[str]] = {k: set() for k in _POLLUTANTS}
+    flagged_details: dict[str, list[str]] = {}
+    for pk, entries in per_poll.items():
+        if len(entries) < (min_peers + 1):
+            continue
+        vals_only = sorted(v for _, v in entries)
+        n = len(vals_only)
+        med = vals_only[n // 2] if n % 2 else (vals_only[n // 2 - 1] + vals_only[n // 2]) / 2.0
+        floor = abs_floor.get(pk, 100.0)
+        for sid, fv in entries:
+            if med > 0 and fv > med * ratio_thresh and fv >= floor:
+                flagged_polls[pk].add(sid)
+                flagged_details.setdefault(sid, []).append(
+                    f"{pk}: {fv:.1f} vs median {med:.1f}"
+                )
+            elif med <= 0 and fv >= floor * ratio_thresh:
+                flagged_polls[pk].add(sid)
+                flagged_details.setdefault(sid, []).append(
+                    f"{pk}: {fv:.1f} vs median {med:.1f}"
+                )
+
+    # 3. Ozone is a secondary photochemical pollutant — it cannot spike from
+    #    any local emission source.  If OZNE is wildly elevated, the sensor
+    #    is broken regardless of what PM is doing.  If only PM is elevated
+    #    and OZNE is normal, that's a real local source (train, dust, etc.).
+    broken = flagged_polls.get("OZNE", set()).copy()
+
+    # 4. Remove broken sensors from the list entirely
+    if broken:
+        for sid in broken:
+            details = flagged_details.get(sid, [])
+            _log(f"[Outlier] Removing broken mobile sensor {sid}: {'; '.join(details)}")
+        mobiles[:] = [m for m in mobiles if m.get("id") not in broken]
+
+    return broken
 
 
 def _clamp_impossible_values(data: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1510,70 +1600,28 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
     return result
 
 
-def history_prefetch_loop(app_state: AppState, data_dir: Path, stop_event: threading.Event) -> None:
-    """Background thread that pre-fetches and caches past 6 days of history.
-    
-    Runs once on startup (after a short delay). Skips days already cached
-    on disk. Past days are immutable so there's no reason to re-run.
-    Retries once if CHPC is initially unreachable.
-    """
-    from datetime import datetime, timezone, timedelta
-    
-    # Initial delay to let the server finish starting up
-    if stop_event.wait(10):
-        return
-    
-    # Wait for CHPC to be reachable before starting (up to ~60s)
-    for attempt in range(6):
-        if stop_event.is_set():
+_history_prefetch_last_date: str | None = None  # last MST date we checked
+
+def _maybe_prefetch_history(app_state: AppState, data_dir: Path) -> None:
+    """Cache any uncached days in the past 6 days. Only runs once per day transition."""
+    global _history_prefetch_last_date
+    mst_tz = timezone(timedelta(hours=-7))
+    today_str = datetime.now(timezone.utc).astimezone(mst_tz).strftime("%Y-%m-%d")
+    if today_str == _history_prefetch_last_date:
+        return  # already checked today
+    _history_prefetch_last_date = today_str
+    today = datetime.now(timezone.utc).astimezone(mst_tz).date()
+    for days_ago in range(1, 7):
+        date_str = (today - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        if _load_cached_historical_day(data_dir, date_str) is not None:
+            continue
+        try:
+            fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir)
+            if _load_cached_historical_day(data_dir, date_str) is not None:
+                _log(f"[HistoryPrefetch] Cached {date_str}")
+        except Exception as e:
+            _log(f"[HistoryPrefetch] {date_str}: {e}")
             return
-        if _is_history_server_reachable():
-            break
-        _log(f"[HistoryPrefetch] CHPC not reachable, retrying in 10s (attempt {attempt + 1}/6)")
-        # Clear the 60s fast-fail so we can retry sooner
-        global _history_server_down_until
-        _history_server_down_until = 0
-        if stop_event.wait(10):
-            return
-    else:
-        _log("[HistoryPrefetch] CHPC unreachable after 6 attempts, giving up")
-        return
-    
-    try:
-        today = datetime.now(timezone.utc).date()
-        fetched = 0
-        for days_ago in range(1, 7):  # 1..6 days ago
-            if stop_event.is_set():
-                return
-            target = today - timedelta(days=days_ago)
-            date_str = target.strftime("%Y-%m-%d")
-            
-            try:
-                # Skip if already cached on disk
-                cached = _load_cached_historical_day(data_dir, date_str)
-                if cached is not None:
-                    _log(f"[HistoryPrefetch] {date_str} already cached, skipping")
-                    continue
-                
-                _log(f"[HistoryPrefetch] Pre-fetching {date_str}")
-                fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir)
-                
-                # Verify it actually got cached
-                cached_after = _load_cached_historical_day(data_dir, date_str) 
-                if cached_after is not None:
-                    _log(f"[HistoryPrefetch] Cached {date_str}")
-                    fetched += 1
-                else:
-                    _log(f"[HistoryPrefetch] {date_str} fetched but NOT cached (empty data?)")
-            except Exception as day_error:
-                _log(f"[HistoryPrefetch] Failed {date_str}: {day_error}")
-            
-            # 5s gap between days to avoid hammering CHPC
-            if stop_event.wait(5):
-                return
-        _log(f"[HistoryPrefetch] Done ({fetched} days fetched)")
-    except Exception as e:
-        _log(f"[HistoryPrefetch] Error: {e}")
 
 
 def _first_last_ts(trail: list[dict[str, Any]]) -> tuple[float | None, float | None]:
@@ -1850,6 +1898,7 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                         nt_dt = parse_utc_timestamp(np.get("t"))
                         if last_old_ms and nt_dt and nt_dt.timestamp() <= last_old_ms:
                             continue
+
                         if "m" not in np:
                             np["m"] = 1
 
@@ -1872,6 +1921,11 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                         except Exception:
                             pass
 
+                # Scrub out-and-back GPS spikes (A→B→C where A≈C) that
+                # span poll boundaries.  clean_trail's spike scan is bounded
+                # to the last ~1200 points so this is cheap.
+                pm["trail"] = clean_trail(pm["trail"])
+
                 if len(pm["trail"]) > 5000:
                     pm["trail"] = pm["trail"][-5000:]
 
@@ -1890,6 +1944,14 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                 pm["ghosted"] = True
                 pm["_sticky_ghosted"] = True
             combined_mobile.append(pm)
+
+        # Detect broken mobile sensors (peer-based outlier detection).
+        # Removes them from the list AND from persistent state so they
+        # don't linger as ghosts — they come back when readings normalize.
+        broken_sids = _scrub_broken_mobile_sensors(combined_mobile)
+        for sid in broken_sids:
+            app_state.persistent_mobile.pop(sid, None)
+
         st["mobile"] = combined_mobile
 
         # Compute and publish the server-authoritative "since last update" window.
@@ -2846,7 +2908,13 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
             update_app_state_with_new_data(app_state, st)
             _log(f"[FetchLoop] Revision {revision} updated")
-            
+
+            # Cache historical days — gated internally to once per MST day transition
+            try:
+                _maybe_prefetch_history(app_state, data_dir)
+            except Exception as pfx_e:
+                _log(f"[HistoryPrefetch] Error: {pfx_e}")
+
             # Periodically save history and snapshot
             if revision % 10 == 0:
                 save_fixed_history(app_state)
@@ -3762,13 +3830,7 @@ def main() -> int:
     ).start()
     _log("[PurpleAir] SLC sensor integration enabled (5-min refresh)")
 
-    # Start background history pre-fetch (caches past 6 days for instant playback)
-    threading.Thread(
-        target=history_prefetch_loop,
-        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
-        daemon=True
-    ).start()
-    _log("[HistoryPrefetch] Background pre-fetch enabled (past 6 days, once on startup)")
+    _log("[HistoryPrefetch] Enabled (runs inside fetch_loop)")
 
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir, server_config=server_config))
     # Timeout for individual requests - helps with Safari/iOS connection issues

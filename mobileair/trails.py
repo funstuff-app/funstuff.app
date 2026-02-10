@@ -220,7 +220,7 @@ def clean_trail(
     changed = True
     while changed:
         changed = False
-        # A-B-C
+        # A-B-C  (single-point spike)
         i = start
         while i < len(pts) - 1:
             a = pts[i - 1]
@@ -229,12 +229,12 @@ def clean_trail(
             latA, lonA = _pt_latlon(a)
             latB, lonB = _pt_latlon(b)
             latC, lonC = _pt_latlon(c)
-            if None in (latA, lonA, latB, lonB, latC, lonC):
+            if latA is None or lonA is None or latB is None or lonB is None or latC is None or lonC is None:
                 i += 1
                 continue
-            dAB = haversine_distance(float(latA), float(lonA), float(latB), float(lonB))
-            dBC = haversine_distance(float(latB), float(lonB), float(latC), float(lonC))
-            dAC = haversine_distance(float(latA), float(lonA), float(latC), float(lonC))
+            dAB = haversine_distance(latA, lonA, latB, lonB)
+            dBC = haversine_distance(latB, lonB, latC, lonC)
+            dAC = haversine_distance(latA, lonA, latC, lonC)
             if (
                 isinstance(dAB, (int, float))
                 and isinstance(dBC, (int, float))
@@ -252,39 +252,52 @@ def clean_trail(
                 continue
             i += 1
 
-        # A-B-C-D
+        # A-B...Z-R  (multi-point plateau spike)
+        # From A, if B jumps far away, scan forward collecting plateau
+        # points that stay within spike_plateau_m of B.  If the first
+        # point after the plateau (R) returns near A, delete the plateau.
         i = start
         while i < len(pts) - 2:
             a = pts[i - 1]
             b = pts[i]
-            c = pts[i + 1]
-            d = pts[i + 2]
             latA, lonA = _pt_latlon(a)
             latB, lonB = _pt_latlon(b)
-            latC, lonC = _pt_latlon(c)
-            latD, lonD = _pt_latlon(d)
-            if None in (latA, lonA, latB, lonB, latC, lonC, latD, lonD):
+            if latA is None or lonA is None or latB is None or lonB is None:
                 i += 1
                 continue
-            dAB = haversine_distance(float(latA), float(lonA), float(latB), float(lonB))
-            dBC = haversine_distance(float(latB), float(lonB), float(latC), float(lonC))
-            dCD = haversine_distance(float(latC), float(lonC), float(latD), float(lonD))
-            dAD = haversine_distance(float(latA), float(lonA), float(latD), float(lonD))
-            if (
-                isinstance(dAB, (int, float))
-                and isinstance(dBC, (int, float))
-                and isinstance(dCD, (int, float))
-                and isinstance(dAD, (int, float))
-                and math.isfinite(dAB)
-                and math.isfinite(dBC)
-                and math.isfinite(dCD)
-                and math.isfinite(dAD)
-                and dAB >= spike_out_m
-                and dCD >= spike_out_m
-                and dAD <= spike_ret_m
-                and dBC <= spike_plateau_m
-            ):
-                del pts[i : i + 2]
+            dAB = haversine_distance(latA, lonA, latB, lonB)
+            if not (isinstance(dAB, (int, float)) and math.isfinite(dAB) and dAB >= spike_out_m):
+                i += 1
+                continue
+            # B is a jump from A — scan forward for the plateau
+            # Compare consecutive points (not all to B) since GPS drifts.
+            j = i + 1
+            prevLat, prevLon = latB, lonB
+            while j < len(pts):
+                latP, lonP = _pt_latlon(pts[j])
+                if latP is None or lonP is None:
+                    break
+                dStep = haversine_distance(prevLat, prevLon, latP, lonP)
+                if not (isinstance(dStep, (int, float)) and math.isfinite(dStep) and dStep <= spike_plateau_m):
+                    break
+                prevLat, prevLon = latP, lonP
+                j += 1
+            # j is now the first point after the plateau (the return candidate R)
+            plateau_len = j - i  # number of spike points (B through last plateau point)
+            if plateau_len < 2 or j >= len(pts):
+                i += 1
+                continue
+            r = pts[j]
+            latR, lonR = _pt_latlon(r)
+            if latR is None or lonR is None:
+                i += 1
+                continue
+            dAR = haversine_distance(latA, lonA, latR, lonR)
+            dLastR = haversine_distance(prevLat, prevLon, latR, lonR)
+            ret_thresh = min(spike_ret_m * max(1, plateau_len), spike_out_m)
+            if (isinstance(dAR, (int, float)) and math.isfinite(dAR) and dAR <= ret_thresh
+                    and isinstance(dLastR, (int, float)) and math.isfinite(dLastR) and dLastR >= spike_out_m):
+                del pts[i:j]
                 changed = True
                 i = max(start, i - 2)
                 continue
@@ -337,9 +350,9 @@ def clean_trail(
     for k in range(i0 + 1, len(pts)):
         latA, lonA = _pt_latlon(pts[k - 1])
         latB, lonB = _pt_latlon(pts[k])
-        if None in (latA, lonA, latB, lonB):
+        if latA is None or lonA is None or latB is None or lonB is None:
             continue
-        d = haversine_distance(float(latA), float(lonA), float(latB), float(lonB))
+        d = haversine_distance(latA, lonA, latB, lonB)
         if isinstance(d, (int, float)) and math.isfinite(d):
             travel += float(d)
             if travel > parked_max_travel_m:

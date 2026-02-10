@@ -1,8 +1,14 @@
 async function fetchState() {
   const url = `${appConfig.apiBaseUrl}/state`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return await res.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000); // 15s timeout
+  try {
+    const res = await fetch(url, { cache: "no-store", signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // injectCastleFixedMarker removed - Home sensor now provided by backend with real PM2.5 data
@@ -2990,10 +2996,21 @@ function main() {
 
   const POLL_MS = 30000;  // 30 seconds
   let _tickInFlight = false;
+  let _tickInFlightSince = 0;  // perf timestamp when _tickInFlight was set
   let _tickLastForceRefreshSeq = null;
 
   async function tick() {
-    if (_tickInFlight) return;
+    // Safety valve: if _tickInFlight has been true for over 60 seconds, force-reset it.
+    // This prevents a permanently wedged poll loop from a hung fetch or unhandled error.
+    if (_tickInFlight) {
+      const stuckMs = performance.now() - _tickInFlightSince;
+      if (stuckMs > 60000) {
+        console.warn(`[tick] _tickInFlight stuck for ${Math.round(stuckMs / 1000)}s, force-resetting`);
+        _tickInFlight = false;
+      } else {
+        return;
+      }
+    }
     
     // Skip live data fetching when viewing historical data OR while loading it
     // Playback loop handles all drawing in historical mode
@@ -3002,6 +3019,7 @@ function main() {
     }
     
     _tickInFlight = true;
+    _tickInFlightSince = performance.now();
     let st = null;
     const statusEl = document.getElementById("statusText");
     try {
@@ -3018,6 +3036,7 @@ function main() {
       return;
     }
 
+    try {
     // Ensure st.fixed is always an array (Home sensor now provided by backend)
     if (!Array.isArray(st.fixed)) st.fixed = [];
 
@@ -3183,6 +3202,10 @@ function main() {
     } catch (e) {
       // Rendering issues should not flip the connection status.
       try { console.error(e); } catch {}
+    }
+    } catch (e) {
+      // Status update or data processing error — must not wedge _tickInFlight.
+      try { console.error("[tick] outer error:", e); } catch {}
     } finally {
       _tickInFlight = false;
     }
