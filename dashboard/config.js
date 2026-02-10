@@ -22,7 +22,8 @@ var TILE_THEMES = {
     template: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 1.45, brightness: 0.80, contrast: 1.08 },
-    defaultDim: 70,
+    defaultDim: 101,
+    defaultSat: 118,
     bgColor: "#282828", // CARTO Dark Matter background
   },
   carto_dark_nolabels: {
@@ -30,6 +31,8 @@ var TILE_THEMES = {
     template: "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 0.90, brightness: 0.95, contrast: 1.06 },
+    defaultDim: 101,
+    defaultSat: 118,
     bgColor: "#282828",
   },
   carto_positron_all: {
@@ -77,6 +80,26 @@ async function loadConfig() {
       // Merge with defaults (server may not provide all fields)
       appConfig = { ...appConfig, ...cfg };
       console.log("[Config] Loaded:", appConfig);
+
+      // Apply server-pushed localStorage defaults.
+      // Only writes keys prefixed with "mobileair." (app namespace).
+      // Each key is written at most once per config version — tracked by
+      // storing the version that last wrote each key. If the user later
+      // changes the value (via slider, etc.), the next deploy with the
+      // SAME configVersion won't overwrite it. Bump configVersion to push
+      // a new value.
+      const lsOverrides = cfg.localStorage;
+      const cfgVer = cfg.configVersion;
+      if (lsOverrides && typeof lsOverrides === "object" && cfgVer != null) {
+        for (const [k, v] of Object.entries(lsOverrides)) {
+          if (typeof k !== "string" || !k.startsWith("mobileair.")) continue;
+          const verKey = k + ".__cfgv";
+          const appliedVer = localStorage.getItem(verKey);
+          if (appliedVer === String(cfgVer)) continue; // already applied this version
+          localStorage.setItem(k, String(v));
+          localStorage.setItem(verKey, String(cfgVer));
+        }
+      }
     }
   } catch (e) {
     console.warn("[Config] Using defaults, server config unavailable:", e.message);

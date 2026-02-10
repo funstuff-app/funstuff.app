@@ -16,6 +16,7 @@
   const DEFAULT_MIN_VISIBLE_SEGMENT_STRAIGHTNESS = 0.2;
   const DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M_TWO_POINTS = 500;
   const DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M_TWO_POINTS = 500;
+  const DEFAULT_MAX_SEGMENT_LENGTH_M = 5000; // cap segment length to ~5km
 
   const _isFinite = (x) => typeof x === "number" && isFinite(x);
 
@@ -99,12 +100,12 @@
     minTrailLengthM = DEFAULT_MIN_TRAIL_LENGTH_M,
     minVisibleSegmentPoints = DEFAULT_MIN_VISIBLE_SEGMENT_POINTS,
     minVisibleSegmentLengthM = DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M,
+    maxSegmentLengthM = DEFAULT_MAX_SEGMENT_LENGTH_M,
   } = {}) {
     if (!Array.isArray(trail) || trail.length < 2) return [];
 
     // Find the last visible point at/before windowEndMs.
     let endIdx = -1;
-    let hasWindowMoving = false;
     for (let i = trail.length - 1; i >= 0; i--) {
       const p = trail[i];
       if (!p) continue;
@@ -119,14 +120,25 @@
       const lon = Number(p.lon);
       if (!_isFinite(lat) || !_isFinite(lon)) continue;
       endIdx = i;
-
-      if (moving && windowStartMs != null && tPointMs != null && tPointMs >= windowStartMs) {
-        hasWindowMoving = true;
-      }
       break;
     }
 
     if (endIdx < 0) return [];
+
+    // Skip vehicles whose most recent visible point is stale — parked/idle for
+    // a long time.  The strict single-point windowStartMs check was too aggressive
+    // because server polling and vehicle reporting are asynchronous; a vehicle can
+    // be actively moving yet its latest point may fall just before windowStartMs.
+    // Instead, use a generous staleness threshold: if the newest point is >5 min
+    // before the update window end, the vehicle is truly idle.
+    if (!includeDebugPath) {
+      const endPoint = trail[endIdx];
+      const endPointMs = parseUtcMs(endPoint?.t);
+      const MAX_STALE_MS = 5 * 60 * 1000; // 5 minutes
+      if (windowEndMs != null && endPointMs != null && (windowEndMs - endPointMs) > MAX_STALE_MS) {
+        return [];
+      }
+    }
 
     const out = [];
     let count = 0;
@@ -158,16 +170,9 @@
       count++;
       if (count >= maxPoints) break;
 
-      // If there's no movement in the server update window, only include a short recent
-      // segment (bounded by distance) so old trails don't dominate the bounds.
-      // Important: include *enough* distance/points to satisfy the segment eligibility
-      // checks later, otherwise we can end up with a tiny 2-point sliver that gets
-      // filtered out and produces empty bounds even on a forced refresh.
-      if (!hasWindowMoving) {
-        const needM = includeDebugPath ? minTrailLengthM : Math.max(minTrailLengthM, minVisibleSegmentLengthM);
-        const needPts = includeDebugPath ? 2 : Math.max(2, minVisibleSegmentPoints);
-        if (totalM >= needM && out.length >= needPts) break;
-      }
+      // Cap segment length so a single long-route vehicle (e.g. TRAX train)
+      // doesn't span the entire metro area and drag the camera out.
+      if (totalM >= maxSegmentLengthM) break;
     }
 
     return out;
@@ -183,6 +188,7 @@
     minVisibleSegmentStraightness = DEFAULT_MIN_VISIBLE_SEGMENT_STRAIGHTNESS,
     minVisibleSegmentLengthM2 = DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M_TWO_POINTS,
     minVisibleSegmentDisplacementM2 = DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M_TWO_POINTS,
+    maxSegmentLengthM = DEFAULT_MAX_SEGMENT_LENGTH_M,
   } = {}) {
     let minLat = Infinity;
     let maxLat = -Infinity;
@@ -211,6 +217,7 @@
         minTrailLengthM,
         minVisibleSegmentPoints,
         minVisibleSegmentLengthM,
+        maxSegmentLengthM,
       });
 
       if (pts.length === 0) continue;
@@ -281,5 +288,6 @@
     DEFAULT_MIN_VISIBLE_SEGMENT_STRAIGHTNESS,
     DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M_TWO_POINTS,
     DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M_TWO_POINTS,
+    DEFAULT_MAX_SEGMENT_LENGTH_M,
   };
 });

@@ -797,7 +797,7 @@ class MapView {
     return pad;
   }
 
-  _animateTo({ centerLat, centerLon, zoom }, { durationMs = 420 } = {}) {
+  _animateTo({ centerLat, centerLon, zoom }, { durationMs = 420, isAutoCamera = false } = {}) {
     const lat0 = this.center.lat;
     const lon0 = this.center.lon;
     const z0 = this.zoom;
@@ -813,6 +813,10 @@ class MapView {
 
     if (this._centerAnimRAF) cancelAnimationFrame(this._centerAnimRAF);
 
+    // Track whether this animation is auto-camera so that view-change
+    // listeners (e.g. localStorage persistence) can ignore it.
+    this._isAutoCameraAnimating = isAutoCamera;
+
     const zoomChanging = Math.abs(z1 - z0) > 1e-6;
 
     // Safety: limit animation frames to prevent runaway loops
@@ -821,6 +825,7 @@ class MapView {
 
     const finish = () => {
       this._centerAnimRAF = null;
+      this._isAutoCameraAnimating = false;
       this.draw(this.lastState);
       this._notifyViewChanged();
     };
@@ -3704,6 +3709,7 @@ class MapView {
   static MIN_CAMERA_FIT_SEGMENT_STRAIGHTNESS = 0.2;
   static MIN_CAMERA_FIT_SEGMENT_LENGTH_M_2PT = 500;
   static MIN_CAMERA_FIT_SEGMENT_DISPLACEMENT_M_2PT = 500;
+  static MAX_CAMERA_FIT_SEGMENT_LENGTH_M = 5000; // cap per-vehicle segment to ~5km
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PROGRESSIVE SPLINE PATH
@@ -4289,10 +4295,11 @@ class MapView {
     // Vehicle physics parameters
     const vp = this._getVehiclePhysics(id);
     
-    // Detect scrubbing: if playback time jumped significantly, snap to new position
+    // Detect scrubbing: if playback time jumped significantly, snap to new position.
     const lastPlaybackT = phys.lastPlaybackT || t;
     const playbackDt = t - lastPlaybackT;
-    const isScrub = Math.abs(playbackDt) > 2000; // >2 second jump = scrub
+    const scrubThreshold = Math.max(2000, (this._playbackSpeed || 1) * 250);
+    const isScrub = Math.abs(playbackDt) > scrubThreshold;
     phys.lastPlaybackT = t;
     
     // Wall-clock dt for physics integration
@@ -5181,7 +5188,7 @@ class MapView {
           ctx.fillText(emoji, sp.x, sp.y);
         }
 
-        if ((this.showFixedLabels && !isPurpleAir) || isSel || f.pinned || String(f.id) === "Home") {
+        if ((this.showFixedLabels && !isPurpleAir) || isSel || String(f.id) === "Home") {
           ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
           const line1 = label;
           const line2Key = pr.key ? String(pr.key) : "";
@@ -6541,7 +6548,7 @@ class MapView {
         }
 
         const showLabel = isPurpleAir ? this.showPublicLabels : this.showFixedLabels;
-        if (showLabel || isSel || f.pinned || String(f.id) === "Home") {
+        if (showLabel || isSel || String(f.id) === "Home") {
           const labelFont = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
           const line1 = label;
           const line2Key = pr.key ? String(pr.key) : "";
@@ -6748,8 +6755,8 @@ class MapView {
         }
       }
 
-      // tiny label pill (show for selected, pinned, or when labels toggle is on)
-      const shouldShowLabel = this.showMobileLabels || isSel || !!m.pinned;
+      // tiny label pill (show for selected or when labels toggle is on)
+      const shouldShowLabel = this.showMobileLabels || isSel;
       if (shouldShowLabel) {
         ctx.save();
         // Reset transform and alpha for label drawing

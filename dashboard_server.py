@@ -3785,6 +3785,14 @@ def main() -> int:
         "apiBaseUrl": "/api",
         "cacheTtl": 30,
         "version": "1.0.0",
+        # Bump configVersion to push new localStorage defaults to all clients.
+        # Each key is written once per version; user changes are preserved
+        # until the next version bump.
+        "configVersion": 1,
+        "localStorage": {
+            "mobileair.mapDim.carto_dark": "101",
+            "mobileair.mapSat.carto_dark": "118",
+        },
     }
 
     data_dir = default_data_dir()
