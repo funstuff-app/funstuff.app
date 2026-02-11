@@ -267,8 +267,8 @@ function main() {
       // V.Unhealthy: 15.5–30.4, Hazardous: 30.5+
       entries: [
         { color: "#00CCFF", lo: 0,    hi: 1.5,  w: 12 },
-        { color: "#0099FF", lo: 1.5,  hi: 3,    w: 15 },
-        { color: "#00E400", lo: 3,    hi: 4.4,  w: 21,  label: "Good" },
+        { color: "#0099FF", lo: 1.5,  hi: 3.0,  w: 15 },
+        { color: "#00E400", lo: 3.0,  hi: 4.4,  w: 21,  label: "Good" },
         { color: "#FFFF00", lo: 4.4,  hi: 9.4,  w: 46,  label: "Moderate" },
         { color: "#FF7E00", lo: 9.4,  hi: 12.4, w: 60,  label: "Sensitive Groups" },
         { color: "#FF0000", lo: 12.4, hi: 15.4, w: 75,  label: "Unhealthy" },
@@ -306,11 +306,17 @@ function main() {
       }
     }
 
+    // If any entry has a fractional lo/hi, format all values with 1 decimal place
+    const useDecimal = entries.some(e =>
+      (e.lo != null && e.lo % 1 !== 0) || (e.hi != null && e.hi % 1 !== 0)
+    );
+    const fmt = (v) => (useDecimal && v != null) ? Number(v).toFixed(1) : `${v}`;
+
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
       const barW = e.w;
-      const loText = e.hi != null ? `${e.lo}` : `${e.lo}+`;
-      const hiText = e.hi != null ? `${e.hi}` : "";
+      const loText = e.hi != null ? fmt(e.lo) : `${fmt(e.lo)}+`;
+      const hiText = e.hi != null ? fmt(e.hi) : "";
 
       const row = document.createElement("div");
       row.className = "legendRow";
@@ -1496,6 +1502,7 @@ function main() {
 
     const b = map.getPlaybackBounds();
     let tMs = map.getPlaybackTimeMs();
+    const tMsBefore = tMs; // snapshot before advancement, for edge-crossing detection
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
     const durMs = hasBounds ? (b.maxMs - b.minMs) : 1;
     const prevKnownMaxMs = _pbLastKnownMaxMs;
@@ -1933,13 +1940,16 @@ function main() {
       const _lwMs2 = (_spd2 <= 5) ? _remS3 * 1000 * _spd2 : 0;
       const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
       var _inLiveWindow2 = hasBounds && tMs != null && isFinite(tMs) && tMs >= bufferEdge;
+      // Only trigger if we CROSSED into the window this frame (were below, now at/above).
+      // If the user scrubbed into the window, let playback continue to maxMs.
+      var _crossedIntoLiveWindow = _inLiveWindow2 && isFinite(tMsBefore) && tMsBefore < bufferEdge;
     }
     if (!_pbIsRewinding &&
         map.getPlaybackPlaying() &&
         !map._playbackLiveFollow &&
         !_pbIsWheelCoasting &&
         didAdvanceTime && _pbVelocity >= 0 &&
-        _inLiveWindow2) {
+        _crossedIntoLiveWindow) {
       // Don't auto-activate Live mode — just stop playback at the buffer edge.
       // The button will show "Live" (not highlighted) so the user can opt in.
       // map._playbackLiveFollow = true;
@@ -2170,8 +2180,44 @@ function main() {
       }
     }
     pbSpeedEl.addEventListener("change", () => {
+      const prevSpeed = map.getPlaybackSpeed() || 1.0;
       map.setPlaybackSpeed(pbSpeedEl.value);
       localStorage.setItem("mobileair.playbackSpeed", pbSpeedEl.value);
+      const newSpeed = map.getPlaybackSpeed() || 1.0;
+
+      // If in LIVE mode and speed increased, recalculate buffer position.
+      // Larger speed = larger buffer window = playhead must move back.
+      if (map._playbackLiveFollow && newSpeed > prevSpeed) {
+        // Speeds >5x don't support Live mode
+        if (newSpeed > 5) {
+          map._playbackLiveFollow = false;
+          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
+          _resetLiveTracking();
+        } else {
+          // Snap playhead back to the new (larger) buffer start
+          const b = map.getPlaybackBounds();
+          if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
+            const meta = map.lastState?.meta || {};
+            const predictedIntervalS = Number(meta.polling_predicted_interval_s) || 600;
+            const timeSinceChangeS = Number(meta.polling_time_since_change_s) || 0;
+            const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
+            const remS = Math.max(0, predictedIntervalS - timeSinceChangeS - wallElapsed);
+            const snapMs = remS * 1000 * newSpeed;
+            if (snapMs > 0) {
+              const bufferStart = Math.max(b.minMs, b.maxMs - snapMs);
+              const curMs = map.getPlaybackTimeMs();
+              // Only snap back if current position is ahead of the new buffer start
+              if (curMs != null && isFinite(curMs) && curMs > bufferStart) {
+                map.setPlaybackTimeMs(bufferStart);
+                // Reset LIVE tracking so buffer accumulation restarts from here
+                _pbLiveStartWallMs = performance.now();
+                _pbLiveStartDataMs = b.maxMs;
+              }
+            }
+          }
+        }
+      }
+
       updatePlaybackUi();
     });
   }
