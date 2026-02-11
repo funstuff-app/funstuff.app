@@ -125,21 +125,6 @@
 
     if (endIdx < 0) return [];
 
-    // Skip vehicles whose most recent visible point is stale — parked/idle for
-    // a long time.  The strict single-point windowStartMs check was too aggressive
-    // because server polling and vehicle reporting are asynchronous; a vehicle can
-    // be actively moving yet its latest point may fall just before windowStartMs.
-    // Instead, use a generous staleness threshold: if the newest point is >5 min
-    // before the update window end, the vehicle is truly idle.
-    if (!includeDebugPath) {
-      const endPoint = trail[endIdx];
-      const endPointMs = parseUtcMs(endPoint?.t);
-      const MAX_STALE_MS = 5 * 60 * 1000; // 5 minutes
-      if (windowEndMs != null && endPointMs != null && (windowEndMs - endPointMs) > MAX_STALE_MS) {
-        return [];
-      }
-    }
-
     const out = [];
     let count = 0;
     let totalM = 0;
@@ -150,6 +135,10 @@
       if (!p) continue;
       const tPointMs = parseUtcMs(p.t);
       if (windowEndMs != null && tPointMs != null && tPointMs > windowEndMs) continue;
+
+      // Don't walk past the start of the update window — only include points
+      // from the *new* segment, not the entire historical trail.
+      if (windowStartMs != null && tPointMs != null && tPointMs < windowStartMs) break;
 
       const moving = isMovingPoint(p);
       const visible = includeDebugPath || moving;
@@ -271,6 +260,213 @@
     return `${q(bounds.minLat)}|${q(bounds.minLon)}|${q(bounds.maxLat)}|${q(bounds.maxLon)}`;
   }
 
+  const DEFAULT_CLUSTER_RADIUS_M = 8000; // 8km — outlier vehicles beyond this are trimmed
+
+  /**
+   * Collect the most recent contiguous visible (moving) segment per vehicle.
+   * Unlike collectMostRecentVisibleSegment this has NO time-window constraint —
+   * it walks backward from the tail of the trail collecting moving points until
+   * it hits a non-moving gap, maxSegmentLengthM, or maxPoints.
+   *
+   * Returns an array of { id, points: [{lat,lon}], centroidLat, centroidLon }.
+   */
+  function collectRecentSegmentPerVehicle(mobiles, {
+    includeDebugPath = false,
+    maxPointsPerVehicle = DEFAULT_MAX_SEGMENT_POINTS,
+    maxSegmentLengthM = DEFAULT_MAX_SEGMENT_LENGTH_M,
+    minTrailLengthM = DEFAULT_MIN_TRAIL_LENGTH_M,
+  } = {}) {
+    const result = [];
+    const arr = Array.isArray(mobiles) ? mobiles : [];
+
+    for (const m of arr) {
+      if (!m || m.ghosted) continue;
+
+      const trail = Array.isArray(m.trail) ? m.trail : [];
+      if (trail.length < 2) continue;
+      if (!trailMeetsMinLength(trail, minTrailLengthM)) continue;
+
+      const pts = [];
+      let totalM = 0;
+      let prev = null;
+
+      for (let i = trail.length - 1; i >= 0; i--) {
+        const p = trail[i];
+        if (!p) continue;
+
+        const moving = isMovingPoint(p);
+        const visible = includeDebugPath || moving;
+        if (!visible) break; // segment boundary
+
+        const lat = Number(p.lat);
+        const lon = Number(p.lon);
+        if (!_isFinite(lat) || !_isFinite(lon)) continue;
+
+        if (prev) {
+          const d = haversineMeters(lat, lon, prev.lat, prev.lon);
+          if (_isFinite(d)) totalM += d;
+        }
+
+        pts.push({ lat, lon });
+        prev = { lat, lon };
+
+        if (pts.length >= maxPointsPerVehicle) break;
+        if (totalM >= maxSegmentLengthM) break;
+      }
+
+      if (pts.length < 2) continue;
+
+      let sumLat = 0, sumLon = 0;
+      for (const pt of pts) {
+        sumLat += pt.lat;
+        sumLon += pt.lon;
+      }
+
+      result.push({
+        id: m.id,
+        points: pts,
+        centroidLat: sumLat / pts.length,
+        centroidLon: sumLon / pts.length,
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * Compute a live-camera bounding box that includes:
+   *   1. Inlier mobile vehicles (outlier-trimmed by median clustering)
+   *   2. The visible trail segments of those inlier vehicles
+   *   3. Any fixed sensors that fall within the cluster radius
+   *
+   * vehicleEntries: [{ id, lat, lon, trail? }] — head positions of non-ghosted mobiles
+   * fixedSensors:   [{ id, lat, lon }]          — fixed sensor positions (optional)
+   *
+   * Returns { minLat, minLon, maxLat, maxLon, visibleVehicleCount, visiblePointCount }
+   */
+  function collectRobustLiveBounds(vehicleEntries, {
+    clusterRadiusM = DEFAULT_CLUSTER_RADIUS_M,
+    fixedSensors = null,
+    includeDebugPath = false,
+    maxSegmentLengthM = DEFAULT_MAX_SEGMENT_LENGTH_M,
+    mustIncludePoints = null,
+  } = {}) {
+    const empty = { minLat: Infinity, minLon: Infinity, maxLat: -Infinity, maxLon: -Infinity, visibleVehicleCount: 0, visiblePointCount: 0 };
+
+    const entries = Array.isArray(vehicleEntries) ? vehicleEntries.filter(v => v && _isFinite(Number(v.lat)) && _isFinite(Number(v.lon))) : [];
+    const fixed = Array.isArray(fixedSensors) ? fixedSensors.filter(f => f && _isFinite(Number(f.lat)) && _isFinite(Number(f.lon))) : [];
+
+    if (entries.length === 0 && fixed.length === 0) return empty;
+
+    // Find median of mobile vehicle head positions
+    let medianLat, medianLon;
+    if (entries.length > 0) {
+      const lats = entries.map(v => Number(v.lat)).sort((a, b) => a - b);
+      const lons = entries.map(v => Number(v.lon)).sort((a, b) => a - b);
+      medianLat = lats[Math.floor(lats.length / 2)];
+      medianLon = lons[Math.floor(lons.length / 2)];
+    } else {
+      // No mobiles — use median of fixed sensors
+      const lats = fixed.map(f => Number(f.lat)).sort((a, b) => a - b);
+      const lons = fixed.map(f => Number(f.lon)).sort((a, b) => a - b);
+      medianLat = lats[Math.floor(lats.length / 2)];
+      medianLon = lons[Math.floor(lons.length / 2)];
+    }
+
+    // Keep mobiles within clusterRadiusM of the median
+    let inlierMobiles;
+    if (entries.length <= 1) {
+      inlierMobiles = entries;
+    } else {
+      inlierMobiles = entries.filter(v => {
+        const d = haversineMeters(Number(v.lat), Number(v.lon), medianLat, medianLon);
+        return _isFinite(d) && d <= clusterRadiusM;
+      });
+      if (inlierMobiles.length === 0) inlierMobiles = entries; // fallback
+    }
+
+    let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+    let visiblePointCount = 0;
+    let visibleVehicleCount = 0;
+
+    // Include head positions of inlier mobiles
+    for (const v of inlierMobiles) {
+      const lat = Number(v.lat);
+      const lon = Number(v.lon);
+      minLat = Math.min(minLat, lat);
+      maxLat = Math.max(maxLat, lat);
+      minLon = Math.min(minLon, lon);
+      maxLon = Math.max(maxLon, lon);
+      visiblePointCount++;
+      visibleVehicleCount++;
+
+      // Also include the visible trail segment of this vehicle
+      const trail = Array.isArray(v.trail) ? v.trail : [];
+      if (trail.length >= 2) {
+        let totalM = 0;
+        let prev = null;
+        for (let i = trail.length - 1; i >= 0; i--) {
+          const p = trail[i];
+          if (!p) continue;
+          const moving = isMovingPoint(p);
+          const visible = includeDebugPath || moving;
+          if (!visible) break; // segment boundary
+          const plat = Number(p.lat);
+          const plon = Number(p.lon);
+          if (!_isFinite(plat) || !_isFinite(plon)) continue;
+          if (prev) {
+            const d = haversineMeters(plat, plon, prev.lat, prev.lon);
+            if (_isFinite(d)) totalM += d;
+          }
+          minLat = Math.min(minLat, plat);
+          maxLat = Math.max(maxLat, plat);
+          minLon = Math.min(minLon, plon);
+          maxLon = Math.max(maxLon, plon);
+          visiblePointCount++;
+          prev = { lat: plat, lon: plon };
+          if (totalM >= maxSegmentLengthM) break;
+        }
+      }
+    }
+
+    // Recompute the median using the inlier-expanded bounds center for fixed sensor inclusion
+    const clusterCenterLat = inlierMobiles.length > 0 ? medianLat : (minLat + maxLat) / 2;
+    const clusterCenterLon = inlierMobiles.length > 0 ? medianLon : (minLon + maxLon) / 2;
+
+    // Include fixed sensors within clusterRadiusM of the cluster center
+    for (const f of fixed) {
+      const flat = Number(f.lat);
+      const flon = Number(f.lon);
+      const d = haversineMeters(flat, flon, clusterCenterLat, clusterCenterLon);
+      if (!_isFinite(d) || d > clusterRadiusM) continue;
+      minLat = Math.min(minLat, flat);
+      maxLat = Math.max(maxLat, flat);
+      minLon = Math.min(minLon, flon);
+      maxLon = Math.max(maxLon, flon);
+      visiblePointCount++;
+      visibleVehicleCount++; // count fixed sensors as contributors
+    }
+
+    // Must-include points bypass the cluster radius filter entirely.
+    // Used for high-AQI alerts that should pull the camera regardless of distance.
+    if (Array.isArray(mustIncludePoints)) {
+      for (const p of mustIncludePoints) {
+        if (!p) continue;
+        const plat = Number(p.lat);
+        const plon = Number(p.lon);
+        if (!_isFinite(plat) || !_isFinite(plon)) continue;
+        minLat = Math.min(minLat, plat);
+        maxLat = Math.max(maxLat, plat);
+        minLon = Math.min(minLon, plon);
+        maxLon = Math.max(maxLon, plon);
+        visiblePointCount++;
+        visibleVehicleCount++;
+      }
+    }
+
+    return { minLat, minLon, maxLat, maxLon, visibleVehicleCount, visiblePointCount };
+  }
+
   return {
     parseUtcMs,
     haversineMeters,
@@ -278,6 +474,8 @@
     trailMeetsMinLength,
     collectMostRecentVisibleSegment,
     collectBoundsForMobilesNewSegment,
+    collectRecentSegmentPerVehicle,
+    collectRobustLiveBounds,
     boundsSignature,
     DEFAULT_MIN_TRAIL_LENGTH_M,
     DEFAULT_MAX_SEGMENT_POINTS,
@@ -289,5 +487,6 @@
     DEFAULT_MIN_VISIBLE_SEGMENT_LENGTH_M_TWO_POINTS,
     DEFAULT_MIN_VISIBLE_SEGMENT_DISPLACEMENT_M_TWO_POINTS,
     DEFAULT_MAX_SEGMENT_LENGTH_M,
+    DEFAULT_CLUSTER_RADIUS_M,
   };
 });
