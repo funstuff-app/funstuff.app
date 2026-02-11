@@ -2871,6 +2871,21 @@ function main() {
     pbThemeSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, e));
   }
   
+  function showAboutModal() {
+    const modal = document.getElementById("aboutModal");
+    if (!modal) return;
+    modal.classList.remove("hidden");
+    const closeBtn = modal.querySelector(".aboutModalClose");
+    const onClose = () => {
+      modal.classList.add("hidden");
+      closeBtn.removeEventListener("click", onClose);
+    };
+    closeBtn.addEventListener("click", onClose);
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) onClose();
+    }, { once: true });
+  }
+
   function handleMenuAction(action) {
     switch (action) {
       case "save":
@@ -2878,6 +2893,9 @@ function main() {
         break;
       case "load":
         showLoadModal();
+        break;
+      case "about":
+        showAboutModal();
         break;
     }
     closePlaybackMenu();
