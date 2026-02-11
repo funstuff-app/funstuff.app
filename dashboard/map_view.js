@@ -198,6 +198,12 @@ class MapView {
     this._wheelPanEndTimer = null; // debounce timer to exit wheel-pan mode
 
     window.addEventListener("resize", () => this.resize());
+    // ResizeObserver catches layout changes that don't trigger window resize
+    // (e.g. dev tools open/close, sidebar toggle, soft keyboard).
+    if (typeof ResizeObserver !== "undefined") {
+      this._resizeObs = new ResizeObserver(() => this.resize());
+      this._resizeObs.observe(this.tilesCanvas.parentElement);
+    }
     
     this.overlayCanvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
     // Safari (macOS) provides native trackpad pinch as gesture events.
