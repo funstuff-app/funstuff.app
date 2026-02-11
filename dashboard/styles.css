@@ -52,7 +52,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
 }
 
 .footerDisclaimer {
-  color: rgba(147,164,186,0.45);
+  color: rgba(147,164,186,1);
 }
 
 .footerContent {
@@ -858,14 +858,15 @@ button#pbPlay.isLive {
   font-size: 10px;
   color: rgba(147,164,186,0.7);
   padding: 4px 12px 0 0;
-  text-align: right;
+  text-align: center;
   letter-spacing: 0.2px;
+  margin-left: -55px; /* Align with range text in rows below */
 }
 .legendFooter {
   font-size: 9px;
-  color: rgba(147,164,186,0.45);
+  color: rgba(147,164,186,1);
   padding: 3px 10px 5px 10px;
-  text-align: left;
+  text-align: center;
   letter-spacing: 0.1px;
   border-top: 1px solid rgba(255,255,255,0.05);
 }
@@ -925,7 +926,7 @@ button#pbPlay.isLive {
 .legendLo {
   display: inline-block;
   min-width: 22px;
-  text-align: right;
+  text-align: left;
 }
 .legendDash {
   display: inline-block;
@@ -936,7 +937,7 @@ button#pbPlay.isLive {
 .legendHi {
   display: inline-block;
   min-width: 22px;
-  text-align: left;
+  text-align: right;
 }
 /* Bracket column: sits on top of pills */
 .legendBracket {
@@ -1001,7 +1002,7 @@ button#pbPlay.isLive {
 /* Category label text */
 .legendCatLabel {
   font-size: 9px;
-  color: rgba(147,164,186,0.7);
+  color: rgba(220,228,240,0.95);
   white-space: nowrap;
   text-align: right;
   letter-spacing: 0.3px;
