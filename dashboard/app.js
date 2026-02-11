@@ -871,6 +871,9 @@ function main() {
   let _pbLastKnownMinMs = null;
   let _pbLastKnownMaxMs = null;
 
+  // Wall-clock ms (Date.now) when last server response arrived
+  let _pbLastServerResponseMs = Date.now();
+
   // Server can bump this to force LIVE camera follow even if data timestamps are unchanged.
   let _pbLastForceRefreshSeq = null;
   
@@ -904,8 +907,14 @@ function main() {
   let _deferredCameraFit = null; // { type: "bounds", bb, durationMs } | { type: "storedView", durationMs }
 
   // Minimum geographic extent (in degrees) for bounds to be considered "meaningful" movement.
-  // ~0.005° lat ≈ 550m. Below this the vehicles are just jittering in place (depot, parking lot).
-  const _pbMinBoundsExtentDeg = 0.005;
+  // ~0.002° lat ≈ 220m. Below this the vehicles are just jittering in place (depot, parking lot).
+  const _pbMinBoundsExtentDeg = 0.002;
+
+  // High-AQI alert camera override: sensors at or above this AQI within SLC metro
+  // bounds are force-included in camera fit, bypassing cluster-radius gating.
+  const _HIGH_ALERT_AQI_THRESHOLD = 151; // EPA "Unhealthy"
+  const _HIGH_ALERT_COOLDOWN_MS = 1200;  // 1.2s override cooldown
+  const _SLC_BOUNDS = { minLat: 40.4, maxLat: 41.0, minLon: -112.2, maxLon: -111.7 };
 
   // Smoothly animate back to the user's stored view (from localStorage) when no
   // meaningful vehicle movement is detected. Acts as a screensaver-like idle return.
@@ -1438,6 +1447,18 @@ function main() {
 
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
     const atEnd = !hasBounds || map.isPlaybackAtEnd(200);
+    // Live window: playhead is close enough to maxMs that continuing playback
+    // would naturally reach the end before the next server update.
+    // Only applies at 1x and 5x; higher speeds don't get the buffer.
+    const _speed = map.getPlaybackSpeed() || 1.0;
+    const _predS = Number(map.lastState?.meta?.polling_predicted_interval_s) || 600;
+    const _tscS2 = Number(map.lastState?.meta?.polling_time_since_change_s) || 0;
+    const _wallElapsed2 = (Date.now() - _pbLastServerResponseMs) / 1000;
+    const _remS2 = Math.max(0, _predS - _tscS2 - _wallElapsed2);
+    const _liveWindowMs = (_speed <= 5) ? _remS2 * 1000 * _speed : 0;
+    const inLiveWindow = !hasBounds || atEnd || (
+      _liveWindowMs > 0 && tMs != null && isFinite(tMs) && tMs >= b.maxMs - _liveWindowMs
+    );
     // LIVE mode is based on the flag, not position - we're replaying the buffer
     const followingLive = map._playbackLiveFollow;
 
@@ -1446,8 +1467,8 @@ function main() {
         // LIVE mode enabled: show Live button highlighted
         pbPlayEl.textContent = "Live";
         pbPlayEl.classList.add("isLive");
-      } else if (atEnd) {
-        // At end but LIVE not enabled: show Live button (not highlighted)
+      } else if (inLiveWindow) {
+        // In live buffer window but LIVE not enabled: show Live button (not highlighted)
         pbPlayEl.textContent = "Live";
         pbPlayEl.classList.remove("isLive");
       } else if (map.getPlaybackPlaying()) {
@@ -1595,19 +1616,81 @@ function main() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // LIVE CAMERA FOLLOW: Frame the current vehicle positions (head positions).
-    // Uses head-position bounds so long trails don't pull the camera away from
-    // where the vehicles actually are.
+    // LIVE CAMERA FOLLOW: Frame where vehicles currently are, their visible
+    // trails, and nearby fixed sensors. Uses median-based outlier trimming so
+    // a distant long-route vehicle doesn't drag the camera to city scale.
     // ─────────────────────────────────────────────────────────────────────────
     {
       if ((newDataArrived || forceCameraFit) && map._playbackLiveFollow) {
         const state = map.lastState;
         const mobiles = state && Array.isArray(state.mobile) ? state.mobile : [];
-        const bb = _collectHeadPositionBounds(mobiles);
-        if (bb && bb.visibleVehicleCount > 0 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
+        const fixed = state && Array.isArray(state.fixed) ? state.fixed : [];
+        const logic = (typeof window !== "undefined") ? window.CameraFitLogic : null;
+        let bb = null;
+
+        if (logic && typeof logic.collectRobustLiveBounds === "function") {
+          // Build per-vehicle entries: head position + trail reference
+          const vehicleEntries = [];
+          for (const m of mobiles) {
+            if (!m || m.ghosted) continue;
+            const trail = Array.isArray(m.trail) ? m.trail : [];
+            if (trail.length === 0) continue;
+            let headLat = NaN, headLon = NaN;
+            for (let i = trail.length - 1; i >= 0; i--) {
+              const p = trail[i];
+              if (!p) continue;
+              const lat = Number(p.lat);
+              const lon = Number(p.lon);
+              if (isFinite(lat) && isFinite(lon)) { headLat = lat; headLon = lon; break; }
+            }
+            if (!isFinite(headLat) || !isFinite(headLon)) continue;
+            vehicleEntries.push({ id: m.id, lat: headLat, lon: headLon, trail });
+          }
+
+          // High-AQI alert: force-include sensors with harmful readings within SLC metro.
+          // These bypass cluster-radius gating so the camera pulls toward the event.
+          const mustIncludePoints = [];
+          const _inSlc = (lat, lon) => lat >= _SLC_BOUNDS.minLat && lat <= _SLC_BOUNDS.maxLat
+            && lon >= _SLC_BOUNDS.minLon && lon <= _SLC_BOUNDS.maxLon;
+          for (const f of fixed) {
+            if (!f || f.purpleair) continue;
+            const flat = Number(f.lat), flon = Number(f.lon);
+            if (!isFinite(flat) || !isFinite(flon) || !_inSlc(flat, flon)) continue;
+            const w = (typeof pickWorstReadingKey === "function") ? pickWorstReadingKey(f.readings) : null;
+            if (w && typeof w.aqi === "number" && w.aqi >= _HIGH_ALERT_AQI_THRESHOLD) {
+              mustIncludePoints.push({ lat: flat, lon: flon });
+            }
+          }
+          for (const m of mobiles) {
+            if (!m || m.ghosted) continue;
+            const mlat = Number(m.lat), mlon = Number(m.lon);
+            if (!isFinite(mlat) || !isFinite(mlon) || !_inSlc(mlat, mlon)) continue;
+            const w = (typeof pickWorstReadingKey === "function") ? pickWorstReadingKey(m.readings) : null;
+            if (w && typeof w.aqi === "number" && w.aqi >= _HIGH_ALERT_AQI_THRESHOLD) {
+              mustIncludePoints.push({ lat: mlat, lon: mlon });
+            }
+          }
+
+          // Override cooldown if any high-AQI sensors detected
+          if (mustIncludePoints.length > 0 && map && typeof map._overrideCooldownForAlert === "function") {
+            map._overrideCooldownForAlert(_HIGH_ALERT_COOLDOWN_MS);
+          }
+
+          bb = logic.collectRobustLiveBounds(vehicleEntries, {
+            fixedSensors: fixed,
+            includeDebugPath: !!map._pbDebugPath,
+            maxSegmentLengthM: MapView.MAX_CAMERA_FIT_SEGMENT_LENGTH_M,
+            mustIncludePoints: mustIncludePoints.length > 0 ? mustIncludePoints : null,
+          });
+        } else {
+          bb = _collectHeadPositionBounds(mobiles);
+        }
+
+        if (bb && bb.visibleVehicleCount >= 2 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
           _animateFitBoundsLatLon(bb, { durationMs: _pbLiveFollowDurationMs });
         } else {
-          // No active vehicles — fall back to the user's stored view.
+          // Not enough active vehicles/sensors to form a meaningful view —
+          // return to the user's stored camera position.
           _animateToStoredView(_pbLiveFollowDurationMs);
         }
       }
@@ -1734,10 +1817,7 @@ function main() {
       } else if (map.getPlaybackPlaying()) {
         // Normal forward playback
         if (atEnd) {
-          // At end, not LIVE, not rewinding: hold playhead and let vehicle physics
-          // finish moving to the end of their paths; rewind will trigger when all
-          // vehicles are actually at the end.
-          if (_pbAtEndSincePerf == null) _pbAtEndSincePerf = now;
+          // At end — velocity zeroed; the Live-mode switch below will activate.
           _pbVelocity = 0;
         } else {
           // Normal forward - maintain playback speed
@@ -1838,28 +1918,38 @@ function main() {
     // ─────────────────────────────────────────────────────────────────────────
     // RENDER
     // ─────────────────────────────────────────────────────────────────────────
-    const waitingForVehiclesAtEnd =
-      !_pbIsRewinding &&
-      map.getPlaybackPlaying() &&
-      !map._playbackLiveFollow &&
-      hasBounds &&
-      tMs != null &&
-      isFinite(tMs) &&
-      (tMs >= b.maxMs - 1) &&
-      (_pbAtEndSincePerf != null);
-
-    if (didAdvanceTime || waitingForVehiclesAtEnd) {
+    if (didAdvanceTime) {
       map.drawOverlay(map.lastState, { cacheUnderlay: true });
     }
 
-    // If we're waiting at the end (no fixed pause), start rewind exactly when
-    // the last vehicle reaches the end of its path.
-    if (waitingForVehiclesAtEnd) {
-      if (_pbAllVehiclesReachedPlaybackEnd(map.lastState)) {
-        _pbIsRewinding = true;
-        _pbVelocity = _pbRewindSpeed;
-        _pbAtEndSincePerf = null;
-      }
+    // When playback enters the live buffer window, stop and show Live button.
+    // Buffer window = predictedInterval * speed, but only for 1x and 5x.
+    {
+      const _spd2 = map.getPlaybackSpeed() || 1.0;
+      const _prdS2 = Number(map.lastState?.meta?.polling_predicted_interval_s) || 600;
+      const _tscS3 = Number(map.lastState?.meta?.polling_time_since_change_s) || 0;
+      const _wallElapsed3 = (Date.now() - _pbLastServerResponseMs) / 1000;
+      const _remS3 = Math.max(0, _prdS2 - _tscS3 - _wallElapsed3);
+      const _lwMs2 = (_spd2 <= 5) ? _remS3 * 1000 * _spd2 : 0;
+      const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
+      var _inLiveWindow2 = hasBounds && tMs != null && isFinite(tMs) && tMs >= bufferEdge;
+    }
+    if (!_pbIsRewinding &&
+        map.getPlaybackPlaying() &&
+        !map._playbackLiveFollow &&
+        !_pbIsWheelCoasting &&
+        didAdvanceTime && _pbVelocity >= 0 &&
+        _inLiveWindow2) {
+      // Don't auto-activate Live mode — just stop playback at the buffer edge.
+      // The button will show "Live" (not highlighted) so the user can opt in.
+      // map._playbackLiveFollow = true;
+      // _pbPageAutoFollow = true;
+      // try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+      _pbVelocity = 0;
+      _pbAtEndSincePerf = null;
+      _pbIsRewinding = false;
+      map.setPlaybackPlaying(false);
+      updatePlaybackUi();
     }
 
     // UI updates
@@ -1969,6 +2059,19 @@ function main() {
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
       const atEnd = map.isPlaybackAtEnd(100);
+      // Buffer snap target: always calculated regardless of speed.
+      // Live window (button shows "Live"): only for 1x and 5x.
+      const _spd = map.getPlaybackSpeed() || 1.0;
+      const _prdS = Number(map.lastState?.meta?.polling_predicted_interval_s) || 600;
+      const _tscS = Number(map.lastState?.meta?.polling_time_since_change_s) || 0;
+      const _wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
+      const _remS = Math.max(0, _prdS - _tscS - _wallElapsed);
+      const _snapMs = _remS * 1000 * _spd;
+      const _lwMs = (_spd <= 5) ? _snapMs : 0;
+      const curMs = map.getPlaybackTimeMs();
+      const inLiveWindow = atEnd || (
+        _lwMs > 0 && curMs != null && isFinite(curMs) && curMs >= b.maxMs - _lwMs
+      );
       
       // If in LIVE mode, clicking turns OFF live camera follow (but keeps playback running).
       // This allows the user to stay at the end receiving new data, but without the camera auto-following.
@@ -1992,12 +2095,31 @@ function main() {
         return;
       }
 
-      // If at end and paused (button shows "Live" but not highlighted), enable LIVE mode
-      if (atEnd && !map.getPlaybackPlaying()) {
+      // If in live window (1x/5x), enable LIVE mode
+      if (inLiveWindow && _spd <= 5 && !map._playbackLiveFollow) {
         map._playbackLiveFollow = true;
         _pbPageAutoFollow = true; // resume page tracking in LIVE mode
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+        // Snap playhead to leading edge of buffer
+        if (_snapMs > 0) {
+          const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
+          map.setPlaybackTimeMs(bufferStart);
+        }
         _pbVelocity = 0;
+        _pbAtEndSincePerf = null;
+        _pbIsRewinding = false;
+        map.setPlaybackPlaying(true);
+        _pbLastPerf = 0;
+        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        updatePlaybackUi();
+        return;
+      }
+
+      // >5x at end: snap to buffer position and play (no Live mode)
+      if (atEnd && _spd > 5 && _snapMs > 0) {
+        const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
+        map.setPlaybackTimeMs(bufferStart);
+        _pbVelocity = _pbPlaybackSpeed * _spd;
         _pbAtEndSincePerf = null;
         _pbIsRewinding = false;
         map.setPlaybackPlaying(true);
@@ -3120,6 +3242,7 @@ function main() {
     if (!Array.isArray(st.fixed)) st.fixed = [];
 
     window.__lastState = st;
+    _pbLastServerResponseMs = Date.now();
     
     // Update save button now that we have data
     updateSaveButtonState();
@@ -3182,6 +3305,11 @@ function main() {
           const timeUntilNextMs = Math.max(60000, (predictedIntervalS - timeSinceChangeS) * 1000);
           const speed = map.getPlaybackSpeed() || 1.0;
           const offsetMs = timeUntilNextMs * speed;
+          
+          // Only activate Live mode for speeds 1-5x
+          if (speed > 5) {
+            map._playbackLiveFollow = false;
+          }
           
           const initMs = map._playbackLiveFollow 
             ? Math.max(b.minMs, b.maxMs - offsetMs)

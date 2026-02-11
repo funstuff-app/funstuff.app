@@ -84,7 +84,7 @@ class MapView {
     // DVR playback: sample all vehicles against a shared global time.
     this.playbackMode = false;
     this._playbackPlaying = false;
-    this._playbackSpeed = 1.0;
+    this._playbackSpeed = 5.0;
     this._playbackNowMs = null; // UTC epoch ms
     this._playbackMinMs = null;
     this._playbackMaxMs = null;
@@ -233,9 +233,19 @@ class MapView {
     }
   }
 
+  // Shorten (never extend) the auto-camera cooldown for high-AQI alerts.
+  // Does NOT cancel animations, set _autoCameraCooldownMs, or affect Live mode.
+  _overrideCooldownForAlert(cooldownMs) {
+    const until = performance.now() + Math.max(0, cooldownMs);
+    if (this._autoCameraSuppressedUntilPerfMs > until) {
+      this._autoCameraSuppressedUntilPerfMs = until;
+    }
+  }
+
   _noteUserInteraction() {
     // User input wins: cancel in-flight camera animations and suppress new auto-fits.
     this._cancelCameraAnimations();
+    this._autoCameraCooldownMs = 300000; // 5 minutes after any user interaction
     this._suppressAutoCamera();
   }
 
@@ -629,6 +639,10 @@ class MapView {
     // snapshot invalid across theme swaps
     this._tilesSnapshotCanvas = null;
     this._tilesSnapshotMeta = null;
+    // Force drawTiles() inside draw(): cache/epoch were invalidated, so even if
+    // center/zoom/theme-key haven't changed the old tiles are gone and we must
+    // start new requests at the current epoch.
+    this._lastTilesViewSig = null;
     this.draw(this.lastState);
   }
 
@@ -825,9 +839,15 @@ class MapView {
 
     const finish = () => {
       this._centerAnimRAF = null;
-      this._isAutoCameraAnimating = false;
+      // Keep _isAutoCameraAnimating true through the final draw + notify so that
+      // view-change listeners (e.g. localStorage persistence) don't overwrite the
+      // user's manually-chosen view with the auto-camera destination.
       this.draw(this.lastState);
       this._notifyViewChanged();
+      this._isAutoCameraAnimating = false;
+      // After the first auto-camera animation, extend cooldown to 5 minutes
+      // so subsequent user interactions suppress auto-camera for much longer.
+      if (isAutoCamera) this._autoCameraCooldownMs = 300000;
     };
 
     const step = () => {

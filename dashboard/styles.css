@@ -861,8 +861,16 @@ button#pbPlay.isLive {
   text-align: right;
   letter-spacing: 0.2px;
 }
+.legendFooter {
+  font-size: 9px;
+  color: rgba(147,164,186,0.45);
+  padding: 3px 10px 5px 10px;
+  text-align: left;
+  letter-spacing: 0.1px;
+  border-top: 1px solid rgba(255,255,255,0.05);
+}
 .legendBody {
-  padding: 4px 6px 8px 6px;
+  padding: 4px 6px 0 6px;
   display: flex;
   flex-direction: column;
   gap: 1px;
