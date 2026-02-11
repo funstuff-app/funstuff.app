@@ -780,6 +780,85 @@ button#pbPlay.isLive {
 .snapshotModalClose:hover { background: rgba(24,32,48,0.90); }
 .snapshotEmpty { color: var(--muted); font-size: 13px; text-align: center; padding: 20px; }
 
+/* About modal */
+.aboutModal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 200;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.aboutModal.hidden { display: none; }
+.aboutModalContent {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  min-width: 300px;
+  max-width: 420px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.aboutModalContent h3 {
+  margin: 0 0 4px 0;
+  font-size: 18px;
+  color: var(--text);
+}
+.aboutVersion {
+  margin: 0 0 12px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.aboutDesc {
+  margin: 0 0 16px 0;
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.5;
+}
+.aboutSection {
+  margin-bottom: 14px;
+}
+.aboutSection h4 {
+  margin: 0 0 6px 0;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--accent);
+}
+.aboutSection p {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  color: rgba(147,164,186,0.85);
+  line-height: 1.5;
+}
+.aboutLegal {
+  font-size: 11px !important;
+  color: rgba(147,164,186,0.6) !important;
+}
+.aboutContact {
+  color: var(--accent);
+  font-size: 13px;
+  text-decoration: none;
+}
+.aboutContact:hover { text-decoration: underline; }
+.aboutModalClose {
+  margin-top: 16px;
+  width: 100%;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(17,24,38,0.80);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+.aboutModalClose:hover { background: rgba(24,32,48,0.90); }
+
 .pbDebug {
   display: inline-flex;
   align-items: center;

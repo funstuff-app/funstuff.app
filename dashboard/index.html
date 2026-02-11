@@ -79,6 +79,11 @@
               </label>
             </div>
           </div>
+          <div class="pbMenuDivider"></div>
+          <div class="pbMenuItem" data-action="about">
+            <span class="pbMenuIcon">ℹ️</span>
+            <span class="pbMenuLabel">About</span>
+          </div>
         </div>
       </div>
     </header>
@@ -153,6 +158,30 @@
         </div>
       </section>
     </main>
+    <!-- About modal -->
+    <div id="aboutModal" class="aboutModal hidden">
+      <div class="aboutModalContent">
+        <h3>About DustyTrails</h3>
+        <p class="aboutVersion">Version 1.1 BETA</p>
+        <p class="aboutDesc">Real-time air quality monitoring dashboard for Utah mobile and fixed sensors.</p>
+        <div class="aboutSection">
+          <h4>Credits</h4>
+          <p>Developed by <strong>Matt</strong> at <strong>Funstuff.wtf</strong></p>
+        </div>
+        <div class="aboutSection">
+          <h4>Legal</h4>
+          <p class="aboutLegal">Copyright &copy; 2026 Funstuff.wtf. All rights reserved.</p>
+          <p class="aboutLegal">This software is proprietary and confidential. Unauthorized copying, distribution, modification, or use of this software, in whole or in part, is strictly prohibited without the express written permission of the copyright holder.</p>
+          <p class="aboutLegal">This software is provided "as-is" without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement. In no event shall the author or copyright holder be liable for any claim, damages, or other liability arising from the use of this software.</p>
+          <p class="aboutLegal">Air quality data is not quality-assured and is subject to change. This application has no university affiliation. Not intended for medical, regulatory, or emergency response use.</p>
+        </div>
+        <div class="aboutSection">
+          <a href="mailto:matt@funstuff.app" class="aboutContact">matt@funstuff.app</a>
+        </div>
+        <button class="aboutModalClose" type="button">Close</button>
+      </div>
+    </div>
+
     <footer id="appFooter">
       <span class="footerContent">©2026 Funstuff.wtf</span>
       <a href="mailto:matt@funstuff.app" class="contactLink">Contact Me</a>
