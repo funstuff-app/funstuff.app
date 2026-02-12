@@ -112,11 +112,11 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertEqual(_get_aqi_color("PM25", 3.5), "#00CCFF")
         self.assertEqual(_get_aqi_color("PM25", 5.0), "#00CCFF")
 
-    def test_color_mid_pm25_is_blue(self):
-        """PM2.5 5.1–9.0 should be blue (#0099FF)."""
-        self.assertEqual(_get_aqi_color("PM25", 5.1), "#0099FF")
-        self.assertEqual(_get_aqi_color("PM25", 8.2), "#0099FF")
-        self.assertEqual(_get_aqi_color("PM25", 9.0), "#0099FF")
+    def test_color_mid_pm25_is_green(self):
+        """PM2.5 5.1–9.0 should be green (#00E400)."""
+        self.assertEqual(_get_aqi_color("PM25", 5.1), "#00E400")
+        self.assertEqual(_get_aqi_color("PM25", 8.2), "#00E400")
+        self.assertEqual(_get_aqi_color("PM25", 9.0), "#00E400")
 
     def test_color_sensor_dot_matches_reading(self):
         """The merged fixed entry color should match its PM25 reading color."""
@@ -129,9 +129,9 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertEqual(f["primary_color"], expected)
         self.assertEqual(f["readings"]["PM25"]["color"], expected)
 
-    def test_color_not_epa_green(self):
-        """Low PM2.5 must NOT be EPA green (#00E400) — must use Utah AQ scale."""
-        for v in [0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 10.0, 12.0]:
+    def test_color_not_epa_green_outside_5_9(self):
+        """PM2.5 outside 5–9 must NOT be EPA green (#00E400)."""
+        for v in [0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 12.0]:
             c = _get_aqi_color("PM25", v)
             self.assertNotEqual(c, "#00E400",
                                 f"PM2.5={v} should not be EPA green")

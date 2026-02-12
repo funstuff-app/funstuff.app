@@ -52,6 +52,7 @@ from mobileair import (
 )
 from mobileair.dashboard import _pick_worst_reading_by_aqi
 from mobileair.trails import clean_trail
+from mobileair.dirigera_home import HOME_LAT, HOME_LON
 
 # Optional offline road map-matching (see ROAD_DATA.md)
 from mobileair.roads import RoadGraph, match_trail_segment_offline
@@ -387,6 +388,7 @@ class AppState:
     # PurpleAir cached data
     purpleair_sensors: list[dict[str, Any]] = field(default_factory=list)
     purpleair_last_fetch: float = 0.0
+    purpleair_meta_last_fetch: float = 0.0  # last time we fetched name/lat/lon
 
     # Optional offline road graph cache for map-matching.
     road_graph: Any | None = None
@@ -1175,8 +1177,8 @@ def _apply_fixed_sensors_to_history(result: dict[str, Any], date_str: str,
                 last_col = _get_aqi_color("PM25", last_val) if last_val is not None else "#cccccc"
                 display_val = int(last_val) if last_val is not None and last_val == int(last_val) else last_val
                 home_entry = {
-                    "id": "Home", "name": "Home", "pinned": True, "emoji": "\U0001f3f0",
-                    "lat": 40.7608, "lon": -111.891,
+                    "id": "Home", "name": "Home (Indoor)", "pinned": True, "emoji": "\U0001f3f0",
+                    "lat": HOME_LAT, "lon": HOME_LON,
                     "readings": {"PM25": {"value": display_val, "color": last_col,
                                           "history": history_values, "history_colors": history_colors,
                                           "history_times": history_times}},
@@ -2150,10 +2152,16 @@ PURPLEAIR_API_KEY = "C2922794-0519-11F1-B596-4201AC1DC123"
 PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
 
 
-def _fetch_purpleair_sensors() -> list[dict[str, Any]]:
-    """Fetch PurpleAir sensors in the SLC bounding box."""
+def _fetch_purpleair_sensors(fields: str = "pm2.5,last_seen") -> list[dict[str, Any]]:
+    """Fetch PurpleAir sensors in the SLC bounding box.
+
+    *fields* controls which columns are requested.  The lightweight default
+    (``pm2.5,last_seen``) is used for the frequent data poll.  Pass the full
+    metadata field list (``name,latitude,longitude``) on the slower hourly
+    cadence to keep the sensor cache up-to-date without burning points.
+    """
     params = {
-        "fields": "name,latitude,longitude,pm2.5,pm2.5_10minute,humidity,temperature,last_seen",
+        "fields": fields,
         "nwlng": str(SLC_BOUNDS["lon_min"]),
         "nwlat": str(SLC_BOUNDS["lat_max"]),
         "selng": str(SLC_BOUNDS["lon_max"]),
@@ -2169,10 +2177,10 @@ def _fetch_purpleair_sensors() -> list[dict[str, Any]]:
         })
         resp.raise_for_status()
         data = resp.json()
-        fields = data.get("fields", [])
+        fields_list = data.get("fields", [])
         results = []
         for row in data.get("data", []):
-            sensor = dict(zip(fields, row))
+            sensor = dict(zip(fields_list, row))
             sensor["sensor_index"] = row[0] if row else None
             results.append(sensor)
         return results
@@ -2262,19 +2270,6 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
                 "key": "PM2.5",
             }
         }
-        # Add humidity/temperature if available
-        humidity = s.get("humidity")
-        if humidity is not None:
-            try:
-                readings["Humidity"] = {"value": round(float(humidity), 0), "color": "#88bbdd", "key": "RH%"}
-            except (TypeError, ValueError):
-                pass
-        temp = s.get("temperature")
-        if temp is not None:
-            try:
-                readings["Temp"] = {"value": round(float(temp), 0), "color": "#ddaa66", "key": "°F"}
-            except (TypeError, ValueError):
-                pass
 
         fixed_list.append({
             "id": sid,
@@ -2301,19 +2296,65 @@ def purpleair_fetch_loop(
     interval_s: float = 300.0,  # 5 minutes
     stop_event: threading.Event,
 ) -> None:
-    """Background loop to fetch PurpleAir sensor data."""
+    """Background loop to fetch PurpleAir sensor data.
+
+    Data fields (pm2.5, last_seen) are polled every 5 minutes.
+    Metadata fields (name, latitude, longitude) are refreshed once per hour
+    and merged into the cached sensor list so lat/lon/name stay current
+    without burning points on every poll.
+    """
+    META_INTERVAL = 3600.0  # 1 hour
+    DATA_INTERVAL = 300.0   # 5 minutes
+
     # Wait for main fetch loop to start
     stop_event.wait(20.0)
 
     while not stop_event.is_set():
+        now = time.time()
         try:
-            sensors = _fetch_purpleair_sensors()
-            if sensors:
+            # ── Metadata refresh (hourly) ──────────────────────────────
+            need_meta = (now - app_state.purpleair_meta_last_fetch) >= META_INTERVAL
+            if need_meta:
+                meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude")
+                if meta_sensors:
+                    with app_state.lock:
+                        # Build lookup by sensor_index for merging
+                        meta_by_id = {s["sensor_index"]: s for s in meta_sensors if s.get("sensor_index")}
+                        # Update existing cached sensors with fresh metadata
+                        for s in app_state.purpleair_sensors:
+                            sid = s.get("sensor_index")
+                            if sid and sid in meta_by_id:
+                                m = meta_by_id.pop(sid)
+                                s["name"] = m.get("name", s.get("name"))
+                                s["latitude"] = m.get("latitude", s.get("latitude"))
+                                s["longitude"] = m.get("longitude", s.get("longitude"))
+                        # Add any brand-new sensors we haven't seen before
+                        for sid, m in meta_by_id.items():
+                            app_state.purpleair_sensors.append(m)
+                        app_state.purpleair_meta_last_fetch = now
+                    _log(f"[PurpleAir] Metadata refreshed ({len(meta_sensors)} sensors)")
+
+            # ── Data poll (every 5 min) ────────────────────────────────
+            data_sensors = _fetch_purpleair_sensors(fields="pm2.5,last_seen")
+            if data_sensors:
                 with app_state.lock:
-                    app_state.purpleair_sensors = sensors
-                    app_state.purpleair_last_fetch = time.time()
+                    data_by_id = {s["sensor_index"]: s for s in data_sensors if s.get("sensor_index")}
+                    # Merge data into existing cached sensors
+                    for s in app_state.purpleair_sensors:
+                        sid = s.get("sensor_index")
+                        if sid and sid in data_by_id:
+                            d = data_by_id[sid]
+                            s["pm2.5"] = d.get("pm2.5")
+                            s["last_seen"] = d.get("last_seen")
+                    # For brand-new sensors seen in data but not yet in cache
+                    existing_ids = {s.get("sensor_index") for s in app_state.purpleair_sensors}
+                    for sid, d in data_by_id.items():
+                        if sid not in existing_ids:
+                            app_state.purpleair_sensors.append(d)
+
+                    app_state.purpleair_last_fetch = now
                     # Accumulate PurpleAir readings into fixed_history for playback
-                    for s in sensors:
+                    for s in app_state.purpleair_sensors:
                         pm25 = s.get("pm2.5")
                         if pm25 is None:
                             continue
@@ -2340,18 +2381,11 @@ def purpleair_fetch_loop(
                         _merge_purpleair_into_fixed(app_state.state, app_state)
                         _inject_fixed_history(app_state, app_state.state)
                         app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
-                _log(f"[PurpleAir] Updated {len(sensors)} sensors")
+                _log(f"[PurpleAir] Updated {len(data_sensors)} sensors")
         except Exception as e:
             _log(f"[PurpleAir] Error: {type(e).__name__}: {e}")
 
-        # Determine wait interval: 10 minutes (1am-8am MST), otherwise 5 minutes
-        mst_tz = timezone(timedelta(hours=-7))
-        now_mst = datetime.now(timezone.utc).astimezone(mst_tz)
-        if 1 <= now_mst.hour < 8:
-            wait_interval_s = 600.0  # 10 minutes off-peak
-        else:
-            wait_interval_s = 300.0  # 5 minutes peak hours
-        stop_event.wait(wait_interval_s)
+        stop_event.wait(DATA_INTERVAL)
 
 
 def _get_mobile_time_range(mobile_list: list[dict[str, Any]]) -> tuple[datetime, datetime] | None:
@@ -2527,7 +2561,7 @@ def _get_aqi_color(pollutant: str, value: Any) -> str:
     if pollutant in ("PM25", "PM2.5"):
         if v <= 2.0:  return "#00FFFF"   # cyan   – Good (very low)
         if v <= 5.0:  return "#00CCFF"   # lt blue – Good
-        if v <= 9.0:  return "#0099FF"   # blue   – Good
+        if v <= 9.0:  return "#00E400"   # green  – Good
         if v <= 35.4: return "#FFFF00"   # yellow – Moderate
         if v <= 55.4: return "#FF7E00"   # orange – USG
         if v <= 125.4: return "#FF0000"  # red    – Unhealthy
