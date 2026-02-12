@@ -1875,7 +1875,7 @@ class MapView {
     // Catches mice that report deltaMode=0 (Logitech, Razer, etc).
     // NOT applied on macOS — two-finger vertical trackpad pan is indistinguishable,
     // and macOS convention is scroll=pan, pinch=zoom (like Apple Maps).
-    const isSmoothScrollZoom = !this._isMac && !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
+    const isSmoothScrollZoom = !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
 
     // Determine if this should be a zoom event:
     // 1. True mouse wheel (deltaMode !== 0) → zoom
@@ -1910,7 +1910,7 @@ class MapView {
       // Adjust zoom sensitivity per input type.
       // Chrome trackpad pinch reports ~3-5x smaller deltaY than Safari for same gesture.
       const isChromePinch = e.ctrlKey && !isMouseWheel && /Chrome/.test(navigator.userAgent || "");
-      const strength = (isMouseWheel || isSmoothScrollZoom) ? 0.006 : isChromePinch ? 0.055 : 0.020;
+      const strength = (isMouseWheel || isSmoothScrollZoom) ? 0.018 : isChromePinch ? 0.055 : 0.020;
       const dz = dir * Math.log1p(Math.abs(dy)) * strength;
       const prevZ = this.zoom;
       const z2 = clamp(this.zoom + dz, this._zoomMin, this._zoomMax);
