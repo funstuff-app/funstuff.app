@@ -49,7 +49,7 @@ def get_home_sensor_entry() -> dict[str, Any] | None:
     
     return {
         "id": "Home",
-        "name": "Home",
+        "name": "Home (Indoor)",
         "pinned": True,
         "emoji": "🏰",
         "lat": HOME_LAT,

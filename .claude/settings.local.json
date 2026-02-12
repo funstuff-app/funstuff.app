@@ -3,7 +3,8 @@
     "allow": [
       "Bash(node --check:*)",
       "Bash(python3:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(python:*)"
     ]
   }
 }
