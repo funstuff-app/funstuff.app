@@ -251,13 +251,13 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
     echo "  API endpoint:   http://${PI_IP}:${DASHBOARD_PORT}/api/state"
     echo ""
     echo "  Useful commands:"
-    echo "    View logs:     sudo journalctl -u ${SERVICE_NAME} -f"
-    echo "    Status:        sudo systemctl status ${SERVICE_NAME}"
-    echo "    Restart:       sudo systemctl restart ${SERVICE_NAME}"
+    echo "    View logs:     sudo -t journalctl -u ${SERVICE_NAME} -f"
+    echo "    Status:        sudo -t systemctl status ${SERVICE_NAME}"
+    echo "    Restart:       sudo -t systemctl restart ${SERVICE_NAME}"
     echo ""
 else
     log_error "Service failed to start. Check logs with:"
-    echo "  sudo journalctl -u ${SERVICE_NAME} -n 50"
+    echo "  sudo -t journalctl -u ${SERVICE_NAME} -n 50"
     exit 1
 fi
 
