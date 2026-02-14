@@ -390,6 +390,7 @@ class AppState:
     purpleair_last_fetch: float = 0.0
     purpleair_meta_last_fetch: float = 0.0  # last time we fetched name/lat/lon
     purpleair_last_seen_cache: dict[int, int] = field(default_factory=dict)  # sensor_index -> last_seen timestamp
+    purpleair_pm25_cache: dict[int, float] = field(default_factory=dict)  # sensor_index -> last known pm2.5 value
 
     # Optional offline road graph cache for map-matching.
     road_graph: Any | None = None
@@ -2407,7 +2408,7 @@ def purpleair_fetch_loop(
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
     META_INTERVAL = 21600.0  # 6 hours
-    DATA_INTERVAL_DAY   = 120.0   # 2 minutes during daytime
+    DATA_INTERVAL_DAY   = 600.0   # 10 minutes during daytime
     DATA_INTERVAL_NIGHT = 900.0   # 15 minutes during nighttime (1 AM – 6 AM MST)
 
     debug_log_path = data_dir / "purpleair_debug.json"
@@ -4154,13 +4155,13 @@ def main() -> int:
     except Exception as e:
         _log(f"[PurpleAir] Initial fetch error (will retry in background): {e}")
 
-    # Start PurpleAir fetch loop (2-min daytime / 15-min nighttime)
+    # Start PurpleAir fetch loop (10-min daytime / 30-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
         daemon=True
     ).start()
-    _log("[PurpleAir] SLC sensor integration enabled (2-min daytime / 15-min nighttime, batched requests)")
+    _log("[PurpleAir] SLC sensor integration enabled (10-min daytime / 30-min nighttime, batched requests)")
 
     _log("[HistoryPrefetch] Enabled (runs inside fetch_loop)")
 
@@ -4270,7 +4271,7 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             daemon=True
         ).start()
 
-    # PurpleAir fetch loop with batched requests (2-min daytime / 15-min nighttime)
+    # PurpleAir fetch loop with batched requests (10-min daytime / 30-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),

@@ -128,14 +128,12 @@ TRAM_LINE_GRAPH_PATH: str | None = _os.path.expanduser("~/.mobileair/roads/trax_
 # HTTP Headers for requests
 # ============================================================================
 HEADERS = {
-    "Pragma": "no-cache",
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Sec-Fetch-Site": "same-origin",
     "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
     "Sec-Fetch-Mode": "cors",
     "Accept-Encoding": "gzip, deflate, br",
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "DustyTrails-AQI-Dashboard (contact: matt@funstuff.app)",
     "Referer": "https://utahaq.chpc.utah.edu/",
     "Connection": "keep-alive",
     "Sec-Fetch-Dest": "empty",

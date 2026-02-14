@@ -200,7 +200,7 @@ function main() {
     const tab = pollutantToLegendTab(pr && pr.key);
     if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
       legendTab = tab;
-      buildLegend();
+      buildLegend(true);
     }
   }
 
@@ -211,7 +211,7 @@ function main() {
     const tab = pollutantToLegendTab(key);
     if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
       legendTab = tab;
-      buildLegend();
+      buildLegend(true);
     }
   }
 
@@ -219,7 +219,7 @@ function main() {
   function revertLegendTab() {
     if (legendTab !== userLegendTab && LEGEND_DATA[userLegendTab]) {
       legendTab = userLegendTab;
-      buildLegend();
+      buildLegend(true);
     }
   }
 
@@ -308,90 +308,234 @@ function main() {
     },
   };
 
-  function buildLegend() {
-    if (!legendBodyEl) return;
-    const data = LEGEND_DATA[legendTab] || LEGEND_DATA.pm25;
-    if (legendUnitEl) legendUnitEl.textContent = data.unit;
+  // Track live row DOM nodes for tweening between pollutant tabs.
+  let _legendRows = [];       // current row elements in the DOM
+  let _legendEntryCount = 0;  // how many entries the current legend has
+  const LEGEND_TWEEN_MS = 300;
 
-    // Animate bars on pollutant switch: add .animating, stagger per-row delay.
-    legendBodyEl.classList.remove("animating");
-    legendBodyEl.innerHTML = "";
-
-    const entries = data.entries;
-
-    // Assign bracket category: walk backwards from labeled entries
+  function _buildBracketInfo(entries) {
     const catAssign = new Array(entries.length).fill("");
     let currentCat = "";
     for (let i = entries.length - 1; i >= 0; i--) {
       if (entries[i].label) currentCat = entries[i].label;
       catAssign[i] = currentCat;
     }
-
-    // Build dimension-line groups
     const dimGroups = [];
     let groupStart = 0;
     for (let i = 0; i < entries.length; i++) {
       if (i === entries.length - 1 || catAssign[i] !== catAssign[i + 1]) {
-        if (catAssign[i]) {
-          dimGroups.push({ name: catAssign[i], startIdx: groupStart, endIdx: i });
-        }
+        if (catAssign[i]) dimGroups.push({ name: catAssign[i], startIdx: groupStart, endIdx: i });
         groupStart = i + 1;
       }
     }
+    return { catAssign, dimGroups };
+  }
 
-    // If any entry has a fractional lo/hi, format all values with 1 decimal place
+  function _makeBracketHtml(i, dimGroups) {
+    const g = dimGroups.find(g => i >= g.startIdx && i <= g.endIdx);
+    if (!g) return `<div class="legendBracket"></div>`;
+    const isFirst = (i === g.startIdx), isLast = (i === g.endIdx), isOnly = (g.startIdx === g.endIdx);
+    let cls = "legendBracket";
+    if (isOnly) cls += " legendBracketOnly";
+    else if (isFirst) cls += " legendBracketTop";
+    else if (isLast) cls += " legendBracketBot";
+    else cls += " legendBracketMid";
+    const midIdx = Math.floor((g.startIdx + g.endIdx) / 2);
+    const lbl = (i === midIdx) ? `<span class="legendCatLabel">${g.name}</span>` : "";
+    return `<div class="${cls}">${lbl}</div>`;
+  }
+
+  function _createLegendRow(entry, idx, dimGroups, useDecimal) {
+    const fmt = (v) => (useDecimal && v != null) ? Number(v).toFixed(1) : `${v}`;
+    const e = entry;
+    const loText = e.hi != null ? fmt(e.lo) : `${fmt(e.lo)}+`;
+    const hiText = e.hi != null ? fmt(e.hi) : "";
+    const row = document.createElement("div");
+    row.className = "legendRow";
+    const pillHtml = `<div class="legendPill" style="width:${e.w}px;background:${e.color};border-color:${darkenHex(e.color,0.55)}"></div>`;
+    const rangeInner = `<span class="legendLo">${loText}</span>` +
+      (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
+    const leftZone = `<div class="legendLeftZone">${pillHtml}</div><div class="legendRange"><div class="legendRangeBg">${rangeInner}</div></div>`;
+    row.innerHTML = leftZone + _makeBracketHtml(idx, dimGroups);
+    return row;
+  }
+
+  function _updateRowContent(row, entry, idx, dimGroups, useDecimal) {
+    const fmt = (v) => (useDecimal && v != null) ? Number(v).toFixed(1) : `${v}`;
+    const e = entry;
+    // Tween the pill bar (CSS transition handles the back-in curve)
+    const pill = row.querySelector(".legendPill");
+    if (pill) {
+      pill.style.width = `${e.w}px`;
+      pill.style.background = e.color;
+      pill.style.borderColor = darkenHex(e.color, 0.55);
+    }
+    // True crossfade for range text: clone old, stack it, fade old out + new in simultaneously
+    const rangeEl = row.querySelector(".legendRange");
+    if (rangeEl) {
+      const oldBg = rangeEl.querySelector(".legendRangeBg");
+      if (oldBg) {
+        const loText = e.hi != null ? fmt(e.lo) : `${fmt(e.lo)}+`;
+        const hiText = e.hi != null ? fmt(e.hi) : "";
+        const newInner = `<span class="legendLo">${loText}</span>` +
+          (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
+        // Skip if text unchanged
+        if (oldBg.innerHTML !== newInner) {
+          // Clone old text as a fading-out ghost
+          const ghost = oldBg.cloneNode(true);
+          ghost.style.cssText = "position:absolute;top:0;left:0;right:0;opacity:1;transition:opacity 0.2s ease-out;pointer-events:none;";
+          rangeEl.style.position = "relative";
+          rangeEl.appendChild(ghost);
+          // Set new text immediately, start invisible
+          oldBg.innerHTML = newInner;
+          oldBg.style.opacity = "0";
+          oldBg.style.transition = "opacity 0.2s ease-out";
+          // Crossfade: old ghost fades out, new fades in
+          requestAnimationFrame(() => {
+            ghost.style.opacity = "0";
+            oldBg.style.opacity = "1";
+          });
+          // Clean up ghost after transition
+          setTimeout(() => { if (ghost.parentNode) ghost.parentNode.removeChild(ghost); }, 220);
+        }
+      }
+    }
+    // Crossfade bracket labels the same way
+    const oldBracket = row.querySelector(".legendBracket");
+    if (oldBracket) {
+      const newHtml = _makeBracketHtml(idx, dimGroups);
+      if (oldBracket.outerHTML !== newHtml) {
+        const ghost = oldBracket.cloneNode(true);
+        ghost.style.cssText += ";position:absolute;right:0;top:0;bottom:0;opacity:1;transition:opacity 0.2s ease-out;pointer-events:none;";
+        oldBracket.parentNode.insertBefore(ghost, oldBracket.nextSibling);
+        oldBracket.outerHTML = newHtml;
+        const newBracket = row.querySelector(".legendBracket");
+        if (newBracket) {
+          newBracket.style.opacity = "0";
+          newBracket.style.transition = "opacity 0.2s ease-out";
+          requestAnimationFrame(() => {
+            ghost.style.opacity = "0";
+            newBracket.style.opacity = "1";
+          });
+        }
+        setTimeout(() => { if (ghost.parentNode) ghost.parentNode.removeChild(ghost); }, 220);
+      }
+    }
+  }
+
+  /** Instant (no-transition) update of a legend row — sets properties directly, no ghosts. */
+  function _updateRowInstant(row, entry, idx, dimGroups, useDecimal) {
+    const fmt = (v) => (useDecimal && v != null) ? Number(v).toFixed(1) : `${v}`;
+    const e = entry;
+    const pill = row.querySelector(".legendPill");
+    if (pill) {
+      pill.style.width = `${e.w}px`;
+      pill.style.background = e.color;
+      pill.style.borderColor = darkenHex(e.color, 0.55);
+    }
+    const rangeEl = row.querySelector(".legendRange");
+    if (rangeEl) {
+      const bg = rangeEl.querySelector(".legendRangeBg");
+      if (bg) {
+        const loText = e.hi != null ? fmt(e.lo) : `${fmt(e.lo)}+`;
+        const hiText = e.hi != null ? fmt(e.hi) : "";
+        bg.innerHTML = `<span class="legendLo">${loText}</span>` +
+          (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
+        bg.style.opacity = "1";
+      }
+    }
+    const oldBracket = row.querySelector(".legendBracket");
+    if (oldBracket) {
+      const newHtml = _makeBracketHtml(idx, dimGroups);
+      if (oldBracket.outerHTML !== newHtml) {
+        oldBracket.outerHTML = newHtml;
+      }
+    }
+  }
+
+  function buildLegend(animate = false) {
+    if (!legendBodyEl) return;
+    const data = LEGEND_DATA[legendTab] || LEGEND_DATA.pm25;
+    if (legendUnitEl) legendUnitEl.textContent = data.unit;
+
+    const entries = data.entries;
+    const { dimGroups } = _buildBracketInfo(entries);
     const useDecimal = entries.some(e =>
       (e.lo != null && e.lo % 1 !== 0) || (e.hi != null && e.hi % 1 !== 0)
     );
-    const fmt = (v) => (useDecimal && v != null) ? Number(v).toFixed(1) : `${v}`;
 
-    for (let i = 0; i < entries.length; i++) {
-      const e = entries[i];
-      const barW = e.w;
-      const loText = e.hi != null ? fmt(e.lo) : `${fmt(e.lo)}+`;
-      const hiText = e.hi != null ? fmt(e.hi) : "";
+    const oldCount = _legendEntryCount;
+    const newCount = entries.length;
+    const commonCount = Math.min(oldCount, newCount);
 
-      const row = document.createElement("div");
-      row.className = "legendRow";
-
-      const pillHtml = `<div class="legendPill" style="width:${barW}px;background:${e.color};border-color:${darkenHex(e.color,0.55)}"></div>`;
-      const rangeInner = `<span class="legendLo">${loText}</span>` +
-        (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
-      const leftZone = `<div class="legendLeftZone">${pillHtml}</div><div class="legendRange"><div class="legendRangeBg">${rangeInner}</div></div>`;
-
-      // Bracket
-      let bracketHtml;
-      const g = dimGroups.find(g => i >= g.startIdx && i <= g.endIdx);
-      if (g) {
-        const isFirst = (i === g.startIdx);
-        const isLast = (i === g.endIdx);
-        const isOnly = (g.startIdx === g.endIdx);
-        let cls = "legendBracket";
-        if (isOnly) cls += " legendBracketOnly";
-        else if (isFirst) cls += " legendBracketTop";
-        else if (isLast) cls += " legendBracketBot";
-        else cls += " legendBracketMid";
-        const midIdx = Math.floor((g.startIdx + g.endIdx) / 2);
-        const lbl = (i === midIdx) ? `<span class="legendCatLabel">${g.name}</span>` : "";
-        bracketHtml = `<div class="${cls}">${lbl}</div>`;
-      } else {
-        bracketHtml = `<div class="legendBracket"></div>`;
+    // First render: full build (no existing DOM to tween from)
+    if (oldCount === 0 || _legendRows.length === 0) {
+      legendBodyEl.innerHTML = "";
+      _legendRows = [];
+      for (let i = 0; i < newCount; i++) {
+        const row = _createLegendRow(entries[i], i, dimGroups, useDecimal);
+        legendBodyEl.appendChild(row);
+        _legendRows.push(row);
       }
-
-      row.innerHTML = leftZone + bracketHtml;
-      // Stagger animation delay per row
-      row.style.animationDelay = `${i * 20}ms`;
-      const pill = row.querySelector(".legendPill");
-      if (pill) pill.style.animationDelay = `${i * 20 + 40}ms`;
-      legendBodyEl.appendChild(row);
+      _legendEntryCount = newCount;
+      const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
+      for (const t of tabs) t.classList.toggle("active", t.dataset.legend === legendTab);
+      return;
     }
 
-    // Trigger grow animation (requestAnimationFrame ensures class removal + re-add is noticed)
-    requestAnimationFrame(() => legendBodyEl.classList.add("animating"));
+    // ── Update existing DOM in place (always — never tear down) ──
 
+    // When not animating, suppress CSS transitions so changes are instant
+    if (!animate) {
+      legendBodyEl.classList.add("legend-no-transition");
+    }
+
+    // Tween (or instant-set) existing rows: bar width/color + text
+    for (let i = 0; i < commonCount; i++) {
+      if (animate) {
+        _updateRowContent(_legendRows[i], entries[i], i, dimGroups, useDecimal);
+      } else {
+        // Instant: set properties directly, no crossfade ghosts
+        _updateRowInstant(_legendRows[i], entries[i], i, dimGroups, useDecimal);
+      }
+    }
+
+    // Remove excess rows
+    if (oldCount > newCount) {
+      for (let i = newCount; i < oldCount; i++) {
+        const row = _legendRows[i];
+        if (animate) {
+          row.classList.add("leaving");
+          setTimeout(() => { if (row.parentNode) row.parentNode.removeChild(row); }, LEGEND_TWEEN_MS);
+        } else {
+          if (row.parentNode) row.parentNode.removeChild(row);
+        }
+      }
+      _legendRows.length = newCount;
+    }
+
+    // Add new rows
+    if (newCount > oldCount) {
+      for (let i = oldCount; i < newCount; i++) {
+        const row = _createLegendRow(entries[i], i, dimGroups, useDecimal);
+        if (animate) row.classList.add("entering");
+        legendBodyEl.appendChild(row);
+        _legendRows.push(row);
+        if (animate) requestAnimationFrame(() => { row.classList.remove("entering"); });
+      }
+    }
+
+    _legendEntryCount = newCount;
     const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
-    for (const t of tabs) {
-      t.classList.toggle("active", t.dataset.legend === legendTab);
+    for (const t of tabs) t.classList.toggle("active", t.dataset.legend === legendTab);
+
+    // Re-enable transitions after instant update completes
+    if (!animate) {
+      // Use rAF to ensure the browser has painted the instant values
+      // before re-enabling transitions
+      requestAnimationFrame(() => {
+        legendBodyEl.classList.remove("legend-no-transition");
+      });
     }
   }
 
@@ -412,7 +556,7 @@ function main() {
         userLegendTab = legendTab;
         legendUserOverride = !!selectedId; // override auto-sync while a marker is selected
         localStorage.setItem(LEGEND_TAB_KEY, legendTab);
-        buildLegend();
+        buildLegend(true);
       });
     }
   }
@@ -1464,10 +1608,21 @@ function main() {
     _pbPageIndex = clamp(idx, 0, total - 1);
   }
 
-  /** After user stops jogging (drag release or wheel coast end), snap the window
-   *  so the playhead lands at 15% or 85% — just outside the 10% jog zone. */
+  /** After user stops scrubbing, re-center the sliding window so the playhead
+   *  sits at 15% (if user was dragging left) or 85% (if dragging right). */
   function _pbSnapWindowToPlayhead() {
-    return; // disabled — the auto-follow logic handles this
+    if (!_pbPagingActive() || _pbSlidingWindowCenter == null) return;
+    const b = map.getPlaybackBounds();
+    const tMs = map.getPlaybackTimeMs();
+    if (tMs == null || !isFinite(tMs)) return;
+    const pr = _pbGetPageRange();
+    // Determine which edge the playhead is near
+    const fracInPage = (pr.maxMs > pr.minMs) ? (tMs - pr.minMs) / (pr.maxMs - pr.minMs) : 0.5;
+    // If near left edge (<25%), snap playhead to 15%; if near right (>75%), snap to 85%
+    const targetFrac = (fracInPage < 0.25) ? 0.15 : (fracInPage > 0.75) ? 0.85 : fracInPage;
+    _pbSlidingWindowCenter = tMs - targetFrac * _pbPageSizeMs + _pbPageSizeMs / 2;
+    const half = _pbPageSizeMs / 2;
+    _pbSlidingWindowCenter = clamp(_pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
   }
 
   /** Check if paging should be active based on data duration. */
@@ -1499,7 +1654,7 @@ function main() {
     }
 
     // Auto-advance page to follow playhead during normal playback (not scrubbing/coasting)
-    if (paging && _pbPageAutoFollow && tMs != null && isFinite(tMs) && !_pbScrubbing && !_pbIsWheelCoasting) {
+    if (paging && _pbPageAutoFollow && tMs != null && isFinite(tMs) && !_pbScrubbing) {
       const pr = _pbGetPageRange();
       if (tMs >= pr.maxMs || tMs < pr.minMs) {
         if (_pbSlidingWindowCenter != null) {
