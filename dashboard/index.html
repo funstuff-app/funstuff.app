@@ -164,19 +164,32 @@
         <h3>About DustyTrails</h3>
         <p class="aboutVersion">Version 1.1 BETA</p>
         <p class="aboutDesc">Real-time air quality monitoring dashboard for Utah mobile and fixed sensors.</p>
+        <p class="aboutTodo">Still under development.</p>
         <div class="aboutSection">
-          <h4>Credits</h4>
-          <p>Developed by <strong>Matt</strong> at <strong>Funstuff.wtf</strong></p>
+          <h4>Attributions</h4>
+          <p>Developed by <strong>Matt P</strong><br>
+            <a href="mailto:matt@funstuff.app" class="aboutContact">matt@funstuff.app</a></p>
+          <p></p>
+          <p>Mobile/Fixed Sensors: Data courtesy of the Utah Division of Air Quality. This project is independent and not endorsed by the Utah DAQ or The University of Utah</p>
+          <p>Community Sensors<br>Source: <a href="https://www.purpleair.com" target="_blank" class="aboutContact">PurpleAir</a></p>
         </div>
+
+        <div class="aboutSection">
+          <h4>Tech Stack</h4>
+          <p>Data Ingestion: Node.js server fetching from Utah DAQ and PurpleAir APIs</p>
+          <p>Frontend: Vanilla JavaScript, HTML5 Canvas, CSS3</p>
+          <p>Map Tiles: Leaflet</p>
+          <p>Logic: Custom AQI mapping and visual normalization across disparate datasets.</p>
+          <p>TODO: Refine this section with more details on libraries, frameworks, and architecture decisions.</p>
+        </div>
+
         <div class="aboutSection">
           <h4>Legal</h4>
           <p class="aboutLegal">Copyright &copy; 2026 Funstuff.wtf. All rights reserved.</p>
+          <p class="aboutLegal"></p>
           <p class="aboutLegal">This software is proprietary and confidential. Unauthorized copying, distribution, modification, or use of this software, in whole or in part, is strictly prohibited without the express written permission of the copyright holder.</p>
           <p class="aboutLegal">This software is provided "as-is" without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement. In no event shall the author or copyright holder be liable for any claim, damages, or other liability arising from the use of this software.</p>
           <p class="aboutLegal">Air quality data is not quality-assured and is subject to change. This application has no university affiliation. Not intended for medical, regulatory, or emergency response use.</p>
-        </div>
-        <div class="aboutSection">
-          <a href="mailto:matt@funstuff.app" class="aboutContact">matt@funstuff.app</a>
         </div>
         <div id="ownerTokenSection" class="aboutSection ownerTokenSection hidden">
           <label class="ownerTokenLabel" for="ownerTokenInput">Owner Token</label>
@@ -193,7 +206,7 @@
     <footer id="appFooter">
       <span class="footerContent">©2026 Funstuff.wtf</span>
       <a href="mailto:matt@funstuff.app" class="contactLink">Contact Me</a>
-      <span class="footerDisclaimer">Not quality-assured, as-is without warranty. No university affiliation. Not for medical/regulatory use.</span>
+      <span class="footerDisclaimer">Not quality-assured, as-is without warranty. Not for medical/regulatory use.<br>Powered by <a href="https://www.purpleair.com" target="_blank" class="contactLink">PurpleAir</a></span>
     </footer>
   </div>
 
