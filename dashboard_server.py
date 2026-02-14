@@ -3917,13 +3917,13 @@ def main() -> int:
     else:
         _log("[AirNow] Integration not available (airnow_slc.py not found)")
 
-    # Start PurpleAir fetch loop (5-minute interval)
+    # Start PurpleAir fetch loop (10-minute interval)
     threading.Thread(
         target=purpleair_fetch_loop,
-        kwargs=dict(app_state=app_state, interval_s=300.0, stop_event=stop_event),
+        kwargs=dict(app_state=app_state, interval_s=600.0, stop_event=stop_event),
         daemon=True
     ).start()
-    _log("[PurpleAir] SLC sensor integration enabled (5-min refresh)")
+    _log("[PurpleAir] SLC sensor integration enabled (10-min refresh)")
 
     _log("[HistoryPrefetch] Enabled (runs inside fetch_loop)")
 
