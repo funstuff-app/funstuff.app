@@ -15,6 +15,7 @@ var TILE_THEMES = {
     template: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
+    defaultDim: 25,
     bgColor: "#c4c0b8",
   },
   carto_dark_all: {
@@ -40,6 +41,7 @@ var TILE_THEMES = {
     template: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 0.45, brightness: 0.60, contrast: 1.10 },
+    defaultDim: 25,
     bgColor: "#a8a8a6",
   },
   carto_positron_nolabels: {
@@ -47,6 +49,7 @@ var TILE_THEMES = {
     template: "https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 0.45, brightness: 0.60, contrast: 1.10 },
+    defaultDim: 25,
     bgColor: "#a8a8a6",
   },
   osm: {
@@ -54,6 +57,7 @@ var TILE_THEMES = {
     template: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     subdomains: [""],
     filter: { saturate: 0.45, brightness: 0.62, contrast: 1.12 },
+    defaultDim: 25,
     bgColor: "#b5b2ab",
   },
 };

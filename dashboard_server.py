@@ -1088,8 +1088,14 @@ def _fetch_history_file(sensor: str, var: str) -> list:
         _history_cache[cache_key] = (now, data)
         return data
     except Exception as e:
+        # Cache 404s permanently — the sensor/variable combo doesn't exist
+        # upstream and won't start existing.
+        is_404 = "404" in str(e)
+        if is_404:
+            _history_cache[cache_key] = (float('inf'), [])
+            return []
         _log(f"[History] Failed to fetch {sensor}/{var}: {e}")
-        # On error, return stale cache if available, else empty
+        # On transient error, return stale cache if available, else empty
         if cache_key in _history_cache:
             return _history_cache[cache_key][1]
         return []
@@ -1447,9 +1453,21 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
     
     # Build raw API format: {PM25: {sensor: {TimeUTC, GLAT, GLON, Value}}, PM10: {...}, OZNE: {...}}
     # This matches the format of MobileMapData.json so normalize_state_for_dashboard can process it
-    
-    last_update_str = day_end.strftime("%Y-%m-%d %H:%M UTC")
-    
+
+    # Compute LastUpdateUTC from the latest actual GPS timestamp across all sensors.
+    # Using day_end would cause staleness detection to ghost every sensor whose last
+    # data point is >30 min before 4 AM — i.e. virtually all of them.
+    _latest_ts_ms: int | None = None
+    for sensor_id_lu in HISTORY_SENSORS:
+        for var_key in ("GLAT", "GLON"):
+            for ts_ms, _ in raw_data.get(sensor_id_lu, {}).get(var_key, []):
+                if _latest_ts_ms is None or ts_ms > _latest_ts_ms:
+                    _latest_ts_ms = ts_ms
+    if _latest_ts_ms is not None:
+        last_update_str = datetime.fromtimestamp(_latest_ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        last_update_str = day_end.strftime("%Y-%m-%d %H:%M UTC")
+
     mobile_raw: dict[str, Any] = {
         "PM25": {"LastUpdateUTC": last_update_str, "VarName": "PM2.5 Concentration", "VarUnit": "ug/m3"},
         "PM10": {"LastUpdateUTC": last_update_str, "VarName": "PM10 Concentration", "VarUnit": "ug/m3"},
@@ -1575,7 +1593,14 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
         road_graph=get_cached_road_graph() if use_road_graph else None,
         tram_line_graph=get_cached_tram_line_graph() if use_road_graph else None,
     )
-    
+
+    # Staleness detection is meaningless for historical data — clear the flags
+    # so sensors aren't hidden from the sidebar.
+    for m in result.get("mobile", []):
+        if isinstance(m, dict):
+            m.pop("ghosted", None)
+            m.pop("stale", None)
+
     # Add historical metadata
     result["meta"]["historical"] = True
     result["meta"]["date"] = date_str
@@ -1603,27 +1628,41 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
 
 
 _history_prefetch_last_date: str | None = None  # last MST date we checked
+_history_prefetch_last_attempt: float = 0.0  # monotonic time of last attempt
+_HISTORY_PREFETCH_RETRY_S: float = 600.0  # retry uncached days every 10 minutes
 
 def _maybe_prefetch_history(app_state: AppState, data_dir: Path) -> None:
-    """Cache any uncached days in the past 6 days. Only runs once per day transition."""
-    global _history_prefetch_last_date
+    """Cache any uncached days in the past 6 days.
+
+    Runs on day transition and retries every 10 minutes if any days are still
+    uncached (e.g. upstream was temporarily unreachable).
+    """
+    global _history_prefetch_last_date, _history_prefetch_last_attempt
+    import time as _time
     mst_tz = timezone(timedelta(hours=-7))
     today_str = datetime.now(timezone.utc).astimezone(mst_tz).strftime("%Y-%m-%d")
-    if today_str == _history_prefetch_last_date:
-        return  # already checked today
-    _history_prefetch_last_date = today_str
+    now_mono = _time.monotonic()
+    day_changed = (today_str != _history_prefetch_last_date)
+    retry_due = (now_mono - _history_prefetch_last_attempt) >= _HISTORY_PREFETCH_RETRY_S
+    if not day_changed and not retry_due:
+        return
     today = datetime.now(timezone.utc).astimezone(mst_tz).date()
+    all_cached = True
     for days_ago in range(1, 7):
         date_str = (today - timedelta(days=days_ago)).strftime("%Y-%m-%d")
         if _load_cached_historical_day(data_dir, date_str) is not None:
             continue
+        all_cached = False
         try:
             fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir)
             if _load_cached_historical_day(data_dir, date_str) is not None:
                 _log(f"[HistoryPrefetch] Cached {date_str}")
         except Exception as e:
             _log(f"[HistoryPrefetch] {date_str}: {e}")
-            return
+            continue  # try remaining days even if one fails
+    _history_prefetch_last_attempt = now_mono
+    if all_cached:
+        _history_prefetch_last_date = today_str
 
 
 def _first_last_ts(trail: list[dict[str, Any]]) -> tuple[float | None, float | None]:
@@ -1985,7 +2024,7 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
         if app_state.purpleair_sensors:
             # Accumulate current PA values into history so history stays
             # in sync with live readings (PA fetch loop runs on its own
-            # 2-min cycle, but the main fetch loop can run more often).
+            # 5-min cycle, but the main fetch loop can run more often).
             time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             for s in app_state.purpleair_sensors:
                 pm25 = s.get("pm2.5")
@@ -2068,9 +2107,9 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
             continue
         
         # Check if within SLC bounds
-        if not (SLC_BOUNDS["lat_min"] <= lat <= SLC_BOUNDS["lat_max"] and
-                SLC_BOUNDS["lon_min"] <= lon <= SLC_BOUNDS["lon_max"]):
-            continue
+        # if not (SLC_BOUNDS["lat_min"] <= lat <= SLC_BOUNDS["lat_max"] and
+        #         SLC_BOUNDS["lon_min"] <= lon <= SLC_BOUNDS["lon_max"]):
+        #     continue
         
         # Filter readings to mobile time range if available
         filtered_readings = readings
@@ -2293,18 +2332,18 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
 def purpleair_fetch_loop(
     *,
     app_state: AppState,
-    interval_s: float = 300.0,  # 5 minutes
+    interval_s: float = 600.0,  # 10 minutes
     stop_event: threading.Event,
 ) -> None:
     """Background loop to fetch PurpleAir sensor data.
 
-    Data fields (pm2.5, last_seen) are polled every 5 minutes.
-    Metadata fields (name, latitude, longitude) are refreshed once per hour
+    Data fields (pm2.5, last_seen) are polled every 10 minutes.
+    Metadata fields (name, latitude, longitude) are refreshed once per six hours
     and merged into the cached sensor list so lat/lon/name stay current
     without burning points on every poll.
     """
-    META_INTERVAL = 3600.0  # 1 hour
-    DATA_INTERVAL = 300.0   # 5 minutes
+    META_INTERVAL = 21600.0  # 6 hour
+    DATA_INTERVAL = 600.0   # 10 minutes
 
     # Wait for main fetch loop to start
     stop_event.wait(20.0)
@@ -2312,7 +2351,7 @@ def purpleair_fetch_loop(
     while not stop_event.is_set():
         now = time.time()
         try:
-            # ── Metadata refresh (hourly) ──────────────────────────────
+            # ── Metadata refresh (every 6 hours) ──────────────────────────────
             need_meta = (now - app_state.purpleair_meta_last_fetch) >= META_INTERVAL
             if need_meta:
                 meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude")
@@ -2334,7 +2373,7 @@ def purpleair_fetch_loop(
                         app_state.purpleair_meta_last_fetch = now
                     _log(f"[PurpleAir] Metadata refreshed ({len(meta_sensors)} sensors)")
 
-            # ── Data poll (every 5 min) ────────────────────────────────
+            # ── Data poll (every 10 min) ────────────────────────────────
             data_sensors = _fetch_purpleair_sensors(fields="pm2.5,last_seen")
             if data_sensors:
                 with app_state.lock:
