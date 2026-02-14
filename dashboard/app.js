@@ -1,5 +1,27 @@
+// Owner token: read from URL hash (#tok=...) and persist in localStorage.
+// Appended to API URLs so the server can include the Home sensor for owners.
+const _ownerTok = (() => {
+  const KEY = "dusty_owner_tok";
+  const hash = location.hash || "";
+  const m = hash.match(/tok=([^&]+)/);
+  if (m) {
+    localStorage.setItem(KEY, m[1]);
+    // Remove token from hash to keep URL clean
+    history.replaceState(null, "", location.pathname + location.search);
+    return m[1];
+  }
+  return localStorage.getItem(KEY) || "";
+})();
+
+/** Append owner token to a URL (if set). */
+function _tokUrl(url) {
+  if (!_ownerTok) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}tok=${encodeURIComponent(_ownerTok)}`;
+}
+
 async function fetchState() {
-  const url = `${appConfig.apiBaseUrl}/state`;
+  const url = _tokUrl(`${appConfig.apiBaseUrl}/state`);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15000); // 15s timeout
   try {
@@ -66,7 +88,11 @@ function main() {
   const validTabs = ["mobile", "fixed", "public"];
   const savedTab = localStorage.getItem(TAB_STORAGE_KEY);
   let activeTab = validTabs.includes(savedTab) ? savedTab : "mobile";
-  let sidebarOpen = localStorage.getItem(SIDEBAR_OPEN_KEY) !== "false"; // Default open
+  // On mobile / narrow screens, default sidebar closed to reduce clutter.
+  const _isMobileWidth = window.innerWidth <= 768;
+  let sidebarOpen = _isMobileWidth
+    ? false
+    : localStorage.getItem(SIDEBAR_OPEN_KEY) !== "false"; // Default open on desktop
   
   // Restore visibility states
   map.showMobile = localStorage.getItem(SHOW_MOBILE_KEY) !== "false";
@@ -76,7 +102,9 @@ function main() {
   // Mobile labels default OFF, fixed labels default ON
   map.showMobileLabels = localStorage.getItem(SHOW_MOBILE_LABELS_KEY) === "true";
   map.showFixedLabels = localStorage.getItem(SHOW_FIXED_LABELS_KEY) === "true";
-  map.showPublicLabels = localStorage.getItem(SHOW_PUBLIC_LABELS_KEY) === "true";
+  // PurpleAir (public) labels always start OFF — too noisy on a crowded map.
+  // Users can toggle them on via the sidebar; that preference is not persisted.
+  map.showPublicLabels = false;
 
   function updateSidebarVisibility() {
     if (sidebarEl) sidebarEl.classList.toggle("hidden", !sidebarOpen);
@@ -146,7 +174,9 @@ function main() {
   const legendUnitEl = document.getElementById("legendUnit");
   const LEGEND_OPEN_KEY = "dusty_legend_open";
   const LEGEND_TAB_KEY = "dusty_legend_tab";
-  let legendOpen = localStorage.getItem(LEGEND_OPEN_KEY) !== "false";
+  let legendOpen = _isMobileWidth
+    ? false
+    : localStorage.getItem(LEGEND_OPEN_KEY) !== "false";
   let legendTab = localStorage.getItem(LEGEND_TAB_KEY) || "pm25";
   let userLegendTab = legendTab; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected
@@ -282,6 +312,9 @@ function main() {
     if (!legendBodyEl) return;
     const data = LEGEND_DATA[legendTab] || LEGEND_DATA.pm25;
     if (legendUnitEl) legendUnitEl.textContent = data.unit;
+
+    // Animate bars on pollutant switch: add .animating, stagger per-row delay.
+    legendBodyEl.classList.remove("animating");
     legendBodyEl.innerHTML = "";
 
     const entries = data.entries;
@@ -346,8 +379,15 @@ function main() {
       }
 
       row.innerHTML = leftZone + bracketHtml;
+      // Stagger animation delay per row
+      row.style.animationDelay = `${i * 20}ms`;
+      const pill = row.querySelector(".legendPill");
+      if (pill) pill.style.animationDelay = `${i * 20 + 40}ms`;
       legendBodyEl.appendChild(row);
     }
+
+    // Trigger grow animation (requestAnimationFrame ensures class removal + re-add is noticed)
+    requestAnimationFrame(() => legendBodyEl.classList.add("animating"));
 
     const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
     for (const t of tabs) {
@@ -689,6 +729,25 @@ function main() {
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
       const newTheme = getSavedThemeForCurrentMode();
       applyTheme(newTheme);
+    });
+  }
+
+  // Re-check system theme when app returns to foreground (PWA / tab switch).
+  // The matchMedia 'change' event may not fire while the app is backgrounded,
+  // so the theme can get out of sync until the user interacts.
+  {
+    let _lastKnownSystemDark = isSystemDarkMode();
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      const nowDark = isSystemDarkMode();
+      if (nowDark !== _lastKnownSystemDark) {
+        _lastKnownSystemDark = nowDark;
+        const newTheme = getSavedThemeForCurrentMode();
+        // Only switch if the current theme's dark/light doesn't match system
+        if (isThemeDark(_currentThemeKey) !== nowDark) {
+          applyTheme(newTheme);
+        }
+      }
     });
   }
 
@@ -2234,16 +2293,19 @@ function main() {
       localStorage.setItem("mobileair.playbackSpeed", pbSpeedEl.value);
       const newSpeed = map.getPlaybackSpeed() || 1.0;
 
-      // If in LIVE mode and speed increased, recalculate buffer position.
-      // Larger speed = larger buffer window = playhead must move back.
-      if (map._playbackLiveFollow && newSpeed > prevSpeed) {
+      // If in LIVE mode, recalculate buffer position when speed changes.
+      if (map._playbackLiveFollow) {
         // Speeds >5x don't support Live mode
         if (newSpeed > 5) {
           map._playbackLiveFollow = false;
           try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
           _resetLiveTracking();
         } else {
-          // Snap playhead back to the new (larger) buffer start
+          // Recalculate buffer start for the new speed.
+          // Larger speed = larger buffer window = playhead must move back.
+          // Smaller speed = smaller buffer window = playhead should move forward
+          //   (otherwise it's behind the new buffer start and Live button state
+          //   becomes inconsistent — the user expects to be "caught up").
           const b = map.getPlaybackBounds();
           if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
             const meta = map.lastState?.meta || {};
@@ -2255,12 +2317,15 @@ function main() {
             if (snapMs > 0) {
               const bufferStart = Math.max(b.minMs, b.maxMs - snapMs);
               const curMs = map.getPlaybackTimeMs();
-              // Only snap back if current position is ahead of the new buffer start
-              if (curMs != null && isFinite(curMs) && curMs > bufferStart) {
-                map.setPlaybackTimeMs(bufferStart);
-                // Reset LIVE tracking so buffer accumulation restarts from here
-                _pbLiveStartWallMs = performance.now();
-                _pbLiveStartDataMs = b.maxMs;
+              if (curMs != null && isFinite(curMs)) {
+                // Speed increased: snap back if ahead of new (larger) buffer start
+                // Speed decreased: snap forward if behind new (smaller) buffer start
+                if (curMs > bufferStart || curMs < bufferStart) {
+                  map.setPlaybackTimeMs(bufferStart);
+                  // Reset LIVE tracking so buffer accumulation restarts from here
+                  _pbLiveStartWallMs = performance.now();
+                  _pbLiveStartDataMs = b.maxMs;
+                }
               }
             }
           }
@@ -2270,6 +2335,35 @@ function main() {
       updatePlaybackUi();
     });
   }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // BACKGROUND RESYNC: When app returns to foreground, snap playhead forward.
+  // requestAnimationFrame pauses when backgrounded, so the playhead freezes
+  // while real time keeps flowing.  On reactivation, jump to where we should be.
+  // ─────────────────────────────────────────────────────────────────────────────
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    if (!map._playbackLiveFollow) return; // only applies in LIVE mode
+    const b = map.getPlaybackBounds();
+    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;
+    const speed = map.getPlaybackSpeed() || 1.0;
+    const meta = map.lastState?.meta || {};
+    const predictedIntervalS = Number(meta.polling_predicted_interval_s) || 600;
+    const timeSinceChangeS = Number(meta.polling_time_since_change_s) || 0;
+    const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
+    const remS = Math.max(0, predictedIntervalS - timeSinceChangeS - wallElapsed);
+    const bufferMs = remS * 1000 * speed;
+    if (bufferMs > 0) {
+      const bufferStart = Math.max(b.minMs, b.maxMs - bufferMs);
+      map.setPlaybackTimeMs(bufferStart);
+      // Restart LIVE tracking from current position
+      _pbLiveStartWallMs = performance.now();
+      _pbLiveStartDataMs = b.maxMs;
+      // Reset the frame timer so dt doesn't include backgrounded time
+      _pbLastPerf = 0;
+      updatePlaybackUi();
+    }
+  });
 
   // ─────────────────────────────────────────────────────────────────────────────
   // DAY SELECTOR: Load historical data for past days
@@ -2373,7 +2467,7 @@ function main() {
       const dayEndLocal = new Date(y, mo - 1, d + 1, 4, 0, 0, 0);  // next 4 AM local
       const startMs = dayStartLocal.getTime();
       const endMs = dayEndLocal.getTime();
-      const resp = await fetch(`${appConfig.apiBaseUrl}/history?date=${encodeURIComponent(dateStr)}&start_ms=${startMs}&end_ms=${endMs}`);
+      const resp = await fetch(_tokUrl(`${appConfig.apiBaseUrl}/history?date=${encodeURIComponent(dateStr)}&start_ms=${startMs}&end_ms=${endMs}`));
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const loadedState = await resp.json();
       
@@ -2959,17 +3053,26 @@ function main() {
     });
   }
   
-  // Share button - opens native share dialog
-  if (shareBtn) {
-    shareBtn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      if (!navigator.share) return;
-      shareBtn.classList.add("open");
-      try {
-        await navigator.share({ title: "DustyTrails", url: window.location.href });
-      } catch (_) {}
-      shareBtn.classList.remove("open");
-    });
+  // Share button - opens native share dialog.
+  // Hidden on desktop (browser already has a share/URL bar).
+  // Only shown in standalone PWA mode on mobile/tablet.
+  {
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+      || window.navigator.standalone === true;
+    const isMobileUA = /iPad|iPhone|iPod|Android/i.test(navigator.userAgent)
+      || (navigator.maxTouchPoints > 1);
+    if (shareBtn && navigator.share && isStandalone && isMobileUA) {
+      shareBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        shareBtn.classList.add("open");
+        try {
+          await navigator.share({ title: "DustyTrails", url: window.location.href });
+        } catch (_) {}
+        shareBtn.classList.remove("open");
+      });
+    } else if (shareBtn) {
+      shareBtn.style.display = "none";
+    }
   }
   
   // Display submenu (dim/sat sliders in three-dot menu)
@@ -3108,6 +3211,7 @@ function main() {
         const shift = jogDir * jogSpeed * (dt / 1000);
 
         const gb = map.getPlaybackBounds();
+        const prevCenter = _pbSlidingWindowCenter;
         _pbSlidingWindowCenter = clamp(
           _pbSlidingWindowCenter + shift,
           gb.minMs + _pbPageSizeMs / 2,
@@ -3121,8 +3225,15 @@ function main() {
         const tMs = clamp(pr.minMs + relMs, gb.minMs, gb.maxMs);
         map.setPlaybackTimeMs(tMs);
         _pbLoopStartMs = tMs;
+
+        // Always update timestamp display during jog, even if window is
+        // clamped to the data boundary (so the user sees the time isn't moving).
         updatePlaybackUi();
         map.drawOverlay(map.lastState);
+      } else {
+        // Not in the jog zone — still update the timestamp so it's never stale
+        // after the user drags out of the edge zone.
+        updatePlaybackUi();
       }
 
       _pbJogLastPerf = now;

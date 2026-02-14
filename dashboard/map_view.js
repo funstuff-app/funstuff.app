@@ -481,6 +481,22 @@ class MapView {
     const midX = sumX / touches.length;
     const midY = sumY / touches.length;
 
+    // Dead zone: ignore pinch-zoom attempts where any finger starts in the
+    // bottom 130px of the canvas (playback bar area).  Single-finger pans are
+    // still allowed so the user can swipe-to-jog on the edge of the bar.
+    if (touches.length >= 2) {
+      const canvasH = rect.height;
+      const deadZonePx = 130;
+      for (let i = 0; i < touches.length; i++) {
+        const ty = touches[i].clientY - rect.top;
+        if (ty > canvasH - deadZonePx) {
+          // Finger is in the dead zone — abort pinch-zoom entirely
+          this._touchActive = false;
+          return;
+        }
+      }
+    }
+
     // For pinch: compute initial distance
     let pinchDist = 0;
     if (touches.length >= 2) {

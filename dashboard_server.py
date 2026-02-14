@@ -685,7 +685,11 @@ def _scrub_broken_mobile_sensors(
                 flagged_details.setdefault(sid, []).append(
                     f"{pk}: {fv:.1f} vs median {med:.1f}"
                 )
-            elif med <= 0 and fv >= floor * ratio_thresh:
+            elif med <= 0 and fv >= floor:
+                # When median is 0 (e.g. nighttime ozone), any reading above
+                # the absolute floor is suspicious.  The floor alone (100 ppb
+                # for OZNE) is a generous ceiling; no need to multiply by
+                # ratio_thresh which made the threshold unreachably high.
                 flagged_polls[pk].add(sid)
                 flagged_details.setdefault(sid, []).append(
                     f"{pk}: {fv:.1f} vs median {med:.1f}"
@@ -718,7 +722,7 @@ def _clamp_impossible_values(data: dict[str, Any] | None) -> dict[str, Any] | No
     if not isinstance(data, dict):
         return data
     
-    bounds = {"PM25": (0.0, 999.0), "PM10": (0.0, 2000.0), "OZNE": (0.0, 600.0)}
+    bounds = {"PM25": (0.0, 999.0), "PM10": (0.0, 2000.0), "OZNE": (0.0, 200.0)}
     
     for pollutant, (lo, hi) in bounds.items():
         section = data.get(pollutant)
@@ -1040,8 +1044,10 @@ HISTORY_VARS = ["GLAT", "GLON", "PM25", "PM10", "OZNE"]
 
 # In-memory cache for week-long history files (they change slowly)
 # Key: (sensor, var), Value: (fetch_time, data)
-_history_cache: dict[tuple[str, str], tuple[float, list]] = {}
+_history_cache: dict[tuple[str, str], tuple[float, list, float]] = {}  # (fetch_time, data, ttl_seconds)
+_history_cache_lock = threading.Lock()
 _HISTORY_CACHE_TTL = 3600  # 1 hour
+_HISTORY_404_TTL = 86400   # 24 hours for 404s (not infinite — sensors may appear)
 
 # Track when history server was last known to be down (for fast-fail)
 _history_server_down_until = 0.0
@@ -1070,35 +1076,38 @@ def _is_history_server_reachable() -> bool:
 
 
 def _fetch_history_file(sensor: str, var: str) -> list:
-    """Fetch a single history file with caching."""
+    """Fetch a single history file with caching (thread-safe)."""
     cache_key = (sensor, var)
     now = time.time()
-    
-    # Check cache
-    if cache_key in _history_cache:
-        fetch_time, data = _history_cache[cache_key]
-        if now - fetch_time < _HISTORY_CACHE_TTL:
-            return data
-    
-    # Fetch from server
+
+    # Check cache (under lock for thread safety)
+    with _history_cache_lock:
+        if cache_key in _history_cache:
+            fetch_time, data, ttl = _history_cache[cache_key]
+            if now - fetch_time < ttl:
+                return data
+
+    # Fetch from server (outside lock to avoid blocking other threads)
     url = f"{HISTORY_BASE_URL}/{sensor}_{var}_TS_10080.json"
     try:
         resp = stdlib_get(url, timeout=3, headers=HEADERS)
         resp.raise_for_status()
         data = resp.json().get("TimeDataUTC", [])
-        _history_cache[cache_key] = (now, data)
+        with _history_cache_lock:
+            _history_cache[cache_key] = (now, data, _HISTORY_CACHE_TTL)
         return data
     except Exception as e:
-        # Cache 404s permanently — the sensor/variable combo doesn't exist
-        # upstream and won't start existing.
         is_404 = "404" in str(e)
         if is_404:
-            _history_cache[cache_key] = (float('inf'), [])
+            # Cache 404s for 24 hours (sensors may appear later)
+            with _history_cache_lock:
+                _history_cache[cache_key] = (now, [], _HISTORY_404_TTL)
             return []
         _log(f"[History] Failed to fetch {sensor}/{var}: {e}")
         # On transient error, return stale cache if available, else empty
-        if cache_key in _history_cache:
-            return _history_cache[cache_key][1]
+        with _history_cache_lock:
+            if cache_key in _history_cache:
+                return _history_cache[cache_key][1]
         return []
 
 
@@ -1144,27 +1153,42 @@ def _save_cached_historical_day(data_dir: Path, date_str: str, result: dict[str,
 def _apply_fixed_sensors_to_history(result: dict[str, Any], date_str: str,
                                      app_state: AppState | None, data_dir: Path) -> None:
     """Add Home + DEQ + PurpleAir fixed sensors to a historical day result.
-    
+
     Called both for freshly-fetched days and for disk-cached days.
     Reconstructs fixed sensors from fixed_history (which accumulates over time)
     and saved snapshots, so cached mobile-only results still get fixed sensors.
     """
     if "fixed" not in result:
         result["fixed"] = []
-    
+
+    # Compute time range for the day: 4 AM local (MST = UTC-7) → next 4 AM.
+    # Using a time range instead of UTC date prefix avoids cutting off data after
+    # midnight UTC (5 PM MST) when UTC date rolls over.
+    try:
+        _day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        _day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    _day_start_utc = _day + timedelta(hours=11)   # 4 AM MST = 11:00 UTC
+    _day_end_utc = _day_start_utc + timedelta(days=1)
+    _day_start_iso = _day_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    _day_end_iso = _day_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _entry_in_day(e: dict) -> bool:
+        t = e.get("time")
+        if not t:
+            return False
+        return _day_start_iso <= t < _day_end_iso
+
     # Remove any stale fixed entries so we rebuild fresh
     existing_fixed_ids = {f.get("id") for f in result["fixed"] if not f.get("purpleair") and f.get("id") != "Home"}
     result["fixed"] = [f for f in result["fixed"] if f.get("id") not in {"Home"} and not f.get("purpleair")]
-    
+
     # ── Home sensor ──
     home_entry = None
     if app_state:
         home_hist = app_state.fixed_history.get("Home", {}).get("PM25", [])
         if home_hist:
-            filtered_hist = [
-                e for e in home_hist
-                if e.get("time") and e["time"].startswith(date_str)
-            ]
+            filtered_hist = [e for e in home_hist if _entry_in_day(e)]
             if filtered_hist:
                 history_values = []
                 history_colors = []
@@ -1213,7 +1237,7 @@ def _apply_fixed_sensors_to_history(result: dict[str, Any], date_str: str,
             pm25_hist = pollutants.get("PM25", [])
             if not pm25_hist:
                 continue
-            day_entries = [e for e in pm25_hist if e.get("time") and e["time"].startswith(date_str)]
+            day_entries = [e for e in pm25_hist if _entry_in_day(e)]
             if not day_entries:
                 continue
             last = day_entries[-1]
@@ -1312,7 +1336,7 @@ def _apply_fixed_sensors_to_history(result: dict[str, Any], date_str: str,
             for pollutant, hist_entries in pollutants.items():
                 if not hist_entries:
                     continue
-                day_entries = [e for e in hist_entries if e.get("time") and e["time"].startswith(date_str)]
+                day_entries = [e for e in hist_entries if _entry_in_day(e)]
                 if not day_entries:
                     continue
                 history_values = []
@@ -1407,7 +1431,9 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
     
     # For past days (not today), check disk cache first.
     # Past days are immutable once complete — no need to re-fetch.
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Use MST (UTC-7) for "today" to match the 4 AM local day boundaries.
+    _mst_tz = timezone(timedelta(hours=-7))
+    today_str = datetime.now(timezone.utc).astimezone(_mst_tz).strftime("%Y-%m-%d")
     is_past_day = (date_str < today_str)
     
     if is_past_day:
@@ -1549,15 +1575,17 @@ def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_
         }
         
         # OZNE - filter out negative values and statistical outliers (sensor glitches)
-        # Use IQR-based outlier detection: values beyond Q3 + 10*IQR are sensor errors
-        ozne_valid = [val for ts, val in ozne_pts if val is not None and val >= 0]
-        ozne_upper = float('inf')
+        # Use IQR-based outlier detection: values beyond Q3 + 10*IQR are sensor errors.
+        # Hard ceiling of 200 ppb (highest O3 ever recorded in SLC is ~115 ppb).
+        OZNE_HARD_CEILING = 200.0
+        ozne_valid = [val for ts, val in ozne_pts if val is not None and 0 <= val <= OZNE_HARD_CEILING]
+        ozne_upper = OZNE_HARD_CEILING
         if len(ozne_valid) >= 10:
             sorted_vals = sorted(ozne_valid)
             q1 = sorted_vals[len(sorted_vals) // 4]
             q3 = sorted_vals[(3 * len(sorted_vals)) // 4]
             iqr = q3 - q1
-            ozne_upper = q3 + 10 * max(iqr, 20)  # At least 20 ppb margin
+            ozne_upper = min(OZNE_HARD_CEILING, q3 + 10 * max(iqr, 20))
         ozne_by_ts = {ts: val for ts, val in ozne_pts if val is None or (0 <= val <= ozne_upper)}
         ozne_vals = []
         last_ozne = None
@@ -2188,7 +2216,11 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
 # PurpleAir Integration
 # ─────────────────────────────────────────────────────────────────────────────
 
-PURPLEAIR_API_KEY = "C2922794-0519-11F1-B596-4201AC1DC123"
+PURPLEAIR_API_KEY = os.environ.get("DUSTY_PURPLEAIR_API_KEY", "C2922794-0519-11F1-B596-4201AC1DC123")
+
+# Owner token: when set, the Home sensor is only included in /api/state
+# responses that carry a matching ?tok= query parameter.
+OWNER_TOKEN = os.environ.get("DUSTY_OWNER_TOKEN", "").strip()
 PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
 
 
@@ -2327,6 +2359,32 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
             "primary_aqi": None,
         })
 
+    # ── Spatial thinning: keep one PurpleAir sensor per ~500 m grid cell ──
+    # This prevents the map from being overwhelmed by dense clusters while
+    # keeping the highest-reading sensor (most informative) in each cell.
+    GRID_DEG = 0.005  # ~500 m at SLC latitude
+    pa_cells: dict[tuple[int, int], int] = {}  # (grid_x, grid_y) → index into fixed_list
+    drop_indices: set[int] = set()
+    for i, f in enumerate(fixed_list):
+        if not f.get("purpleair"):
+            continue
+        gx = int(f["lon"] / GRID_DEG)
+        gy = int(f["lat"] / GRID_DEG)
+        key = (gx, gy)
+        if key in pa_cells:
+            prev_i = pa_cells[key]
+            prev_val = fixed_list[prev_i].get("primary_value", 0) or 0
+            cur_val = f.get("primary_value", 0) or 0
+            if cur_val > prev_val:
+                drop_indices.add(prev_i)
+                pa_cells[key] = i
+            else:
+                drop_indices.add(i)
+        else:
+            pa_cells[key] = i
+    if drop_indices:
+        fixed_list = [f for i, f in enumerate(fixed_list) if i not in drop_indices]
+
     st["fixed"] = fixed_list
 
 
@@ -2334,7 +2392,6 @@ def purpleair_fetch_loop(
     *,
     app_state: AppState,
     data_dir: Path,
-    interval_s: float = 600.0,  # 10 minutes
     stop_event: threading.Event,
 ) -> None:
     """Background loop to fetch PurpleAir sensor data.
@@ -2349,18 +2406,28 @@ def purpleair_fetch_loop(
     """
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
-    META_INTERVAL = 21600.0  # 6 hour
-    DATA_INTERVAL = 600.0   # 10 minutes
+    META_INTERVAL = 21600.0  # 6 hours
+    DATA_INTERVAL_DAY   = 120.0   # 2 minutes during daytime
+    DATA_INTERVAL_NIGHT = 900.0   # 15 minutes during nighttime (1 AM – 6 AM MST)
 
     debug_log_path = data_dir / "purpleair_debug.json"
     _log(f"[PurpleAir] Debug file path: {debug_log_path}")
+
+    def _current_data_interval() -> float:
+        """Return the poll interval based on MST hour (nighttime = reduced polling)."""
+        utc_now = datetime.now(timezone.utc)
+        mst_hour = (utc_now.hour - 7) % 24  # MST = UTC-7
+        if 1 <= mst_hour < 6:
+            return DATA_INTERVAL_NIGHT
+        return DATA_INTERVAL_DAY
 
     # Write initial debug file immediately
     try:
         initial_debug = {
             "status": "initialized",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "interval_seconds": DATA_INTERVAL,
+            "interval_day_seconds": DATA_INTERVAL_DAY,
+            "interval_night_seconds": DATA_INTERVAL_NIGHT,
             "meta_interval_seconds": META_INTERVAL,
             "note": "Waiting 20s for main fetch loop, then starting first poll"
         }
@@ -2540,7 +2607,7 @@ def purpleair_fetch_loop(
             _log(f"[PurpleAir] Debug log write error: {e}")
             _log(f"[PurpleAir] Attempted path: {debug_log_path}")
 
-        stop_event.wait(DATA_INTERVAL)
+        stop_event.wait(_current_data_interval())
 
 
 def _get_mobile_time_range(mobile_list: list[dict[str, Any]]) -> tuple[datetime, datetime] | None:
@@ -3602,6 +3669,19 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 # Short edge cache - data must stay fresh
                 with app_state.lock:
                     _ensure_force_refresh_seq_cached(app_state)
+                    # If an owner token is configured, strip the Home sensor
+                    # from responses that don't carry the matching ?tok= param.
+                    if OWNER_TOKEN:
+                        from urllib.parse import urlparse, parse_qs
+                        qs = parse_qs(urlparse(self.path).query)
+                        tok = (qs.get("tok") or [""])[0]
+                        if tok != OWNER_TOKEN:
+                            # Build a one-off JSON without the Home sensor
+                            st_copy = json.loads(app_state.cached_json_bytes)
+                            if isinstance(st_copy.get("fixed"), list):
+                                st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
+                            return self._send(200, json.dumps(st_copy).encode("utf-8"),
+                                              "application/json", cache_control="private, max-age=15")
                     return self._send(200, app_state.cached_json_bytes, "application/json", cache_control="public, max-age=15, s-maxage=30")
             if self.path.startswith("/api/fixed"):
                 # Return just the fixed sensor array (lightweight for TUI remote mode)
@@ -3731,6 +3811,11 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             
             try:
                 result = fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir, start_ms=client_start_ms, end_ms=client_end_ms)
+                # Strip Home sensor for non-owner requests
+                if OWNER_TOKEN:
+                    tok = (query.get("tok") or [""])[0]
+                    if tok != OWNER_TOKEN and isinstance(result.get("fixed"), list):
+                        result["fixed"] = [f for f in result["fixed"] if f.get("id") != "Home"]
                 body = json.dumps(result).encode("utf-8")
                 return self._send(200, body, "application/json")
             except Exception as e:
@@ -4033,13 +4118,45 @@ def main() -> int:
     else:
         _log("[AirNow] Integration not available (airnow_slc.py not found)")
 
-    # Start PurpleAir fetch loop (10-minute interval)
+    # Eager initial PurpleAir fetch so first /api/state includes PA sensors.
+    # Without this, clients connecting right after restart see no PurpleAir
+    # sensors until the background thread runs (20s+ delay), and some clients
+    # don't pick up the newly-appeared sensors without a full reload.
+    try:
+        _log("[PurpleAir] Performing initial fetch...")
+        meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude")
+        if meta_sensors:
+            with app_state.lock:
+                for s in meta_sensors:
+                    if s.get("sensor_index"):
+                        app_state.purpleair_sensors.append(s)
+                app_state.purpleair_meta_last_fetch = time.time()
+            _log(f"[PurpleAir] Metadata loaded ({len(meta_sensors)} sensors)")
+        data_sensors = _fetch_purpleair_sensors(fields="pm2.5")
+        if data_sensors:
+            data_by_id = {s["sensor_index"]: s for s in data_sensors if s.get("sensor_index")}
+            with app_state.lock:
+                for s in app_state.purpleair_sensors:
+                    sid = s.get("sensor_index")
+                    if sid and sid in data_by_id:
+                        s["pm2.5"] = data_by_id[sid].get("pm2.5")
+                app_state.purpleair_last_fetch = time.time()
+                # Re-bake state with PurpleAir included
+                if isinstance(app_state.state, dict):
+                    _merge_purpleair_into_fixed(app_state.state, app_state)
+                    _inject_fixed_history(app_state, app_state.state)
+                    app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
+            _log(f"[PurpleAir] Initial data loaded ({len(data_sensors)} sensors)")
+    except Exception as e:
+        _log(f"[PurpleAir] Initial fetch error (will retry in background): {e}")
+
+    # Start PurpleAir fetch loop (2-min daytime / 15-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
-        kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=600.0, stop_event=stop_event),
+        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
         daemon=True
     ).start()
-    _log("[PurpleAir] SLC sensor integration enabled (10-min refresh, batched requests)")
+    _log("[PurpleAir] SLC sensor integration enabled (2-min daytime / 15-min nighttime, batched requests)")
 
     _log("[HistoryPrefetch] Enabled (runs inside fetch_loop)")
 
@@ -4149,10 +4266,10 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             daemon=True
         ).start()
 
-    # PurpleAir fetch loop with batched requests (10-minute interval)
+    # PurpleAir fetch loop with batched requests (2-min daytime / 15-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
-        kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=600.0, stop_event=stop_event),
+        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
         daemon=True
     ).start()
 
