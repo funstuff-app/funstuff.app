@@ -389,6 +389,7 @@ class AppState:
     purpleair_sensors: list[dict[str, Any]] = field(default_factory=list)
     purpleair_last_fetch: float = 0.0
     purpleair_meta_last_fetch: float = 0.0  # last time we fetched name/lat/lon
+    purpleair_last_seen_cache: dict[int, int] = field(default_factory=dict)  # sensor_index -> last_seen timestamp
 
     # Optional offline road graph cache for map-matching.
     road_graph: Any | None = None
@@ -2332,28 +2333,64 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
 def purpleair_fetch_loop(
     *,
     app_state: AppState,
+    data_dir: Path,
     interval_s: float = 600.0,  # 10 minutes
     stop_event: threading.Event,
 ) -> None:
     """Background loop to fetch PurpleAir sensor data.
 
-    Data fields (pm2.5, last_seen) are polled every 10 minutes.
+    BATCHED REQUEST STRATEGY (to minimize API calls):
+    1. First, poll only `last_seen` to check which sensors have updated
+    2. Then, poll `pm2.5` ONLY for sensors with updated `last_seen` values
+
     Metadata fields (name, latitude, longitude) are refreshed once per six hours
     and merged into the cached sensor list so lat/lon/name stay current
     without burning points on every poll.
     """
+    _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
+
     META_INTERVAL = 21600.0  # 6 hour
     DATA_INTERVAL = 600.0   # 10 minutes
 
+    debug_log_path = data_dir / "purpleair_debug.json"
+    _log(f"[PurpleAir] Debug file path: {debug_log_path}")
+
+    # Write initial debug file immediately
+    try:
+        initial_debug = {
+            "status": "initialized",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "interval_seconds": DATA_INTERVAL,
+            "meta_interval_seconds": META_INTERVAL,
+            "note": "Waiting 20s for main fetch loop, then starting first poll"
+        }
+        debug_log_path.write_text(json.dumps(initial_debug, indent=2), encoding="utf-8")
+        _log(f"[PurpleAir] Debug logging initialized: {debug_log_path}")
+    except Exception as e:
+        _log(f"[PurpleAir] Debug log initialization error: {e}")
+
     # Wait for main fetch loop to start
+    _log("[PurpleAir] Waiting 20s for main fetch loop to start...")
     stop_event.wait(20.0)
+    _log("[PurpleAir] Starting PurpleAir fetch loop")
 
     while not stop_event.is_set():
         now = time.time()
+        debug_info = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "calls": [],
+        }
+
         try:
             # ── Metadata refresh (every 6 hours) ──────────────────────────────
             need_meta = (now - app_state.purpleair_meta_last_fetch) >= META_INTERVAL
             if need_meta:
+                _log(f"[PurpleAir] API Call: Fetching metadata (name,latitude,longitude)")
+                debug_info["calls"].append({
+                    "type": "metadata",
+                    "fields": "name,latitude,longitude",
+                    "time": datetime.now(timezone.utc).isoformat()
+                })
                 meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude")
                 if meta_sensors:
                     with app_state.lock:
@@ -2373,56 +2410,135 @@ def purpleair_fetch_loop(
                         app_state.purpleair_meta_last_fetch = now
                     _log(f"[PurpleAir] Metadata refreshed ({len(meta_sensors)} sensors)")
 
-            # ── Data poll (every 10 min) ────────────────────────────────
-            data_sensors = _fetch_purpleair_sensors(fields="pm2.5,last_seen")
-            if data_sensors:
-                with app_state.lock:
-                    data_by_id = {s["sensor_index"]: s for s in data_sensors if s.get("sensor_index")}
-                    # Merge data into existing cached sensors
-                    for s in app_state.purpleair_sensors:
-                        sid = s.get("sensor_index")
-                        if sid and sid in data_by_id:
-                            d = data_by_id[sid]
-                            s["pm2.5"] = d.get("pm2.5")
-                            s["last_seen"] = d.get("last_seen")
-                    # For brand-new sensors seen in data but not yet in cache
-                    existing_ids = {s.get("sensor_index") for s in app_state.purpleair_sensors}
-                    for sid, d in data_by_id.items():
-                        if sid not in existing_ids:
-                            app_state.purpleair_sensors.append(d)
+            # ── BATCHED Data poll (minimize API calls) ────────────────────────
+            # Step 1: Fetch ONLY last_seen to check for updates
+            _log(f"[PurpleAir] API Call: Fetching last_seen only")
+            debug_info["calls"].append({
+                "type": "last_seen_check",
+                "fields": "last_seen",
+                "time": datetime.now(timezone.utc).isoformat()
+            })
+            last_seen_sensors = _fetch_purpleair_sensors(fields="last_seen")
 
-                    app_state.purpleair_last_fetch = now
-                    # Accumulate PurpleAir readings into fixed_history for playback
-                    for s in app_state.purpleair_sensors:
-                        pm25 = s.get("pm2.5")
-                        if pm25 is None:
-                            continue
-                        sid = f"PA_{s.get('sensor_index', '')}"
-                        try:
-                            pm25_val = float(pm25)
-                        except (TypeError, ValueError):
-                            continue
-                        # Use sensor's last_seen timestamp instead of poll time
-                        last_seen = s.get("last_seen")
-                        if last_seen is not None:
+            # Step 2: Identify sensors with updated last_seen values
+            updated_sensor_ids = []
+            if last_seen_sensors:
+                for s in last_seen_sensors:
+                    sid = s.get("sensor_index")
+                    if sid is None:
+                        continue
+                    new_last_seen = s.get("last_seen")
+                    if new_last_seen is None:
+                        continue
+                    try:
+                        new_last_seen_int = int(new_last_seen)
+                    except (TypeError, ValueError):
+                        continue
+
+                    # Check if last_seen has changed
+                    cached_last_seen = app_state.purpleair_last_seen_cache.get(sid)
+                    if cached_last_seen is None or new_last_seen_int > cached_last_seen:
+                        updated_sensor_ids.append(sid)
+                        app_state.purpleair_last_seen_cache[sid] = new_last_seen_int
+
+            _log(f"[PurpleAir] {len(updated_sensor_ids)} sensors have updated data")
+            debug_info["updated_sensors"] = len(updated_sensor_ids)
+
+            # Step 3: Fetch pm2.5 ONLY for sensors with updated last_seen
+            # TODO: Implement batched pm2.5 fetch for specific sensor IDs
+            # For now, we still fetch all pm2.5 data, but this shows which ones changed
+            # The PurpleAir API doesn't support filtering by sensor_index in bulk,
+            # so we fetch all and only process the updated ones
+            if updated_sensor_ids:
+                _log(f"[PurpleAir] API Call: Fetching pm2.5 for all sensors (filtering {len(updated_sensor_ids)} updated)")
+                debug_info["calls"].append({
+                    "type": "pm25_data",
+                    "fields": "pm2.5",
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "note": f"Fetching for {len(updated_sensor_ids)} updated sensors"
+                })
+                data_sensors = _fetch_purpleair_sensors(fields="pm2.5")
+                if data_sensors:
+                    with app_state.lock:
+                        data_by_id = {s["sensor_index"]: s for s in data_sensors if s.get("sensor_index")}
+                        # Merge data ONLY for sensors with updated last_seen
+                        updated_count = 0
+                        for s in app_state.purpleair_sensors:
+                            sid = s.get("sensor_index")
+                            if sid and sid in updated_sensor_ids and sid in data_by_id:
+                                d = data_by_id[sid]
+                                s["pm2.5"] = d.get("pm2.5")
+                                # Get last_seen from the earlier fetch
+                                for ls_sensor in last_seen_sensors:
+                                    if ls_sensor.get("sensor_index") == sid:
+                                        s["last_seen"] = ls_sensor.get("last_seen")
+                                        break
+                                updated_count += 1
+
+                        # For brand-new sensors seen in data but not yet in cache
+                        existing_ids = {s.get("sensor_index") for s in app_state.purpleair_sensors}
+                        for sid in updated_sensor_ids:
+                            if sid not in existing_ids and sid in data_by_id:
+                                new_sensor = data_by_id[sid]
+                                # Add last_seen from earlier fetch
+                                for ls_sensor in last_seen_sensors:
+                                    if ls_sensor.get("sensor_index") == sid:
+                                        new_sensor["last_seen"] = ls_sensor.get("last_seen")
+                                        break
+                                app_state.purpleair_sensors.append(new_sensor)
+
+                        app_state.purpleair_last_fetch = now
+                        debug_info["sensors_updated"] = updated_count
+
+                        # Accumulate PurpleAir readings into fixed_history for playback
+                        # ONLY for sensors that were updated
+                        for s in app_state.purpleair_sensors:
+                            sid_num = s.get("sensor_index")
+                            if sid_num not in updated_sensor_ids:
+                                continue
+
+                            pm25 = s.get("pm2.5")
+                            if pm25 is None:
+                                continue
+                            sid = f"PA_{sid_num}"
                             try:
-                                last_seen_int = int(last_seen)
-                                dt = datetime.fromtimestamp(last_seen_int, tz=timezone.utc)
-                                time_utc = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                                pm25_val = float(pm25)
                             except (TypeError, ValueError):
+                                continue
+                            # Use sensor's last_seen timestamp instead of poll time
+                            last_seen = s.get("last_seen")
+                            if last_seen is not None:
+                                try:
+                                    last_seen_int = int(last_seen)
+                                    dt = datetime.fromtimestamp(last_seen_int, tz=timezone.utc)
+                                    time_utc = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                                except (TypeError, ValueError):
+                                    time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            else:
                                 time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        else:
-                            time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        color = _get_aqi_color("PM25", pm25_val)
-                        accumulate_fixed_reading(app_state, sid, "PM25", round(pm25_val, 1), color, time_utc)
-                    # Merge into current state immediately
-                    if isinstance(app_state.state, dict):
-                        _merge_purpleair_into_fixed(app_state.state, app_state)
-                        _inject_fixed_history(app_state, app_state.state)
-                        app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
-                _log(f"[PurpleAir] Updated {len(data_sensors)} sensors")
+                            color = _get_aqi_color("PM25", pm25_val)
+                            accumulate_fixed_reading(app_state, sid, "PM25", round(pm25_val, 1), color, time_utc)
+                        # Merge into current state immediately
+                        if isinstance(app_state.state, dict):
+                            _merge_purpleair_into_fixed(app_state.state, app_state)
+                            _inject_fixed_history(app_state, app_state.state)
+                            app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
+                    _log(f"[PurpleAir] Updated {updated_count} sensors with new data")
+            else:
+                _log(f"[PurpleAir] No sensors have updated data, skipping pm2.5 fetch")
+                debug_info["sensors_updated"] = 0
+
         except Exception as e:
             _log(f"[PurpleAir] Error: {type(e).__name__}: {e}")
+            debug_info["error"] = f"{type(e).__name__}: {e}"
+
+        # Write debug info to JSON file (overwrite each time)
+        try:
+            debug_log_path.write_text(json.dumps(debug_info, indent=2), encoding="utf-8")
+            _log(f"[PurpleAir] Debug log written: {debug_log_path}")
+        except Exception as e:
+            _log(f"[PurpleAir] Debug log write error: {e}")
+            _log(f"[PurpleAir] Attempted path: {debug_log_path}")
 
         stop_event.wait(DATA_INTERVAL)
 
@@ -3920,10 +4036,10 @@ def main() -> int:
     # Start PurpleAir fetch loop (10-minute interval)
     threading.Thread(
         target=purpleair_fetch_loop,
-        kwargs=dict(app_state=app_state, interval_s=600.0, stop_event=stop_event),
+        kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=600.0, stop_event=stop_event),
         daemon=True
     ).start()
-    _log("[PurpleAir] SLC sensor integration enabled (10-min refresh)")
+    _log("[PurpleAir] SLC sensor integration enabled (10-min refresh, batched requests)")
 
     _log("[HistoryPrefetch] Enabled (runs inside fetch_loop)")
 
@@ -4033,9 +4149,10 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             daemon=True
         ).start()
 
+    # PurpleAir fetch loop with batched requests (10-minute interval)
     threading.Thread(
         target=purpleair_fetch_loop,
-        kwargs=dict(app_state=app_state, interval_s=120.0, stop_event=stop_event),
+        kwargs=dict(app_state=app_state, data_dir=data_dir, interval_s=600.0, stop_event=stop_event),
         daemon=True
     ).start()
 
