@@ -326,6 +326,8 @@ aside, section { min-height: 0; }
   -webkit-backdrop-filter: blur(10px);
   max-width: min(860px, calc(100% - 28px));
   width: 680px;
+  /* Prevent touch drags on the bar from scrolling the page */
+  touch-action: none;
 }
 
 .pbRow1 {
@@ -423,6 +425,7 @@ button#pbPlay.isLive {
   flex: 1;
   min-width: 140px;
   accent-color: var(--accent);
+  touch-action: none;
 }
 
 
@@ -512,19 +515,20 @@ button#pbPlay.isLive {
 }
 
 .pbMenuBtn {
-  width: 32px;
   height: 30px;
+  padding: 0 10px;
   border-radius: 10px;
   border: 1px solid var(--border);
   background: rgba(17,24,38,0.80);
   color: rgba(232,238,247,0.92);
   cursor: pointer;
-  font-size: 18px;
-  font-weight: 600;
-  letter-spacing: 1px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.5px;
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 4px;
   transition: all 0.12s ease;
 }
 .pbMenuBtn:hover {
@@ -556,6 +560,8 @@ button#pbPlay.isLive {
   transform: translateY(4px);
   pointer-events: none;
   transition: opacity 0.12s ease, transform 0.12s ease;
+  touch-action: none;
+  overscroll-behavior: none;
 }
 .pbMenu.visible {
   opacity: 1;
@@ -651,6 +657,8 @@ button#pbPlay.isLive {
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.1s, visibility 0s 0.15s;
+  touch-action: none;
+  overscroll-behavior: none;
 }
 .pbSubmenu.visible {
   visibility: visible;
@@ -719,6 +727,7 @@ button#pbPlay.isLive {
   flex: 1;
   width: 120px;
   accent-color: var(--accent);
+  touch-action: none;
 }
 
 /* Snapshot load modal */

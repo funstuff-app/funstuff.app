@@ -570,7 +570,12 @@ function main() {
 
   function applyThemeAndFilters(themeKey, dimVal0to100, satVal0to150) {
     const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
-    map.setTheme(themeKey);
+    // Only call setTheme when the theme actually changes — it clears the tile
+    // cache and forces a full reload, which causes visible flashing when just
+    // adjusting dim/sat sliders.
+    if (map.themeKey !== themeKey) {
+      map.setTheme(themeKey);
+    }
 
     const dim01 = (dimVal0to100 / 100);
     const brightness = dimToBrightness(dim01);
@@ -1338,6 +1343,12 @@ function main() {
   let _pbPageIndex = -1;                  // -1 = "all" (no paging), 0..N = page index
   let _pbPageAutoFollow = true;           // auto-advance page to follow playhead
 
+  // Sliding window: when set, overrides index-based paging for click-drag scrubbing.
+  // The window is centered on this timestamp instead of a fixed page boundary.
+  let _pbSlidingWindowCenter = null;      // null = use index-based paging
+  let _pbJogRAF = null;                   // rAF ID for edge-jog during drag
+  let _pbJogLastPerf = 0;                 // last rAF timestamp for jog dt
+
   /** Compute total page count for current bounds.
    *  Uses floor so the last page absorbs any remainder < pageSize,
    *  keeping scrub resolution reasonable instead of creating a tiny final page. */
@@ -1347,11 +1358,25 @@ function main() {
     return Math.max(1, Math.floor((b.maxMs - b.minMs) / _pbPageSizeMs));
   }
 
-  /** Get the time range for the current page (or full range if paging disabled). */
+  /** Get the time range for the current page (or full range if paging disabled).
+   *  When _pbSlidingWindowCenter is set, the window is centered on that point
+   *  instead of using index-based page boundaries. */
   function _pbGetPageRange() {
     const b = map.getPlaybackBounds();
     if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return b;
     if (_pbPageIndex < 0) return b; // "all" mode
+
+    // Sliding window mode: center window on _pbSlidingWindowCenter
+    if (_pbSlidingWindowCenter != null) {
+      const half = _pbPageSizeMs / 2;
+      let wMin = _pbSlidingWindowCenter - half;
+      let wMax = _pbSlidingWindowCenter + half;
+      // Clamp to global bounds, preserving window size when possible
+      if (wMin < b.minMs) { wMin = b.minMs; wMax = Math.min(b.maxMs, wMin + _pbPageSizeMs); }
+      if (wMax > b.maxMs) { wMax = b.maxMs; wMin = Math.max(b.minMs, wMax - _pbPageSizeMs); }
+      return { minMs: wMin, maxMs: wMax };
+    }
+
     const total = _pbPageCount();
     const idx = clamp(_pbPageIndex, 0, total - 1);
     const pageStart = b.minMs + idx * _pbPageSizeMs;
@@ -1365,6 +1390,7 @@ function main() {
     const total = _pbPageCount();
     if (total <= 0) { _pbPageIndex = -1; return; }
     _pbPageIndex = clamp(idx, 0, total - 1);
+    _pbSlidingWindowCenter = null; // exit sliding window, use index-based page
     _pbPageAutoFollow = false; // user explicitly chose a page
     updatePlaybackUi();
   }
@@ -1377,6 +1403,12 @@ function main() {
     if (total <= 0) return;
     const idx = Math.floor((tMs - b.minMs) / _pbPageSizeMs);
     _pbPageIndex = clamp(idx, 0, total - 1);
+  }
+
+  /** After user stops jogging (drag release or wheel coast end), snap the window
+   *  so the playhead lands at 15% or 85% — just outside the 10% jog zone. */
+  function _pbSnapWindowToPlayhead() {
+    return; // disabled — the auto-follow logic handles this
   }
 
   /** Check if paging should be active based on data duration. */
@@ -1404,15 +1436,24 @@ function main() {
       _pbPageAutoFollow = true; // started automatically, follow playhead
     } else if (!paging) {
       _pbPageIndex = -1; // disable paging when duration shrinks
+      _pbSlidingWindowCenter = null;
     }
 
-    // Auto-advance page to follow playhead during normal playback
-    if (paging && _pbPageAutoFollow && tMs != null && isFinite(tMs) && !_pbScrubbing) {
+    // Auto-advance page to follow playhead during normal playback (not scrubbing/coasting)
+    if (paging && _pbPageAutoFollow && tMs != null && isFinite(tMs) && !_pbScrubbing && !_pbIsWheelCoasting) {
       const pr = _pbGetPageRange();
       if (tMs >= pr.maxMs || tMs < pr.minMs) {
-        _pbPageForTime(tMs);
-        _pbPageAutoFollow = true; // keep following
+        if (_pbSlidingWindowCenter != null) {
+          // Shift window just enough so playhead is inside, giving room in the direction of travel
+          const frac = (tMs >= pr.maxMs) ? 0.85 : 0.15;
+          _pbSlidingWindowCenter = tMs - frac * _pbPageSizeMs + _pbPageSizeMs / 2;
+          const half = _pbPageSizeMs / 2;
+          _pbSlidingWindowCenter = clamp(_pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
+        } else {
+          _pbPageForTime(tMs);
+        }
       }
+      _pbPageAutoFollow = true; // keep following
     }
 
     // Use page range for slider when paging is active
@@ -1469,11 +1510,11 @@ function main() {
     const followingLive = map._playbackLiveFollow;
 
     if (pbPlayEl) {
-      if (followingLive) {
+      if (followingLive && !map._historicalMode) {
         // LIVE mode enabled: show Live button highlighted
         pbPlayEl.textContent = "Live";
         pbPlayEl.classList.add("isLive");
-      } else if (inLiveWindow) {
+      } else if (inLiveWindow && !map._historicalMode) {
         // In live buffer window but LIVE not enabled: show Live button (not highlighted)
         pbPlayEl.textContent = "Live";
         pbPlayEl.classList.remove("isLive");
@@ -1842,6 +1883,7 @@ function main() {
         if (_pbVelocity > 0 && _pbVelocity <= playbackSpeed) {
           // Forward coasting reached playback speed - resume
           _pbIsWheelCoasting = false;
+          _pbSnapWindowToPlayhead();
           if (_pbCommitLoopStartOnCoastEnd) {
             _pbLoopStartMs = tMs;
             _pbCommitLoopStartOnCoastEnd = false;
@@ -1852,6 +1894,7 @@ function main() {
         } else if (_pbVelocity < 0 && Math.abs(_pbVelocity) < _pbVelocityThreshold) {
           // Backward coasting stopped - resume forward playback
           _pbIsWheelCoasting = false;
+          _pbSnapWindowToPlayhead();
           if (_pbCommitLoopStartOnCoastEnd) {
             _pbLoopStartMs = tMs;
             _pbCommitLoopStartOnCoastEnd = false;
@@ -1866,8 +1909,12 @@ function main() {
       // Rewind easing is handled inside the _pbIsRewinding block above
       
       // Snap to zero if very slow
-      if (Math.abs(_pbVelocity) < _pbVelocityThreshold) {
+      if (Math.abs(_pbVelocity) < _pbVelocityThreshold && _pbVelocity !== 0) {
         _pbVelocity = 0;
+        // Final UI update so time labels reflect where the playhead landed
+        if (!map.getPlaybackPlaying()) {
+          updatePlaybackUi();
+        }
       }
       
       // Move playhead
@@ -1893,6 +1940,7 @@ function main() {
           map.setPlaybackTimeMs(nextMs);
           tMs = nextMs;
           didAdvanceTime = true;
+
           // Force slider to update immediately during coasting
           if (!map.getPlaybackPlaying()) {
             updatePlaybackUi();
@@ -2044,6 +2092,7 @@ function main() {
   } else {
     // DVR toggle hidden - default to playback mode always ON
     map.setPlaybackMode(true);
+    map._playbackLiveFollow = true;
     if (pbBarEl) pbBarEl.classList.remove("hidden");
     map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
     map.setPlaybackPlaying(false);
@@ -2105,8 +2154,8 @@ function main() {
         return;
       }
 
-      // If in live window (1x/5x), enable LIVE mode
-      if (inLiveWindow && _spd <= 5 && !map._playbackLiveFollow) {
+      // If in live window (1x/5x), enable LIVE mode (not available for historical replays)
+      if (inLiveWindow && _spd <= 5 && !map._playbackLiveFollow && !map._historicalMode) {
         map._playbackLiveFollow = true;
         _pbPageAutoFollow = true; // resume page tracking in LIVE mode
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
@@ -2362,7 +2411,8 @@ function main() {
       map._playbackNowMs = null;  // Reset playback time
       _pbPageIndex = -1;  // Reset paging for new data
       _pbPageAutoFollow = true;
-      
+      _pbSlidingWindowCenter = null;
+
       // Enable DVR/playback mode for historical data
       // NOTE: setPlaybackMode(true) sets _playbackLiveFollow=true and draws overlay,
       // so we must disable live follow AFTER and avoid the internal draw.
@@ -2618,7 +2668,8 @@ function main() {
       map._playbackNowMs = null;
       _pbPageIndex = -1;  // Reset paging for new data
       _pbPageAutoFollow = true;
-      
+      _pbSlidingWindowCenter = null;
+
       // Enable DVR/playback mode
       map.playbackMode = true;
       map._playbackLiveFollow = false;
@@ -3012,7 +3063,74 @@ function main() {
 
       updatePlaybackUi();
       map.drawOverlay(map.lastState);
+
+      // Start or stop edge-jog during drag
+      if (_pbScrubbing && _pbSlidingWindowCenter != null) {
+        _pbStartEdgeJog();
+      }
     };
+
+    // Edge-jog: when the slider thumb is in the outer 10% during a drag,
+    // continuously shift the sliding window in that direction.
+    const _pbEdgeThreshold = 0.10; // outer 10% of slider triggers jog
+    function _pbStartEdgeJog() {
+      if (_pbJogRAF) return; // already running
+      _pbJogLastPerf = performance.now();
+      _pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
+    }
+    function _pbStopEdgeJog() {
+      if (_pbJogRAF) { cancelAnimationFrame(_pbJogRAF); _pbJogRAF = null; }
+    }
+    function _pbEdgeJogTick(now) {
+      _pbJogRAF = null;
+      if (!_pbScrubbing || _pbSlidingWindowCenter == null) return;
+
+      const maxVal = Number(pbScrubEl.max);
+      const curVal = Number(pbScrubEl.value);
+      if (!maxVal) return;
+      const frac = curVal / maxVal; // 0..1 position within window
+
+      // Determine jog direction and intensity
+      let jogDir = 0;
+      let intensity = 0;
+      if (frac >= 1 - _pbEdgeThreshold) {
+        jogDir = 1; // jog forward
+        intensity = (frac - (1 - _pbEdgeThreshold)) / _pbEdgeThreshold; // 0..1
+      } else if (frac <= _pbEdgeThreshold) {
+        jogDir = -1; // jog backward
+        intensity = (_pbEdgeThreshold - frac) / _pbEdgeThreshold; // 0..1
+      }
+
+      if (jogDir !== 0) {
+        const dt = now - _pbJogLastPerf;
+        // Jog speed: up to 1 page-width per second at full intensity
+        const jogSpeed = _pbPageSizeMs * intensity * 1.0;
+        const shift = jogDir * jogSpeed * (dt / 1000);
+
+        const gb = map.getPlaybackBounds();
+        _pbSlidingWindowCenter = clamp(
+          _pbSlidingWindowCenter + shift,
+          gb.minMs + _pbPageSizeMs / 2,
+          gb.maxMs - _pbPageSizeMs / 2
+        );
+
+        // Re-apply scrub with the new window position — the absolute time
+        // the thumb maps to changes as the window shifts under it.
+        const pr = _pbGetPageRange();
+        const relMs = Number(pbScrubEl.value);
+        const tMs = clamp(pr.minMs + relMs, gb.minMs, gb.maxMs);
+        map.setPlaybackTimeMs(tMs);
+        _pbLoopStartMs = tMs;
+        updatePlaybackUi();
+        map.drawOverlay(map.lastState);
+      }
+
+      _pbJogLastPerf = now;
+      // Keep ticking while dragging
+      if (_pbScrubbing) {
+        _pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
+      }
+    }
 
     pbScrubEl.addEventListener("pointerdown", () => {
       // Cancel ALL physics immediately - user is taking control
@@ -3031,6 +3149,13 @@ function main() {
       map._playbackLiveFollow = false; // exit live mode when user grabs slider
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
       _resetLiveTracking();
+      // Activate sliding window: freeze the current window in place for the drag.
+      // If already in sliding window mode, keep the existing center.
+      // If in index-based mode, convert the current page center to a sliding window.
+      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+        const pr = _pbGetPageRange();
+        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+      }
       updatePlaybackUi();
     });
     pbScrubEl.addEventListener("pointerup", () => {
@@ -3039,24 +3164,35 @@ function main() {
       // (e.g. pointerup pages back, then touchend undoes it via auto-follow).
       if (_scrubTouchStartX != null) return;
 
+      _pbStopEdgeJog();
+      _pbSnapWindowToPlayhead();
       _pbScrubbing = false;
       _pbVelocity = 0;
       _pbPageAutoFollow = true; // resume auto-following after manual scrub
 
-      // Page back if slider is near the left edge (1% threshold for reduced-sensitivity touch)
-      if (_pbPagingActive() && Number(pbScrubEl.value) <= Number(pbScrubEl.max) * 0.01 && _pbPageIndex > 0) {
-        _pbSetPage(_pbPageIndex - 1);
-        const prev = _pbGetPageRange();
-        map.setPlaybackTimeMs(prev.maxMs);
-        _pbLoopStartMs = prev.maxMs;
-        pbScrubEl.max = String(prev.maxMs - prev.minMs);
-        pbScrubEl.value = pbScrubEl.max;
-        map.setPlaybackPlaying(true);
-        _pbLastPerf = performance.now();
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
-        map.drawOverlay(map.lastState);
-        return;
+      // Page back if slider is near the left edge (1% threshold)
+      if (_pbPagingActive() && Number(pbScrubEl.value) <= Number(pbScrubEl.max) * 0.01) {
+        const gb = map.getPlaybackBounds();
+        const pr = _pbGetPageRange();
+        if (pr.minMs > gb.minMs) {
+          // Shift the sliding window left by one page
+          if (_pbSlidingWindowCenter != null) {
+            _pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, _pbSlidingWindowCenter - _pbPageSizeMs);
+          } else if (_pbPageIndex > 0) {
+            _pbSetPage(_pbPageIndex - 1);
+          }
+          const prev = _pbGetPageRange();
+          map.setPlaybackTimeMs(prev.maxMs);
+          _pbLoopStartMs = prev.maxMs;
+          pbScrubEl.max = String(prev.maxMs - prev.minMs);
+          pbScrubEl.value = pbScrubEl.max;
+          map.setPlaybackPlaying(true);
+          _pbLastPerf = performance.now();
+          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          updatePlaybackUi();
+          map.drawOverlay(map.lastState);
+          return;
+        }
       }
 
       // Don't auto-enable LIVE mode when released at end - user must click Live button.
@@ -3064,6 +3200,7 @@ function main() {
       _pbLastPerf = performance.now();
       if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
       applyScrub();
+
     });
     var _scrubRAF = 0;
     pbScrubEl.addEventListener("input", () => {
@@ -3115,12 +3252,27 @@ function main() {
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
       _pbIsWheelCoasting = true;
       _pbCommitLoopStartOnCoastEnd = true;
-      // Horizontal scroll (two-finger swipe): deltaX > 0 = swipe right = backward in time
-      // Scale by timeline duration for proportional movement, reduced sensitivity
+      // Activate sliding window so the playhead isn't clamped to a fixed page boundary
+      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+        const pr = _pbGetPageRange();
+        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+      }
+      // Two-finger swipe (deltaX) or vertical scroll wheel (deltaY): scrub through time.
+      // deltaX > 0 = swipe right = backward; deltaY > 0 = scroll down = forward.
       const b = map.getPlaybackBounds();
       const durMs = (b.maxMs - b.minMs) || 1;
-      const nudge = (e.deltaX / 1000) * (durMs / 480); // ~0.02% of timeline per scroll tick
+      const isHorizontal = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
+      const isMouseWheel = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
+      // Mouse wheel: flip direction (scroll down = forward). Trackpad swipe: keep native.
+      const delta = isHorizontal ? e.deltaX : (isMouseWheel ? e.deltaY : -e.deltaY) * 0.15;
+      const nudge = (delta / 1000) * (durMs / 480);
+      const prevDir = Math.sign(_pbVelocity);
       _pbVelocity -= nudge;
+      // On direction reversal, snap window so playhead stays just outside the jog zone
+      if (prevDir !== 0 && Math.sign(_pbVelocity) !== 0 && Math.sign(_pbVelocity) !== prevDir) {
+        _pbSnapWindowToPlayhead();
+        updatePlaybackUi();
+      }
       // Ensure loop is running
       if (!_pbRAF) {
         _pbLastPerf = performance.now(); // valid dt for next frame
@@ -3158,6 +3310,11 @@ function main() {
       map._playbackLiveFollow = false;
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
       _resetLiveTracking();
+      // Activate sliding window
+      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+        const pr = _pbGetPageRange();
+        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+      }
       updatePlaybackUi();
     }, { passive: false });
 
@@ -3189,24 +3346,34 @@ function main() {
       _scrubTouchRawTarget = null;
       // Cancel any pending applyScrub rAF so it doesn't overwrite page-back
       if (_scrubRAF) { cancelAnimationFrame(_scrubRAF); _scrubRAF = 0; }
+      _pbStopEdgeJog();
+      _pbSnapWindowToPlayhead();
       _pbScrubbing = false;
       _pbVelocity = 0;
       _pbPageAutoFollow = true;
 
       // Page back if user dragged past the left edge
-      if (_pbPagingActive() && rawTarget != null && rawTarget < 0 && _pbPageIndex > 0) {
-        _pbSetPage(_pbPageIndex - 1);
-        const prev = _pbGetPageRange();
-        map.setPlaybackTimeMs(prev.maxMs);
-        _pbLoopStartMs = prev.maxMs;
-        pbScrubEl.max = String(prev.maxMs - prev.minMs);
-        pbScrubEl.value = pbScrubEl.max;
-        map.setPlaybackPlaying(true);
-        _pbLastPerf = performance.now();
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
-        map.drawOverlay(map.lastState);
-        return;
+      if (_pbPagingActive() && rawTarget != null && rawTarget < 0) {
+        const gb = map.getPlaybackBounds();
+        const pr = _pbGetPageRange();
+        if (pr.minMs > gb.minMs) {
+          if (_pbSlidingWindowCenter != null) {
+            _pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, _pbSlidingWindowCenter - _pbPageSizeMs);
+          } else if (_pbPageIndex > 0) {
+            _pbSetPage(_pbPageIndex - 1);
+          }
+          const prev = _pbGetPageRange();
+          map.setPlaybackTimeMs(prev.maxMs);
+          _pbLoopStartMs = prev.maxMs;
+          pbScrubEl.max = String(prev.maxMs - prev.minMs);
+          pbScrubEl.value = pbScrubEl.max;
+          map.setPlaybackPlaying(true);
+          _pbLastPerf = performance.now();
+          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          updatePlaybackUi();
+          map.drawOverlay(map.lastState);
+          return;
+        }
       }
 
       map.setPlaybackPlaying(true);

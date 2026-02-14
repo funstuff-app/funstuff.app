@@ -1198,11 +1198,8 @@ class MapView {
       this._playbackPlaying = false;
       this._playbackNewestSegmentStartMs = null;
       this._playbackLastMaxMs = null;
-      this._playbackLiveFollow = true;
       this._playbackInitialized = false;
     } else {
-      // Entering DVR starts in LIVE follow-tail at the end-of-data.
-      this._playbackLiveFollow = true;
       this._playbackInitialized = false;  // Will be initialized by playback loop
       // Don't set _playbackNowMs here - let the playback loop handle it with 10-min offset
     }
@@ -1905,7 +1902,9 @@ class MapView {
       this._pinchAnchorSX = sx;
       this._pinchAnchorSY = sy;
 
-      const dy = clamp(e.deltaY, -300, 300);
+      const rawDy = clamp(e.deltaY, -300, 300);
+      // Mouse wheel natural direction is inverted vs trackpad pinch
+      const dy = (isMouseWheel || isSmoothScrollZoom) ? -rawDy : rawDy;
       const dir = dy < 0 ? 1 : -1;
       // Adjust zoom sensitivity per input type.
       // Chrome trackpad pinch reports ~3-5x smaller deltaY than Safari for same gesture.
