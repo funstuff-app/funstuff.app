@@ -711,6 +711,8 @@ class MapView {
     */
 
     this._noteUserInteraction();
+    this._stopPinchInertia();
+    this._pinchZooming = false;
     this._mouseDragging = true;
     this._mouseDragMoved = false;
     this._mouseDragStart = { x: e.clientX, y: e.clientY };
