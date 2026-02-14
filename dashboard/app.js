@@ -3016,10 +3016,57 @@ function main() {
     pbThemeSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, e));
   }
   
+  // ── Owner token secret tap state ──
+  let _aboutTapCount = 0;
+  let _aboutTapTimer = null;
+
   function showAboutModal() {
     const modal = document.getElementById("aboutModal");
     if (!modal) return;
     modal.classList.remove("hidden");
+
+    // Reset token section visibility each time modal opens
+    const tokenSection = document.getElementById("ownerTokenSection");
+    const tokenInput = document.getElementById("ownerTokenInput");
+    const tokenSaveBtn = document.getElementById("ownerTokenSave");
+    const tokenStatus = document.getElementById("ownerTokenStatus");
+    if (tokenSection) tokenSection.classList.add("hidden");
+    _aboutTapCount = 0;
+
+    // Tap version label 5 times to reveal token input
+    const versionEl = modal.querySelector(".aboutVersion");
+    if (versionEl) {
+      versionEl.style.cursor = "default";
+      versionEl.onclick = () => {
+        _aboutTapCount++;
+        clearTimeout(_aboutTapTimer);
+        _aboutTapTimer = setTimeout(() => { _aboutTapCount = 0; }, 2000);
+        if (_aboutTapCount >= 5) {
+          _aboutTapCount = 0;
+          if (tokenSection) {
+            tokenSection.classList.remove("hidden");
+            if (tokenInput) tokenInput.value = localStorage.getItem("dusty_owner_tok") || "";
+            if (tokenStatus) tokenStatus.textContent = "";
+          }
+        }
+      };
+    }
+
+    // Save token button
+    if (tokenSaveBtn && tokenInput) {
+      tokenSaveBtn.onclick = () => {
+        const val = (tokenInput.value || "").trim();
+        if (val) {
+          localStorage.setItem("dusty_owner_tok", val);
+        } else {
+          localStorage.removeItem("dusty_owner_tok");
+        }
+        if (tokenStatus) {
+          tokenStatus.textContent = val ? "Saved. Reload to apply." : "Cleared.";
+        }
+      };
+    }
+
     const closeBtn = modal.querySelector(".aboutModalClose");
     const onClose = () => {
       modal.classList.add("hidden");

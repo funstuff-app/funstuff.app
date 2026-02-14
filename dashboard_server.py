@@ -3675,13 +3675,17 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         from urllib.parse import urlparse, parse_qs
                         qs = parse_qs(urlparse(self.path).query)
                         tok = (qs.get("tok") or [""])[0]
+                        # Both owner and non-owner responses must be no-store
+                        # to prevent Cloudflare (or any CDN) from caching one
+                        # variant and serving it to the other audience.
                         if tok != OWNER_TOKEN:
-                            # Build a one-off JSON without the Home sensor
                             st_copy = json.loads(app_state.cached_json_bytes)
                             if isinstance(st_copy.get("fixed"), list):
                                 st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
                             return self._send(200, json.dumps(st_copy).encode("utf-8"),
-                                              "application/json", cache_control="private, max-age=15")
+                                              "application/json", cache_control="private, no-store")
+                        return self._send(200, app_state.cached_json_bytes,
+                                          "application/json", cache_control="private, no-store")
                     return self._send(200, app_state.cached_json_bytes, "application/json", cache_control="public, max-age=15, s-maxage=30")
             if self.path.startswith("/api/fixed"):
                 # Return just the fixed sensor array (lightweight for TUI remote mode)
