@@ -584,37 +584,104 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         return False
 
 
+def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
+    """Strip history entries from fixed sensors that don't belong to date_str.
+
+    Fixed sensor history arrays (history_values, history_colors, history_times)
+    can span multiple days because fixed_history accumulates 48 hours of data.
+    Before saving a snapshot we trim them to only the entries from date_str so
+    loading a snapshot never shows data from other days.
+    """
+    for sensor in (state.get("fixed") or []):
+        if not isinstance(sensor, dict):
+            continue
+        for reading in (sensor.get("readings") or {}).values():
+            if not isinstance(reading, dict):
+                continue
+            times = reading.get("history_times")
+            values = reading.get("history_values") or reading.get("history")
+            colors = reading.get("history_colors")
+            if not isinstance(times, list):
+                continue
+            # Build filtered index list
+            keep = [i for i, t in enumerate(times)
+                    if isinstance(t, str) and t.startswith(date_str)]
+            reading["history_times"]  = [times[i]  for i in keep]
+            reading["history"]        = [values[i] for i in keep] if isinstance(values, list) and len(values) == len(times) else []
+            reading["history_colors"] = [colors[i] for i in keep] if isinstance(colors, list) and len(colors) == len(times) else []
+
+
+def _trim_trails_to_day(state: dict[str, Any], date_str: str) -> None:
+    """Filter mobile sensor trails to the 5 AM – 5 AM local-time window for date_str.
+
+    The "day" for air-quality purposes runs from 5:00 AM local on date_str to
+    5:00 AM local on the following day, matching the client-side live playback
+    window in map_view.js.  Trail point timestamps (``"t"``) are UTC ISO
+    strings; we convert each to local time for comparison.
+    """
+    try:
+        requested_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return  # Can't parse date, skip trimming
+
+    # Build the 5 AM – 5 AM window in local time
+    day_start_local = requested_date.replace(hour=5, minute=0, second=0, microsecond=0)
+    day_start_local = day_start_local.astimezone()          # attach system tz
+    day_end_local = day_start_local + timedelta(hours=24)
+
+    day_start_utc = day_start_local.astimezone(timezone.utc)
+    day_end_utc   = day_end_local.astimezone(timezone.utc)
+
+    for sensor in (state.get("mobile") or []):
+        if not isinstance(sensor, dict):
+            continue
+        trail = sensor.get("trail")
+        if not isinstance(trail, list):
+            continue
+        filtered = []
+        for p in trail:
+            if not isinstance(p, dict):
+                continue
+            dt = parse_utc_timestamp(p.get("t"))
+            if dt is None:
+                continue
+            if day_start_utc <= dt < day_end_utc:
+                filtered.append(p)
+        sensor["trail"] = filtered
+
+
 def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
     """Save current state as today's snapshot.
-    
+
     Called on graceful shutdown to persist the accumulated trail data.
     Returns True if saved successfully, False otherwise.
     """
     today_str = datetime.now().strftime("%Y-%m-%d")
     try:
         with app_state.lock:
-            # Build state from persistent_mobile
             state_bytes = app_state.cached_json_bytes
             if not state_bytes:
                 return False
             state = json.loads(state_bytes.decode("utf-8"))
-        
+
         # Validate there's something worth saving
         mobiles = state.get("mobile", [])
         if not isinstance(mobiles, list) or not mobiles:
             _log("[Snapshot] Nothing to save (no mobile sensors)")
             return False
-        
-        # Check if we have any trails worth saving
+
         total_points = sum(len(m.get("trail", [])) for m in mobiles if isinstance(m, dict))
         if total_points < 10:
             _log("[Snapshot] Not enough data to save (fewer than 10 trail points)")
             return False
-        
+
+        # Trim fixed sensor history to today only before saving
+        _trim_history_to_date(state, today_str)
+
         result = save_snapshot(data_dir, today_str, state)
         _log(f"[Snapshot] Saved today's state: {result.get('filename')} ({result.get('size_bytes')} bytes)")
         return True
-        
+
     except Exception as e:
         _log(f"[Snapshot] Failed to save today's snapshot: {e}")
         return False
@@ -774,13 +841,22 @@ def accumulate_fixed_reading(
     
     hist = app_state.fixed_history[sensor_id][pollutant]
     now_ts = time.time()
-    
-    # Dedupe: skip if same value and time as last entry
+    is_pa = sensor_id.startswith("PA_")
+
+    # Dedupe: skip if same value and time as last entry.
+    # For PurpleAir sensors (accumulated every 30s from main loop), use
+    # value-only dedup with a minimum time gap to prevent flooding history.
     if hist:
         last = hist[-1]
-        if last.get("val") == str(value) and last.get("time") == time_utc:
-            return
-    
+        if is_pa:
+            # PA: skip if same value AND less than 5 minutes since last entry
+            elapsed = now_ts - (last.get("recorded_at") or 0)
+            if last.get("val") == str(value) and elapsed < 300:
+                return
+        else:
+            if last.get("val") == str(value) and last.get("time") == time_utc:
+                return
+
     # Append new reading
     hist.append({
         "val": str(value) if value is not None else None,
@@ -788,11 +864,12 @@ def accumulate_fixed_reading(
         "time": time_utc,
         "recorded_at": now_ts,
     })
-    
+
     # Keep history based on sensor type:
     # - Home sensor: 5760 entries (~48 hours at 30-second intervals) to span today + yesterday
+    # - PurpleAir: 5760 entries (~48+ hours with 5-min dedup) to span today + yesterday
     # - Utah sensors: 2880 entries (~24 hours at 5-10 min intervals spans days anyway)
-    max_entries = 5760 if sensor_id == "Home" else 2880
+    max_entries = 5760 if (sensor_id == "Home" or is_pa) else 2880
     if len(hist) > max_entries:
         app_state.fixed_history[sensor_id][pollutant] = hist[-max_entries:]
     
@@ -861,44 +938,51 @@ def _accumulate_home_sensor_reading(app_state: AppState, st: dict[str, Any]) -> 
 
 
 def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
-    """Inject history arrays into fixed sensor readings from accumulated history."""
+    """Inject history arrays into fixed sensor readings from accumulated history.
+
+    Only injects entries from today (local date) so stale multi-day history
+    accumulated in fixed_history.json doesn't bleed into the live state.
+    """
     fixed_list = st.get("fixed", [])
     if not isinstance(fixed_list, list):
         return
-    
+
+    today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     for sensor in fixed_list:
         sensor_id = sensor.get("id")
         if not sensor_id:
             continue
-        
+
         hist_for_sensor = app_state.fixed_history.get(sensor_id, {})
         if not hist_for_sensor:
             continue
-        
+
         readings = sensor.get("readings", {})
         if not isinstance(readings, dict):
             continue
-        
+
         for pollutant, reading in readings.items():
             if not isinstance(reading, dict):
                 continue
             if pollutant in _WEATHER_KEYS:
                 continue
-            
+
             hist_entries = hist_for_sensor.get(pollutant, [])
             if not hist_entries:
                 continue
-            
-            # Build history arrays
+
+            # Only include entries from today — never inject stale history
+            # from previous days that lingers in fixed_history.json
             history_values = []
             history_colors = []
             history_times = []
-            
+
             for entry in hist_entries:
+                t = entry.get("time") or ""
+                if not t.startswith(today_prefix):
+                    continue
                 val = entry.get("val")
-                t = entry.get("time")
-                
-                # Parse value; preserve integer-ness (e.g. Home sensor reports ints)
                 try:
                     fval = float(val) if val is not None else None
                     if fval is not None and fval == int(fval):
@@ -906,10 +990,9 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
                 except (ValueError, TypeError):
                     fval = None
                 history_values.append(fval)
-                # Recompute color from value (stored colors may be stale)
                 history_colors.append(_get_aqi_color(pollutant, fval) if fval is not None else "#cccccc")
                 history_times.append(t)
-            
+
             reading["history"] = history_values
             reading["history_colors"] = history_colors
             reading["history_times"] = history_times
@@ -1032,667 +1115,148 @@ def build_state(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Historical data fetching (week-long timeseries from CHPC)
+# Historical data fetching (week-long timeseries from CHPC) — DISABLED
+# "Select Day" now loads from local snapshots instead of upstream servers.
+# All upstream fetching, caching, lazy loading, and prefetch infrastructure
+# is commented out since we already store this data locally from mobile,
+# fixed, and PurpleAir sensor integrations.
 # ─────────────────────────────────────────────────────────────────────────────
 
-HISTORY_BASE_URL = "https://utahaq.chpc.utah.edu/jsondata"
-HISTORY_SENSORS = [
-    "BUS01", "BUS02", "BUS03", "BUS04", "BUS05", "BUS06", "BUS07", "BUS08",
-    "BUS09", "BUS10", "BUS11", "BUS12", "BUS13", "BUS14", "BUS15",
-    "TRX01", "TRX02", "TRX03",
-]
-HISTORY_VARS = ["GLAT", "GLON", "PM25", "PM10", "OZNE"]
-
-# In-memory cache for week-long history files (they change slowly)
-# Key: (sensor, var), Value: (fetch_time, data)
-_history_cache: dict[tuple[str, str], tuple[float, list, float]] = {}  # (fetch_time, data, ttl_seconds)
-_history_cache_lock = threading.Lock()
-_HISTORY_CACHE_TTL = 3600  # 1 hour
-_HISTORY_404_TTL = 86400   # 24 hours for 404s (not infinite — sensors may appear)
-
-# Track when history server was last known to be down (for fast-fail)
-_history_server_down_until = 0.0
-
-
-def _is_history_server_reachable() -> bool:
-    """Quick check if history server is reachable (2s timeout)."""
-    global _history_server_down_until
-    now = time.time()
-    
-    # If we recently determined server is down, fast-fail
-    if now < _history_server_down_until:
-        return False
-    
-    # HEAD request to a known file (lightweight, no body download)
-    import urllib.request
-    test_url = f"{HISTORY_BASE_URL}/BUS06_GLAT_TS_10080.json"
-    try:
-        req = urllib.request.Request(test_url, method='HEAD')
-        req.add_header("User-Agent", "MobileAir/1.0")
-        urllib.request.urlopen(req, timeout=2)
-        return True
-    except Exception:
-        _history_server_down_until = now + 60
-        return False
-
-
-def _fetch_history_file(sensor: str, var: str) -> list:
-    """Fetch a single history file with caching (thread-safe)."""
-    cache_key = (sensor, var)
-    now = time.time()
-
-    # Check cache (under lock for thread safety)
-    with _history_cache_lock:
-        if cache_key in _history_cache:
-            fetch_time, data, ttl = _history_cache[cache_key]
-            if now - fetch_time < ttl:
-                return data
-
-    # Fetch from server (outside lock to avoid blocking other threads)
-    url = f"{HISTORY_BASE_URL}/{sensor}_{var}_TS_10080.json"
-    try:
-        resp = stdlib_get(url, timeout=3, headers=HEADERS)
-        resp.raise_for_status()
-        data = resp.json().get("TimeDataUTC", [])
-        with _history_cache_lock:
-            _history_cache[cache_key] = (now, data, _HISTORY_CACHE_TTL)
-        return data
-    except Exception as e:
-        is_404 = "404" in str(e)
-        if is_404:
-            # Cache 404s for 24 hours (sensors may appear later)
-            with _history_cache_lock:
-                _history_cache[cache_key] = (now, [], _HISTORY_404_TTL)
-            return []
-        _log(f"[History] Failed to fetch {sensor}/{var}: {e}")
-        # On transient error, return stale cache if available, else empty
-        with _history_cache_lock:
-            if cache_key in _history_cache:
-                return _history_cache[cache_key][1]
-        return []
-
-
-def _get_history_cache_dir(data_dir: Path) -> Path:
-    """Return the directory for cached historical day results."""
-    cache_dir = data_dir / "history_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
-
-
-def _load_cached_historical_day(data_dir: Path, date_str: str) -> dict[str, Any] | None:
-    """Load a cached historical day result from disk. Returns None if not cached."""
-    cache_dir = _get_history_cache_dir(data_dir)
-    safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
-    if not safe_date or len(safe_date) > 20:
-        return None
-    cache_file = cache_dir / f"{safe_date}.json"
-    if not cache_file.exists():
-        return None
-    try:
-        data = json.loads(cache_file.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("mobile"), list):
-            return data
-    except Exception as e:
-        _log(f"[History] Failed to load cache for {date_str}: {e}")
-    return None
-
-
-def _save_cached_historical_day(data_dir: Path, date_str: str, result: dict[str, Any]) -> None:
-    """Save a processed historical day result to disk cache."""
-    cache_dir = _get_history_cache_dir(data_dir)
-    safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
-    if not safe_date or len(safe_date) > 20:
-        return
-    cache_file = cache_dir / f"{safe_date}.json"
-    try:
-        cache_file.write_text(json.dumps(result, separators=(",", ":")), encoding="utf-8")
-        _log(f"[History] Cached day {date_str} ({cache_file.stat().st_size} bytes)")
-    except Exception as e:
-        _log(f"[History] Failed to cache {date_str}: {e}")
-
-
-def _apply_fixed_sensors_to_history(result: dict[str, Any], date_str: str,
-                                     app_state: AppState | None, data_dir: Path) -> None:
-    """Add Home + DEQ + PurpleAir fixed sensors to a historical day result.
-
-    Called both for freshly-fetched days and for disk-cached days.
-    Reconstructs fixed sensors from fixed_history (which accumulates over time)
-    and saved snapshots, so cached mobile-only results still get fixed sensors.
-    """
-    if "fixed" not in result:
-        result["fixed"] = []
-
-    # Compute time range for the day: 4 AM local (MST = UTC-7) → next 4 AM.
-    # Using a time range instead of UTC date prefix avoids cutting off data after
-    # midnight UTC (5 PM MST) when UTC date rolls over.
-    try:
-        _day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except ValueError:
-        _day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    _day_start_utc = _day + timedelta(hours=11)   # 4 AM MST = 11:00 UTC
-    _day_end_utc = _day_start_utc + timedelta(days=1)
-    _day_start_iso = _day_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-    _day_end_iso = _day_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    def _entry_in_day(e: dict) -> bool:
-        t = e.get("time")
-        if not t:
-            return False
-        return _day_start_iso <= t < _day_end_iso
-
-    # Remove any stale fixed entries so we rebuild fresh
-    existing_fixed_ids = {f.get("id") for f in result["fixed"] if not f.get("purpleair") and f.get("id") != "Home"}
-    result["fixed"] = [f for f in result["fixed"] if f.get("id") not in {"Home"} and not f.get("purpleair")]
-
-    # ── Home sensor ──
-    home_entry = None
-    if app_state:
-        home_hist = app_state.fixed_history.get("Home", {}).get("PM25", [])
-        if home_hist:
-            filtered_hist = [e for e in home_hist if _entry_in_day(e)]
-            if filtered_hist:
-                history_values = []
-                history_colors = []
-                history_times = []
-                for entry in filtered_hist:
-                    val = entry.get("val")
-                    try:
-                        fval = float(val) if val is not None else None
-                        if fval is not None and fval == int(fval):
-                            fval = int(fval)
-                    except (ValueError, TypeError):
-                        fval = None
-                    history_values.append(fval)
-                    history_colors.append(_get_aqi_color("PM25", fval) if fval is not None else "#cccccc")
-                    history_times.append(entry.get("time"))
-                last_val = history_values[-1] if history_values else None
-                last_col = _get_aqi_color("PM25", last_val) if last_val is not None else "#cccccc"
-                display_val = int(last_val) if last_val is not None and last_val == int(last_val) else last_val
-                home_entry = {
-                    "id": "Home", "name": "Home (Indoor)", "pinned": True, "emoji": "\U0001f3f0",
-                    "lat": HOME_LAT, "lon": HOME_LON,
-                    "readings": {"PM25": {"value": display_val, "color": last_col,
-                                          "history": history_values, "history_colors": history_colors,
-                                          "history_times": history_times}},
-                    "color": last_col, "primary_key": "PM25", "primary_value": display_val,
-                    "primary_color": last_col, "primary_aqi": None,
-                }
-    if not home_entry:
-        try:
-            snapshot = load_snapshot(data_dir, date_str)
-            if snapshot and isinstance(snapshot.get("fixed"), list):
-                for sensor in snapshot["fixed"]:
-                    if sensor.get("id") == "Home":
-                        home_entry = sensor
-                        break
-        except Exception:
-            pass
-    if home_entry:
-        result["fixed"].insert(0, home_entry)
-    
-    # ── PurpleAir sensors from fixed_history ──
-    if app_state:
-        for sensor_id, pollutants in app_state.fixed_history.items():
-            if not sensor_id.startswith("PA_"):
-                continue
-            pm25_hist = pollutants.get("PM25", [])
-            if not pm25_hist:
-                continue
-            day_entries = [e for e in pm25_hist if _entry_in_day(e)]
-            if not day_entries:
-                continue
-            last = day_entries[-1]
-            val_str = last.get("val")
-            try:
-                pm25_val = float(val_str) if val_str is not None else None
-            except (TypeError, ValueError):
-                pm25_val = None
-            if pm25_val is None:
-                continue
-            color = _get_aqi_color("PM25", pm25_val)
-            lat, lon = None, None
-            sensor_idx = sensor_id[3:]
-            for s in app_state.purpleair_sensors:
-                if str(s.get("sensor_index", "")) == sensor_idx:
-                    lat = s.get("latitude")
-                    lon = s.get("longitude")
-                    break
-            if lat is None or lon is None:
-                continue
-            history_values, history_colors, history_times = [], [], []
-            for entry in day_entries:
-                v = entry.get("val")
-                try:
-                    fv = float(v) if v is not None else None
-                    if fv is not None and fv == int(fv):
-                        fv = int(fv)
-                except (TypeError, ValueError):
-                    fv = None
-                history_values.append(fv)
-                history_colors.append(_get_aqi_color("PM25", fv) if fv is not None else "#cccccc")
-                history_times.append(entry.get("time"))
-            display_val = round(pm25_val, 1)
-            name = sensor_id
-            for s in app_state.purpleair_sensors:
-                if str(s.get("sensor_index", "")) == sensor_idx:
-                    name = s.get("name", sensor_id)
-                    name = re.sub(r'(?:\s*-\s*|\s+)power(?:ed)?\s+by\s+uto[pi]{2}a(?:\s+fiber)?', '', name, flags=re.IGNORECASE).strip()
-                    break
-            result["fixed"].append({
-                "id": sensor_id, "name": name, "pinned": False, "emoji": "",
-                "lat": lat, "lon": lon,
-                "readings": {"PM25": {"value": display_val, "color": color, "key": "PM2.5",
-                                      "history": history_values, "history_colors": history_colors,
-                                      "history_times": history_times}},
-                "color": color, "purpleair": True, "primary_key": "PM25",
-                "primary_value": display_val, "primary_color": color, "primary_aqi": None,
-            })
-    
-    # ── DEQ / Utah AQ fixed stations from fixed_history ──
-    # These are the stationary government sensors (Hawthorne, Rose Park, etc.)
-    # accumulated from live FixedSiteMapData.json polls.
-    # Get lat/lon from the current live state (locations are static).
-    if app_state:
-        # Build a lookup of lat/lon/name from the current live fixed sensor state
-        live_fixed_lookup: dict[str, dict[str, Any]] = {}
-        live_state = app_state.state if isinstance(app_state.state, dict) else {}
-        for f in (live_state.get("fixed") or []):
-            if isinstance(f, dict) and f.get("id"):
-                live_fixed_lookup[f["id"]] = f
-        
-        # Also check raw_fixed for lat/lon (more reliable source)
-        if isinstance(app_state.raw_fixed, dict):
-            for _pollutant_key, sensors in app_state.raw_fixed.items():
-                if not isinstance(sensors, dict):
-                    continue
-                for sid, s_data in sensors.items():
-                    if sid in ("LastUpdateUTC", "LastUpdateLocal", "APITimeStart", "APITimeEnd", "VarName", "VarUnit"):
-                        continue
-                    if not isinstance(s_data, dict):
-                        continue
-                    lat_f = coerce_float(s_data.get("Latitude"))
-                    lon_f = coerce_float(s_data.get("Longitude"))
-                    if lat_f is not None and lon_f is not None and sid not in live_fixed_lookup:
-                        live_fixed_lookup[sid] = {"id": sid, "lat": lat_f, "lon": lon_f, "name": ""}
-        
-        # IDs already in result (Home, PurpleAir) — skip these
-        already_added = {f.get("id") for f in result["fixed"]}
-        
-        for sensor_id, pollutants in app_state.fixed_history.items():
-            # Skip Home, PurpleAir (already handled above), and anything already added
-            if sensor_id == "Home" or sensor_id.startswith("PA_") or sensor_id in already_added:
-                continue
-            
-            # Need lat/lon from live state
-            live_info = live_fixed_lookup.get(sensor_id)
-            if not live_info:
-                continue
-            lat = coerce_float(live_info.get("lat"))
-            lon = coerce_float(live_info.get("lon"))
-            if lat is None or lon is None:
-                continue
-            
-            # Build readings for each pollutant that has history for this day
-            readings: dict[str, Any] = {}
-            for pollutant, hist_entries in pollutants.items():
-                if not hist_entries:
-                    continue
-                day_entries = [e for e in hist_entries if _entry_in_day(e)]
-                if not day_entries:
-                    continue
-                history_values = []
-                history_colors = []
-                history_times = []
-                for entry in day_entries:
-                    v = entry.get("val")
-                    try:
-                        fv = float(v) if v is not None else None
-                        if fv is not None and fv == int(fv):
-                            fv = int(fv)
-                    except (TypeError, ValueError):
-                        fv = None
-                    history_values.append(fv)
-                    history_colors.append(_get_aqi_color(pollutant, fv) if fv is not None else "#cccccc")
-                    history_times.append(entry.get("time"))
-                last_val = history_values[-1] if history_values else None
-                last_col = _get_aqi_color(pollutant, last_val) if last_val is not None else "#cccccc"
-                display_val = last_val
-                if display_val is not None:
-                    try:
-                        if float(display_val) == int(float(display_val)):
-                            display_val = int(float(display_val))
-                    except (ValueError, TypeError):
-                        pass
-                readings[pollutant] = {
-                    "value": display_val, "color": last_col,
-                    "history": history_values, "history_colors": history_colors,
-                    "history_times": history_times,
-                }
-            
-            if not readings:
-                continue
-            
-            worst = _pick_worst_reading_by_aqi(readings)
-            name = live_info.get("name") or ""
-            pinned = bool(live_info.get("pinned"))
-            result["fixed"].append({
-                "id": sensor_id, "name": name, "pinned": pinned, "emoji": "📍",
-                "lat": lat, "lon": lon,
-                "readings": readings,
-                "color": worst.get("color") or "#cccccc",
-                "primary_key": worst.get("key"),
-                "primary_value": worst.get("value"),
-                "primary_color": worst.get("color"),
-                "primary_aqi": worst.get("aqi"),
-            })
+# HISTORY_BASE_URL = "https://utahaq.chpc.utah.edu/jsondata"
+# HISTORY_SENSORS = [
+#     "BUS01", "BUS02", "BUS03", "BUS04", "BUS05", "BUS06", "BUS07", "BUS08",
+#     "BUS09", "BUS10", "BUS11", "BUS12", "BUS13", "BUS14", "BUS15",
+#     "TRX01", "TRX02", "TRX03",
+# ]
+# HISTORY_VARS = ["GLAT", "GLON", "PM25", "PM10", "OZNE"]
+#
+# # In-memory cache for week-long history files (they change slowly)
+# # Key: (sensor, var), Value: (fetch_time, data)
+# _history_cache: dict[tuple[str, str], tuple[float, list, float]] = {}  # (fetch_time, data, ttl_seconds)
+# _history_cache_lock = threading.Lock()
+# _HISTORY_CACHE_TTL = 3600  # 1 hour
+# _HISTORY_404_TTL = 86400   # 24 hours for 404s (not infinite — sensors may appear)
+#
+# # Track when history server was last known to be down (for fast-fail)
+# _history_server_down_until = 0.0
+#
+#
+# def _is_history_server_reachable() -> bool:
+#     """Quick check if history server is reachable (2s timeout)."""
+#     global _history_server_down_until
+#     now = time.time()
+#
+#     # If we recently determined server is down, fast-fail
+#     if now < _history_server_down_until:
+#         return False
+#
+#     # HEAD request to a known file (lightweight, no body download)
+#     import urllib.request
+#     test_url = f"{HISTORY_BASE_URL}/BUS06_GLAT_TS_10080.json"
+#     try:
+#         req = urllib.request.Request(test_url, method='HEAD')
+#         req.add_header("User-Agent", "MobileAir/1.0")
+#         urllib.request.urlopen(req, timeout=2)
+#         return True
+#     except Exception:
+#         _history_server_down_until = now + 60
+#         return False
+#
+#
+# def _fetch_history_file(sensor: str, var: str) -> list:
+#     """Fetch a single history file with caching (thread-safe)."""
+#     cache_key = (sensor, var)
+#     now = time.time()
+#
+#     # Check cache (under lock for thread safety)
+#     with _history_cache_lock:
+#         if cache_key in _history_cache:
+#             fetch_time, data, ttl = _history_cache[cache_key]
+#             if now - fetch_time < ttl:
+#                 return data
+#
+#     # Fetch from server (outside lock to avoid blocking other threads)
+#     url = f"{HISTORY_BASE_URL}/{sensor}_{var}_TS_10080.json"
+#     try:
+#         resp = stdlib_get(url, timeout=3, headers=HEADERS)
+#         resp.raise_for_status()
+#         data = resp.json().get("TimeDataUTC", [])
+#         with _history_cache_lock:
+#             _history_cache[cache_key] = (now, data, _HISTORY_CACHE_TTL)
+#         return data
+#     except Exception as e:
+#         is_404 = "404" in str(e)
+#         if is_404:
+#             # Cache 404s for 24 hours (sensors may appear later)
+#             with _history_cache_lock:
+#                 _history_cache[cache_key] = (now, [], _HISTORY_404_TTL)
+#             return []
+#         _log(f"[History] Failed to fetch {sensor}/{var}: {e}")
+#         # On transient error, return stale cache if available, else empty
+#         with _history_cache_lock:
+#             if cache_key in _history_cache:
+#                 return _history_cache[cache_key][1]
+#         return []
+#
+#
+# def _get_history_cache_dir(data_dir: Path) -> Path:
+#     """Return the directory for cached historical day results."""
+#     cache_dir = data_dir / "history_cache"
+#     cache_dir.mkdir(parents=True, exist_ok=True)
+#     return cache_dir
+#
+#
+# def _load_cached_historical_day(data_dir: Path, date_str: str) -> dict[str, Any] | None:
+#     """Load a cached historical day result from disk. Returns None if not cached."""
+#     cache_dir = _get_history_cache_dir(data_dir)
+#     safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
+#     if not safe_date or len(safe_date) > 20:
+#         return None
+#     cache_file = cache_dir / f"{safe_date}.json"
+#     if not cache_file.exists():
+#         return None
+#     try:
+#         data = json.loads(cache_file.read_text(encoding="utf-8"))
+#         if isinstance(data, dict) and isinstance(data.get("mobile"), list):
+#             return data
+#     except Exception as e:
+#         _log(f"[History] Failed to load cache for {date_str}: {e}")
+#     return None
+#
+#
+# def _save_cached_historical_day(data_dir: Path, date_str: str, result: dict[str, Any]) -> None:
+#     """Save a processed historical day result to disk cache."""
+#     cache_dir = _get_history_cache_dir(data_dir)
+#     safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
+#     if not safe_date or len(safe_date) > 20:
+#         return
+#     cache_file = cache_dir / f"{safe_date}.json"
+#     try:
+#         cache_file.write_text(json.dumps(result, separators=(",", ":")), encoding="utf-8")
+#         _log(f"[History] Cached day {date_str} ({cache_file.stat().st_size} bytes)")
+#     except Exception as e:
+#         _log(f"[History] Failed to cache {date_str}: {e}")
 
 
-def fetch_historical_day(date_str: str, app_state: AppState | None = None, data_dir: Path | None = None, start_ms: int | None = None, end_ms: int | None = None) -> dict[str, Any]:
-    """Fetch week-long data and filter to a specific day.
-    
-    Day boundaries are 4 AM local time to 4 AM the next day.
-    If start_ms/end_ms are provided (from client), use them directly.
-    Otherwise fall back to server-side computation (MST, UTC-7).
-    Past days are cached on disk so upstream data is only fetched once.
-    
-    Returns data in RAW API FORMAT so it can be processed by 
-    normalize_state_for_dashboard like live data.
-    
-    Args:
-        date_str: Date in YYYY-MM-DD format
-        app_state: Optional AppState for accessing Home sensor history
-        data_dir: Data directory for loading snapshots (defaults to ~/.mobileair)
-        start_ms: Optional day-start epoch ms from client (4 AM local)
-        end_ms: Optional day-end epoch ms from client (next 4 AM local)
-    
-    Returns:
-        Dict with 'mobile' in raw API format (same as MobileMapData.json)
-    """
-    # Default data_dir if not provided
-    if data_dir is None:
-        data_dir = default_data_dir()
-    from datetime import datetime, timezone, timedelta
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    
-    # Use client-provided boundaries if available, else compute server-side.
-    if start_ms is not None and end_ms is not None:
-        day_start = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
-        day_end = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
-    else:
-        # Fallback: Parse date and compute day boundaries at 4 AM local (MST = UTC-7).
-        # 4 AM MST = 11:00 UTC, so add 11 hours to midnight UTC of the selected date.
-        try:
-            day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            raise ValueError(f"Invalid date format: {date_str}. Use YYYY-MM-DD.")
-        day_start = day_start + timedelta(hours=11)  # 4 AM MST = 11:00 UTC
-        day_end = day_start + timedelta(days=1)
-        start_ms = int(day_start.timestamp() * 1000)
-        end_ms = int(day_end.timestamp() * 1000)
-    
-    # For past days (not today), check disk cache first.
-    # Past days are immutable once complete — no need to re-fetch.
-    # Use MST (UTC-7) for "today" to match the 4 AM local day boundaries.
-    _mst_tz = timezone(timedelta(hours=-7))
-    today_str = datetime.now(timezone.utc).astimezone(_mst_tz).strftime("%Y-%m-%d")
-    is_past_day = (date_str < today_str)
-    
-    if is_past_day:
-        cached = _load_cached_historical_day(data_dir, date_str)
-        if cached is not None:
-            _log(f"[History] Serving {date_str} from disk cache")
-            # Always reconstruct fixed sensors from current fixed_history
-            # (cache only stores mobile data; fixed history accumulates over time)
-            _apply_fixed_sensors_to_history(cached, date_str, app_state, data_dir)
-            return cached
-    
-    # Check if history server is reachable (will use AirNow-only if not)
-    utah_aq_available = _is_history_server_reachable()
-    if not utah_aq_available:
-        _log(f"[History] Utah AQ server unreachable, will use AirNow-only for {date_str}")
-    
-    # Fetch data for all sensors in parallel (using cached week files)
-    # Skip if Utah AQ is unavailable - we'll still have Home sensor + AirNow
-    raw_data: dict[str, dict[str, list]] = {s: {} for s in HISTORY_SENSORS}
-    
-    if utah_aq_available:
-        def fetch_sensor_var(sensor: str, var: str) -> tuple[str, str, list]:
-            try:
-                all_points = _fetch_history_file(sensor, var)
-                # Filter to requested day
-                points = [
-                    (ts, val) for ts, val in all_points
-                    if start_ms <= ts < end_ms
-                ]
-                return sensor, var, points
-            except Exception:
-                return sensor, var, []
-        
-        # Parallel fetch
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [
-                executor.submit(fetch_sensor_var, sensor, var)
-                for sensor in HISTORY_SENSORS
-                for var in HISTORY_VARS
-            ]
-            for future in as_completed(futures):
-                sensor, var, points = future.result()
-                raw_data[sensor][var] = points
-    
-    # Build raw API format: {PM25: {sensor: {TimeUTC, GLAT, GLON, Value}}, PM10: {...}, OZNE: {...}}
-    # This matches the format of MobileMapData.json so normalize_state_for_dashboard can process it
-
-    # Compute LastUpdateUTC from the latest actual GPS timestamp across all sensors.
-    # Using day_end would cause staleness detection to ghost every sensor whose last
-    # data point is >30 min before 4 AM — i.e. virtually all of them.
-    _latest_ts_ms: int | None = None
-    for sensor_id_lu in HISTORY_SENSORS:
-        for var_key in ("GLAT", "GLON"):
-            for ts_ms, _ in raw_data.get(sensor_id_lu, {}).get(var_key, []):
-                if _latest_ts_ms is None or ts_ms > _latest_ts_ms:
-                    _latest_ts_ms = ts_ms
-    if _latest_ts_ms is not None:
-        last_update_str = datetime.fromtimestamp(_latest_ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    else:
-        last_update_str = day_end.strftime("%Y-%m-%d %H:%M UTC")
-
-    mobile_raw: dict[str, Any] = {
-        "PM25": {"LastUpdateUTC": last_update_str, "VarName": "PM2.5 Concentration", "VarUnit": "ug/m3"},
-        "PM10": {"LastUpdateUTC": last_update_str, "VarName": "PM10 Concentration", "VarUnit": "ug/m3"},
-        "OZNE": {"LastUpdateUTC": last_update_str, "VarName": "Ozone Concentration", "VarUnit": "ppbv"},
-    }
-    
-    for sensor_id in HISTORY_SENSORS:
-        sensor_data = raw_data[sensor_id]
-        lat_pts = sensor_data.get("GLAT", [])
-        lon_pts = sensor_data.get("GLON", [])
-        pm25_pts = sensor_data.get("PM25", [])
-        pm10_pts = sensor_data.get("PM10", [])
-        ozne_pts = sensor_data.get("OZNE", [])
-        
-        if not lat_pts or not lon_pts:
-            continue
-        
-        # Build arrays for each variable in API format
-        lat_by_ts = {ts: val for ts, val in lat_pts if val is not None}
-        lon_by_ts = {ts: val for ts, val in lon_pts if val is not None}
-        
-        # Use GPS timestamps as primary (they're most frequent)
-        all_gps_times = sorted(set(lat_by_ts.keys()) & set(lon_by_ts.keys()))
-        
-        if not all_gps_times:
-            continue
-        
-        # Convert timestamps to UTC strings
-        def ts_to_utc(ts_ms):
-            dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-            return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-        
-        # GPS data - format as strings to match live API format
-        gps_times_utc = [ts_to_utc(ts) for ts in all_gps_times]
-        gps_lats = [str(lat_by_ts[ts]) for ts in all_gps_times]
-        gps_lons = [str(lon_by_ts[ts]) for ts in all_gps_times]
-        
-        def fmt_val(v):
-            """Format value as string like live API does."""
-            if v is None:
-                return None
-            return f"{v:.2f}"
-        
-        # Add sensor data for each pollutant using GPS timestamps
-        # NOTE: We do NOT include ValueColor here - let normalize_state_for_dashboard
-        # compute colors the same way it does for live data
-        
-        # PM25
-        pm25_by_ts = {ts: val for ts, val in pm25_pts}
-        pm25_vals = []
-        last_pm25 = None
-        for ts in all_gps_times:
-            if ts in pm25_by_ts:
-                last_pm25 = pm25_by_ts[ts]
-            pm25_vals.append(fmt_val(last_pm25))
-        
-        mobile_raw["PM25"][sensor_id] = {
-            "TimeUTC": gps_times_utc,
-            "Latitude": gps_lats,
-            "Longitude": gps_lons,
-            "Value": pm25_vals,
-        }
-        
-        # PM10
-        pm10_by_ts = {ts: val for ts, val in pm10_pts}
-        pm10_vals = []
-        last_pm10 = None
-        for ts in all_gps_times:
-            if ts in pm10_by_ts:
-                last_pm10 = pm10_by_ts[ts]
-            pm10_vals.append(fmt_val(last_pm10))
-        
-        mobile_raw["PM10"][sensor_id] = {
-            "TimeUTC": gps_times_utc,
-            "Latitude": gps_lats,
-            "Longitude": gps_lons,
-            "Value": pm10_vals,
-        }
-        
-        # OZNE - filter out negative values and statistical outliers (sensor glitches)
-        # Use IQR-based outlier detection: values beyond Q3 + 10*IQR are sensor errors.
-        # Hard ceiling of 200 ppb (highest O3 ever recorded in SLC is ~115 ppb).
-        OZNE_HARD_CEILING = 200.0
-        ozne_valid = [val for ts, val in ozne_pts if val is not None and 0 <= val <= OZNE_HARD_CEILING]
-        ozne_upper = OZNE_HARD_CEILING
-        if len(ozne_valid) >= 10:
-            sorted_vals = sorted(ozne_valid)
-            q1 = sorted_vals[len(sorted_vals) // 4]
-            q3 = sorted_vals[(3 * len(sorted_vals)) // 4]
-            iqr = q3 - q1
-            ozne_upper = min(OZNE_HARD_CEILING, q3 + 10 * max(iqr, 20))
-        ozne_by_ts = {ts: val for ts, val in ozne_pts if val is None or (0 <= val <= ozne_upper)}
-        ozne_vals = []
-        last_ozne = None
-        for ts in all_gps_times:
-            if ts in ozne_by_ts:
-                last_ozne = ozne_by_ts[ts]
-            ozne_vals.append(fmt_val(last_ozne))
-        
-        mobile_raw["OZNE"][sensor_id] = {
-            "TimeUTC": gps_times_utc,
-            "Latitude": gps_lats,
-            "Longitude": gps_lons,
-            "Value": ozne_vals,
-        }
-    
-    # Now process through normalize_state_for_dashboard like live data
-    # NOTE: For historical data on past days, we do NOT apply road graph snapping
-    # (too slow). The client progressively snaps during playback.
-    # For TODAY's historical data, we DO apply road snapping (same as live).
-    # Override: MOBILEAIR_FORCE_ROAD_SNAP_HISTORICAL=1 forces snapping for all dates (testing)
-    combined = {"mobile": mobile_raw, "fixed": {}}
-    
-    force_snap = os.environ.get("MOBILEAIR_FORCE_ROAD_SNAP_HISTORICAL", "").strip() == "1"
-    use_road_graph = (date_str == today_str) or force_snap
-    
-    result = normalize_state_for_dashboard(
-        combined,
-        custom_names={},
-        pinned_sensors=set(),
-        max_points=5000,  # Allow more points for historical data
-        mobile_url=MOBILE_URL,
-        fixed_url=FIXED_URL,
-        data_dir=str(default_data_dir()),
-        road_graph=get_cached_road_graph() if use_road_graph else None,
-        tram_line_graph=get_cached_tram_line_graph() if use_road_graph else None,
-    )
-
-    # Staleness detection is meaningless for historical data — clear the flags
-    # so sensors aren't hidden from the sidebar.
-    for m in result.get("mobile", []):
-        if isinstance(m, dict):
-            m.pop("ghosted", None)
-            m.pop("stale", None)
-
-    # Add historical metadata
-    result["meta"]["historical"] = True
-    result["meta"]["date"] = date_str
-    
-    # Track data availability
-    mobile_count = len(result.get("mobile", []))
-    if not utah_aq_available:
-        result["meta"]["utah_aq_unavailable"] = True
-        if mobile_count == 0:
-            result["meta"]["mobile_data_unavailable"] = True
-    
-    # Add fixed sensors (Home + PurpleAir) from fixed_history / snapshots
-    _apply_fixed_sensors_to_history(result, date_str, app_state, data_dir)
-    
-    # Cache past days to disk for instant future loads
-    # Only cache mobile data — fixed sensors are reconstructed on serve
-    # Only cache if Utah AQ was reachable and we got actual mobile data
-    if is_past_day:
-        if utah_aq_available and mobile_count > 0:
-            _save_cached_historical_day(data_dir, date_str, result)
-        else:
-            _log(f"[History] Skipping cache for {date_str} (utah_aq_available={utah_aq_available}, mobile_count={mobile_count})")
-    
-    return result
+# def _apply_fixed_sensors_to_history(result, date_str, app_state, data_dir):
+#     """DISABLED — snapshots already contain all fixed sensor data.
+#     Previously reconstructed Home + DEQ + PurpleAir fixed sensors for upstream
+#     historical day results. No longer needed since Select Day loads snapshots."""
+#     pass
 
 
-_history_prefetch_last_date: str | None = None  # last MST date we checked
-_history_prefetch_last_attempt: float = 0.0  # monotonic time of last attempt
-_HISTORY_PREFETCH_RETRY_S: float = 600.0  # retry uncached days every 10 minutes
-
-def _maybe_prefetch_history(app_state: AppState, data_dir: Path) -> None:
-    """Cache any uncached days in the past 6 days.
-
-    Runs on day transition and retries every 10 minutes if any days are still
-    uncached (e.g. upstream was temporarily unreachable).
-    """
-    global _history_prefetch_last_date, _history_prefetch_last_attempt
-    import time as _time
-    mst_tz = timezone(timedelta(hours=-7))
-    today_str = datetime.now(timezone.utc).astimezone(mst_tz).strftime("%Y-%m-%d")
-    now_mono = _time.monotonic()
-    day_changed = (today_str != _history_prefetch_last_date)
-    retry_due = (now_mono - _history_prefetch_last_attempt) >= _HISTORY_PREFETCH_RETRY_S
-    if not day_changed and not retry_due:
-        return
-    today = datetime.now(timezone.utc).astimezone(mst_tz).date()
-    all_cached = True
-    for days_ago in range(1, 7):
-        date_str = (today - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-        if _load_cached_historical_day(data_dir, date_str) is not None:
-            continue
-        all_cached = False
-        try:
-            fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir)
-            if _load_cached_historical_day(data_dir, date_str) is not None:
-                _log(f"[HistoryPrefetch] Cached {date_str}")
-        except Exception as e:
-            _log(f"[HistoryPrefetch] {date_str}: {e}")
-            continue  # try remaining days even if one fails
-    _history_prefetch_last_attempt = now_mono
-    if all_cached:
-        _history_prefetch_last_date = today_str
+# def fetch_historical_day(date_str, app_state=None, data_dir=None, start_ms=None, end_ms=None):
+#     """DISABLED — Select Day now loads from local snapshots.
+#     Previously fetched week-long timeseries from CHPC upstream servers,
+#     filtered to a specific day, and cached results on disk.
+#     No longer needed since we already store all data locally."""
+#     pass
+#
+# def _history_prefetch_loop(app_state, data_dir, stop_event):
+#     """DISABLED — no upstream history data to prefetch.
+#     Previously trickle-downloaded past 6 days from CHPC in the background.
+#     No longer needed since Select Day loads from local snapshots."""
+#     pass
 
 
 def _first_last_ts(trail: list[dict[str, Any]]) -> tuple[float | None, float | None]:
@@ -2050,24 +1614,10 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
         if app_state.airnow_readings:
             _merge_airnow_into_fixed(st, app_state)
 
-        # Merge PurpleAir sensors into fixed sensors
+        # Merge PurpleAir sensors into fixed sensors.
+        # NOTE: PA history accumulation happens in purpleair_fetch_loop (not here)
+        # to avoid flooding fixed_history with duplicate entries every 30s tick.
         if app_state.purpleair_sensors:
-            # Accumulate current PA values into history so history stays
-            # in sync with live readings (PA fetch loop runs on its own
-            # 5-min cycle, but the main fetch loop can run more often).
-            time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            for s in app_state.purpleair_sensors:
-                pm25 = s.get("pm2.5")
-                if pm25 is None:
-                    continue
-                sid = f"PA_{s.get('sensor_index', '')}"
-                try:
-                    pm25_val = float(pm25)
-                except (TypeError, ValueError):
-                    continue
-                color = _get_aqi_color("PM25", pm25_val)
-                accumulate_fixed_reading(app_state, sid, "PM25", round(pm25_val, 1), color, time_utc)
-
             _merge_purpleair_into_fixed(st, app_state)
             # Inject history into PurpleAir sensors (they were added after the
             # earlier _inject_fixed_history call, so they missed it)
@@ -2225,22 +1775,30 @@ OWNER_TOKEN = os.environ.get("DUSTY_OWNER_TOKEN", "").strip()
 PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
 
 
-def _fetch_purpleair_sensors(fields: str = "pm2.5,last_seen") -> list[dict[str, Any]]:
+def _fetch_purpleair_sensors(fields: str = "pm2.5,last_seen",
+                             sensor_indices: list[int] | None = None) -> list[dict[str, Any]]:
     """Fetch PurpleAir sensors in the SLC bounding box.
 
-    *fields* controls which columns are requested.  The lightweight default
-    (``pm2.5,last_seen``) is used for the frequent data poll.  Pass the full
-    metadata field list (``name,latitude,longitude``) on the slower hourly
-    cadence to keep the sensor cache up-to-date without burning points.
+    *fields* controls which columns are requested.
+    *sensor_indices* — if provided, uses the ``show_only`` parameter to fetch
+    only those specific sensors (no bounding box needed).  Used for targeted
+    neighbour refreshes so we don't burn points fetching the entire grid.
     """
-    params = {
-        "fields": fields,
-        "nwlng": str(SLC_BOUNDS["lon_min"]),
-        "nwlat": str(SLC_BOUNDS["lat_max"]),
-        "selng": str(SLC_BOUNDS["lon_max"]),
-        "selat": str(SLC_BOUNDS["lat_min"]),
-        "location_type": "0",  # outdoor only
-    }
+    if sensor_indices is not None:
+        # Targeted fetch: specific sensor indices only, no bbox
+        params = {
+            "fields": fields,
+            "show_only": ",".join(str(i) for i in sensor_indices),
+        }
+    else:
+        params = {
+            "fields": fields,
+            "nwlng": str(SLC_BOUNDS["lon_min"]),
+            "nwlat": str(SLC_BOUNDS["lat_max"]),
+            "selng": str(SLC_BOUNDS["lon_max"]),
+            "selat": str(SLC_BOUNDS["lat_min"]),
+            "location_type": "0",  # outdoor only
+        }
     qs = "&".join(f"{k}={v}" for k, v in params.items())
     url = f"{PURPLEAIR_API_URL}?{qs}"
     try:
@@ -2397,218 +1955,251 @@ def purpleair_fetch_loop(
 ) -> None:
     """Background loop to fetch PurpleAir sensor data.
 
-    BATCHED REQUEST STRATEGY (to minimize API calls):
-    1. First, poll only `last_seen` to check which sensors have updated
-    2. Then, poll `pm2.5` ONLY for sensors with updated `last_seen` values
+    SPARSE SENTINEL STRATEGY:
+    Each cycle polls one sentinel sensor per ~2 km grid cell (typically ~30–50
+    sentinels for SLC's ~242 outdoor sensors).  If a sentinel's pm2.5 crosses
+    an AQI color boundary, every sensor in that cell is fetched immediately via
+    show_only.  Cells whose sentinel didn't change color are skipped entirely.
 
-    Metadata fields (name, latitude, longitude) are refreshed once per six hours
-    and merged into the cached sensor list so lat/lon/name stay current
-    without burning points on every poll.
+    Metadata (name, lat, lon + full pm2.5 sweep) refreshes every 6 hours so
+    the complete sensor picture stays current regardless of sentinel activity.
+
+    Budget math (2,000,000 pts/month, 242 sensors, ~1 pt/sensor/field):
+      Sentinel poll  ~50 pts/cycle (one per occupied grid cell)
+      Cluster fetch  up to ~489 pts if ALL cells trigger (worst case)
+      Metadata       ~970 pts per refresh (242 sensors × 4 fields)
+
+      Day  (19h, 10 min):  114 cycles × 50  =  5,700 pts  (sentinel only)
+                           114 cycles × 489 = 55,746 pts  (worst-case clusters)
+      Night (5h, 30 min):   10 cycles × 50  =    500 pts
+      Metadata (4×/day):     4         × 970 =  3,880 pts
+      ──────────────────────────────────────────────────────
+      Quiet day  (no clusters): ~10,080 pts/day →   ~307K/month
+      Worst-case day (all clusters): ~60,126 pts/day → ~1.83M/month
+      Budget: 2,000,000 pts/month ✓ even in worst case
     """
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
-    META_INTERVAL = 21600.0  # 6 hours
-    DATA_INTERVAL_DAY   = 600.0   # 10 minutes during daytime
-    DATA_INTERVAL_NIGHT = 900.0   # 15 minutes during nighttime (1 AM – 6 AM MST)
+    META_INTERVAL       = 21600.0  # 6 hours
+    DATA_INTERVAL_DAY   = 600.0    # 10 min during day
+    DATA_INTERVAL_NIGHT = 1800.0   # 30 min during night (1 AM – 6 AM MST)
+    NEIGHBOR_RADIUS_DEG = 0.018    # ~2 km grid cell side length
 
     debug_log_path = data_dir / "purpleair_debug.json"
-    _log(f"[PurpleAir] Debug file path: {debug_log_path}")
 
-    def _current_data_interval() -> float:
-        """Return the poll interval based on MST hour (nighttime = reduced polling)."""
-        utc_now = datetime.now(timezone.utc)
-        mst_hour = (utc_now.hour - 7) % 24  # MST = UTC-7
-        if 1 <= mst_hour < 6:
-            return DATA_INTERVAL_NIGHT
-        return DATA_INTERVAL_DAY
+    def _is_night() -> bool:
+        mst_hour = (datetime.now(timezone.utc).hour - 7) % 24
+        return 1 <= mst_hour < 6
 
-    # Write initial debug file immediately
+    def _current_interval() -> float:
+        return DATA_INTERVAL_NIGHT if _is_night() else DATA_INTERVAL_DAY
+
+    def _aqi_color_category(pm25: float) -> str:
+        """Return the AQI color string for a pm2.5 value.  Only the COLOR
+        matters — value changes within the same color are ignored."""
+        return _get_aqi_color("PM25", pm25)
+
+    def _build_grid(sensors: list[dict]) -> dict[tuple[int, int], list[int]]:
+        """Divide all sensors into spatial grid cells (NEIGHBOR_RADIUS_DEG × NEIGHBOR_RADIUS_DEG).
+        Returns a dict mapping (grid_x, grid_y) → list of sensor_index values in that cell.
+        Sensors in adjacent cells breathe the same air, so when any sentinel in a cell
+        detects a color change we fetch every sensor in that cell."""
+        grid: dict[tuple[int, int], list[int]] = {}
+        for s in sensors:
+            lat = s.get("latitude")
+            lon = s.get("longitude")
+            sid = s.get("sensor_index")
+            if lat is None or lon is None or sid is None:
+                continue
+            cell = (int(lat / NEIGHBOR_RADIUS_DEG), int(lon / NEIGHBOR_RADIUS_DEG))
+            grid.setdefault(cell, []).append(sid)
+        return grid
+
+    def _pick_sentinels(sensors: list[dict], grid: dict[tuple[int, int], list[int]]) -> list[dict]:
+        """Pick one sensor per grid cell as the sentinel for that cell.
+        This guarantees every cluster has exactly one representative regardless
+        of how densely packed sensors are in any particular area."""
+        by_sid = {s["sensor_index"]: s for s in sensors if s.get("sensor_index") is not None}
+        sentinels = []
+        for cell_members in grid.values():
+            # Pick whichever member we have full data for (lat/lon present)
+            for sid in cell_members:
+                s = by_sid.get(sid)
+                if s and s.get("latitude") is not None and s.get("longitude") is not None:
+                    sentinels.append(s)
+                    break
+        return sentinels
+
+    def _cluster_of(sid: int, grid: dict[tuple[int, int], list[int]],
+                    sensors: list[dict]) -> list[int]:
+        """Return all sensor_index values in the same grid cell as sid.
+        These are the sensors that breathe the same air and need updating
+        when their sentinel detects an AQI color change."""
+        by_sid = {s["sensor_index"]: s for s in sensors if s.get("sensor_index") is not None}
+        s = by_sid.get(sid)
+        if s is None:
+            return []
+        lat, lon = s.get("latitude"), s.get("longitude")
+        if lat is None or lon is None:
+            return []
+        cell = (int(lat / NEIGHBOR_RADIUS_DEG), int(lon / NEIGHBOR_RADIUS_DEG))
+        return grid.get(cell, [])
+
+    def _apply_fetched(fetched: list[dict], now: float) -> None:
+        """Merge fetched pm2.5 readings into app_state and accumulate history.
+        Must be called with app_state.lock held."""
+        time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        by_id = {s["sensor_index"]: s for s in fetched if s.get("sensor_index") is not None}
+        existing_ids = {s.get("sensor_index") for s in app_state.purpleair_sensors}
+        for s in app_state.purpleair_sensors:
+            sid = s.get("sensor_index")
+            if sid not in by_id:
+                continue
+            pm25_raw = by_id[sid].get("pm2.5")
+            if pm25_raw is None:
+                continue
+            try:
+                pm25_val = float(pm25_raw)
+            except (TypeError, ValueError):
+                continue
+            s["pm2.5"] = pm25_val
+            color = _get_aqi_color("PM25", pm25_val)
+            accumulate_fixed_reading(app_state, f"PA_{sid}", "PM25", round(pm25_val, 1), color, time_utc)
+        # Brand-new sensors not yet in cache
+        for sid, s in by_id.items():
+            if sid not in existing_ids:
+                app_state.purpleair_sensors.append(s)
+                pm25_raw = s.get("pm2.5")
+                if pm25_raw is not None:
+                    try:
+                        pm25_val = float(pm25_raw)
+                        color = _get_aqi_color("PM25", pm25_val)
+                        accumulate_fixed_reading(app_state, f"PA_{sid}", "PM25", round(pm25_val, 1), color, time_utc)
+                    except (TypeError, ValueError):
+                        pass
+        app_state.purpleair_last_fetch = now
+        if isinstance(app_state.state, dict):
+            _merge_purpleair_into_fixed(app_state.state, app_state)
+            _inject_fixed_history(app_state, app_state.state)
+            app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
+
+    # Write initial debug file
     try:
-        initial_debug = {
+        debug_log_path.write_text(json.dumps({
             "status": "initialized",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "interval_day_seconds": DATA_INTERVAL_DAY,
-            "interval_night_seconds": DATA_INTERVAL_NIGHT,
-            "meta_interval_seconds": META_INTERVAL,
-            "note": "Waiting 20s for main fetch loop, then starting first poll"
-        }
-        debug_log_path.write_text(json.dumps(initial_debug, indent=2), encoding="utf-8")
-        _log(f"[PurpleAir] Debug logging initialized: {debug_log_path}")
+            "interval_day_s": DATA_INTERVAL_DAY,
+            "interval_night_s": DATA_INTERVAL_NIGHT,
+            "neighbor_radius_deg": NEIGHBOR_RADIUS_DEG,
+            "budget": "2M pts/month — worst-case ~1.83M, typical ~307K",
+        }, indent=2), encoding="utf-8")
     except Exception as e:
-        _log(f"[PurpleAir] Debug log initialization error: {e}")
+        _log(f"[PurpleAir] Debug log init error: {e}")
 
-    # Wait for main fetch loop to start
     _log("[PurpleAir] Waiting 20s for main fetch loop to start...")
     stop_event.wait(20.0)
-    _log("[PurpleAir] Starting PurpleAir fetch loop")
+    _log("[PurpleAir] Starting PurpleAir fetch loop (sparse sentinel strategy)")
 
     while not stop_event.is_set():
         now = time.time()
-        debug_info = {
+        debug_info: dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "calls": [],
         }
 
         try:
             # ── Metadata refresh (every 6 hours) ──────────────────────────────
+            # Also fetches all pm2.5 values so the full picture stays current.
             need_meta = (now - app_state.purpleair_meta_last_fetch) >= META_INTERVAL
             if need_meta:
-                _log(f"[PurpleAir] API Call: Fetching metadata (name,latitude,longitude)")
-                debug_info["calls"].append({
-                    "type": "metadata",
-                    "fields": "name,latitude,longitude",
-                    "time": datetime.now(timezone.utc).isoformat()
-                })
-                meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude")
+                _log("[PurpleAir] Metadata refresh: fetching name,latitude,longitude,pm2.5 for all sensors")
+                meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude,pm2.5")
+                debug_info["calls"].append({"type": "metadata_full", "count": len(meta_sensors)})
                 if meta_sensors:
                     with app_state.lock:
-                        # Build lookup by sensor_index for merging
                         meta_by_id = {s["sensor_index"]: s for s in meta_sensors if s.get("sensor_index")}
-                        # Update existing cached sensors with fresh metadata
                         for s in app_state.purpleair_sensors:
                             sid = s.get("sensor_index")
                             if sid and sid in meta_by_id:
                                 m = meta_by_id.pop(sid)
-                                s["name"] = m.get("name", s.get("name"))
-                                s["latitude"] = m.get("latitude", s.get("latitude"))
+                                s["name"]      = m.get("name",      s.get("name"))
+                                s["latitude"]  = m.get("latitude",  s.get("latitude"))
                                 s["longitude"] = m.get("longitude", s.get("longitude"))
-                        # Add any brand-new sensors we haven't seen before
+                                if m.get("pm2.5") is not None:
+                                    s["pm2.5"] = m["pm2.5"]
                         for sid, m in meta_by_id.items():
                             app_state.purpleair_sensors.append(m)
                         app_state.purpleair_meta_last_fetch = now
-                    _log(f"[PurpleAir] Metadata refreshed ({len(meta_sensors)} sensors)")
+                        _apply_fetched(meta_sensors, now)
+                    _log(f"[PurpleAir] Metadata+pm2.5 refreshed ({len(meta_sensors)} sensors)")
 
-            # ── BATCHED Data poll (minimize API calls) ────────────────────────
-            # Step 1: Fetch ONLY last_seen to check for updates
-            _log(f"[PurpleAir] API Call: Fetching last_seen only")
-            debug_info["calls"].append({
-                "type": "last_seen_check",
-                "fields": "last_seen",
-                "time": datetime.now(timezone.utc).isoformat()
-            })
-            last_seen_sensors = _fetch_purpleair_sensors(fields="last_seen")
+            # ── Sparse sentinel poll ───────────────────────────────────────────
+            # Build the spatial grid fresh each cycle (sensors list may have grown
+            # after a metadata refresh). One sentinel per grid cell.
+            with app_state.lock:
+                grid = _build_grid(app_state.purpleair_sensors)
+                sentinels = _pick_sentinels(app_state.purpleair_sensors, grid)
+            sentinel_ids = [s["sensor_index"] for s in sentinels]
 
-            # Step 2: Identify sensors with updated last_seen values
-            updated_sensor_ids = []
-            if last_seen_sensors:
-                for s in last_seen_sensors:
-                    sid = s.get("sensor_index")
-                    if sid is None:
-                        continue
-                    new_last_seen = s.get("last_seen")
-                    if new_last_seen is None:
-                        continue
-                    try:
-                        new_last_seen_int = int(new_last_seen)
-                    except (TypeError, ValueError):
-                        continue
+            _log(f"[PurpleAir] Polling {len(sentinel_ids)} sentinels ({len(grid)} grid cells)")
+            sentinel_data = _fetch_purpleair_sensors(fields="pm2.5", sensor_indices=sentinel_ids)
+            debug_info["calls"].append({"type": "sentinel_poll", "count": len(sentinel_ids)})
 
-                    # Check if last_seen has changed
-                    cached_last_seen = app_state.purpleair_last_seen_cache.get(sid)
-                    if cached_last_seen is None or new_last_seen_int > cached_last_seen:
-                        updated_sensor_ids.append(sid)
-                        app_state.purpleair_last_seen_cache[sid] = new_last_seen_int
-
-            _log(f"[PurpleAir] {len(updated_sensor_ids)} sensors have updated data")
-            debug_info["updated_sensors"] = len(updated_sensor_ids)
-
-            # Step 3: Fetch pm2.5 ONLY for sensors with updated last_seen
-            # TODO: Implement batched pm2.5 fetch for specific sensor IDs
-            # For now, we still fetch all pm2.5 data, but this shows which ones changed
-            # The PurpleAir API doesn't support filtering by sensor_index in bulk,
-            # so we fetch all and only process the updated ones
-            if updated_sensor_ids:
-                _log(f"[PurpleAir] API Call: Fetching pm2.5 for all sensors (filtering {len(updated_sensor_ids)} updated)")
-                debug_info["calls"].append({
-                    "type": "pm25_data",
-                    "fields": "pm2.5",
-                    "time": datetime.now(timezone.utc).isoformat(),
-                    "note": f"Fetching for {len(updated_sensor_ids)} updated sensors"
-                })
-                data_sensors = _fetch_purpleair_sensors(fields="pm2.5")
-                if data_sensors:
+            # Detect AQI color-category changes and queue full cluster fetches
+            cluster_ids_to_fetch: set[int] = set()
+            for s in sentinel_data:
+                sid = s.get("sensor_index")
+                pm25_raw = s.get("pm2.5")
+                if sid is None or pm25_raw is None:
+                    continue
+                try:
+                    pm25_val = float(pm25_raw)
+                except (TypeError, ValueError):
+                    continue
+                new_color = _aqi_color_category(pm25_val)
+                old_pm25  = app_state.purpleair_pm25_cache.get(sid)
+                old_color = _aqi_color_category(old_pm25) if old_pm25 is not None else None
+                app_state.purpleair_pm25_cache[sid] = pm25_val
+                if old_color is None or new_color != old_color:
+                    # First read (no baseline yet) or color changed — fetch the whole cluster
                     with app_state.lock:
-                        data_by_id = {s["sensor_index"]: s for s in data_sensors if s.get("sensor_index")}
-                        # Merge data ONLY for sensors with updated last_seen
-                        updated_count = 0
-                        for s in app_state.purpleair_sensors:
-                            sid = s.get("sensor_index")
-                            if sid and sid in updated_sensor_ids and sid in data_by_id:
-                                d = data_by_id[sid]
-                                s["pm2.5"] = d.get("pm2.5")
-                                # Get last_seen from the earlier fetch
-                                for ls_sensor in last_seen_sensors:
-                                    if ls_sensor.get("sensor_index") == sid:
-                                        s["last_seen"] = ls_sensor.get("last_seen")
-                                        break
-                                updated_count += 1
+                        cluster = _cluster_of(sid, grid, app_state.purpleair_sensors)
+                    cluster_ids_to_fetch.update(cluster)
+                    if old_color is not None:
+                        _log(f"[PurpleAir] Sentinel {sid} color {old_color}→{new_color}, "
+                             f"queuing {len(cluster)} cluster members")
 
-                        # For brand-new sensors seen in data but not yet in cache
-                        existing_ids = {s.get("sensor_index") for s in app_state.purpleair_sensors}
-                        for sid in updated_sensor_ids:
-                            if sid not in existing_ids and sid in data_by_id:
-                                new_sensor = data_by_id[sid]
-                                # Add last_seen from earlier fetch
-                                for ls_sensor in last_seen_sensors:
-                                    if ls_sensor.get("sensor_index") == sid:
-                                        new_sensor["last_seen"] = ls_sensor.get("last_seen")
-                                        break
-                                app_state.purpleair_sensors.append(new_sensor)
+            # Apply sentinel readings
+            with app_state.lock:
+                _apply_fetched(sentinel_data, now)
 
-                        app_state.purpleair_last_fetch = now
-                        debug_info["sensors_updated"] = updated_count
-
-                        # Accumulate PurpleAir readings into fixed_history for playback
-                        # ONLY for sensors that were updated
-                        for s in app_state.purpleair_sensors:
-                            sid_num = s.get("sensor_index")
-                            if sid_num not in updated_sensor_ids:
-                                continue
-
-                            pm25 = s.get("pm2.5")
-                            if pm25 is None:
-                                continue
-                            sid = f"PA_{sid_num}"
-                            try:
-                                pm25_val = float(pm25)
-                            except (TypeError, ValueError):
-                                continue
-                            # Use sensor's last_seen timestamp instead of poll time
-                            last_seen = s.get("last_seen")
-                            if last_seen is not None:
-                                try:
-                                    last_seen_int = int(last_seen)
-                                    dt = datetime.fromtimestamp(last_seen_int, tz=timezone.utc)
-                                    time_utc = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                                except (TypeError, ValueError):
-                                    time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                            else:
-                                time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                            color = _get_aqi_color("PM25", pm25_val)
-                            accumulate_fixed_reading(app_state, sid, "PM25", round(pm25_val, 1), color, time_utc)
-                        # Merge into current state immediately
-                        if isinstance(app_state.state, dict):
-                            _merge_purpleair_into_fixed(app_state.state, app_state)
-                            _inject_fixed_history(app_state, app_state.state)
-                            app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
-                    _log(f"[PurpleAir] Updated {updated_count} sensors with new data")
+            # ── Cluster fetch (only for cells whose sentinel changed color) ────
+            # Remove sentinels — already fetched above.
+            cluster_ids_to_fetch -= set(sentinel_ids)
+            if cluster_ids_to_fetch:
+                cluster_list = list(cluster_ids_to_fetch)
+                _log(f"[PurpleAir] Fetching {len(cluster_list)} cluster sensors (show_only)")
+                cluster_data = _fetch_purpleair_sensors(fields="pm2.5",
+                                                        sensor_indices=cluster_list)
+                debug_info["calls"].append({"type": "cluster_fetch", "count": len(cluster_list)})
+                with app_state.lock:
+                    _apply_fetched(cluster_data, now)
             else:
-                _log(f"[PurpleAir] No sensors have updated data, skipping pm2.5 fetch")
-                debug_info["sensors_updated"] = 0
+                _log("[PurpleAir] No color-category changes, no cluster fetches needed")
+
+            debug_info["sentinel_count"] = len(sentinel_ids)
+            debug_info["cluster_sensors_fetched"] = len(cluster_ids_to_fetch)
 
         except Exception as e:
             _log(f"[PurpleAir] Error: {type(e).__name__}: {e}")
             debug_info["error"] = f"{type(e).__name__}: {e}"
 
-        # Write debug info to JSON file (overwrite each time)
         try:
             debug_log_path.write_text(json.dumps(debug_info, indent=2), encoding="utf-8")
-            _log(f"[PurpleAir] Debug log written: {debug_log_path}")
-        except Exception as e:
-            _log(f"[PurpleAir] Debug log write error: {e}")
-            _log(f"[PurpleAir] Attempted path: {debug_log_path}")
+        except Exception:
+            pass
 
-        stop_event.wait(_current_data_interval())
+        stop_event.wait(_current_interval())
 
 
 def _get_mobile_time_range(mobile_list: list[dict[str, Any]]) -> tuple[datetime, datetime] | None:
@@ -3166,16 +2757,15 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             meta["server_revision"] = revision
             # Include adaptive polling info in meta
             meta["polling_predicted_interval_s"] = poller.predicted_interval
+            meta["client_poll_in_s"] = poller.get_next_poll_delay()
             if poller.last_change_ts:
-                meta["polling_time_since_change_s"] = int(time.time() - poller.last_change_ts)
+                time_since_change = time.time() - poller.last_change_ts
+                meta["polling_time_since_change_s"] = int(time_since_change)
+                meta["polling_next_update_in_s"] = max(0.0, poller.predicted_interval - time_since_change)
             update_app_state_with_new_data(app_state, st)
             _log(f"[FetchLoop] Revision {revision} updated")
 
-            # Cache historical days — gated internally to once per MST day transition
-            try:
-                _maybe_prefetch_history(app_state, data_dir)
-            except Exception as pfx_e:
-                _log(f"[HistoryPrefetch] Error: {pfx_e}")
+            # Historical day prefetch DISABLED — Select Day loads from local snapshots
 
             # Periodically save history and snapshot
             if revision % 10 == 0:
@@ -3701,8 +3291,9 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._send(200, json.dumps(raw).encode("utf-8"), "application/json")
             if self.path.startswith("/api/tui"):
                 return self._handle_tui_state()
-            if self.path.startswith("/api/history"):
-                return self._handle_history_request()
+            # /api/history disabled — Select Day now loads from /api/snapshot/load
+            # if self.path.startswith("/api/history"):
+            #     return self._handle_history_request()
             if self.path.startswith("/api/match_segment"):
                 return self._handle_match_segment()
             if self.path.startswith("/api/road_edges"):
@@ -3744,17 +3335,17 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             date_str = query.get("date", [None])[0]
-            
+
             if not date_str:
                 # Default to today's date
                 date_str = datetime.now().strftime("%Y-%m-%d")
-            
+
             try:
                 # Read POSTed body
                 content_length = int(self.headers.get("Content-Length", 0))
                 if content_length > MAX_SNAPSHOT_SIZE_BYTES:
                     return self._send(413, b'{"error": "Request too large"}', "application/json")
-                
+
                 if content_length > 0:
                     # Client sent state data - parse and sanitize it
                     raw_body = self.rfile.read(content_length)
@@ -3763,7 +3354,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                     # No body - save current live state (legacy behavior)
                     with app_state.lock:
                         state_to_save = json.loads(app_state.cached_json_bytes.decode("utf-8"))
-                
+
+                # Trim fixed sensor history to the snapshot's date only
+                _trim_history_to_date(state_to_save, date_str)
+
                 result = save_snapshot(data_dir, date_str, state_to_save)
                 body = json.dumps(result).encode("utf-8")
                 return self._send(200, body, "application/json")
@@ -3775,57 +3369,62 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._send(500, body, "application/json")
 
         def _handle_load_snapshot(self):
-            """Load a saved snapshot by date."""
+            """Load a saved snapshot by date.
+
+            PA sensors baked into old snapshot files are stripped unless
+            fixed_history actually contains PA readings for that date —
+            confirming the data existed at that time.
+            """
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             date_str = query.get("date", [None])[0]
-            
+
             if not date_str:
                 return self._send(400, b'{"error": "date parameter required"}', "application/json")
-            
+
             try:
                 state = load_snapshot(data_dir, date_str)
                 if state is None:
                     return self._send(404, b'{"error": "snapshot not found"}', "application/json")
+
+                # Strip PA sensors from the snapshot unless fixed_history confirms
+                # PA data actually existed on this date.  Old snapshot files may have
+                # PA entries baked in from a time when the sensor list was different or
+                # data was injected incorrectly.
+                existing_pa = [f for f in (state.get("fixed") or []) if f.get("purpleair")]
+                if existing_pa:
+                    # Check fixed_history for any PA entry timestamped on this date
+                    date_prefix = date_str  # "YYYY-MM-DD"
+                    pa_confirmed = False
+                    with app_state.lock:
+                        for sensor_id, pollutants in app_state.fixed_history.items():
+                            if not sensor_id.startswith("PA_"):
+                                continue
+                            for entries in pollutants.values():
+                                if any(e.get("time", "").startswith(date_prefix) for e in entries):
+                                    pa_confirmed = True
+                                    break
+                            if pa_confirmed:
+                                break
+                    if not pa_confirmed:
+                        _log(f"[Snapshot] Stripping {len(existing_pa)} stale PA sensors from {date_str} (no fixed_history data for that date)")
+                        state["fixed"] = [f for f in state["fixed"] if not f.get("purpleair")]
+
+                # Trim data to the requested date's window only (5 AM – 5 AM local)
+                _trim_trails_to_day(state, date_str)
+                _trim_history_to_date(state, date_str)
+
                 body = json.dumps(state).encode("utf-8")
                 return self._send(200, body, "application/json")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 return self._send(500, body, "application/json")
 
-        def _handle_history_request(self):
-            """Fetch week-long historical data for all sensors for a specific date."""
-            from urllib.parse import urlparse, parse_qs
-            query = parse_qs(urlparse(self.path).query)
-            date_str = query.get("date", [None])[0]  # e.g. "2025-12-29"
-            
-            if not date_str:
-                return self._send(400, b'{"error": "date parameter required"}', "application/json")
-            
-            # Parse optional client-provided day boundaries (4 AM local → next 4 AM local)
-            client_start_ms = None
-            client_end_ms = None
-            try:
-                s = query.get("start_ms", [None])[0]
-                e = query.get("end_ms", [None])[0]
-                if s is not None and e is not None:
-                    client_start_ms = int(s)
-                    client_end_ms = int(e)
-            except (ValueError, TypeError):
-                pass
-            
-            try:
-                result = fetch_historical_day(date_str, app_state=app_state, data_dir=data_dir, start_ms=client_start_ms, end_ms=client_end_ms)
-                # Strip Home sensor for non-owner requests
-                if OWNER_TOKEN:
-                    tok = (query.get("tok") or [""])[0]
-                    if tok != OWNER_TOKEN and isinstance(result.get("fixed"), list):
-                        result["fixed"] = [f for f in result["fixed"] if f.get("id") != "Home"]
-                body = json.dumps(result).encode("utf-8")
-                return self._send(200, body, "application/json")
-            except Exception as e:
-                body = json.dumps({"error": str(e)}).encode("utf-8")
-                return self._send(500, body, "application/json")
+        # def _handle_history_request(self):
+        #     """DISABLED — Select Day now loads from /api/snapshot/load instead.
+        #     Previously fetched week-long timeseries from CHPC upstream servers
+        #     and reconstructed a day's worth of data for the dashboard."""
+        #     pass
 
         def _handle_match_segment(self):
             """Road-match a trail segment for a sensor during playback.
@@ -4163,7 +3762,13 @@ def main() -> int:
     ).start()
     _log("[PurpleAir] SLC sensor integration enabled (10-min daytime / 30-min nighttime, batched requests)")
 
-    _log("[HistoryPrefetch] Enabled (runs inside fetch_loop)")
+    # History prefetch disabled — Select Day now loads from local snapshots
+    # threading.Thread(
+    #     target=_history_prefetch_loop,
+    #     kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+    #     daemon=True
+    # ).start()
+    # _log("[HistoryPrefetch] Background trickle-download thread started")
 
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir, server_config=server_config))
     # Timeout for individual requests - helps with Safari/iOS connection issues
@@ -4277,6 +3882,13 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
         daemon=True
     ).start()
+
+    # History prefetch disabled — Select Day now loads from local snapshots
+    # threading.Thread(
+    #     target=_history_prefetch_loop,
+    #     kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+    #     daemon=True
+    # ).start()
 
     # Default config for in-process server (TUI mode)
     server_config = {

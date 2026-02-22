@@ -1712,10 +1712,9 @@ function main() {
     // would naturally reach the end before the next server update.
     // Only applies at 1x and 5x; higher speeds don't get the buffer.
     const _speed = map.getPlaybackSpeed() || 1.0;
-    const _predS = Number(map.lastState?.meta?.polling_predicted_interval_s) || 600;
-    const _tscS2 = Number(map.lastState?.meta?.polling_time_since_change_s) || 0;
+    const _nextInS = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
     const _wallElapsed2 = (Date.now() - _pbLastServerResponseMs) / 1000;
-    const _remS2 = Math.max(0, _predS - _tscS2 - _wallElapsed2);
+    const _remS2 = Math.max(0, _nextInS - _wallElapsed2);
     const _liveWindowMs = (_speed <= 5) ? _remS2 * 1000 * _speed : 0;
     const inLiveWindow = !hasBounds || atEnd || (
       _liveWindowMs > 0 && tMs != null && isFinite(tMs) && tMs >= b.maxMs - _liveWindowMs
@@ -1849,9 +1848,9 @@ function main() {
       // Initialize playhead if not set (handled above, but keep for safety)
       if (tMs == null || !isFinite(tMs)) {
         const meta = map.lastState?.meta;
-        const predictedIntervalS = Number(meta?.polling_predicted_interval_s) || 600;
+        const nextInS = Number(meta?.polling_next_update_in_s) ?? Number(meta?.polling_predicted_interval_s) ?? 600;
         const speed = map.getPlaybackSpeed() || 1.0;
-        const offsetMs = predictedIntervalS * 1000 * speed;
+        const offsetMs = nextInS * 1000 * speed;
         tMs = Math.max(b.minMs, b.maxMs - offsetMs);
         map.setPlaybackTimeMs(tMs);
       }
@@ -2195,10 +2194,9 @@ function main() {
     // Buffer window = predictedInterval * speed, but only for 1x and 5x.
     {
       const _spd2 = map.getPlaybackSpeed() || 1.0;
-      const _prdS2 = Number(map.lastState?.meta?.polling_predicted_interval_s) || 600;
-      const _tscS3 = Number(map.lastState?.meta?.polling_time_since_change_s) || 0;
+      const _nextInS2 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
       const _wallElapsed3 = (Date.now() - _pbLastServerResponseMs) / 1000;
-      const _remS3 = Math.max(0, _prdS2 - _tscS3 - _wallElapsed3);
+      const _remS3 = Math.max(0, _nextInS2 - _wallElapsed3);
       const _lwMs2 = (_spd2 <= 5) ? _remS3 * 1000 * _spd2 : 0;
       const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
       var _inLiveWindow2 = hasBounds && tMs != null && isFinite(tMs) && tMs >= bufferEdge;
@@ -2335,10 +2333,9 @@ function main() {
       // Buffer snap target: always calculated regardless of speed.
       // Live window (button shows "Live"): only for 1x and 5x.
       const _spd = map.getPlaybackSpeed() || 1.0;
-      const _prdS = Number(map.lastState?.meta?.polling_predicted_interval_s) || 600;
-      const _tscS = Number(map.lastState?.meta?.polling_time_since_change_s) || 0;
+      const _nextInS3 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
       const _wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
-      const _remS = Math.max(0, _prdS - _tscS - _wallElapsed);
+      const _remS = Math.max(0, _nextInS3 - _wallElapsed);
       const _snapMs = _remS * 1000 * _spd;
       const _lwMs = (_spd <= 5) ? _snapMs : 0;
       const curMs = map.getPlaybackTimeMs();
@@ -2464,10 +2461,9 @@ function main() {
           const b = map.getPlaybackBounds();
           if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
             const meta = map.lastState?.meta || {};
-            const predictedIntervalS = Number(meta.polling_predicted_interval_s) || 600;
-            const timeSinceChangeS = Number(meta.polling_time_since_change_s) || 0;
+            const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
             const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
-            const remS = Math.max(0, predictedIntervalS - timeSinceChangeS - wallElapsed);
+            const remS = Math.max(0, nextInS - wallElapsed);
             const snapMs = remS * 1000 * newSpeed;
             if (snapMs > 0) {
               const bufferStart = Math.max(b.minMs, b.maxMs - snapMs);
@@ -2503,10 +2499,9 @@ function main() {
     if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;
     const speed = map.getPlaybackSpeed() || 1.0;
     const meta = map.lastState?.meta || {};
-    const predictedIntervalS = Number(meta.polling_predicted_interval_s) || 600;
-    const timeSinceChangeS = Number(meta.polling_time_since_change_s) || 0;
+    const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
     const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
-    const remS = Math.max(0, predictedIntervalS - timeSinceChangeS - wallElapsed);
+    const remS = Math.max(0, nextInS - wallElapsed);
     const bufferMs = remS * 1000 * speed;
     if (bufferMs > 0) {
       const bufferStart = Math.max(b.minMs, b.maxMs - bufferMs);
@@ -2616,25 +2611,18 @@ function main() {
     updateSaveButtonState();
     
     try {
-      // Compute 4 AM local → next 4 AM local as epoch ms for accurate day boundaries
-      const [y, mo, d] = dateStr.split("-").map(Number);
-      const dayStartLocal = new Date(y, mo - 1, d, 4, 0, 0, 0);  // 4 AM local
-      const dayEndLocal = new Date(y, mo - 1, d + 1, 4, 0, 0, 0);  // next 4 AM local
-      const startMs = dayStartLocal.getTime();
-      const endMs = dayEndLocal.getTime();
-      const resp = await fetch(_tokUrl(`${appConfig.apiBaseUrl}/history?date=${encodeURIComponent(dateStr)}&start_ms=${startMs}&end_ms=${endMs}`));
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const loadedState = await resp.json();
-      
-      // Check for server-side error (e.g., Utah AQ down)
-      if (loadedState?.meta?.data_unavailable) {
-        const errMsg = loadedState.meta.error || "Historical data unavailable";
-        throw new Error(errMsg);
+      // Load from local snapshots — we already store all data (mobile, fixed,
+      // purpleair, etc.) so there's no need to fetch from upstream history servers.
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`);
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        throw new Error(errData.error || `No snapshot for ${dateStr}`);
       }
-      
+      const loadedState = await resp.json();
+
       // Validate the loaded data before using it
       if (!validateStateSchema(loadedState)) {
-        throw new Error("Invalid data structure received from server");
+        throw new Error("Invalid data structure in snapshot");
       }
       
       window._historicalState = loadedState;
@@ -2687,7 +2675,7 @@ function main() {
       renderLists(window._historicalState, selectedId);
       
       if (statusEl) {
-        statusEl.textContent = `Historical: ${dateStr}`;
+        statusEl.textContent = `Snapshot: ${dateStr}`;
         statusEl.classList.remove("live");
       }
       
@@ -3084,45 +3072,66 @@ function main() {
     pbDaysSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, e));
   }
   
-  function updateDaysSubmenu() {
+  async function updateDaysSubmenu() {
     if (!pbDaysSubmenu) return;
     pbDaysSubmenu.innerHTML = "";
-    
+
+    // Fetch available snapshots to know which days have data
+    const snapshotDates = new Map(); // dateStr -> size_bytes
+    try {
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`);
+      if (resp.ok) {
+        const data = await resp.json();
+        for (const snap of (data.snapshots || [])) {
+          snapshotDates.set(snap.date, snap.size_bytes);
+        }
+      }
+    } catch (e) {
+      console.warn("Failed to fetch snapshot list:", e);
+    }
+
+    // Always show Today (Live) first
+    const liveItem = document.createElement("div");
+    liveItem.className = "pbSubmenuItem" + (_selectedDayValue === "live" ? " active" : "");
+    liveItem.textContent = "🔮 Today (Live)";
+    liveItem.addEventListener("click", (e) => {
+      e.stopPropagation();
+      _selectedDayValue = "live";
+      loadHistoricalDay("live");
+      closePlaybackMenu();
+    });
+    pbDaysSubmenu.appendChild(liveItem);
+
+    // Show the past 7 days, every day, snapshot or not
     const now = new Date();
-    const options = [];
-    
-    // Today (live)
-    options.push({ value: "live", label: "🔮 Today (Live)" });
-    
-    // Past 6 days
-    for (let i = 1; i <= 6; i++) {
+    for (let i = 1; i <= 7; i++) {
       const d = new Date(now);
       d.setDate(d.getDate() - i);
-      // Use local date components to avoid UTC day-shift mismatch
       const yyyy = d.getFullYear();
       const mm = String(d.getMonth() + 1).padStart(2, "0");
       const dd = String(d.getDate()).padStart(2, "0");
       const dateStr = `${yyyy}-${mm}-${dd}`;
       const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
       const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-      const label = i === 1 ? `Yesterday (${monthDay})` : `${dayName} ${monthDay}`;
-      options.push({ value: dateStr, label });
-    }
-    
-    for (const opt of options) {
+      const hasSnapshot = snapshotDates.has(dateStr);
+
       const item = document.createElement("div");
       item.className = "pbSubmenuItem";
-      if (opt.value === _selectedDayValue) {
-        item.classList.add("active");
+      if (hasSnapshot) {
+        const sizeMB = (snapshotDates.get(dateStr) / (1024 * 1024)).toFixed(1);
+        item.textContent = `${dayName} ${monthDay} (${sizeMB} MB)`;
+        if (_selectedDayValue === dateStr) item.classList.add("active");
+        item.addEventListener("click", (e) => {
+          e.stopPropagation();
+          _selectedDayValue = dateStr;
+          loadHistoricalDay(dateStr);
+          closePlaybackMenu();
+        });
+      } else {
+        item.textContent = `${dayName} ${monthDay}`;
+        item.style.opacity = "0.35";
+        item.style.pointerEvents = "none";
       }
-      item.textContent = opt.label;
-      item.dataset.value = opt.value;
-      item.addEventListener("click", (e) => {
-        e.stopPropagation();
-        _selectedDayValue = opt.value;
-        loadHistoricalDay(opt.value);
-        closePlaybackMenu();
-      });
       pbDaysSubmenu.appendChild(item);
     }
   }
@@ -3739,7 +3748,8 @@ function main() {
     });
   }
 
-  const POLL_MS = 30000;  // 30 seconds
+  const POLL_MS = 30000;  // fallback poll interval (ms) if server doesn't specify
+  let _tickTimeout = null; // dynamic poll scheduler handle
   let _tickInFlight = false;
   let _tickInFlightSince = 0;  // perf timestamp when _tickInFlight was set
   let _tickLastForceRefreshSeq = null;
@@ -3760,6 +3770,8 @@ function main() {
     // Skip live data fetching when viewing historical data OR while loading it
     // Playback loop handles all drawing in historical mode
     if (window._historicalState || _isLoadingData) {
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      _tickTimeout = setTimeout(tick, POLL_MS);
       return;
     }
     
@@ -3778,7 +3790,7 @@ function main() {
       // Even if we're offline, keep redrawing the overlay so time-based fades continue.
       try { map.drawOverlay(map.lastState); } catch {}
       _tickInFlight = false;
-      return;
+      return; // finally block below reschedules
     }
 
     try {
@@ -3787,7 +3799,7 @@ function main() {
 
     window.__lastState = st;
     _pbLastServerResponseMs = Date.now();
-    
+
     // Update save button now that we have data
     updateSaveButtonState();
     
@@ -3844,11 +3856,9 @@ function main() {
         const b = map.getPlaybackBounds();
         if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
           const meta = st?.meta || {};
-          const predictedIntervalS = Number(meta.polling_predicted_interval_s) || 600;
-          const timeSinceChangeS = Number(meta.polling_time_since_change_s) || 0;
-          const timeUntilNextMs = Math.max(60000, (predictedIntervalS - timeSinceChangeS) * 1000);
+          const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
           const speed = map.getPlaybackSpeed() || 1.0;
-          const offsetMs = timeUntilNextMs * speed;
+          const offsetMs = nextInS * 1000 * speed;
           
           // Only activate Live mode for speeds 1-5x
           if (speed > 5) {
@@ -3937,6 +3947,11 @@ function main() {
       try { console.error("[tick] outer error:", e); } catch {}
     } finally {
       _tickInFlight = false;
+      // Always reschedule. Use server-provided timing if available, else fallback.
+      const clientPollS = Number(window.__lastState?.meta?.client_poll_in_s);
+      const nextMs = (isFinite(clientPollS) && clientPollS > 0) ? clientPollS * 1000 : POLL_MS;
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      _tickTimeout = setTimeout(tick, nextMs);
     }
   }
 
@@ -3945,8 +3960,7 @@ function main() {
   loadConfig().then(() => {
     // Re-apply theme in case config pushed new localStorage defaults
     applyTheme(_currentThemeKey, true);
-    tick();
-    setInterval(tick, POLL_MS);
+    tick(); // finally block inside tick() schedules all subsequent polls
   });
 }
 
