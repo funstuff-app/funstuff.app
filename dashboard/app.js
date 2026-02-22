@@ -144,7 +144,7 @@ function main() {
     if (listMobileEl) listMobileEl.classList.toggle("hidden", activeTab !== "mobile");
     if (listFixedEl) listFixedEl.classList.toggle("hidden", activeTab !== "fixed");
     if (listPublicEl) listPublicEl.classList.toggle("hidden", activeTab !== "public");
-    localStorage.setItem(TAB_STORAGE_KEY, activeTab);
+    localStorage.setItem(TAB_STORAGE_KEY, activeTab === "public" ? "mobile" : activeTab);
     localStorage.setItem(SHOW_MOBILE_KEY, map.showMobile ? "true" : "false");
     localStorage.setItem(SHOW_FIXED_KEY, map.showFixed ? "true" : "false");
     localStorage.setItem(SHOW_PUBLIC_KEY, map.showPublic ? "true" : "false");
