@@ -31,16 +31,19 @@
   <meta name="apple-mobile-web-app-title" content="DustyTrails" />
   <link rel="apple-touch-icon" href="/icon-180.png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260202n" />
+  <link rel="stylesheet" href="/styles.css?v=20260222a" />
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
 </head>
 <body>
   <script>
-    window.__bootSearch = location.search;
-    if (location.search) history.replaceState(null, '', location.pathname);
-    if (new URLSearchParams(window.__bootSearch).get('lite') === '1') document.body.classList.add('lite');
+    if (new URLSearchParams(location.search).get('lite') === '1') {
+      document.body.classList.add('lite');
+      var s = document.createElement('style');
+      s.textContent = 'body.lite #topbar,body.lite #sidebar,body.lite #legend,body.lite #legendToggle,body.lite #playbackBar,body.lite #appFooter,body.lite #aboutModal{display:none!important}body.lite #mapPane{position:fixed;inset:0}body.lite #layout{height:100vh}';
+      document.head.appendChild(s);
+    }
   </script>
   <div id="app">
     <header id="topbar">
@@ -235,17 +238,17 @@
 
   <!-- Load order: nav engine → camera logic → config → projections → colors →
        aqi → format → data → MapView class → sidebar UI → main entry point -->
-  <script src="map_nav_engine.js?v=20260205d"></script>
-  <script src="camera_fit_logic.js?v=20260205d"></script>
-  <script src="config.js?v=20260205d"></script>
-  <script src="projections.js?v=20260205d"></script>
-  <script src="colors.js?v=20260205d"></script>
-  <script src="aqi.js?v=20260205d"></script>
-  <script src="format_utils.js?v=20260205d"></script>
-  <script src="data_utils.js?v=20260205d"></script>
-  <script src="map_view.js?v=20260205d"></script>
-  <script src="sidebar_ui.js?v=20260205d"></script>
-  <script src="app.js?v=20260205d"></script>
+  <script src="map_nav_engine.js?v=20260222a"></script>
+  <script src="camera_fit_logic.js?v=20260222a"></script>
+  <script src="config.js?v=20260222a"></script>
+  <script src="projections.js?v=20260222a"></script>
+  <script src="colors.js?v=20260222a"></script>
+  <script src="aqi.js?v=20260222a"></script>
+  <script src="format_utils.js?v=20260222a"></script>
+  <script src="data_utils.js?v=20260222a"></script>
+  <script src="map_view.js?v=20260222a"></script>
+  <script src="sidebar_ui.js?v=20260222a"></script>
+  <script src="app.js?v=20260222a"></script>
 </body>
 </html>
 

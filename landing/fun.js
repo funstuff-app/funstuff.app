@@ -2,6 +2,97 @@
 (function () {
   "use strict";
 
+  /* ── Weekend snapshot logic for embedded map widget ── */
+  var _widgetLoadTime = Date.now();
+  var _widgetSnapshotParams = null;
+  var _snapshotIdx = 0;
+  var _dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+  function _snapshotDate(idx) {
+    var now = new Date();
+    var day = now.getDay();
+    var daysSinceLastFriday = (day === 6) ? 1 : 2;
+    var daysBack = daysSinceLastFriday + idx;
+    var target = new Date(now);
+    target.setDate(target.getDate() - daysBack);
+    return target;
+  }
+
+  function _formatDate(d) {
+    return d.getFullYear() + "-" +
+      String(d.getMonth() + 1).padStart(2, "0") + "-" +
+      String(d.getDate()).padStart(2, "0");
+  }
+
+  function _snapshotParamStr(dateStr) {
+    return "date=" + dateStr + "&start=10&duration=2&playhead=60&speed=20";
+  }
+
+  function _loadSnapshot(idx) {
+    var iframe = document.getElementById("map-iframe");
+    if (!iframe) return;
+    var baseSrc = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
+    var target = _snapshotDate(idx);
+    var dateStr = _formatDate(target);
+    iframe.src = baseSrc + "?" + _snapshotParamStr(dateStr) + "&lite=1";
+    _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
+    _widgetLoadTime = Date.now();
+    _snapshotIdx = idx;
+    _updateIndicator(target);
+  }
+
+  function _cycleSnapshot(idx) {
+    var iframe = document.getElementById("map-iframe");
+    if (!iframe || !iframe.contentWindow) return;
+    var target = _snapshotDate(idx);
+    var dateStr = _formatDate(target);
+    try { iframe.contentWindow.location.hash = _snapshotParamStr(dateStr); } catch(e) { _loadSnapshot(idx); return; }
+    _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
+    _widgetLoadTime = Date.now();
+    _snapshotIdx = idx;
+    _updateIndicator(target);
+  }
+
+  function _updateIndicator(target) {
+    var indicator = document.getElementById("snapshot-indicator");
+    if (indicator) {
+      indicator.textContent = "\u25B6 " + _dayNames[target.getDay()] + " " +
+        (target.getMonth() + 1) + "/" + target.getDate() + " 11AM";
+      indicator.style.display = "block";
+    }
+  }
+
+  (function setMapIframeSrc() {
+    var now = new Date();
+    var day = now.getDay();
+    if (day === 0 || day === 6) {
+      var key = "funstuff_weekday_idx";
+      var stored = sessionStorage.getItem(key);
+      var idx = stored !== null ? (parseInt(stored, 10) + 1) % 5 : 0;
+      sessionStorage.setItem(key, String(idx));
+      _loadSnapshot(idx);
+      var overlayLabel = document.getElementById("demo-overlay-label");
+      if (overlayLabel) overlayLabel.textContent = "Recorded snapshot \u2014 click to open live app";
+    } else {
+      var iframe = document.getElementById("map-iframe");
+      if (iframe) iframe.src = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
+      var overlayLabel = document.getElementById("demo-overlay-label");
+      if (overlayLabel) overlayLabel.textContent = "Live preview \u2014 click to open full app";
+      var indicator = document.getElementById("snapshot-indicator");
+      if (indicator) indicator.style.display = "none";
+    }
+  })();
+
+  var indicatorEl = document.getElementById("snapshot-indicator");
+  if (indicatorEl) {
+    indicatorEl.addEventListener("click", function (e) {
+      e.stopPropagation();
+      var nextIdx = (_snapshotIdx + 1) % 5;
+      _cycleSnapshot(nextIdx);
+      sessionStorage.setItem("funstuff_weekday_idx", String(_snapshotIdx));
+    });
+  }
+
   /* ── Taskbar clock ── */
   var clockEl = document.getElementById("tray-clock");
   function tickClock() {
@@ -15,11 +106,26 @@
   tickClock();
   setInterval(tickClock, 15000);
 
-  /* ── Map overlay → link to full app ── */
+  /* ── Map overlay → link to full app (synced on weekends) ── */
   var mapOverlay = document.querySelector(".demo-overlay");
   if (mapOverlay) {
     mapOverlay.addEventListener("click", function () {
-      window.open("https://dustytrails.funstuff.app/", "_blank", "noopener");
+      if (_widgetSnapshotParams) {
+        var elapsedMin = Math.floor((Date.now() - _widgetLoadTime) / 60000);
+        var simElapsed = elapsedMin * _widgetSnapshotParams.speed;
+        var syncedPlayhead = _widgetSnapshotParams.basePlayhead + simElapsed;
+        var p = _widgetSnapshotParams;
+        var url = "https://dustytrails.funstuff.app/" +
+          "?date=" + p.date +
+          "&start=" + p.start +
+          "&duration=" + p.duration +
+          "&playhead=" + syncedPlayhead +
+          "&speed=" + p.speed +
+          "&fresh=1";
+        window.open(url, "_blank", "noopener");
+      } else {
+        window.open("https://dustytrails.funstuff.app/", "_blank", "noopener");
+      }
     });
   }
 
