@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>funstuff.app — DustyTrails: Real-Time Air Quality in Salt Lake City</title>
+  <meta name="description" content="DustyTrails is a real-time air quality map for Salt Lake City and the Wasatch Front. PM2.5, ozone, and NO₂ from Utah DAQ mobile buses, TRAX light-rail sensors, EPA fixed monitors, and PurpleAir community sensors. A personal project by a person who breathes this air." />
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="funstuff.app — DustyTrails: Salt Lake City Air Quality" />
+  <meta property="og:description" content="Real-time air quality map for Salt Lake City. PM2.5, ozone, NO₂ from mobile buses, TRAX, fixed monitors, and PurpleAir sensors." />
+  <meta property="og:url" content="https://funstuff.app/" />
+  <meta property="og:site_name" content="funstuff.app" />
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="funstuff.app — DustyTrails: Salt Lake City Air Quality" />
+  <meta name="twitter:description" content="Real-time air quality map for Salt Lake City and the Wasatch Front." />
+
+  <link rel="canonical" href="https://funstuff.app/" />
+
+  <!-- Structured Data -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "DustyTrails",
+    "url": "https://dustytrails.funstuff.app/",
+    "description": "Real-time air quality map for Salt Lake City and the Wasatch Front showing PM2.5, ozone, and NO₂ from mobile and fixed sensors.",
+    "applicationCategory": "EnvironmentApplication",
+    "operatingSystem": "Web",
+    "areaServed": {
+      "@type": "City",
+      "name": "Salt Lake City",
+      "containedInPlace": {
+        "@type": "State",
+        "name": "Utah"
+      }
+    },
+    "creator": {
+      "@type": "Person",
+      "name": "funstuff.app"
+    },
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    }
+  }
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=VT323&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="crt-lines" aria-hidden="true"></div>
+
+  <div class="page">
+
+    <!-- ─── Title Bar ─── -->
+    <header class="window titlebar">
+      <div class="titlebar-left">
+        <span class="titlebar-icon">&#128190;</span>
+        <span class="titlebar-text">C:\FUNSTUFF\</span>
+      </div>
+      <div class="titlebar-buttons">
+        <button class="tb-btn" aria-label="Minimize">_</button>
+        <button class="tb-btn" aria-label="Maximize">&#9633;</button>
+        <button class="tb-btn tb-close" aria-label="Close">&#10005;</button>
+      </div>
+    </header>
+
+    <!-- ─── Main Window ─── -->
+    <main class="window main-window">
+
+      <div class="hero">
+        <h1 class="site-title">funstuff<span class="dot">.</span>app</h1>
+        <p class="tagline">named after the funstuff folder on early Windows machines. you know the one.</p>
+      </div>
+
+      <hr class="divider" />
+
+      <!-- ─── DustyTrails Section ─── -->
+      <section class="project-section" id="dustytrails">
+        <div class="project-header">
+          <div class="folder-icon" aria-hidden="true">
+            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+              <path d="M4 12 C4 10 6 8 8 8 L18 8 L22 12 L40 12 C42 12 44 14 44 16 L44 38 C44 40 42 42 40 42 L8 42 C6 42 4 40 4 38 Z" fill="#e8a735" stroke="#c4881d" stroke-width="1.5"/>
+            </svg>
+          </div>
+          <div>
+            <h2 class="project-name">DustyTrails</h2>
+            <p class="project-sub">real-time air quality for Salt Lake City</p>
+          </div>
+        </div>
+
+        <div class="project-body">
+          <p>
+            [placeholder — a real person will write this, not an AI]
+          </p>
+          <p>
+            DustyTrails is a real-time air quality map for Salt Lake City and the Wasatch Front.
+            It shows PM2.5, ozone, and NO₂ readings from several sources:
+          </p>
+
+          <ul class="source-list">
+            <li>
+              <strong>Utah DAQ mobile sensor buses</strong> — government-operated vehicles that drive around the Salt Lake Valley collecting air quality measurements in real time. Data provided by the University of Utah.
+            </li>
+            <li>
+              <strong>UTA TRAX light-rail sensors</strong> — sensors mounted on TRAX trains. Every trip through the valley is a transect of air quality data.
+            </li>
+            <li>
+              <strong>EPA / DAQ fixed monitoring stations</strong> — the traditional fixed-location monitors you see on AirNow, but integrated into the same map alongside mobile data.
+            </li>
+            <li>
+              <strong>PurpleAir community sensors</strong> — crowdsourced, community-operated sensors. More real-time than the government sensors. (API token limitations mean I can't update these as frequently as I'd like.)
+            </li>
+          </ul>
+
+          <p>
+            This is a personal project. I live in Salt Lake City and I breathe this air. It's not a startup. It's not a product. I don't have an LLC. The sensor data terms don't allow profiting off it anyway, and I wouldn't want to — this is just something I wanted to exist.
+          </p>
+
+          <!-- ─── Map Preview ─── -->
+          <div class="demo-window">
+            <div class="demo-titlebar">
+              <span class="demo-titlebar-icon">&#127758;</span>
+              <span class="demo-titlebar-text">DustyTrails — Live Map Preview</span>
+              <div class="demo-titlebar-buttons">
+                <span class="demo-tb-btn">_</span>
+                <span class="demo-tb-btn">&#9633;</span>
+                <span class="demo-tb-btn demo-tb-close">&#10005;</span>
+              </div>
+            </div>
+            <div class="demo-viewport map-viewport">
+              <iframe
+                src="https://dustytrails.funstuff.app/"
+                title="DustyTrails real-time air quality map for Salt Lake City"
+                loading="lazy"
+                sandbox="allow-scripts allow-same-origin"
+              ></iframe>
+              <div class="demo-overlay" aria-hidden="true">
+                <span class="demo-overlay-label">Live preview — click to open full app</span>
+              </div>
+            </div>
+          </div>
+
+          <a href="https://dustytrails.funstuff.app/" class="launch-btn" rel="noopener">
+            <span class="btn-icon">&#9654;</span>
+            Open DustyTrails
+          </a>
+        </div>
+      </section>
+
+      <hr class="divider" />
+
+      <!-- ─── TUI Terminal Window ─── -->
+      <section class="project-section" id="tui-demo">
+        <div class="project-header">
+          <div class="folder-icon" aria-hidden="true">
+            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+              <rect x="4" y="6" width="40" height="36" rx="2" fill="#1a1a2e" stroke="#444" stroke-width="1.5"/>
+              <rect x="6" y="8" width="36" height="4" rx="1" fill="#333"/>
+              <circle cx="10" cy="10" r="1.5" fill="#e74c3c"/>
+              <circle cx="15" cy="10" r="1.5" fill="#f39c12"/>
+              <circle cx="20" cy="10" r="1.5" fill="#2ecc71"/>
+              <text x="24" y="28" font-family="monospace" font-size="8" fill="#0f0" text-anchor="middle">&gt;_</text>
+            </svg>
+          </div>
+          <div>
+            <h2 class="project-name">Terminal View</h2>
+            <p class="project-sub">the same data, rendered for a CRT</p>
+          </div>
+        </div>
+
+        <div class="project-body">
+          <p>
+            Same sensor readings, tabulated. Updates live. This is what it looks like if your monitor is 80 columns wide and you think GUIs were a mistake.
+          </p>
+
+          <div class="demo-window terminal-window">
+            <div class="demo-titlebar terminal-titlebar">
+              <span class="demo-titlebar-icon">&#9618;</span>
+              <span class="demo-titlebar-text">C:\DUSTYTRAILS\TUI.EXE</span>
+              <div class="demo-titlebar-buttons">
+                <span class="demo-tb-btn">_</span>
+                <span class="demo-tb-btn">&#9633;</span>
+                <span class="demo-tb-btn demo-tb-close">&#10005;</span>
+              </div>
+            </div>
+            <div class="demo-viewport tui-viewport">
+              <iframe
+                src="https://dustytrails.funstuff.app/tui.html"
+                title="DustyTrails TUI — text-mode air quality dashboard"
+                loading="lazy"
+                sandbox="allow-scripts allow-same-origin"
+              ></iframe>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <hr class="divider" />
+
+      <!-- ─── About / SLC Context ─── -->
+      <section class="info-section" id="about">
+        <h3>Why Salt Lake City?</h3>
+        <p>
+          Salt Lake City has a unique air quality situation. The valley is surrounded by mountains on three sides (the Wasatch Range, the Oquirrhs, the Traverse Range) which trap inversions — cold air sinking into the valley and sitting there, accumulating pollution. Winter inversions are the worst. Some days the air quality in the valley is among the worst in the country while the mountains above are pristine.
+        </p>
+        <p>
+          The state of Utah and the University of Utah have invested in mobile sensor platforms — buses and trains that measure air quality as they move through the valley. This is unusual. Most cities only have fixed monitoring stations. The mobile sensors give a much more granular picture of what's happening block by block, hour by hour.
+        </p>
+        <p>
+          If your city has similar mobile air quality sensor programs and you'd like to see your data on a map like this, <a href="mailto:contact@funstuff.app">get in touch</a>. I'd be interested in hearing about it.
+        </p>
+      </section>
+
+      <hr class="divider" />
+
+      <!-- ─── "Other funstuff" teaser ─── -->
+      <section class="info-section" id="more">
+        <h3>Other funstuff</h3>
+        <p>
+          DustyTrails is the only thing here right now. More projects may show up eventually. Or not. It's a personal domain.
+        </p>
+      </section>
+
+    </main>
+
+    <!-- ─── Taskbar ─── -->
+    <footer class="taskbar">
+      <div class="start-btn">
+        <span class="start-icon">&#9776;</span>
+        <span class="start-text">Start</span>
+      </div>
+      <div class="taskbar-tray">
+        <span class="tray-item" id="tray-clock"></span>
+      </div>
+    </footer>
+
+  </div>
+
+  <script src="fun.js"></script>
+</body>
+</html>
