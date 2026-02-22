@@ -87,7 +87,7 @@ function main() {
   
   const validTabs = ["mobile", "fixed", "public"];
   // fresh=1 URL param: render as new user (ignore localStorage preferences)
-  const _freshMode = new URLSearchParams(location.search).get('fresh') === '1';
+  const _freshMode = new URLSearchParams(window.__bootSearch || '').get('fresh') === '1';
   const savedTab = _freshMode ? null : localStorage.getItem(TAB_STORAGE_KEY);
   let activeTab = validTabs.includes(savedTab) ? savedTab : "mobile";
   // On mobile / narrow screens, default sidebar closed to reduce clutter.
@@ -3978,7 +3978,7 @@ function main() {
     applyTheme(_currentThemeKey, true);
 
     // Check for ?date= URL parameter to load a historical snapshot
-    const urlParams = new URLSearchParams(window.location.search);
+    const urlParams = new URLSearchParams(window.__bootSearch || '');
     const urlDate = urlParams.get("date");
     if (urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
       // Validate it's a real date and within the last 7 days
@@ -4009,8 +4009,6 @@ function main() {
           const sp = Number(rawSpeed);
           if (sp >= 1 && sp <= 200) opts.speed = sp;
         }
-        // Clean URL bar now — all params already captured in local vars
-        history.replaceState(null, "", location.pathname);
         try {
           await loadHistoricalDay(urlDate, opts);
           return; // snapshot loaded — don't start live polling
