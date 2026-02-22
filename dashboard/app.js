@@ -3971,6 +3971,37 @@ function main() {
     }
   }
 
+  /** Parse snapshot params from a query/hash string like "?date=...&start=...". */
+  function _parseSnapshotParams(searchStr) {
+    const p = new URLSearchParams(searchStr);
+    const dateStr = p.get("date");
+    if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+    const parsed = new Date(dateStr + "T00:00:00");
+    const now = new Date();
+    const sevenDaysAgo = new Date(now);
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    if (isNaN(parsed.getTime()) || parsed < sevenDaysAgo || parsed > now) return null;
+    const opts = {};
+    const rs = p.get("start");
+    if (rs !== null && /^\d{1,2}$/.test(rs)) { const s = Number(rs); if (s >= 0 && s <= 23) opts.startHour = s; }
+    const rd = p.get("duration");
+    if (rd !== null && /^\d{1,2}$/.test(rd)) { const d = Number(rd); if (d >= 1 && d <= 24) opts.duration = d; }
+    const rp = p.get("playhead");
+    if (rp !== null && /^\d{1,4}$/.test(rp)) { const ph = Number(rp); if (ph >= 0 && ph <= 1440) opts.playhead = ph; }
+    const rsp = p.get("speed");
+    if (rsp !== null && /^\d{1,3}$/.test(rsp)) { const sp = Number(rsp); if (sp >= 1 && sp <= 200) opts.speed = sp; }
+    return { dateStr, opts };
+  }
+
+  // Listen for hash changes — parent iframe can cycle snapshots without reloading
+  window.addEventListener("hashchange", async () => {
+    const hash = location.hash.replace(/^#/, "");
+    if (!hash) return;
+    const snap = _parseSnapshotParams(hash);
+    if (!snap) return;
+    try { await loadHistoricalDay(snap.dateStr, snap.opts); } catch (_e) { /* ignore */ }
+  });
+
   // Load server config before starting data polling
   // This allows the server to control CDN/caching behavior
   loadConfig().then(async () => {
@@ -3978,44 +4009,14 @@ function main() {
     applyTheme(_currentThemeKey, true);
 
     // Check for ?date= URL parameter to load a historical snapshot
-    const urlParams = new URLSearchParams(window.__bootSearch || '');
-    const urlDate = urlParams.get("date");
-    if (urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
-      // Validate it's a real date and within the last 7 days
-      const parsed = new Date(urlDate + "T00:00:00");
-      const now = new Date();
-      const sevenDaysAgo = new Date(now);
-      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-      if (!isNaN(parsed.getTime()) && parsed >= sevenDaysAgo && parsed <= now) {
-        // Parse optional start hour (0-23) and duration (1-24 hours)
-        const rawStart = urlParams.get("start");
-        const rawDur   = urlParams.get("duration");
-        const opts = {};
-        if (rawStart !== null && /^\d{1,2}$/.test(rawStart)) {
-          const s = Number(rawStart);
-          if (s >= 0 && s <= 23) opts.startHour = s;
-        }
-        if (rawDur !== null && /^\d{1,2}$/.test(rawDur)) {
-          const d = Number(rawDur);
-          if (d >= 1 && d <= 24) opts.duration = d;
-        }
-        const rawPh = urlParams.get("playhead");
-        if (rawPh !== null && /^\d{1,4}$/.test(rawPh)) {
-          const ph = Number(rawPh);
-          if (ph >= 0 && ph <= 1440) opts.playhead = ph;
-        }
-        const rawSpeed = urlParams.get("speed");
-        if (rawSpeed !== null && /^\d{1,3}$/.test(rawSpeed)) {
-          const sp = Number(rawSpeed);
-          if (sp >= 1 && sp <= 200) opts.speed = sp;
-        }
+    const snap = _parseSnapshotParams(window.__bootSearch || '');
+    if (snap) {
         try {
-          await loadHistoricalDay(urlDate, opts);
+          await loadHistoricalDay(snap.dateStr, snap.opts);
           return; // snapshot loaded — don't start live polling
         } catch (_e) {
           // Snapshot load failed (404 or bad data) — fall through to live
         }
-      }
     }
     tick(); // finally block inside tick() schedules all subsequent polls
   });

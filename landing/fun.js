@@ -6,14 +6,82 @@
   var _widgetLoadTime = Date.now();
   // Snapshot params set by setMapIframeSrc (null on weekdays/live)
   var _widgetSnapshotParams = null;
+  // Current weekday cycle index (0=Fri, 1=Thu, 2=Wed, 3=Tue, 4=Mon)
+  var _snapshotIdx = 0;
+
+  var _dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+  /** Compute the weekday snapshot date for a given index (0–4). */
+  function _snapshotDate(idx) {
+    var now = new Date();
+    var day = now.getDay();
+    var daysSinceLastFriday = (day === 6) ? 1 : 2;
+    var daysBack = daysSinceLastFriday + idx;
+    var target = new Date(now);
+    target.setDate(target.getDate() - daysBack);
+    return target;
+  }
+
+  function _formatDate(d) {
+    return d.getFullYear() + "-" +
+      String(d.getMonth() + 1).padStart(2, "0") + "-" +
+      String(d.getDate()).padStart(2, "0");
+  }
+
+  /** Build the param string for a snapshot (without leading ? or #). */
+  function _snapshotParamStr(dateStr) {
+    return "date=" + dateStr + "&start=10&duration=2&playhead=60&speed=20";
+  }
+
+  /** Full load a snapshot into the iframe (first load — sets src). */
+  function _loadSnapshot(idx) {
+    var iframe = document.getElementById("map-iframe");
+    var indicator = document.getElementById("snapshot-indicator");
+    if (!iframe) return;
+    var baseSrc = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
+
+    var target = _snapshotDate(idx);
+    var dateStr = _formatDate(target);
+
+    iframe.src = baseSrc + "?" + _snapshotParamStr(dateStr) + "&lite=1";
+
+    _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
+    _widgetLoadTime = Date.now();
+    _snapshotIdx = idx;
+
+    _updateIndicator(target);
+  }
+
+  /** Cycle to a new snapshot without reloading the iframe (hash change only). */
+  function _cycleSnapshot(idx) {
+    var iframe = document.getElementById("map-iframe");
+    if (!iframe || !iframe.contentWindow) return;
+
+    var target = _snapshotDate(idx);
+    var dateStr = _formatDate(target);
+
+    // Update iframe hash — triggers hashchange inside the dashboard, no reload
+    iframe.contentWindow.location.hash = _snapshotParamStr(dateStr);
+
+    _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
+    _widgetLoadTime = Date.now();
+    _snapshotIdx = idx;
+
+    _updateIndicator(target);
+  }
+
+  function _updateIndicator(target) {
+    var indicator = document.getElementById("snapshot-indicator");
+    if (indicator) {
+      indicator.textContent = "\u25B6 " + _dayNames[target.getDay()] + " " +
+        (target.getMonth() + 1) + "/" + target.getDate() + " 11AM";
+      indicator.style.display = "block";
+    }
+  }
 
   // ── Weekend snapshot date logic for embedded map ──
   // On weekends, load a recent weekday snapshot so the iframe doesn't show "offline"
   (function setMapIframeSrc() {
-    var iframe = document.getElementById("map-iframe");
-    if (!iframe) return;
-    var baseSrc = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
-    var indicator = document.getElementById("snapshot-indicator");
     var now = new Date();
     var day = now.getDay(); // 0=Sun, 6=Sat
 
@@ -21,42 +89,35 @@
       // Weekend — pick a weekday snapshot, rotating through Mon-Fri across reloads
       var key = "funstuff_weekday_idx";
       var stored = sessionStorage.getItem(key);
-      // Weekday offsets from most-recent Friday, cycling: Fri(0), Thu(1), Wed(2), Tue(3), Mon(4)
       var idx = stored !== null ? (parseInt(stored, 10) + 1) % 5 : 0;
       sessionStorage.setItem(key, String(idx));
 
-      // Calculate the target weekday date
-      // daysSinceLastFriday: how many days back from today to reach last Friday
-      var daysSinceLastFriday = (day === 6) ? 1 : 2; // Sat->1 back, Sun->2 back
-      var daysBack = daysSinceLastFriday + idx; // then add rotation offset (0=Fri,1=Thu,...)
-      var target = new Date(now);
-      target.setDate(target.getDate() - daysBack);
-      var dateStr = target.getFullYear() + "-" +
-        String(target.getMonth() + 1).padStart(2, "0") + "-" +
-        String(target.getDate()).padStart(2, "0");
-
-      iframe.src = baseSrc + "?date=" + dateStr + "&start=10&duration=2&playhead=60&speed=20&lite=1";
-
-      // Store params so the overlay click can sync playhead
-      _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
+      _loadSnapshot(idx);
 
       var overlayLabel = document.getElementById("demo-overlay-label");
       if (overlayLabel) overlayLabel.textContent = "Recorded snapshot \u2014 click to open live app";
-
-      if (indicator) {
-        var dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-        indicator.textContent = "\u25B6 " + dayNames[target.getDay()] + " " +
-          (target.getMonth() + 1) + "/" + target.getDate() + " 11AM";
-        indicator.style.display = "block";
-      }
     } else {
       // Weekday — load live
-      iframe.src = baseSrc;
+      var iframe = document.getElementById("map-iframe");
+      if (iframe) iframe.src = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
       var overlayLabel = document.getElementById("demo-overlay-label");
       if (overlayLabel) overlayLabel.textContent = "Live preview \u2014 click to open full app";
+      var indicator = document.getElementById("snapshot-indicator");
       if (indicator) indicator.style.display = "none";
     }
   })();
+
+  // ── Snapshot indicator click → cycle to next weekday snapshot ──
+  var indicatorEl = document.getElementById("snapshot-indicator");
+  if (indicatorEl) {
+    indicatorEl.addEventListener("click", function (e) {
+      e.stopPropagation(); // don't trigger the overlay click-through
+      var nextIdx = (_snapshotIdx + 1) % 5;
+      _cycleSnapshot(nextIdx);
+      // Persist so next page reload continues from here
+      sessionStorage.setItem("funstuff_weekday_idx", String(_snapshotIdx));
+    });
+  }
 
   // ── Taskbar clock ──
   const clockEl = document.getElementById("tray-clock");

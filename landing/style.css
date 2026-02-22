@@ -377,7 +377,12 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.2);
   letter-spacing: 0.3px;
   z-index: 2;
-  pointer-events: none;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+.snapshot-indicator:hover {
+  background: rgba(0, 0, 180, 0.85);
 }
 
 /* ─── TUI terminal viewport ─── */
