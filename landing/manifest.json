@@ -1,0 +1,18 @@
+{
+  "name": "funstuff.app",
+  "short_name": "funstuff",
+  "description": "funstuff.app — home of DustyTrails and other personal projects.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#008080",
+  "theme_color": "#008080",
+  "icons": [
+    {
+      "src": "https://dustytrails.funstuff.app/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

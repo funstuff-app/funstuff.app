@@ -20,6 +20,7 @@
   <link rel="canonical" href="https://funstuff.app/" />
   <meta name="theme-color" content="#008080" />
   <link rel="icon" href="https://dustytrails.funstuff.app/icon-512.png" type="image/png" />
+  <link rel="manifest" href="manifest.json" />
 
   <script type="application/ld+json">
   {
@@ -61,6 +62,7 @@
 
   <div class="page">
 
+    <div class="app-window" id="app-window">
     <!-- ─── Title Bar ─── -->
     <header class="window titlebar">
       <div class="titlebar-left">
@@ -139,16 +141,14 @@
             </div>
             <div class="demo-viewport map-viewport">
               <iframe
-                id="map-iframe"
-                data-src="https://dustytrails.funstuff.app/"
+                src="https://dustytrails.funstuff.app/"
                 title="DustyTrails real-time air quality map for Salt Lake City"
                 loading="lazy"
                 sandbox="allow-scripts allow-same-origin"
               ></iframe>
               <div class="demo-overlay" aria-hidden="true">
-                <span class="demo-overlay-label" id="demo-overlay-label">Click to open full app</span>
+                <span class="demo-overlay-label">Live preview — click to open full app</span>
               </div>
-              <div class="snapshot-indicator" id="snapshot-indicator"></div>
             </div>
           </div>
 
@@ -234,19 +234,61 @@
       </section>
 
     </main>
-
-    <!-- ─── Taskbar ─── -->
-    <footer class="taskbar">
-      <div class="start-btn">
-        <span class="start-icon">&#9776;</span>
-        <span class="start-text">Start</span>
-      </div>
-      <div class="taskbar-tray">
-        <span class="tray-item" id="tray-clock"></span>
-      </div>
-    </footer>
+    </div>
 
   </div>
+
+  <!-- ─── Taskbar ─── -->
+  <footer class="taskbar" id="taskbar">
+
+      <nav class="start-menu" id="start-menu" aria-label="Start menu" aria-hidden="true">
+        <div class="start-menu-banner" aria-hidden="true">
+          <span class="start-menu-banner-text">funstuff</span>
+        </div>
+        <div class="start-menu-items">
+          <button class="start-menu-item" id="sm-dustytrails">
+            <span class="sm-icon">
+              <svg width="16" height="16" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M4 12 C4 10 6 8 8 8 L18 8 L22 12 L40 12 C42 12 44 14 44 16 L44 38 C44 40 42 42 40 42 L8 42 C6 42 4 40 4 38 Z" fill="#e8a735" stroke="#c4881d" stroke-width="3"/></svg>
+            </span>
+            <span>DustyTrails</span>
+          </button>
+          <button class="start-menu-item" id="sm-tui">
+            <span class="sm-icon">
+              <svg width="16" height="16" viewBox="0 0 48 48" fill="none" aria-hidden="true"><rect x="4" y="6" width="40" height="36" rx="2" fill="#1a1a2e" stroke="#444" stroke-width="2"/><text x="24" y="30" font-family="monospace" font-size="16" fill="#0f0" text-anchor="middle">&gt;_</text></svg>
+            </span>
+            <span>Terminal View</span>
+          </button>
+          <div class="start-menu-sep" role="separator"></div>
+          <button class="start-menu-item start-menu-item-shutdown" id="sm-shutdown">
+            <span class="sm-icon">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6" stroke="#c0c0c0" stroke-width="1.5"/><path d="M8 4V8" stroke="#c0c0c0" stroke-width="1.5" stroke-linecap="round"/><path d="M5.2 5.2 A4 4 0 1 0 10.8 5.2" stroke="#c0c0c0" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>
+            </span>
+            <span>Shut Down...</span>
+          </button>
+        </div>
+      </nav>
+
+      <button class="start-btn" id="start-btn" aria-haspopup="true" aria-expanded="false" aria-controls="start-menu">
+        <span class="start-icon">&#9776;</span>
+        <span class="start-text">Start</span>
+      </button>
+
+      <div class="taskbar-apps" id="taskbar-apps">
+        <button class="taskbar-app-btn active" id="tb-main" title="C:\FUNSTUFF\">
+          <span>funstuff.app</span>
+        </button>
+        <button class="taskbar-app-btn" id="tb-dustytrails" style="display:none" title="DustyTrails">
+          <span>DustyTrails</span>
+        </button>
+        <button class="taskbar-app-btn" id="tb-tui" style="display:none" title="Terminal View">
+          <span>&gt;_ TUI</span>
+        </button>
+      </div>
+
+      <div class="taskbar-tray">
+        <span class="tray-item" id="tray-clock"></span>
+    </div>
+  </footer>
 
   <script src="fun.js"></script>
 </body>

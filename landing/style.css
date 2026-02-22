@@ -40,7 +40,8 @@ body {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: var(--win-bg);
   color: var(--text);
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   line-height: 1.6;
@@ -65,16 +66,25 @@ body {
 .page {
   width: 100%;
   max-width: var(--window-max);
-  margin: 24px auto;
-  padding: 0 12px;
+  margin: 0 auto;
+  padding: 24px 12px 0;
   display: flex;
   flex-direction: column;
   flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    Windows 95–style window chrome
    ═══════════════════════════════════════════════════════════════════════════ */
+.app-window {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
 .window {
   background: var(--win-silver);
   border: 2px solid;
@@ -141,6 +151,8 @@ body {
   padding: 24px 28px;
   background: var(--win-surface);
   flex: 1;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 /* ─── Hero ─── */
@@ -232,7 +244,6 @@ body {
   border-color: var(--win-btn-highlight) var(--win-btn-shadow) var(--win-btn-shadow) var(--win-btn-highlight);
   text-decoration: none;
   cursor: pointer;
-  margin-top: 4px;
   transition: filter 0.1s;
 }
 
@@ -388,6 +399,9 @@ body {
 /* ─── TUI terminal viewport ─── */
 .terminal-window {
   background: #0a0a0a;
+  max-width: 640px;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .terminal-titlebar {
@@ -423,6 +437,19 @@ body {
   }
 }
 
+/* ─── Maximized mode ─── */
+.page.maximized {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+.page.maximized .map-viewport {
+  height: 560px;
+}
+.page.maximized .tui-viewport {
+  height: 600px;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    Info sections
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -448,46 +475,197 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   Launch row + PWA install button
+   ═══════════════════════════════════════════════════════════════════════════ */
+.launch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 4px;
+}
+
+.install-btn {
+  display: none;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 18px;
+  font-family: 'VT323', monospace;
+  font-size: 1.3rem;
+  color: var(--text);
+  background: var(--win-silver);
+  border: 2px solid;
+  border-color: var(--win-btn-highlight) var(--win-btn-shadow) var(--win-btn-shadow) var(--win-btn-highlight);
+  cursor: pointer;
+  transition: filter 0.1s;
+}
+
+.install-btn:hover { filter: brightness(0.93); }
+.install-btn:active {
+  border-color: var(--win-btn-shadow) var(--win-btn-highlight) var(--win-btn-highlight) var(--win-btn-shadow);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    Taskbar (footer)
    ═══════════════════════════════════════════════════════════════════════════ */
 .taskbar {
-  position: sticky;
-  bottom: 0;
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 3px 6px;
+  gap: 4px;
+  padding: 3px 12px;
   background: var(--win-silver);
   border-top: 2px solid var(--win-btn-highlight);
   font-family: 'VT323', monospace;
   font-size: 0.95rem;
   user-select: none;
-  z-index: 100;
-  margin-top: 24px;
-  max-width: var(--window-max);
+  z-index: 200;
+  flex-shrink: 0;
   width: 100%;
-  align-self: center;
 }
 
+/* ─── Start button ─── */
 .start-btn {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   padding: 2px 10px;
   border: 2px solid;
   border-color: var(--win-btn-highlight) var(--win-btn-shadow) var(--win-btn-shadow) var(--win-btn-highlight);
   cursor: pointer;
   background: var(--win-silver);
+  font-family: 'VT323', monospace;
+  font-size: 0.95rem;
   font-weight: bold;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
-
-.start-btn:active {
+.start-btn:active,
+.start-btn.open {
   border-color: var(--win-btn-shadow) var(--win-btn-highlight) var(--win-btn-highlight) var(--win-btn-shadow);
+  background: rgba(0,0,0,0.05);
 }
 
-.start-icon {
-  font-size: 1rem;
+/* ─── Start Menu ─── */
+.start-menu {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 2px);
+  left: 0;
+  z-index: 999;
+  background: var(--win-silver);
+  border: 2px solid;
+  border-color: var(--win-btn-highlight) var(--win-btn-shadow) var(--win-btn-shadow) var(--win-btn-highlight);
+  box-shadow: 3px 3px 10px rgba(0,0,0,0.45);
+  flex-direction: row;
+  min-width: 210px;
 }
+.start-menu.open {
+  display: flex;
+  flex-direction: row;
+}
+
+.start-menu-banner {
+  width: 28px;
+  background: linear-gradient(to top, #000070 0%, #1a237e 35%, #283593 65%, #1565c0 100%);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 10px;
+  flex-shrink: 0;
+  min-height: 150px;
+}
+.start-menu-banner-text {
+  font-family: 'VT323', monospace;
+  font-size: 1.05rem;
+  color: rgba(255,255,255,0.5);
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  letter-spacing: 3px;
+  white-space: nowrap;
+  user-select: none;
+  text-transform: lowercase;
+}
+
+.start-menu-items {
+  flex: 1;
+  padding: 3px 0;
+  display: flex;
+  flex-direction: column;
+}
+.start-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 14px 5px 6px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-family: 'Inter', sans-serif;
+  font-size: 0.88rem;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+.start-menu-item:hover,
+.start-menu-item:focus {
+  background: var(--win-navy);
+  color: var(--win-title-text);
+  outline: none;
+}
+.start-menu-item-shutdown {
+  margin-top: auto;
+}
+.sm-icon {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.start-menu-sep {
+  border: none;
+  border-top: 1px solid var(--win-dark);
+  border-bottom: 1px solid var(--win-white);
+  margin: 4px 4px;
+}
+
+/* ─── Taskbar app buttons ─── */
+.taskbar-apps {
+  flex: 1;
+  display: flex;
+  gap: 3px;
+  align-items: center;
+  padding: 0 2px;
+  overflow: hidden;
+  min-width: 0;
+}
+.taskbar-app-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  font-family: 'VT323', monospace;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: var(--win-silver);
+  border: 2px solid;
+  border-color: var(--win-btn-highlight) var(--win-btn-shadow) var(--win-btn-shadow) var(--win-btn-highlight);
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+.taskbar-app-btn.active {
+  border-color: var(--win-btn-shadow) var(--win-btn-highlight) var(--win-btn-highlight) var(--win-btn-shadow);
+  background: rgba(0,0,0,0.06);
+}
+.taskbar-app-btn:hover:not(.active) { filter: brightness(0.95); }
 
 .taskbar-tray {
   display: flex;
@@ -498,6 +676,8 @@ body {
   border-color: var(--win-btn-shadow) var(--win-btn-highlight) var(--win-btn-highlight) var(--win-btn-shadow);
   font-size: 0.9rem;
   color: var(--text);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

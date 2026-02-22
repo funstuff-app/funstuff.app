@@ -1,201 +1,199 @@
-/* funstuff.app — tiny interactions */
+/* funstuff.app — interactions */
 (function () {
   "use strict";
 
-  // Track when the widget loaded (for syncing playhead on click-through)
-  var _widgetLoadTime = Date.now();
-  // Snapshot params set by setMapIframeSrc (null on weekdays/live)
-  var _widgetSnapshotParams = null;
-  // Current weekday cycle index (0=Fri, 1=Thu, 2=Wed, 3=Tue, 4=Mon)
-  var _snapshotIdx = 0;
-
-  var _dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-  /** Compute the weekday snapshot date for a given index (0–4). */
-  function _snapshotDate(idx) {
+  /* ── Taskbar clock ── */
+  var clockEl = document.getElementById("tray-clock");
+  function tickClock() {
     var now = new Date();
-    var day = now.getDay();
-    var daysSinceLastFriday = (day === 6) ? 1 : 2;
-    var daysBack = daysSinceLastFriday + idx;
-    var target = new Date(now);
-    target.setDate(target.getDate() - daysBack);
-    return target;
+    var h = now.getHours();
+    var m = String(now.getMinutes()).padStart(2, "0");
+    var ampm = h >= 12 ? "PM" : "AM";
+    var h12 = h % 12 || 12;
+    if (clockEl) clockEl.textContent = h12 + ":" + m + " " + ampm;
   }
+  tickClock();
+  setInterval(tickClock, 15000);
 
-  function _formatDate(d) {
-    return d.getFullYear() + "-" +
-      String(d.getMonth() + 1).padStart(2, "0") + "-" +
-      String(d.getDate()).padStart(2, "0");
-  }
-
-  /** Build the param string for a snapshot (without leading ? or #). */
-  function _snapshotParamStr(dateStr) {
-    return "date=" + dateStr + "&start=10&duration=2&playhead=60&speed=20";
-  }
-
-  /** Full load a snapshot into the iframe (first load — sets src). */
-  function _loadSnapshot(idx) {
-    var iframe = document.getElementById("map-iframe");
-    var indicator = document.getElementById("snapshot-indicator");
-    if (!iframe) return;
-    var baseSrc = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
-
-    var target = _snapshotDate(idx);
-    var dateStr = _formatDate(target);
-
-    iframe.src = baseSrc + "?" + _snapshotParamStr(dateStr) + "&lite=1";
-
-    _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
-    _widgetLoadTime = Date.now();
-    _snapshotIdx = idx;
-
-    _updateIndicator(target);
-  }
-
-  /** Cycle to a new snapshot without reloading the iframe (hash change only). */
-  function _cycleSnapshot(idx) {
-    var iframe = document.getElementById("map-iframe");
-    if (!iframe || !iframe.contentWindow) return;
-
-    var target = _snapshotDate(idx);
-    var dateStr = _formatDate(target);
-
-    // Update iframe hash — triggers hashchange inside the dashboard, no reload
-    iframe.contentWindow.location.hash = _snapshotParamStr(dateStr);
-
-    _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
-    _widgetLoadTime = Date.now();
-    _snapshotIdx = idx;
-
-    _updateIndicator(target);
-  }
-
-  function _updateIndicator(target) {
-    var indicator = document.getElementById("snapshot-indicator");
-    if (indicator) {
-      indicator.textContent = "\u25B6 " + _dayNames[target.getDay()] + " " +
-        (target.getMonth() + 1) + "/" + target.getDate() + " 11AM";
-      indicator.style.display = "block";
-    }
-  }
-
-  // ── Weekend snapshot date logic for embedded map ──
-  // On weekends, load a recent weekday snapshot so the iframe doesn't show "offline"
-  (function setMapIframeSrc() {
-    var now = new Date();
-    var day = now.getDay(); // 0=Sun, 6=Sat
-
-    if (day === 0 || day === 6) {
-      // Weekend — pick a weekday snapshot, rotating through Mon-Fri across reloads
-      var key = "funstuff_weekday_idx";
-      var stored = sessionStorage.getItem(key);
-      var idx = stored !== null ? (parseInt(stored, 10) + 1) % 5 : 0;
-      sessionStorage.setItem(key, String(idx));
-
-      _loadSnapshot(idx);
-
-      var overlayLabel = document.getElementById("demo-overlay-label");
-      if (overlayLabel) overlayLabel.textContent = "Recorded snapshot \u2014 click to open live app";
-    } else {
-      // Weekday — load live
-      var iframe = document.getElementById("map-iframe");
-      if (iframe) iframe.src = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
-      var overlayLabel = document.getElementById("demo-overlay-label");
-      if (overlayLabel) overlayLabel.textContent = "Live preview \u2014 click to open full app";
-      var indicator = document.getElementById("snapshot-indicator");
-      if (indicator) indicator.style.display = "none";
-    }
-  })();
-
-  // ── Snapshot indicator click → cycle to next weekday snapshot ──
-  var indicatorEl = document.getElementById("snapshot-indicator");
-  if (indicatorEl) {
-    indicatorEl.addEventListener("click", function (e) {
-      e.stopPropagation(); // don't trigger the overlay click-through
-      var nextIdx = (_snapshotIdx + 1) % 5;
-      _cycleSnapshot(nextIdx);
-      // Persist so next page reload continues from here
-      sessionStorage.setItem("funstuff_weekday_idx", String(_snapshotIdx));
-    });
-  }
-
-  // ── Taskbar clock ──
-  const clockEl = document.getElementById("tray-clock");
-  function tick() {
-    const now = new Date();
-    const h = now.getHours();
-    const m = String(now.getMinutes()).padStart(2, "0");
-    const ampm = h >= 12 ? "PM" : "AM";
-    const h12 = h % 12 || 12;
-    clockEl.textContent = h12 + ":" + m + " " + ampm;
-  }
-  tick();
-  setInterval(tick, 15000);
-
-  // ── Title-bar buttons (just for fun) ──
-  const closeBtn = document.querySelector(".tb-close");
-  const mainWindow = document.querySelector(".main-window");
-
-  // ── Map overlay → link to full app (synced to widget playhead on weekends) ──
+  /* ── Map overlay → link to full app ── */
   var mapOverlay = document.querySelector(".demo-overlay");
   if (mapOverlay) {
     mapOverlay.addEventListener("click", function () {
-      if (_widgetSnapshotParams) {
-        // Weekend: sync playhead to elapsed time since widget loaded
-        var elapsedMin = Math.floor((Date.now() - _widgetLoadTime) / 60000);
-        // Scale by playback speed to get simulated minutes elapsed
-        var simElapsed = elapsedMin * _widgetSnapshotParams.speed;
-        var syncedPlayhead = _widgetSnapshotParams.basePlayhead + simElapsed;
-        var p = _widgetSnapshotParams;
-        var url = "https://dustytrails.funstuff.app/" +
-          "?date=" + p.date +
-          "&start=" + p.start +
-          "&duration=" + p.duration +
-          "&playhead=" + syncedPlayhead +
-          "&speed=" + p.speed +
-          "&fresh=1";
-        window.open(url, "_blank", "noopener");
+      window.open("https://dustytrails.funstuff.app/", "_blank", "noopener");
+    });
+  }
+
+  /* ── BSOD ── */
+  var appWindow  = document.getElementById("app-window");
+  var mainWindow = document.querySelector(".main-window");
+  var tbMainBtn  = document.getElementById("tb-main");
+
+  function showBSOD() {
+    var bsod = document.createElement("div");
+    bsod.style.cssText =
+      "position:fixed;inset:0;background:#000080;color:#fff;" +
+      "font-family:'VT323',monospace;display:flex;align-items:center;" +
+      "justify-content:center;font-size:1.6rem;text-align:center;" +
+      "z-index:10000;padding:40px;line-height:1.8;cursor:default;";
+    bsod.innerHTML =
+      "A fatal exception 0E has occurred at 0028:C0011E36<br><br>" +
+      "* Press any key to return to funstuff.app<br>" +
+      "* Press CTRL+ALT+DEL to pretend this didn't happen<br><br>" +
+      "Press any key to continue _";
+    document.body.appendChild(bsod);
+    function dismiss() {
+      bsod.remove();
+      restoreWindow();
+      document.removeEventListener("keydown", dismiss);
+      document.removeEventListener("click", dismiss);
+    }
+    setTimeout(function () {
+      document.addEventListener("keydown", dismiss, { once: true });
+      document.addEventListener("click", dismiss, { once: true });
+    }, 300);
+  }
+
+  /* ── Window minimize / restore ── */
+  function minimizeWindow() {
+    if (!appWindow) return;
+    appWindow.style.transition = "opacity 0.2s, transform 0.2s";
+    appWindow.style.opacity = "0";
+    appWindow.style.transform = "scaleY(0.97) translateY(-4px)";
+    setTimeout(function () {
+      appWindow.style.display = "none";
+      appWindow.style.transition = "";
+      appWindow.style.transform = "";
+    }, 220);
+    if (tbMainBtn) tbMainBtn.classList.remove("active");
+  }
+
+  function restoreWindow() {
+    if (!appWindow) return;
+    appWindow.style.display = "";
+    appWindow.style.opacity = "0";
+    appWindow.style.transform = "scaleY(0.97) translateY(-4px)";
+    appWindow.style.transition = "opacity 0.2s, transform 0.2s";
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        appWindow.style.opacity = "1";
+        appWindow.style.transform = "";
+      });
+    });
+    if (tbMainBtn) tbMainBtn.classList.add("active");
+    if (mainWindow) mainWindow.scrollTop = 0;
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  /* ── Maximize button ── */
+  var maximizeBtn = document.querySelector('.tb-btn[aria-label="Maximize"]');
+  var minimizeBtn = document.querySelector('.tb-btn[aria-label="Minimize"]');
+  var page = document.querySelector(".page");
+
+  if (minimizeBtn) minimizeBtn.addEventListener("click", minimizeWindow);
+
+  if (maximizeBtn && page) {
+    maximizeBtn.addEventListener("click", function () {
+      page.classList.toggle("maximized");
+    });
+  }
+
+  /* Taskbar main-window button: toggle */
+  if (tbMainBtn) {
+    tbMainBtn.addEventListener("click", function () {
+      if (appWindow && appWindow.style.display === "none") {
+        restoreWindow();
       } else {
-        // Weekday: open live with no params
-        window.open("https://dustytrails.funstuff.app/", "_blank", "noopener");
+        minimizeWindow();
       }
     });
   }
 
-  if (closeBtn && mainWindow) {
-    closeBtn.addEventListener("click", function () {
-      mainWindow.style.transition = "opacity 0.3s, transform 0.3s";
-      mainWindow.style.opacity = "0";
-      mainWindow.style.transform = "scale(0.95)";
-      setTimeout(function () {
-        mainWindow.style.display = "none";
-        // Show a BSOD-style joke for 2 seconds then bring it back
-        const bsod = document.createElement("div");
-        bsod.style.cssText =
-          "position:fixed;inset:0;background:#000080;color:#fff;font-family:'VT323',monospace;" +
-          "display:flex;align-items:center;justify-content:center;font-size:1.6rem;" +
-          "text-align:center;z-index:10000;padding:40px;line-height:1.8;";
-        bsod.innerHTML =
-          "A fatal exception 0E has occurred at 0028:C0011E36<br><br>" +
-          "* Press any key to return to funstuff.app<br>" +
-          "* Press CTRL+ALT+DEL to pretend this didn't happen<br><br>" +
-          "Press any key to continue _";
-        document.body.appendChild(bsod);
+  /* ── Taskbar DustyTrails / TUI buttons (scroll to section) ── */
+  var tbDustyTrails = document.getElementById("tb-dustytrails");
+  var tbTui         = document.getElementById("tb-tui");
 
-        function restore() {
-          bsod.remove();
-          mainWindow.style.display = "";
-          mainWindow.style.opacity = "1";
-          mainWindow.style.transform = "";
-          document.removeEventListener("keydown", restore);
-          document.removeEventListener("click", restore);
-        }
-        // Any key or click brings it back
-        setTimeout(function () {
-          document.addEventListener("keydown", restore, { once: true });
-          document.addEventListener("click", restore, { once: true });
-        }, 300);
-      }, 350);
-    });
+  function scrollToSection(id) {
+    var wasHidden = appWindow && appWindow.style.display === "none";
+    if (wasHidden) restoreWindow();
+    setTimeout(function () {
+      var el = document.getElementById(id);
+      if (el && mainWindow) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    }, wasHidden ? 260 : 0);
   }
+
+  if (tbDustyTrails) tbDustyTrails.addEventListener("click", function () { scrollToSection("dustytrails"); });
+  if (tbTui)         tbTui.addEventListener("click",         function () { scrollToSection("tui-demo"); });
+
+  /* ── Start Menu ── */
+  var startBtn  = document.getElementById("start-btn");
+  var startMenu = document.getElementById("start-menu");
+
+  function openStartMenu() {
+    if (!startMenu) return;
+    startMenu.classList.add("open");
+    startMenu.setAttribute("aria-hidden", "false");
+    if (startBtn) { startBtn.classList.add("open"); startBtn.setAttribute("aria-expanded", "true"); }
+  }
+  function closeStartMenu() {
+    if (!startMenu) return;
+    startMenu.classList.remove("open");
+    startMenu.setAttribute("aria-hidden", "true");
+    if (startBtn) { startBtn.classList.remove("open"); startBtn.setAttribute("aria-expanded", "false"); }
+  }
+
+  if (startBtn) startBtn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    startMenu && startMenu.classList.contains("open") ? closeStartMenu() : openStartMenu();
+  });
+  document.addEventListener("click", function (e) {
+    if (startMenu && startMenu.classList.contains("open") &&
+        !startMenu.contains(e.target) && e.target !== startBtn) closeStartMenu();
+  });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeStartMenu(); });
+
+  var smShutdown    = document.getElementById("sm-shutdown");
+  var smDustyTrails  = document.getElementById("sm-dustytrails");
+  var smTui          = document.getElementById("sm-tui");
+
+  if (smDustyTrails) smDustyTrails.addEventListener("click", function () {
+    closeStartMenu();
+    scrollToSection("dustytrails");
+  });
+  if (smTui) smTui.addEventListener("click", function () {
+    closeStartMenu();
+    scrollToSection("tui-demo");
+  });
+  if (smShutdown) smShutdown.addEventListener("click", function () {
+    closeStartMenu();
+    minimizeWindow();
+    setTimeout(showBSOD, 250);
+  });
+
+  /* ── PWA install ── */
+  var _installPrompt = null;
+
+  function showPwaTaskbarButtons() {
+    if (tbDustyTrails) tbDustyTrails.style.display = "";
+    if (tbTui)         tbTui.style.display = "";
+    localStorage.setItem("funstuff_pwa_installed", "1");
+  }
+
+  /* Already installed on a previous visit? */
+  if (localStorage.getItem("funstuff_pwa_installed") === "1" ||
+      window.matchMedia("(display-mode: standalone)").matches) {
+    showPwaTaskbarButtons();
+  }
+
+  window.addEventListener("beforeinstallprompt", function (e) {
+    e.preventDefault();
+    _installPrompt = e;
+  });
+
+  window.addEventListener("appinstalled", function () {
+    _installPrompt = null;
+    showPwaTaskbarButtons();
+  });
+
 })();
