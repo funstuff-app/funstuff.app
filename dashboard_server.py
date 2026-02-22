@@ -28,6 +28,9 @@ from pathlib import Path
 import subprocess
 from typing import Any
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+_MOUNTAIN_TZ = ZoneInfo("America/Denver")
 
 
 def _get_bundle_dir() -> Path:
@@ -595,6 +598,8 @@ def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
     for sensor in (state.get("fixed") or []):
         if not isinstance(sensor, dict):
             continue
+        if sensor.get("purpleair"):
+            continue  # PA data is never trimmed — all readings go into the snapshot
         for reading in (sensor.get("readings") or {}).values():
             if not isinstance(reading, dict):
                 continue
@@ -624,13 +629,15 @@ def _trim_trails_to_day(state: dict[str, Any], date_str: str) -> None:
     except (ValueError, TypeError):
         return  # Can't parse date, skip trimming
 
-    # Build the 5 AM – 5 AM window in local time
-    day_start_local = requested_date.replace(hour=5, minute=0, second=0, microsecond=0)
-    day_start_local = day_start_local.astimezone()          # attach system tz
-    day_end_local = day_start_local + timedelta(hours=24)
+    # Build the 5 AM – 5 AM window in Mountain Time (Utah sensors are always MT).
+    # Using the server's local tz (.astimezone()) would give the wrong boundary
+    # on UTC servers (Pi, Docker), where "5am local" = "5am UTC" = "11pm MT".
+    day_start_mt = requested_date.replace(hour=5, minute=0, second=0, microsecond=0,
+                                          tzinfo=_MOUNTAIN_TZ)
+    day_end_mt = day_start_mt + timedelta(hours=24)
 
-    day_start_utc = day_start_local.astimezone(timezone.utc)
-    day_end_utc   = day_end_local.astimezone(timezone.utc)
+    day_start_utc = day_start_mt.astimezone(timezone.utc)
+    day_end_utc   = day_end_mt.astimezone(timezone.utc)
 
     for sensor in (state.get("mobile") or []):
         if not isinstance(sensor, dict):
@@ -867,11 +874,12 @@ def accumulate_fixed_reading(
 
     # Keep history based on sensor type:
     # - Home sensor: 5760 entries (~48 hours at 30-second intervals) to span today + yesterday
-    # - PurpleAir: 5760 entries (~48+ hours with 5-min dedup) to span today + yesterday
+    # - PurpleAir: no cap — all readings accumulate into the snapshot
     # - Utah sensors: 2880 entries (~24 hours at 5-10 min intervals spans days anyway)
-    max_entries = 5760 if (sensor_id == "Home" or is_pa) else 2880
-    if len(hist) > max_entries:
-        app_state.fixed_history[sensor_id][pollutant] = hist[-max_entries:]
+    if not is_pa:
+        max_entries = 5760 if sensor_id == "Home" else 2880
+        if len(hist) > max_entries:
+            app_state.fixed_history[sensor_id][pollutant] = hist[-max_entries:]
     
     app_state.fixed_history_dirty = True
 
@@ -962,13 +970,23 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
         if not isinstance(readings, dict):
             continue
 
+        # Reverse lookup: mapped key -> possible raw keys stored in history
+        _REVERSE_PARAM = {"PM25": ["PM25", "PM2.5"], "OZNE": ["OZNE", "OZONE", "O3"],
+                          "PM10": ["PM10"], "NO2": ["NO2"], "CO": ["CO"], "SO2": ["SO2"]}
+
         for pollutant, reading in readings.items():
             if not isinstance(reading, dict):
                 continue
             if pollutant in _WEATHER_KEYS:
                 continue
 
+            # Try the exact key first, then equivalent raw-API spellings
             hist_entries = hist_for_sensor.get(pollutant, [])
+            if not hist_entries:
+                for alt in _REVERSE_PARAM.get(pollutant, ()):
+                    hist_entries = hist_for_sensor.get(alt, [])
+                    if hist_entries:
+                        break
             if not hist_entries:
                 continue
 
@@ -2961,9 +2979,12 @@ def _fetch_airnow_data(app_state: AppState) -> None:
                         dt = r.get("datetime")
                         time_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
                         sensor_key = f"AIRNOW_{site_id}"
+                        # Normalize AirNow param names (PM2.5→PM25, OZONE→OZNE)
+                        # so history keys match the canonical reading keys.
+                        acc_param = AIRNOW_PARAM_MAP.get(param, param)
                         accumulate_fixed_reading(
-                            app_state, sensor_key, param, val,
-                            _get_aqi_color(param, val), time_str
+                            app_state, sensor_key, acc_param, val,
+                            _get_aqi_color(acc_param, val), time_str
                         )
                 
             except Exception as e:
@@ -3275,13 +3296,23 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                                 st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
                             return self._send(200, json.dumps(st_copy).encode("utf-8"),
                                               "application/json", cache_control="private, no-store")
-                        return self._send(200, app_state.cached_json_bytes,
+                        # Owner token matched — still strip Home from browser
+                        st_copy = json.loads(app_state.cached_json_bytes)
+                        if isinstance(st_copy.get("fixed"), list):
+                            st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
+                        return self._send(200, json.dumps(st_copy).encode("utf-8"),
                                           "application/json", cache_control="private, no-store")
-                    return self._send(200, app_state.cached_json_bytes, "application/json", cache_control="public, max-age=15, s-maxage=30")
+                    # No owner token — still strip Home from browser responses
+                    st_copy = json.loads(app_state.cached_json_bytes)
+                    if isinstance(st_copy.get("fixed"), list):
+                        st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
+                    return self._send(200, json.dumps(st_copy).encode("utf-8"), "application/json", cache_control="public, max-age=15, s-maxage=30")
             if self.path.startswith("/api/fixed"):
                 # Return just the fixed sensor array (lightweight for TUI remote mode)
                 with app_state.lock:
                     fixed = app_state.state.get("fixed", []) if isinstance(app_state.state, dict) else []
+                # Strip Home sensor from browser-facing endpoint
+                fixed = [f for f in fixed if f.get("id") != "Home"]
                 body = json.dumps(fixed).encode("utf-8")
                 return self._send(200, body, "application/json", cache_control="public, max-age=15")
             if self.path.startswith("/api/raw"):

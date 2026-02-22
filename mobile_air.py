@@ -1408,22 +1408,26 @@ class AirQualityApp(App):
                         if time_utc is not None and time_utc == last_api_time:
                             pass  # same reading, don't append
                         else:
-                            # Check for gaps since last update
-                            if hist_list:
-                                last_entry = hist_list[-1]
-                                last_ts = last_entry.get('recorded_at', now_ts)
-                                
-                                # If gap > 90s (interval is 60s), insert None for missing intervals
-                                # We use 90s to allow some jitter/latency
-                                gap = now_ts - last_ts
-                                if gap > 90:
-                                    # Insert empty slots. One slot per ~60s
-                                    num_missing = int(gap // 60) - 1
-                                    # Cap missing at say 10 to avoid flooding
-                                    num_missing = min(num_missing, 10)
-                                    for _ in range(num_missing):
-                                        hist_list.append({'val': None, 'col': '#000000', 'time': None, 'recorded_at': last_ts + 60})
-                                        last_ts += 60
+                            # Only insert gap Nones when we know we actually missed
+                            # readings (i.e. the API timestamp advanced by more than
+                            # one interval).  Never gap-fill on startup/restart
+                            # where recorded_at is stale — that floods history with
+                            # Nones and kills sparklines.
+                            if hist_list and last_api_time is not None and time_utc is not None:
+                                try:
+                                    from mobileair_core import parse_utc_timestamp as _parse_ts
+                                    prev_dt = _parse_ts(last_api_time)
+                                    curr_dt = _parse_ts(time_utc)
+                                    if prev_dt and curr_dt:
+                                        api_gap_s = (curr_dt - prev_dt).total_seconds()
+                                        # Fixed sensors update roughly every 3600s;
+                                        # insert Nones only for genuinely skipped intervals
+                                        if api_gap_s > 5400:  # > 1.5 hours
+                                            num_missing = min(int(api_gap_s / 3600) - 1, 5)
+                                            for _ in range(num_missing):
+                                                hist_list.append({'val': None, 'col': '#000000', 'time': None, 'recorded_at': now_ts})
+                                except Exception:
+                                    pass
 
                             # Ensure val is string format for consistency
                             hist_list.append({'val': str(val), 'col': col, 'time': time_utc, 'recorded_at': now_ts})
@@ -1443,6 +1447,8 @@ class AirQualityApp(App):
 
         # ── Merge enriched fixed sensors from dashboard server (AirNow, Home, etc.) ──
         # These are NOT in the raw Utah AQ data but the dashboard server provides them.
+        # For sensors already in unified_sensors from raw data, merge in the server's
+        # richer history (which has hourly AirNow data) when the local history is thin.
         # Skip known weather/meteorological params — everything else passes through
         _WEATHER_KEYS = {"BARPR", "DEWPOINT", "TEMP", "WD", "WS", "RHUM", "SOLAR", "PRECIP", "CEIL", "VSBY", "BC_LC", "BC_DC"}
         dashboard_fixed = data.get("dashboard_fixed", [])
@@ -1450,8 +1456,8 @@ class AirQualityApp(App):
             if not isinstance(df, dict):
                 continue
             s_key = df.get("id", "")
-            if not s_key or s_key in unified_sensors:
-                continue  # Already have this sensor from raw data
+            if not s_key:
+                continue
             # Skip PurpleAir sensors — not wanted in TUI
             if s_key.startswith("PA_"):
                 continue
@@ -1466,6 +1472,29 @@ class AirQualityApp(App):
             readings = df.get("readings", {})
             if not readings:
                 continue
+
+            # If sensor already exists from raw data, merge server history into
+            # existing readings when the server has more history points.
+            if s_key in unified_sensors:
+                existing = unified_sensors[s_key]
+                for p_key, r_data in readings.items():
+                    if p_key in _WEATHER_KEYS:
+                        continue
+                    if not isinstance(r_data, dict):
+                        continue
+                    server_hist = r_data.get("history", [])
+                    if not server_hist:
+                        continue
+                    if p_key in existing['readings']:
+                        # readings tuple: (val, col, lat, lon, unit, history, history_cols)
+                        cur = existing['readings'][p_key]
+                        local_hist = cur[5] if len(cur) > 5 else []
+                        if len(server_hist) > len(local_hist):
+                            hist_strs = [str(v) if v is not None else None for v in server_hist]
+                            hist_cols = [color_for_value(p_key, str(v)) if v is not None else '#000000' for v in server_hist]
+                            existing['readings'][p_key] = (cur[0], cur[1], cur[2], cur[3], cur[4], hist_strs, hist_cols)
+                continue
+
             sensor_entry = {'type': 'fixed', 'readings': {}}
             display_name = df.get("name", "")
             if display_name and display_name != s_key:
