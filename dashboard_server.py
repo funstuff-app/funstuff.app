@@ -3272,6 +3272,16 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._send(200, (static_dir / "tui.css").read_bytes(), "text/css", cache_control="public, max-age=86400")
             if self.path == "/tui.js":
                 return self._send(200, (static_dir / "tui.js").read_bytes(), "text/javascript", cache_control="public, max-age=86400")
+            if self.path == "/sitemap.xml":
+                sitemap = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                           '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+                           '  <url>\n'
+                           '    <loc>https://dustytrails.funstuff.app/</loc>\n'
+                           '    <changefreq>always</changefreq>\n'
+                           '    <priority>1.0</priority>\n'
+                           '  </url>\n'
+                           '</urlset>\n')
+                return self._send(200, sitemap.encode("utf-8"), "application/xml", cache_control="public, max-age=86400")
             if self.path.startswith("/api/config"):
                 # Return server configuration for client scaling/caching decisions
                 # Cache for 5 minutes - config changes rarely

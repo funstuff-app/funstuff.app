@@ -91,6 +91,7 @@ if [[ "$IS_FIRST_RUN" == "1" ]] || [[ "$FORCE_SETUP" == "1" ]]; then
     log_info "Running first-time setup..."
 
     log_info "Installing system dependencies..."
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq python3 python3-pip python3-venv git curl
 

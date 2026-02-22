@@ -27,6 +27,7 @@ rsync -avz --progress \
     "$SCRIPT_DIR/dashboard_server.py" \
     "$SCRIPT_DIR/mobileair_core.py" \
     "$SCRIPT_DIR/airnow_slc.py" \
+    "$SCRIPT_DIR/airnow_api.py" \
     "$SCRIPT_DIR/aqi_breakpoints.csv" \
     "$SCRIPT_DIR/requirements.txt" \
     "$SCRIPT_DIR/deploy_raspberry_pi.sh" \
