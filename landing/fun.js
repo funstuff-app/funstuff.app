@@ -2,6 +2,62 @@
 (function () {
   "use strict";
 
+  // Track when the widget loaded (for syncing playhead on click-through)
+  var _widgetLoadTime = Date.now();
+  // Snapshot params set by setMapIframeSrc (null on weekdays/live)
+  var _widgetSnapshotParams = null;
+
+  // ── Weekend snapshot date logic for embedded map ──
+  // On weekends, load a recent weekday snapshot so the iframe doesn't show "offline"
+  (function setMapIframeSrc() {
+    var iframe = document.getElementById("map-iframe");
+    if (!iframe) return;
+    var baseSrc = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
+    var indicator = document.getElementById("snapshot-indicator");
+    var now = new Date();
+    var day = now.getDay(); // 0=Sun, 6=Sat
+
+    if (day === 0 || day === 6) {
+      // Weekend — pick a weekday snapshot, rotating through Mon-Fri across reloads
+      var key = "funstuff_weekday_idx";
+      var stored = sessionStorage.getItem(key);
+      // Weekday offsets from most-recent Friday, cycling: Fri(0), Thu(1), Wed(2), Tue(3), Mon(4)
+      var idx = stored !== null ? (parseInt(stored, 10) + 1) % 5 : 0;
+      sessionStorage.setItem(key, String(idx));
+
+      // Calculate the target weekday date
+      // daysSinceLastFriday: how many days back from today to reach last Friday
+      var daysSinceLastFriday = (day === 6) ? 1 : 2; // Sat->1 back, Sun->2 back
+      var daysBack = daysSinceLastFriday + idx; // then add rotation offset (0=Fri,1=Thu,...)
+      var target = new Date(now);
+      target.setDate(target.getDate() - daysBack);
+      var dateStr = target.getFullYear() + "-" +
+        String(target.getMonth() + 1).padStart(2, "0") + "-" +
+        String(target.getDate()).padStart(2, "0");
+
+      iframe.src = baseSrc + "?date=" + dateStr + "&start=10&duration=2&playhead=60&speed=20&lite=1";
+
+      // Store params so the overlay click can sync playhead
+      _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
+
+      var overlayLabel = document.getElementById("demo-overlay-label");
+      if (overlayLabel) overlayLabel.textContent = "Recorded snapshot \u2014 click to open live app";
+
+      if (indicator) {
+        var dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        indicator.textContent = "\u25B6 " + dayNames[target.getDay()] + " " +
+          (target.getMonth() + 1) + "/" + target.getDate() + " 11AM";
+        indicator.style.display = "block";
+      }
+    } else {
+      // Weekday — load live
+      iframe.src = baseSrc;
+      var overlayLabel = document.getElementById("demo-overlay-label");
+      if (overlayLabel) overlayLabel.textContent = "Live preview \u2014 click to open full app";
+      if (indicator) indicator.style.display = "none";
+    }
+  })();
+
   // ── Taskbar clock ──
   const clockEl = document.getElementById("tray-clock");
   function tick() {
@@ -19,11 +75,29 @@
   const closeBtn = document.querySelector(".tb-close");
   const mainWindow = document.querySelector(".main-window");
 
-  // ── Map overlay → link to full app ──
+  // ── Map overlay → link to full app (synced to widget playhead on weekends) ──
   var mapOverlay = document.querySelector(".demo-overlay");
   if (mapOverlay) {
     mapOverlay.addEventListener("click", function () {
-      window.open("https://dustytrails.funstuff.app/", "_blank", "noopener");
+      if (_widgetSnapshotParams) {
+        // Weekend: sync playhead to elapsed time since widget loaded
+        var elapsedMin = Math.floor((Date.now() - _widgetLoadTime) / 60000);
+        // Scale by playback speed to get simulated minutes elapsed
+        var simElapsed = elapsedMin * _widgetSnapshotParams.speed;
+        var syncedPlayhead = _widgetSnapshotParams.basePlayhead + simElapsed;
+        var p = _widgetSnapshotParams;
+        var url = "https://dustytrails.funstuff.app/" +
+          "?date=" + p.date +
+          "&start=" + p.start +
+          "&duration=" + p.duration +
+          "&playhead=" + syncedPlayhead +
+          "&speed=" + p.speed +
+          "&fresh=1";
+        window.open(url, "_blank", "noopener");
+      } else {
+        // Weekday: open live with no params
+        window.open("https://dustytrails.funstuff.app/", "_blank", "noopener");
+      }
     });
   }
 

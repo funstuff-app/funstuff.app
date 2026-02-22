@@ -32,3 +32,5 @@ deploy/*/.minify_cache/
 deploy/
 .github/prompts/plan-fixDashboardStuckAfterRestart.prompt.md
 HANDOFF.md
+CICD_PLAYBOOK.md
+POSTMORTEM_SNAPSHOT_PERF.md

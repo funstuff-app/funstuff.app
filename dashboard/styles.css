@@ -14,6 +14,17 @@
   --map-shadow-lift: 0; /* 0..1 */
 }
 
+/* ─── Lite / embed mode: map-only, no chrome ─── */
+body.lite #topbar,
+body.lite #sidebar,
+body.lite #legend,
+body.lite #legendToggle,
+body.lite #playbackBar,
+body.lite #appFooter,
+body.lite #aboutModal { display: none !important; }
+body.lite #mapPane { position: fixed; inset: 0; }
+body.lite #layout { height: 100vh; }
+
 * { box-sizing: border-box; }
 html, body {
   height: 100%;

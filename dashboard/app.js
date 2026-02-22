@@ -86,22 +86,26 @@ function main() {
   const sidebarCloseEl = document.getElementById("sidebarClose");
   
   const validTabs = ["mobile", "fixed", "public"];
-  const savedTab = localStorage.getItem(TAB_STORAGE_KEY);
+  // fresh=1 URL param: render as new user (ignore localStorage preferences)
+  const _freshMode = new URLSearchParams(location.search).get('fresh') === '1';
+  const savedTab = _freshMode ? null : localStorage.getItem(TAB_STORAGE_KEY);
   let activeTab = validTabs.includes(savedTab) ? savedTab : "mobile";
   // On mobile / narrow screens, default sidebar closed to reduce clutter.
   const _isMobileWidth = window.innerWidth <= 768;
-  let sidebarOpen = _isMobileWidth
+  let sidebarOpen = _freshMode
     ? false
-    : localStorage.getItem(SIDEBAR_OPEN_KEY) !== "false"; // Default open on desktop
+    : (_isMobileWidth
+      ? false
+      : localStorage.getItem(SIDEBAR_OPEN_KEY) !== "false"); // Default open on desktop
   
   // Restore visibility states
-  map.showMobile = localStorage.getItem(SHOW_MOBILE_KEY) !== "false";
-  map.showFixed = localStorage.getItem(SHOW_FIXED_KEY) !== "false";
-  map.showPublic = localStorage.getItem(SHOW_PUBLIC_KEY) !== "false";
-  const legacyShowLabels = localStorage.getItem(SHOW_LABELS_LEGACY_KEY);
+  map.showMobile = _freshMode ? true : localStorage.getItem(SHOW_MOBILE_KEY) !== "false";
+  map.showFixed = _freshMode ? true : localStorage.getItem(SHOW_FIXED_KEY) !== "false";
+  map.showPublic = _freshMode ? true : localStorage.getItem(SHOW_PUBLIC_KEY) !== "false";
+  const legacyShowLabels = _freshMode ? null : localStorage.getItem(SHOW_LABELS_LEGACY_KEY);
   // Mobile labels default OFF, fixed labels default ON
-  map.showMobileLabels = localStorage.getItem(SHOW_MOBILE_LABELS_KEY) === "true";
-  map.showFixedLabels = localStorage.getItem(SHOW_FIXED_LABELS_KEY) === "true";
+  map.showMobileLabels = _freshMode ? false : localStorage.getItem(SHOW_MOBILE_LABELS_KEY) === "true";
+  map.showFixedLabels = _freshMode ? false : localStorage.getItem(SHOW_FIXED_LABELS_KEY) === "true";
   // PurpleAir (public) labels always start OFF — too noisy on a crowded map.
   // Users can toggle them on via the sidebar; that preference is not persisted.
   map.showPublicLabels = false;
@@ -174,10 +178,12 @@ function main() {
   const legendUnitEl = document.getElementById("legendUnit");
   const LEGEND_OPEN_KEY = "dusty_legend_open";
   const LEGEND_TAB_KEY = "dusty_legend_tab";
-  let legendOpen = _isMobileWidth
+  let legendOpen = _freshMode
     ? false
-    : localStorage.getItem(LEGEND_OPEN_KEY) !== "false";
-  let legendTab = localStorage.getItem(LEGEND_TAB_KEY) || "pm25";
+    : (_isMobileWidth
+      ? false
+      : localStorage.getItem(LEGEND_OPEN_KEY) !== "false");
+  let legendTab = (_freshMode ? null : localStorage.getItem(LEGEND_TAB_KEY)) || "pm25";
   let userLegendTab = legendTab; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected
 
@@ -2568,7 +2574,11 @@ function main() {
     // No-op: old button removed, menu handles state dynamically
   }
   
-  async function loadHistoricalDay(dateStr) {
+  async function loadHistoricalDay(dateStr, opts) {
+    const _startHour = opts?.startHour;   // 0-23 or undefined
+    const _duration  = opts?.duration;    // hours or undefined
+    const _playhead  = opts?.playhead;    // minutes offset from start or undefined
+    const _speed     = opts?.speed;       // playback speed multiplier or undefined
     if (dateStr === "live") {
       window._historicalState = null;
       map._historicalMode = false;
@@ -2613,7 +2623,11 @@ function main() {
     try {
       // Load from local snapshots — we already store all data (mobile, fixed,
       // purpleair, etc.) so there's no need to fetch from upstream history servers.
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`);
+      let snapUrl = `${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`;
+      if (_startHour != null && _duration != null) {
+        snapUrl += `&start=${_startHour}&duration=${_duration}`;
+      }
+      const resp = await fetch(snapUrl);
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `No snapshot for ${dateStr}`);
@@ -2658,14 +2672,15 @@ function main() {
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
       
-      // Build playback points and set time to 5AM
+      // Build playback points and set playhead to start hour (default 5 AM)
       map._ensurePlaybackPoints(window._historicalState);
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
-        // Set playhead to 5AM local on the loaded day
         const [_y, _mo, _d] = dateStr.split("-").map(Number);
-        const fiveAM = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
-        const initMs = clamp(fiveAM, b.minMs, b.maxMs);
+        const startH = (_startHour != null && _startHour >= 0 && _startHour <= 23) ? _startHour : 5;
+        const playheadMin = (_playhead != null && _playhead >= 0 && _playhead <= 1440) ? _playhead : 0;
+        const startTime = new Date(_y, _mo - 1, _d, startH, playheadMin, 0, 0).getTime();
+        const initMs = clamp(startTime, b.minMs, b.maxMs);
         map.setPlaybackTimeMs(initMs);
       }
       
@@ -2690,6 +2705,7 @@ function main() {
       }
       
       // Start playback loop (auto-play)
+      if (_speed != null && _speed > 0) map.setPlaybackSpeed(_speed);
       _pbLastPerf = 0;
       _pbLastUiPerf = 0;
       _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
@@ -3957,9 +3973,52 @@ function main() {
 
   // Load server config before starting data polling
   // This allows the server to control CDN/caching behavior
-  loadConfig().then(() => {
+  loadConfig().then(async () => {
     // Re-apply theme in case config pushed new localStorage defaults
     applyTheme(_currentThemeKey, true);
+
+    // Check for ?date= URL parameter to load a historical snapshot
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlDate = urlParams.get("date");
+    if (urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
+      // Validate it's a real date and within the last 7 days
+      const parsed = new Date(urlDate + "T00:00:00");
+      const now = new Date();
+      const sevenDaysAgo = new Date(now);
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+      if (!isNaN(parsed.getTime()) && parsed >= sevenDaysAgo && parsed <= now) {
+        // Parse optional start hour (0-23) and duration (1-24 hours)
+        const rawStart = urlParams.get("start");
+        const rawDur   = urlParams.get("duration");
+        const opts = {};
+        if (rawStart !== null && /^\d{1,2}$/.test(rawStart)) {
+          const s = Number(rawStart);
+          if (s >= 0 && s <= 23) opts.startHour = s;
+        }
+        if (rawDur !== null && /^\d{1,2}$/.test(rawDur)) {
+          const d = Number(rawDur);
+          if (d >= 1 && d <= 24) opts.duration = d;
+        }
+        const rawPh = urlParams.get("playhead");
+        if (rawPh !== null && /^\d{1,4}$/.test(rawPh)) {
+          const ph = Number(rawPh);
+          if (ph >= 0 && ph <= 1440) opts.playhead = ph;
+        }
+        const rawSpeed = urlParams.get("speed");
+        if (rawSpeed !== null && /^\d{1,3}$/.test(rawSpeed)) {
+          const sp = Number(rawSpeed);
+          if (sp >= 1 && sp <= 200) opts.speed = sp;
+        }
+        // Clean URL bar now — all params already captured in local vars
+        history.replaceState(null, "", location.pathname);
+        try {
+          await loadHistoricalDay(urlDate, opts);
+          return; // snapshot loaded — don't start live polling
+        } catch (_e) {
+          // Snapshot load failed (404 or bad data) — fall through to live
+        }
+      }
+    }
     tick(); // finally block inside tick() schedules all subsequent polls
   });
 }

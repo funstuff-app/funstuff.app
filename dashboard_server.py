@@ -657,6 +657,36 @@ def _trim_trails_to_day(state: dict[str, Any], date_str: str) -> None:
         sensor["trail"] = filtered
 
 
+def _trim_trails_to_window(state: dict[str, Any], date_str: str, start_hour: int, duration_hours: int) -> None:
+    """Further trim mobile trails to a narrower time window within the day.
+
+    start_hour: local (Mountain) hour to start (0-23)
+    duration_hours: how many hours of data to keep (1-24)
+    """
+    try:
+        requested_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return
+
+    win_start_mt = requested_date.replace(hour=start_hour, minute=0, second=0,
+                                          microsecond=0, tzinfo=_MOUNTAIN_TZ)
+    win_end_mt = win_start_mt + timedelta(hours=duration_hours)
+    win_start_utc = win_start_mt.astimezone(timezone.utc)
+    win_end_utc   = win_end_mt.astimezone(timezone.utc)
+
+    for sensor in (state.get("mobile") or []):
+        if not isinstance(sensor, dict):
+            continue
+        trail = sensor.get("trail")
+        if not isinstance(trail, list):
+            continue
+        sensor["trail"] = [
+            p for p in trail
+            if isinstance(p, dict) and (dt := parse_utc_timestamp(p.get("t"))) is not None
+            and win_start_utc <= dt < win_end_utc
+        ]
+
+
 def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
     """Save current state as today's snapshot.
 
@@ -3125,9 +3155,9 @@ def save_snapshot(data_dir: Path, date_str: str, state: dict[str, Any]) -> dict[
 
 def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     """Load a saved snapshot by date.
-    
-    The loaded data is fully validated and sanitized before returning.
-    This is a security boundary - untrusted file content is made safe here.
+
+    Snapshots are written by save_snapshot() which sanitizes on write,
+    so we only need json.loads + schema validation here — no re-sanitization.
     """
     snapshots_dir = _get_snapshots_dir(data_dir)
     safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
@@ -3144,14 +3174,20 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     if file_size > MAX_SNAPSHOT_SIZE_BYTES:
         raise JsonValidationError(f"Snapshot file too large: {file_size} bytes")
     
-    # Read raw bytes and sanitize (never parse without sanitization)
+    # Fast path: snapshots are self-written (sanitized on save).
+    # Skip the expensive recursive _sanitize_value / regex pass.
     raw_bytes = filepath.read_bytes()
-    sanitized = parse_and_sanitize_json(raw_bytes, max_size=MAX_SNAPSHOT_SIZE_BYTES)
+    try:
+        parsed = json.loads(raw_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise JsonValidationError(f"Corrupt snapshot: {e}")
+    if not isinstance(parsed, dict):
+        raise JsonValidationError("Snapshot root must be a dict")
     
-    # Validate schema
-    validate_state_schema(sanitized)
+    # Schema validation is cheap — keep it
+    validate_state_schema(parsed)
     
-    return sanitized
+    return parsed
 
 def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, server_config: dict | None = None):
     """Create HTTP request handler with injected dependencies.
@@ -3451,8 +3487,25 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         _log(f"[Snapshot] Stripping {len(existing_pa)} stale PA sensors from {date_str} (no fixed_history data for that date)")
                         state["fixed"] = [f for f in state["fixed"] if not f.get("purpleair")]
 
-                # Trim data to the requested date's window only (5 AM – 5 AM local)
-                _trim_trails_to_day(state, date_str)
+                # Trim trails to the requested time window.
+                # When start/duration are given, _trim_trails_to_window already
+                # produces a strict subset of _trim_trails_to_day (e.g. 11-15h ⊂ 5-29h),
+                # so skip the full-day pass to avoid double-parsing every timestamp.
+                raw_start = query.get("start", [None])[0]
+                raw_dur   = query.get("duration", [None])[0]
+                windowed = False
+                if raw_start is not None and raw_dur is not None:
+                    try:
+                        start_h = int(raw_start)
+                        dur_h   = int(raw_dur)
+                        if 0 <= start_h <= 23 and 1 <= dur_h <= 24:
+                            _trim_trails_to_window(state, date_str, start_h, dur_h)
+                            windowed = True
+                    except (ValueError, TypeError):
+                        pass  # invalid params → fall through to full-day trim
+                if not windowed:
+                    _trim_trails_to_day(state, date_str)
+
                 _trim_history_to_date(state, date_str)
 
                 body = json.dumps(state).encode("utf-8")

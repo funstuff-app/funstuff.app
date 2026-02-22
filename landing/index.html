@@ -79,7 +79,7 @@
 
       <div class="hero">
         <h1 class="site-title">funstuff<span class="dot">.</span>app</h1>
-        <p class="tagline">named after the funstuff folder on early Windows machines. you know the one.</p>
+        <p class="tagline">named after the funstuff folder on early Windows machines. <a href="https://www.youtube.com/watch?v=kemivUKb4f4" target="_blank" rel="noopener noreferrer">you know the one.</a></p>
       </div>
 
       <hr class="divider" />
@@ -118,7 +118,7 @@
               <strong>EPA / DAQ fixed monitoring stations</strong> — the traditional fixed-location monitors you see on AirNow, but integrated into the same map alongside mobile data.
             </li>
             <li>
-              <strong>PurpleAir community sensors</strong> — crowdsourced, community-operated sensors. More real-time than the government sensors. (API token limitations mean I can't update these as frequently as I'd like.)
+              <strong>PurpleAir community sensors</strong> — crowdsourced, community-operated sensors. More real-time than the government sensors. (API token cost limitations mean I can't update these as frequently as I'd like.)
             </li>
           </ul>
 
@@ -139,14 +139,16 @@
             </div>
             <div class="demo-viewport map-viewport">
               <iframe
-                src="https://dustytrails.funstuff.app/"
+                id="map-iframe"
+                data-src="https://dustytrails.funstuff.app/"
                 title="DustyTrails real-time air quality map for Salt Lake City"
                 loading="lazy"
                 sandbox="allow-scripts allow-same-origin"
               ></iframe>
               <div class="demo-overlay" aria-hidden="true">
-                <span class="demo-overlay-label">Live preview — click to open full app</span>
+                <span class="demo-overlay-label" id="demo-overlay-label">Click to open full app</span>
               </div>
+              <div class="snapshot-indicator" id="snapshot-indicator"></div>
             </div>
           </div>
 
