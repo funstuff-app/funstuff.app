@@ -3,3 +3,7 @@
 
 PI_HOST="raspberrypi.local"
 PI_USER="pi"
+
+# Secrets (injected into systemd service Environment)
+DUSTY_PURPLEAIR_API_KEY="your-purpleair-api-key"
+#DUSTY_OWNER_TOKEN="optional-owner-token"

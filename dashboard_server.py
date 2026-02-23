@@ -1815,7 +1815,7 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
 # PurpleAir Integration
 # ─────────────────────────────────────────────────────────────────────────────
 
-PURPLEAIR_API_KEY = os.environ.get("DUSTY_PURPLEAIR_API_KEY", "C2922794-0519-11F1-B596-4201AC1DC123")
+PURPLEAIR_API_KEY = os.environ.get("DUSTY_PURPLEAIR_API_KEY", "")
 
 # Owner token: when set, the Home sensor is only included in /api/state
 # responses that carry a matching ?tok= query parameter.

@@ -405,6 +405,8 @@ WorkingDirectory=${INSTALL_DIR}
 # Environment
 Environment="PYTHONUNBUFFERED=1"
 Environment="HOME=/home/${PI_USER}"
+Environment="DUSTY_PURPLEAIR_API_KEY=${DUSTY_PURPLEAIR_API_KEY:-}"
+Environment="DUSTY_OWNER_TOKEN=${DUSTY_OWNER_TOKEN:-}"
 
 # Run the dashboard server
 ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/dashboard_server.py --host 0.0.0.0 --port 8766
