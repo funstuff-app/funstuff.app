@@ -159,8 +159,8 @@
       "z-index:10000;padding:40px;line-height:1.8;cursor:default;";
     bsod.innerHTML =
       "A fatal exception 0E has occurred at 0028:C0011E36<br><br>" +
-      "* Press any key to return to funstuff.app<br>" +
-      "* Press CTRL+ALT+DEL to pretend this didn't happen<br><br>" +
+      "* Click to return to funstuff.app<br>" +
+      "* CTRL+ALT+DEL to pretend this didn't happen<br><br>" +
       "Press any key to continue _";
     document.body.appendChild(bsod);
     function dismiss() {
