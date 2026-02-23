@@ -185,6 +185,7 @@
       appWindow.style.display = "none";
       appWindow.style.transition = "";
       appWindow.style.transform = "";
+      if (_pageEl) _pageEl.style.pointerEvents = "none";
     }, 220);
     /* Mark as minimized in the z-stack */
     var mw = _deskWins["__main"];
@@ -213,6 +214,7 @@
 
   function restoreWindow() {
     if (!appWindow) return;
+    if (_pageEl) _pageEl.style.pointerEvents = "";
     appWindow.style.display = "";
     appWindow.style.opacity = "0";
     appWindow.style.transform = "scaleY(0.97) translateY(-4px)";
@@ -462,13 +464,23 @@
     if (w) w.el.style.zIndex = _topZ;
     _focusedWin = id;
 
-    /* Update all taskbar button active states */
+    /* Update all taskbar button active states + titlebar colors */
     Object.keys(_deskWins).forEach(function (wid) {
       var dw = _deskWins[wid];
-      if (!dw.tbBtn) return;
-      if (wid === id && !dw.minimized) dw.tbBtn.classList.add("active");
-      else dw.tbBtn.classList.remove("active");
+      var tb = dw.el && (dw.el.querySelector(".desktop-titlebar") || dw.el.querySelector(".titlebar"));
+      if (wid === id && !dw.minimized) {
+        if (dw.tbBtn) dw.tbBtn.classList.add("active");
+        if (tb) tb.classList.remove("inactive");
+      } else {
+        if (dw.tbBtn) dw.tbBtn.classList.remove("active");
+        if (tb) tb.classList.add("inactive");
+      }
     });
+
+    /* Winamp taskbar button: active only when winamp is focused */
+    if (_winampTbBtn) {
+      _winampTbBtn.classList.toggle("active", id === "__winamp");
+    }
 
     /* When main window is focused, re-highlight the active section button.
        When any other window is focused, deactivate all section buttons. */
@@ -513,6 +525,25 @@
     }
   }
 
+  function _recalcLastWinPos() {
+    /* Recompute cascade position from remaining open windows */
+    _lastWinX = null;
+    _lastWinY = null;
+    Object.keys(_deskWins).forEach(function (wid) {
+      if (wid === "__main") return;
+      var dw = _deskWins[wid];
+      var r = dw.el.getBoundingClientRect();
+      _lastWinX = Math.round(r.left);
+      _lastWinY = Math.round(r.top);
+    });
+    /* Also account for Winamp if it's open */
+    if (_webampContainer) {
+      var wr = _webampContainer.getBoundingClientRect();
+      _lastWinX = Math.round(wr.left);
+      _lastWinY = Math.round(wr.top);
+    }
+  }
+
   function _closeDeskWin(id) {
     var w = _deskWins[id];
     if (!w) return;
@@ -521,6 +552,7 @@
     if (w.tbBtn) w.tbBtn.remove();
     delete _deskWins[id];
     if (_focusedWin === id) _focusedWin = null;
+    _recalcLastWinPos();
   }
 
   function _makeDraggable(win, handle) {
@@ -839,10 +871,158 @@
     });
   }
 
+  /* ── Winamp (Webamp) ── */
+  var _webampInst = null;
+  var _webampContainer = null;
+  var _winampTbBtn = null;
+  var _webampEl = null;
+
+  var WINAMP_TB_ICON =
+    '<svg class="tb-icon" width="14" height="14" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true">' +
+    '<rect width="16" height="16" rx="1" fill="#1a1a2e"/>' +
+    '<rect x="2" y="6" width="3" height="5" fill="#f90"/>' +
+    '<rect x="6" y="4" width="3" height="9" fill="#f90"/>' +
+    '<rect x="10" y="2" width="4" height="12" fill="#f90"/>' +
+    '</svg>';
+
+  function _focusWinamp() {
+    _topZ++;
+    _focusedWin = "__winamp";
+    /* Raise Webamp's actual DOM element into the stacking order */
+    if (_webampEl) _webampEl.style.zIndex = _topZ;
+    /* Deactivate all desktop-window taskbar buttons + gray out titlebars */
+    Object.keys(_deskWins).forEach(function (wid) {
+      var dw = _deskWins[wid];
+      if (dw.tbBtn) dw.tbBtn.classList.remove("active");
+      var tb = dw.el && (dw.el.querySelector(".desktop-titlebar") || dw.el.querySelector(".titlebar"));
+      if (tb) tb.classList.add("inactive");
+    });
+    if (tbMainBtn) tbMainBtn.classList.remove("active");
+    Object.keys(_sectionBtns).forEach(function (key) {
+      if (_sectionBtns[key]) _sectionBtns[key].classList.remove("active");
+    });
+    if (_winampTbBtn) _winampTbBtn.classList.add("active");
+  }
+
+  function openWinampWindow() {
+    closeStartMenu();
+
+    /* If already open: taskbar click logic */
+    if (_webampInst) {
+      if (!_webampContainer) return;
+      var isHidden = _webampContainer.style.display === "none";
+      if (isHidden) {
+        /* Restore from minimized */
+        _webampContainer.style.display = "";
+        _focusWinamp();
+      } else if (_focusedWin === "__winamp") {
+        /* Already focused — minimize */
+        _webampContainer.style.display = "none";
+        if (_winampTbBtn) _winampTbBtn.classList.remove("active");
+        _focusedWin = null;
+      } else {
+        /* Visible but not focused — just focus */
+        _focusWinamp();
+      }
+      return;
+    }
+
+    var Webamp = window._WebampClass;
+    if (!Webamp) { console.warn("Webamp not loaded yet"); return; }
+
+    /* Block text selection while dragging Webamp's own windows */
+    var _blockSelect = function (e) { e.preventDefault(); };
+    document.addEventListener("selectstart", _blockSelect);
+
+    _webampContainer = document.createElement("div");
+    _webampContainer.id = "winamp-container";
+    /* Use the same cascade position as other desktop windows */
+    var baseX = 12, baseY = 32;
+    var wx, wy;
+    if (_lastWinX !== null && _lastWinY !== null) {
+      wx = _lastWinX + CASCADE_OFFSET;
+      wy = _lastWinY + CASCADE_OFFSET;
+    } else {
+      wx = baseX;
+      wy = baseY;
+    }
+    var ww = 275, wh = 232;
+    if (wx + ww > window.innerWidth - 20 || wy > window.innerHeight - 140) {
+      wx = baseX;
+      wy = baseY;
+    }
+    wx = Math.max(0, Math.min(wx, window.innerWidth - ww - 10));
+    wy = Math.max(0, Math.min(wy, window.innerHeight - 80));
+    _lastWinX = wx;
+    _lastWinY = wy;
+    _webampContainer.style.cssText =
+      "position:fixed;top:" + wy + "px;left:" + wx + "px;width:" + ww + "px;height:" + wh + "px;pointer-events:none;";
+    document.body.appendChild(_webampContainer);
+
+    _webampInst = new Webamp({
+      initialTracks: [
+        { metaData: { artist: "The Incredible Machine", title: "Title Screen Theme"           }, url: "mp3s/01_Title_Screen_Theme.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Unplugged (ft. Bill Barrett)" }, url: "mp3s/02_Unplugged_(ft._Bill_Barrett).mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Steel Drums"                  }, url: "mp3s/03_Steel_Drums.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "New Age"                      }, url: "mp3s/04_New_Age.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Hay Seed (ft. Bill Barrett)"  }, url: "mp3s/05_Hay_Seed_(ft._Bill_Barrett).mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Progressive"                  }, url: "mp3s/06_Progressive.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Salsa"                        }, url: "mp3s/07_Salsa.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Techno Rave"                  }, url: "mp3s/08_Techno_Rave.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "1959 Prom"                    }, url: "mp3s/09_1959_Prom.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Bongo Bango"                  }, url: "mp3s/10_Bongo_Bango.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Ragtime"                      }, url: "mp3s/11_Ragtime.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Hip Hop"                      }, url: "mp3s/12_Hip_Hop.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Keep Tryin'"                  }, url: "mp3s/13_Keep_Tryin'.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Detective Theme"              }, url: "mp3s/14_Detective_Theme.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Dreams"                       }, url: "mp3s/15_Dreams.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Tuna Loaf"                    }, url: "mp3s/16_Tuna_Loaf.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "60s Rock"                     }, url: "mp3s/17_60s_Rock.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Pictures"                     }, url: "mp3s/18_Pictures.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Huey Dewey"                   }, url: "mp3s/19_Huey_Dewey.mp3" },
+        { metaData: { artist: "The Incredible Machine", title: "Hip Hop (Reprise)"            }, url: "mp3s/20_Hip_Hop_(Reprise).mp3" },
+      ],
+      zIndex: 300,
+    });
+
+    _webampInst.renderWhenReady(_webampContainer).then(function () {
+      /* Webamp inserts its actual UI as a new direct child of <body>,
+         NOT inside our container. Find it and attach focus listener. */
+      var webampEl = document.body.lastElementChild;
+      if (webampEl) {
+        _webampEl = webampEl;
+        webampEl.addEventListener("mousedown", function () {
+          _focusWinamp();
+        }, true);
+      }
+    });
+
+    /* Add taskbar button matching our existing style */
+    _winampTbBtn = document.createElement("button");
+    _winampTbBtn.className = "taskbar-app-btn active";
+    _winampTbBtn.title = "Winamp";
+    _winampTbBtn.innerHTML = WINAMP_TB_ICON + "<span>Winamp</span>";
+    _winampTbBtn.addEventListener("click", function () { openWinampWindow(); });
+    document.getElementById("taskbar-apps").appendChild(_winampTbBtn);
+
+    _focusWinamp();
+
+    _webampInst.onClose(function () {
+      document.removeEventListener("selectstart", _blockSelect);
+      if (_webampContainer) { _webampContainer.remove(); _webampContainer = null; }
+      if (_winampTbBtn) { _winampTbBtn.remove(); _winampTbBtn = null; }
+      if (_focusedWin === "__winamp") _focusedWin = null;
+      _webampInst = null;
+      _webampEl = null;
+      _recalcLastWinPos();
+    });
+  }
+
   /* ── Wire up Start Menu items ── */
   var smPipes = document.getElementById("sm-pipes");
   var smFlowerbox = document.getElementById("sm-flowerbox");
   var smVideos = document.getElementById("sm-videos");
+  var smWinamp = document.getElementById("sm-winamp");
 
   if (smPipes) smPipes.addEventListener("click", function (e) {
     e.preventDefault();
@@ -855,6 +1035,10 @@
   if (smVideos) smVideos.addEventListener("click", function (e) {
     e.preventDefault();
     openVideosWindow();
+  });
+  if (smWinamp) smWinamp.addEventListener("click", function (e) {
+    e.preventDefault();
+    openWinampWindow();
   });
 
 })();

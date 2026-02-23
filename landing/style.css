@@ -113,6 +113,10 @@ body {
   user-select: none;
   cursor: default;
 }
+.titlebar.inactive {
+  background: linear-gradient(90deg, #808080, #b0b0b0);
+  color: #d4d0c8;
+}
 
 .titlebar-left {
   display: flex;
@@ -598,6 +602,7 @@ body {
   border-color: var(--win-btn-highlight) var(--win-btn-shadow) var(--win-btn-shadow) var(--win-btn-highlight);
   cursor: pointer;
   background: var(--win-silver);
+  color: var(--text);
   font-family: 'VT323', monospace;
   font-size: 0.95rem;
   font-weight: bold;
@@ -856,6 +861,10 @@ body {
   user-select: none;
   cursor: grab;
   flex-shrink: 0;
+}
+.desktop-titlebar.inactive {
+  background: linear-gradient(90deg, #808080, #b0b0b0);
+  color: #d4d0c8;
 }
 .desktop-titlebar:active {
   cursor: grabbing;

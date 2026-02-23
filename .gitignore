@@ -35,3 +35,6 @@ HANDOFF.md
 CICD_PLAYBOOK.md
 POSTMORTEM_SNAPSHOT_PERF.md
 TOKEN_STREAM_NOTE.md
+
+# Static audio files
+landing/mp3s/
