@@ -5,6 +5,7 @@
 
 /* ─── Reset & base ─── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+* { touch-action: manipulation; }          /* disable double-tap zoom on iOS */
 
 :root {
   /* Win95 palette */
@@ -829,4 +830,86 @@ body {
   .crt-lines, .taskbar, .titlebar-buttons { display: none; }
   body { background: #fff; }
   .window { box-shadow: none; border: 1px solid #ccc; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Floating desktop windows (Start menu widgets — draggable)
+   ═══════════════════════════════════════════════════════════════════════════ */
+.desktop-window {
+  position: fixed;
+  z-index: 300;
+  background: var(--win-silver);
+  border: 2px solid;
+  border-color: var(--win-btn-highlight) var(--win-btn-shadow) var(--win-btn-shadow) var(--win-btn-highlight);
+  box-shadow:
+    inset 1px 1px 0 var(--win-white),
+    inset -1px -1px 0 #404040,
+    4px 4px 14px rgba(0,0,0,0.45);
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+}
+
+.desktop-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 4px;
+  background: linear-gradient(90deg, var(--win-navy), #1084d0);
+  color: var(--win-title-text);
+  font-family: 'VT323', 'Courier New', monospace;
+  font-size: 1rem;
+  letter-spacing: 0.5px;
+  user-select: none;
+  cursor: grab;
+  flex-shrink: 0;
+}
+.desktop-titlebar:active {
+  cursor: grabbing;
+}
+
+.desk-tb-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  min-width: 0;
+}
+.desk-tb-icon {
+  font-size: 0.9rem;
+  flex-shrink: 0;
+}
+.desk-tb-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.desk-tb-btns {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.desk-tb-btn {
+  width: 18px;
+  height: 18px;
+  font-size: 10px;
+  font-family: 'VT323', monospace;
+  background: var(--win-silver);
+  border: 2px solid;
+  border-color: var(--win-btn-highlight) var(--win-btn-shadow) var(--win-btn-shadow) var(--win-btn-highlight);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  padding: 0;
+  color: #000;
+}
+.desk-tb-btn:active {
+  border-color: var(--win-btn-shadow) var(--win-btn-highlight) var(--win-btn-highlight) var(--win-btn-shadow);
+}
+
+.desktop-window-body {
+  overflow: hidden;
 }

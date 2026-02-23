@@ -354,4 +354,322 @@
     _installPrompt = null;
   });
 
+  /* ═══════════════════════════════════════════════════════════════════════
+     Floating desktop windows (Win95-style draggable widgets)
+     ═══════════════════════════════════════════════════════════════════════ */
+  var _deskWins = {};
+  var _topZ = 300;
+  var _focusedWin = null;
+  var _lastWinX = null;
+  var _lastWinY = null;
+  var CASCADE_OFFSET = 28;
+
+  function _bringToFront(id) {
+    _topZ++;
+    var w = _deskWins[id];
+    if (w) w.el.style.zIndex = _topZ;
+    _focusedWin = id;
+    Object.keys(_deskWins).forEach(function (wid) {
+      var dw = _deskWins[wid];
+      if (dw.tbBtn) {
+        if (wid === id && !dw.minimized) dw.tbBtn.classList.add("active");
+        else dw.tbBtn.classList.remove("active");
+      }
+    });
+  }
+
+  function _toggleDeskMin(id) {
+    var w = _deskWins[id];
+    if (!w) return;
+    if (w.minimized) {
+      w.el.style.display = "";
+      w.minimized = false;
+      _bringToFront(id);
+    } else {
+      w.el.style.display = "none";
+      w.minimized = true;
+      _focusedWin = null;
+      if (w.tbBtn) w.tbBtn.classList.remove("active");
+    }
+  }
+
+  function _closeDeskWin(id) {
+    var w = _deskWins[id];
+    if (!w) return;
+    if (w.onClose) w.onClose();
+    w.el.remove();
+    if (w.tbBtn) w.tbBtn.remove();
+    delete _deskWins[id];
+    if (_focusedWin === id) _focusedWin = null;
+  }
+
+  function _makeDraggable(win, handle) {
+    var ox, oy, sx, sy, dragging = false;
+
+    function setIframeBlock(block) {
+      var iframes = win.querySelectorAll("iframe");
+      for (var i = 0; i < iframes.length; i++)
+        iframes[i].style.pointerEvents = block ? "none" : "";
+    }
+
+    function onDown(e) {
+      if (e.target.closest(".desk-tb-btn")) return;
+      dragging = true;
+      var touch = e.touches ? e.touches[0] : e;
+      ox = touch.clientX;
+      oy = touch.clientY;
+      var rect = win.getBoundingClientRect();
+      sx = rect.left;
+      sy = rect.top;
+      setIframeBlock(true);
+      e.preventDefault();
+    }
+    function onMove(e) {
+      if (!dragging) return;
+      var touch = e.touches ? e.touches[0] : e;
+      var nx = sx + (touch.clientX - ox);
+      var ny = sy + (touch.clientY - oy);
+      nx = Math.max(-win.offsetWidth + 80, Math.min(window.innerWidth - 40, nx));
+      ny = Math.max(0, Math.min(window.innerHeight - 40, ny));
+      win.style.left = nx + "px";
+      win.style.top = ny + "px";
+      e.preventDefault();
+    }
+    function onUp() { if (dragging) setIframeBlock(false); dragging = false; }
+
+    handle.addEventListener("mousedown", onDown);
+    handle.addEventListener("touchstart", onDown, { passive: false });
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("touchmove", onMove, { passive: false });
+    document.addEventListener("mouseup", onUp);
+    document.addEventListener("touchend", onUp);
+  }
+
+  function openDesktopWindow(opts) {
+    /* opts: id, title, icon, tbIconSVG, width, bodyEl, bodyHTML, onClose, onOpen */
+    if (_deskWins[opts.id]) {
+      var ew = _deskWins[opts.id];
+      if (ew.minimized) _toggleDeskMin(opts.id);
+      _bringToFront(opts.id);
+      return ew.bodyEl;
+    }
+
+    var win = document.createElement("div");
+    win.className = "desktop-window";
+    win.id = "dwin-" + opts.id;
+    win.style.width = opts.width + "px";
+
+    /* Cascade from top-left, offset from last opened window */
+    var baseX = 12, baseY = 32; /* below the main window titlebar */
+    var x, y;
+    if (_lastWinX !== null && _lastWinY !== null) {
+      x = _lastWinX + CASCADE_OFFSET;
+      y = _lastWinY + CASCADE_OFFSET;
+    } else {
+      x = baseX;
+      y = baseY;
+    }
+    /* Wrap back if cascading off-screen */
+    if (x + opts.width > window.innerWidth - 20 || y > window.innerHeight - 140) {
+      x = baseX;
+      y = baseY;
+    }
+    x = Math.max(0, Math.min(x, window.innerWidth - opts.width - 10));
+    y = Math.max(0, Math.min(y, window.innerHeight - 80));
+    _lastWinX = x;
+    _lastWinY = y;
+    win.style.left = x + "px";
+    win.style.top = y + "px";
+
+    /* Title bar */
+    var tb = document.createElement("div");
+    tb.className = "desktop-titlebar";
+    tb.innerHTML =
+      '<div class="desk-tb-left">' +
+        '<span class="desk-tb-icon">' + (opts.icon || "&#128190;") + '</span>' +
+        '<span class="desk-tb-text">' + opts.title + '</span>' +
+      '</div>' +
+      '<div class="desk-tb-btns">' +
+        '<button class="desk-tb-btn" data-action="min" aria-label="Minimize">_</button>' +
+        '<button class="desk-tb-btn desk-tb-close" data-action="close" aria-label="Close">&#10005;</button>' +
+      '</div>';
+    win.appendChild(tb);
+
+    /* Body */
+    var body = document.createElement("div");
+    body.className = "desktop-window-body";
+    if (opts.bodyHTML) body.innerHTML = opts.bodyHTML;
+    if (opts.bodyEl) body.appendChild(opts.bodyEl);
+    win.appendChild(body);
+
+    /* Focus on click */
+    win.addEventListener("mousedown", function () { _bringToFront(opts.id); });
+
+    /* Title-bar buttons */
+    tb.querySelector('[data-action="min"]').addEventListener("click", function (e) {
+      e.stopPropagation();
+      _toggleDeskMin(opts.id);
+    });
+    tb.querySelector('[data-action="close"]').addEventListener("click", function (e) {
+      e.stopPropagation();
+      _closeDeskWin(opts.id);
+    });
+
+    _makeDraggable(win, tb);
+
+    /* Insert into DOM before the taskbar */
+    document.body.insertBefore(win, document.getElementById("taskbar"));
+
+    /* Taskbar button */
+    var tbApps = document.getElementById("taskbar-apps");
+    var tbBtn = document.createElement("button");
+    tbBtn.className = "taskbar-app-btn";
+    tbBtn.title = opts.title;
+    tbBtn.innerHTML =
+      (opts.tbIconSVG ? opts.tbIconSVG : "") +
+      "<span>" + opts.title + "</span>";
+    tbBtn.addEventListener("click", function () {
+      var w = _deskWins[opts.id];
+      if (!w) return;
+      if (w.minimized) {
+        _toggleDeskMin(opts.id);
+      } else if (_focusedWin === opts.id) {
+        _toggleDeskMin(opts.id);
+      } else {
+        _bringToFront(opts.id);
+      }
+    });
+    tbApps.appendChild(tbBtn);
+
+    _deskWins[opts.id] = {
+      el: win,
+      bodyEl: body,
+      tbBtn: tbBtn,
+      minimized: false,
+      onClose: opts.onClose,
+    };
+    _bringToFront(opts.id);
+
+    if (opts.onOpen) opts.onOpen(body);
+
+    return body;
+  }
+
+  /* ── Pipes screensaver window ── */
+  var _pipesInst = null;
+
+  var PIPES_TB_ICON =
+    '<svg class="tb-icon" width="14" height="14" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true">' +
+    '<rect width="16" height="16" fill="#000"/>' +
+    '<rect x="3" y="2" width="3" height="8" fill="#c00"/>' +
+    '<rect x="6" y="7" width="6" height="3" fill="#c00"/>' +
+    '<rect x="9" y="5" width="3" height="8" fill="#2e8b57"/>' +
+    '<rect x="1" y="10" width="8" height="3" fill="#2e8b57"/>' +
+    '</svg>';
+
+  function openPipesWindow() {
+    closeStartMenu();
+    if (_deskWins.pipes) {
+      if (_deskWins.pipes.minimized) _toggleDeskMin("pipes");
+      _bringToFront("pipes");
+      return;
+    }
+
+    var w = Math.min(500, window.innerWidth - 40);
+    var h = Math.min(380, window.innerHeight - 120);
+
+    var wrap = document.createElement("div");
+    wrap.style.position = "relative";
+
+    var canvas = document.createElement("canvas");
+    canvas.style.width = "100%";
+    canvas.style.height = h + "px";
+    canvas.style.display = "block";
+    canvas.style.background = "#000";
+    wrap.appendChild(canvas);
+
+    /* Camera toggle button */
+    var togBtn = document.createElement("button");
+    togBtn.textContent = "\u21BB Orbit";
+    togBtn.style.cssText =
+      "position:absolute;top:6px;right:6px;z-index:2;" +
+      "font-family:'VT323',monospace;font-size:0.8rem;padding:2px 8px;" +
+      "background:rgba(192,192,192,0.85);border:1px solid #888;" +
+      "cursor:pointer;color:#000;";
+    wrap.appendChild(togBtn);
+
+    togBtn.addEventListener("click", function () {
+      if (!_pipesInst) return;
+      var cur = _pipesInst.getMode();
+      var next = cur === "classic" ? "rotate" : "classic";
+      _pipesInst.setMode(next);
+      togBtn.textContent = next === "classic" ? "\u21BB Orbit" : "\u25A3 Classic";
+    });
+
+    openDesktopWindow({
+      id: "pipes",
+      title: "3D Pipes",
+      icon: "&#9883;",
+      tbIconSVG: PIPES_TB_ICON,
+      width: w,
+      bodyEl: wrap,
+      onClose: function () {
+        if (_pipesInst) { _pipesInst.stop(); _pipesInst = null; }
+      },
+      onOpen: function () {
+        setTimeout(function () {
+          if (typeof PipesScreensaver === "function") {
+            _pipesInst = PipesScreensaver(canvas, { mode: "classic" });
+          }
+        }, 60);
+      },
+    });
+  }
+
+  /* ── YouTube / Weezer window ── */
+  var VIDEOS_TB_ICON =
+    '<svg class="tb-icon" width="14" height="14" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true">' +
+    '<rect x="1" y="3" width="14" height="10" rx="1" fill="#1a1a2e" stroke="#c0c0c0" stroke-width="1"/>' +
+    '<polygon points="6,5 6,11 12,8" fill="#c0c0c0"/>' +
+    '</svg>';
+
+  function openVideosWindow() {
+    closeStartMenu();
+    if (_deskWins.videos) {
+      if (_deskWins.videos.minimized) _toggleDeskMin("videos");
+      _bringToFront("videos");
+      return;
+    }
+
+    var w = Math.min(520, window.innerWidth - 40);
+    var aspectH = Math.round(w * 9 / 16);
+
+    openDesktopWindow({
+      id: "videos",
+      title: "Weezer — Buddy Holly",
+      icon: "&#9654;",
+      tbIconSVG: VIDEOS_TB_ICON,
+      width: w,
+      bodyHTML:
+        '<iframe width="100%" height="' + aspectH + '" ' +
+        'src="https://www.youtube.com/embed/kemivUKb4f4" ' +
+        'title="Weezer — Buddy Holly" frameborder="0" ' +
+        'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" ' +
+        'allowfullscreen style="display:block;"></iframe>',
+    });
+  }
+
+  /* ── Wire up Start Menu items ── */
+  var smPipes = document.getElementById("sm-pipes");
+  var smVideos = document.getElementById("sm-videos");
+
+  if (smPipes) smPipes.addEventListener("click", function (e) {
+    e.preventDefault();
+    openPipesWindow();
+  });
+  if (smVideos) smVideos.addEventListener("click", function (e) {
+    e.preventDefault();
+    openVideosWindow();
+  });
+
 })();
