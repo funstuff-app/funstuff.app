@@ -1,0 +1,42 @@
+# DustyTrails Ingress
+# Configures external access via DigitalOcean Load Balancer
+# Works with Cloudflare proxy for edge caching
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dustytrails
+  namespace: dustytrails
+  labels:
+    app: dustytrails
+  annotations:
+    # DigitalOcean Load Balancer annotations
+    kubernetes.digitalocean.com/load-balancer-id: ""
+    service.beta.kubernetes.io/do-loadbalancer-protocol: "http"
+    service.beta.kubernetes.io/do-loadbalancer-tls-ports: "443"
+    service.beta.kubernetes.io/do-loadbalancer-redirect-http-to-https: "true"
+    
+    # Use cert-manager for TLS (optional, Cloudflare can terminate TLS)
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    
+    # NGINX Ingress Controller annotations (if using nginx-ingress)
+    # nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    # Update with your domain
+    - host: dustytrails.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dustytrails
+                port:
+                  number: 80
+  # TLS configuration (optional if Cloudflare handles TLS)
+  # tls:
+  #   - hosts:
+  #       - dustytrails.example.com
+  #     secretName: dustytrails-tls

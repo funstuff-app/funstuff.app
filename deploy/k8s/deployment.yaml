@@ -1,0 +1,84 @@
+# DustyTrails Deployment
+# Runs the dashboard server with horizontal scaling
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dustytrails
+  namespace: dustytrails
+  labels:
+    app: dustytrails
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dustytrails
+  template:
+    metadata:
+      labels:
+        app: dustytrails
+    spec:
+      containers:
+        - name: dustytrails
+          # Update this to your container registry
+          image: dustytrails:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8766
+              protocol: TCP
+          env:
+            - name: MOBILEAIR_DATA_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: dustytrails-config
+                  key: MOBILEAIR_DATA_DIR
+          args:
+            - python
+            - dashboard_server.py
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8766"
+            - --data-mode
+            - "proxy"
+            - --interval
+            - "60"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /api/config
+              port: 8766
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/config
+              port: 8766
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dustytrails-data
+      # Spread pods across nodes for high availability
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: dustytrails
+                topologyKey: kubernetes.io/hostname

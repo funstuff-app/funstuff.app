@@ -27,9 +27,9 @@ HANDOFF_SCREENSHOTS/
 # Deployment staging
 deploy/*/.staging/
 deploy/*/.minify_cache/
+deploy/*/deploy.config
 
 # Deployment
-deploy/
 .github/prompts/plan-fixDashboardStuckAfterRestart.prompt.md
 HANDOFF.md
 CICD_PLAYBOOK.md

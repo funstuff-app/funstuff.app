@@ -1,0 +1,35 @@
+[Unit]
+Description=funstuff.app Landing Page Server
+Documentation=https://funstuff.app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jpark
+Group=jpark
+WorkingDirectory=/home/jpark/funstuff
+
+Environment="PYTHONUNBUFFERED=1"
+
+ExecStart=/usr/bin/python3 /home/jpark/funstuff/landing_server.py --host 0.0.0.0 --port 8767
+
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/jpark/funstuff
+
+# Resource limits (minimal — it's a static file server)
+MemoryMax=64M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=funstuff-landing
+
+[Install]
+WantedBy=multi-user.target
