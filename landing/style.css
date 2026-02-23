@@ -416,6 +416,11 @@ body {
 .tui-viewport iframe {
   width: 100%;
   height: 100%;
+  pointer-events: none;
+}
+
+.tui-viewport iframe.interactive {
+  pointer-events: auto;
 }
 
 /* ─── Responsive demo sizes ─── */
@@ -472,6 +477,20 @@ body {
 
 .info-section a:hover {
   color: var(--link-hover);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Window footer (copyright inside main-window)
+   ═══════════════════════════════════════════════════════════════════════════ */
+.window-footer {
+  margin-top: 24px;
+  padding: 12px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  text-align: center;
+  font-family: 'VT323', monospace;
+  font-size: 0.85rem;
+  color: rgba(0, 0, 0, 0.45);
+  letter-spacing: 0.5px;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

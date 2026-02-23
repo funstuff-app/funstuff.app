@@ -1284,7 +1284,9 @@ class MapView {
     const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     const worldToScreenFast = (wx, wy) => ({ x: wx - centerW.x + w / 2, y: wy - centerW.y + h / 2 });
 
-    for (const m of mobiles) {
+    // Iterate in reverse so the topmost (last-drawn) marker is found first.
+    for (let i = mobiles.length - 1; i >= 0; i--) {
+      const m = mobiles[i];
       const pose = this._mobilePoseForRender(m, nowMs);
       const lat = Number(pose?.lat);
       const lon = Number(pose?.lon);
@@ -1985,31 +1987,59 @@ class MapView {
     }
 
     // hit test markers (emoji halo radius ~18), mobile + fixed
+    // Iterate in reverse draw order so the topmost (last-drawn) marker is found first.
+    // Draw order: PurpleAir fixed → non-PurpleAir fixed → mobiles → selected mobile.
     let hit = null;
-    const candidates = [
-      ...mobiles.map(m => ({ type: "mobile", ...m })),
-      ...fixed.map(f => ({ type: "fixed", ...f })),
-    ];
-    for (const m of candidates) {
+    const nowMs = performance.now();
+    const selKey = this.selectedId;
+    const hitR2 = 20 * 20;
+    const testHit = (type, m) => {
       let lat = Number(m.lat), lon = Number(m.lon);
-      if (m.type === "mobile") {
-        const pose = this._mobilePoseForRender(m, performance.now());
+      if (type === "mobile") {
+        const pose = this._mobilePoseForRender(m, nowMs);
         lat = pose.lat;
         lon = pose.lon;
       }
-      if (m.type === "fixed" && this._fixedGeoOffsets) {
+      if (type === "fixed" && this._fixedGeoOffsets) {
         const fKey = m._key || keyFor("fixed", m.id);
         const geo = this._fixedGeoOffsets.get(fKey);
         if (geo) { lat += geo.dlat; lon += geo.dlon; }
       }
-      if (!isFinite(lat) || !isFinite(lon)) continue;
+      if (!isFinite(lat) || !isFinite(lon)) return false;
       const wpt = latLonToWorld(lat, lon, this.zoom);
       const sp = this.worldToScreen(wpt.x, wpt.y);
       const dx = sp.x - sx;
       const dy = sp.y - sy;
-      if ((dx*dx + dy*dy) <= (20*20)) {
-        hit = keyFor(m.type, m.id);
-        break;
+      return (dx * dx + dy * dy) <= hitR2;
+    };
+    // 1. Selected mobile (drawn last = topmost)
+    if (selKey) {
+      const selM = mobiles.find(m => keyFor("mobile", m.id) === selKey);
+      if (selM && testHit("mobile", selM)) hit = selKey;
+    }
+    // 2. Other mobiles in reverse array order (later = drawn on top)
+    if (!hit) {
+      for (let i = mobiles.length - 1; i >= 0; i--) {
+        const m = mobiles[i];
+        const k = keyFor("mobile", m.id);
+        if (k === selKey) continue;
+        if (testHit("mobile", m)) { hit = k; break; }
+      }
+    }
+    // 3. Non-PurpleAir fixed in reverse (drawn after PurpleAir)
+    if (!hit) {
+      for (let i = fixed.length - 1; i >= 0; i--) {
+        const f = fixed[i];
+        if (f.purpleair) continue;
+        if (testHit("fixed", f)) { hit = keyFor("fixed", f.id); break; }
+      }
+    }
+    // 4. PurpleAir fixed in reverse (drawn first = bottommost)
+    if (!hit) {
+      for (let i = fixed.length - 1; i >= 0; i--) {
+        const f = fixed[i];
+        if (!f.purpleair) continue;
+        if (testHit("fixed", f)) { hit = keyFor("fixed", f.id); break; }
       }
     }
     if (hit) {
@@ -2027,31 +2057,58 @@ class MapView {
     const mobiles = st && Array.isArray(st.mobile) ? st.mobile : [];
     const fixed = st && Array.isArray(st.fixed) ? st.fixed : [];
 
+    // Iterate in reverse draw order so the topmost (last-drawn) marker is found first.
     let hit = null;
-    const candidates = [
-      ...mobiles.map(m => ({ type: "mobile", ...m })),
-      ...fixed.map(f => ({ type: "fixed", ...f })),
-    ];
-    for (const m of candidates) {
+    const nowMs = performance.now();
+    const selKey = this.selectedId;
+    const hitR2 = 35 * 35; // Large hit area for iOS touch accuracy
+    const testHit = (type, m) => {
       let lat = Number(m.lat), lon = Number(m.lon);
-      if (m.type === "mobile") {
-        const pose = this._mobilePoseForRender(m, performance.now());
+      if (type === "mobile") {
+        const pose = this._mobilePoseForRender(m, nowMs);
         lat = pose.lat;
         lon = pose.lon;
       }
-      if (m.type === "fixed" && this._fixedGeoOffsets) {
+      if (type === "fixed" && this._fixedGeoOffsets) {
         const fKey = m._key || keyFor("fixed", m.id);
         const geo = this._fixedGeoOffsets.get(fKey);
         if (geo) { lat += geo.dlat; lon += geo.dlon; }
       }
-      if (!isFinite(lat) || !isFinite(lon)) continue;
+      if (!isFinite(lat) || !isFinite(lon)) return false;
       const wpt = latLonToWorld(lat, lon, this.zoom);
       const sp = this.worldToScreen(wpt.x, wpt.y);
       const dx = sp.x - sx;
       const dy = sp.y - sy;
-      if ((dx*dx + dy*dy) <= (35*35)) { // Large hit area for iOS touch accuracy
-        hit = keyFor(m.type, m.id);
-        break;
+      return (dx * dx + dy * dy) <= hitR2;
+    };
+    // 1. Selected mobile (drawn last = topmost)
+    if (selKey) {
+      const selM = mobiles.find(m => keyFor("mobile", m.id) === selKey);
+      if (selM && testHit("mobile", selM)) hit = selKey;
+    }
+    // 2. Other mobiles in reverse array order
+    if (!hit) {
+      for (let i = mobiles.length - 1; i >= 0; i--) {
+        const m = mobiles[i];
+        const k = keyFor("mobile", m.id);
+        if (k === selKey) continue;
+        if (testHit("mobile", m)) { hit = k; break; }
+      }
+    }
+    // 3. Non-PurpleAir fixed in reverse
+    if (!hit) {
+      for (let i = fixed.length - 1; i >= 0; i--) {
+        const f = fixed[i];
+        if (f.purpleair) continue;
+        if (testHit("fixed", f)) { hit = keyFor("fixed", f.id); break; }
+      }
+    }
+    // 4. PurpleAir fixed in reverse (bottommost layer)
+    if (!hit) {
+      for (let i = fixed.length - 1; i >= 0; i--) {
+        const f = fixed[i];
+        if (!f.purpleair) continue;
+        if (testHit("fixed", f)) { hit = keyFor("fixed", f.id); break; }
       }
     }
     if (hit) {

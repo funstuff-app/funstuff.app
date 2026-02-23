@@ -66,10 +66,12 @@
     var now = new Date();
     var day = now.getDay();
     if (day === 0 || day === 6) {
-      var key = "funstuff_weekday_idx";
-      var stored = sessionStorage.getItem(key);
-      var idx = stored !== null ? (parseInt(stored, 10) + 1) % 5 : 0;
-      sessionStorage.setItem(key, String(idx));
+      // Always load the most recent Friday (idx 0); cycling disabled for now
+      var idx = 0;
+      // var key = "funstuff_weekday_idx";
+      // var stored = sessionStorage.getItem(key);
+      // var idx = stored !== null ? (parseInt(stored, 10) + 1) % 5 : 0;
+      // sessionStorage.setItem(key, String(idx));
       _loadSnapshot(idx);
       var overlayLabel = document.getElementById("demo-overlay-label");
       if (overlayLabel) overlayLabel.textContent = "Recorded snapshot \u2014 click to open live app";
@@ -79,7 +81,10 @@
       var overlayLabel = document.getElementById("demo-overlay-label");
       if (overlayLabel) overlayLabel.textContent = "Live preview \u2014 click to open full app";
       var indicator = document.getElementById("snapshot-indicator");
-      if (indicator) indicator.style.display = "none";
+      if (indicator) {
+        indicator.textContent = "\u25CF Live";
+        indicator.style.display = "block";
+      }
     }
   })();
 
@@ -87,9 +92,25 @@
   if (indicatorEl) {
     indicatorEl.addEventListener("click", function (e) {
       e.stopPropagation();
-      var nextIdx = (_snapshotIdx + 1) % 5;
-      _cycleSnapshot(nextIdx);
-      sessionStorage.setItem("funstuff_weekday_idx", String(_snapshotIdx));
+      // Open the full app synced to current snapshot playhead
+      if (_widgetSnapshotParams) {
+        var elapsedMin = Math.floor((Date.now() - _widgetLoadTime) / 60000);
+        var simElapsed = elapsedMin * _widgetSnapshotParams.speed;
+        var syncedPlayhead = _widgetSnapshotParams.basePlayhead + simElapsed;
+        var p = _widgetSnapshotParams;
+        var url = "https://dustytrails.funstuff.app/" +
+          "?date=" + p.date +
+          "&start=" + p.start +
+          "&duration=" + p.duration +
+          "&playhead=" + syncedPlayhead +
+          "&speed=" + p.speed +
+          "&fresh=1";
+        window.location.href = url;
+      }
+      // Cycling disabled for now — will be re-enabled with a separate UI element
+      // var nextIdx = (_snapshotIdx + 1) % 5;
+      // _cycleSnapshot(nextIdx);
+      // sessionStorage.setItem("funstuff_weekday_idx", String(_snapshotIdx));
     });
   }
 
@@ -106,26 +127,21 @@
   tickClock();
   setInterval(tickClock, 15000);
 
-  /* ── Map overlay → link to full app (synced on weekends) ── */
-  var mapOverlay = document.querySelector(".demo-overlay");
+  /* ── Map overlay → always opens plain live app (no params) ── */
+  var mapOverlay = document.querySelector(".demo-overlay:not(.tui-overlay)");
   if (mapOverlay) {
     mapOverlay.addEventListener("click", function () {
-      if (_widgetSnapshotParams) {
-        var elapsedMin = Math.floor((Date.now() - _widgetLoadTime) / 60000);
-        var simElapsed = elapsedMin * _widgetSnapshotParams.speed;
-        var syncedPlayhead = _widgetSnapshotParams.basePlayhead + simElapsed;
-        var p = _widgetSnapshotParams;
-        var url = "https://dustytrails.funstuff.app/" +
-          "?date=" + p.date +
-          "&start=" + p.start +
-          "&duration=" + p.duration +
-          "&playhead=" + syncedPlayhead +
-          "&speed=" + p.speed +
-          "&fresh=1";
-        window.open(url, "_blank", "noopener");
-      } else {
-        window.open("https://dustytrails.funstuff.app/", "_blank", "noopener");
-      }
+      window.location.href = "https://dustytrails.funstuff.app/";
+    });
+  }
+
+  /* ── TUI overlay → click to enable interaction ── */
+  var tuiOverlay = document.getElementById("tui-overlay");
+  var tuiIframe = document.getElementById("tui-iframe");
+  if (tuiOverlay && tuiIframe) {
+    tuiOverlay.addEventListener("click", function () {
+      tuiOverlay.style.display = "none";
+      tuiIframe.classList.add("interactive");
     });
   }
 
@@ -262,6 +278,7 @@
   var smShutdown    = document.getElementById("sm-shutdown");
   var smDustyTrails  = document.getElementById("sm-dustytrails");
   var smTui          = document.getElementById("sm-tui");
+  var smAbout        = document.getElementById("sm-about");
 
   if (smDustyTrails) smDustyTrails.addEventListener("click", function () {
     closeStartMenu();
@@ -270,6 +287,10 @@
   if (smTui) smTui.addEventListener("click", function () {
     closeStartMenu();
     scrollToSection("tui-demo");
+  });
+  if (smAbout) smAbout.addEventListener("click", function () {
+    closeStartMenu();
+    scrollToSection("about");
   });
   if (smShutdown) smShutdown.addEventListener("click", function () {
     closeStartMenu();
