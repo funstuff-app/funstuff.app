@@ -5,7 +5,7 @@
 # Builds locally (prepares runtime files) and deploys over SSH.
 # Does NOT send the git repo - only necessary runtime files.
 #
-# Service: dustytrails (serves at funstuff.app/dustytrails via reverse proxy)
+# Service: dustytrails (exposed via reverse proxy)
 #
 # Usage:
 #   ./deploy_to_pi.sh              # Full deploy (files + setup service)
@@ -35,7 +35,6 @@ PI_TARGET="${PI_USER}@${PI_HOST}"
 SERVICE_NAME="dustytrails"
 INSTALL_DIR="/home/${PI_USER}/dustytrails"
 DASHBOARD_PORT="8766"
-BASE_PATH="/dustytrails"  # For reverse proxy path prefix
 
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 STAGING_DIR="$SCRIPT_DIR/.staging"
@@ -103,7 +102,7 @@ patch_dashboard_for_subpath() {
     patch_file "$dashboard_dir/manifest.json" \
         -e 's|"start_url": "/"|"start_url": "."|g'
     
-    log_info "Dashboard patched for $BASE_PATH"
+    log_info "Dashboard patched for subpath deployment"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,7 +391,7 @@ REMOTE_SCRIPT
     service_content=$(cat << EOF
 [Unit]
 Description=Dusty Trails - MobileAir Dashboard Server
-Documentation=https://funstuff.app/dustytrails
+Documentation=https://github.com/your-repo/dustytrails
 After=network-online.target
 Wants=network-online.target
 
@@ -485,7 +484,6 @@ main() {
     echo "═══════════════════════════════════════════════════════════════════"
     echo ""
     echo "  Dashboard:  http://$PI_HOST:$DASHBOARD_PORT/"
-    echo "  Public URL: https://funstuff.app$BASE_PATH"
     echo ""
     echo "  Commands:"
     echo "    Logs:    ssh $PI_TARGET 'sudo journalctl -u $SERVICE_NAME -f'"

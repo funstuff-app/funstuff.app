@@ -32,6 +32,7 @@ HANDOFF_SCREENSHOTS/
 deploy/*/.staging/
 deploy/*/.minify_cache/
 deploy/*/deploy.config
+deploy/*/tunnel.config
 
 # Deployment
 .github/prompts/plan-fixDashboardStuckAfterRestart.prompt.md

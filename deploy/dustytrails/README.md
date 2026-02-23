@@ -9,7 +9,6 @@ Configured via `deploy.config` (copy `deploy.config.example` to get started).
 - **Install Path**: `~/dustytrails`
 - **Service Name**: `dustytrails`
 - **Internal Port**: `8766`
-- **Public URL**: `https://funstuff.app/dustytrails`
 
 ## Quick Deploy
 
