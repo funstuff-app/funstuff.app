@@ -6,13 +6,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=jpark
-Group=jpark
-WorkingDirectory=/home/jpark/funstuff
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/funstuff
 
 Environment="PYTHONUNBUFFERED=1"
 
-ExecStart=/usr/bin/python3 /home/jpark/funstuff/landing_server.py --host 0.0.0.0 --port 8767
+ExecStart=/usr/bin/python3 /home/pi/funstuff/landing_server.py --host 0.0.0.0 --port 8767
 
 Restart=always
 RestartSec=10
@@ -22,7 +22,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/jpark/funstuff
+ReadWritePaths=/home/pi/funstuff
 
 # Resource limits (minimal — it's a static file server)
 MemoryMax=64M

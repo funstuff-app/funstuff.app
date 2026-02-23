@@ -5,8 +5,8 @@
 # Deploys the landing page static files and server behind the existing
 # cloudflared tunnel. Adds funstuff.app as a second hostname to the tunnel.
 #
-# Target: jpark@192.168.10.148 (same Pi as dustytrails)
-# Service: funstuff-landing (serves on port 8767)
+# Configuration lives in deploy.config (copy deploy.config.example to start).
+# Service: funstuff-landing
 # Public URL: https://funstuff.app
 #
 # Usage:
@@ -18,15 +18,25 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
-PI_HOST="${PI_HOST:-192.168.10.148}"
-PI_USER="${PI_USER:-jpark}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/deploy.config"
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    echo "Error: No deploy.config found. Copy deploy.config.example and customize." >&2
+    exit 1
+fi
+
+if [[ -z "${PI_HOST:-}" || -z "${PI_USER:-}" ]]; then
+    echo "Error: PI_HOST and PI_USER must be set in deploy.config" >&2
+    exit 1
+fi
 PI_TARGET="${PI_USER}@${PI_HOST}"
 
 SERVICE_NAME="funstuff-landing"
 INSTALL_DIR="/home/${PI_USER}/funstuff"
 LANDING_PORT="8767"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Colors
@@ -43,13 +53,27 @@ log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 
 FILES_ONLY=false
 
-for arg in "$@"; do
-  case "$arg" in
-    --files-only) FILES_ONLY=true ;;
-    --host) shift; PI_HOST="$1" ;;
-    --user) shift; PI_USER="$1" ;;
-    *) log_error "Unknown argument: $arg"; exit 1 ;;
-  esac
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --files-only)
+            FILES_ONLY=true
+            shift
+            ;;
+        --host)
+            PI_HOST="$2"
+            PI_TARGET="${PI_USER}@${PI_HOST}"
+            shift 2
+            ;;
+        --user)
+            PI_USER="$2"
+            PI_TARGET="${PI_USER}@${PI_HOST}"
+            shift 2
+            ;;
+        *)
+            log_error "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
 done
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -9,6 +9,10 @@ dist/
 # Environment
 .venv/
 .env
+.github/
+.claude/
+.cursor/
+.pytest_cache/
 
 # IDE
 .vscode/
@@ -31,10 +35,6 @@ deploy/*/deploy.config
 
 # Deployment
 .github/prompts/plan-fixDashboardStuckAfterRestart.prompt.md
-HANDOFF.md
-CICD_PLAYBOOK.md
-POSTMORTEM_SNAPSHOT_PERF.md
-TOKEN_STREAM_NOTE.md
 
 # Static audio files
 landing/mp3s/
