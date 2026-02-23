@@ -27,7 +27,11 @@ HANDOFF_SCREENSHOTS/
 # Deployment staging
 deploy/*/.staging/
 deploy/*/.minify_cache/
+deploy/*/deploy.config
+deploy/*/tunnel.config
 
 # Deployment
-deploy/
 .github/prompts/plan-fixDashboardStuckAfterRestart.prompt.md
+
+# Static files
+landing/mp3s/
