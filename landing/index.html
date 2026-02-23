@@ -2,25 +2,26 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>funstuff.app — DustyTrails: Real-Time Air Quality in Salt Lake City</title>
   <meta name="description" content="DustyTrails is a real-time air quality map for Salt Lake City and the Wasatch Front. PM2.5, ozone, and NO₂ from Utah DAQ mobile buses, TRAX light-rail sensors, EPA fixed monitors, and PurpleAir community sensors. A personal project by a person who breathes this air." />
 
-  <!-- Open Graph -->
   <meta property="og:type" content="website" />
   <meta property="og:title" content="funstuff.app — DustyTrails: Salt Lake City Air Quality" />
   <meta property="og:description" content="Real-time air quality map for Salt Lake City. PM2.5, ozone, NO₂ from mobile buses, TRAX, fixed monitors, and PurpleAir sensors." />
   <meta property="og:url" content="https://funstuff.app/" />
+  <meta property="og:image" content="https://dustytrails.funstuff.app/icon-512.png" />
   <meta property="og:site_name" content="funstuff.app" />
-
-  <!-- Twitter Card -->
   <meta name="twitter:card" content="summary" />
   <meta name="twitter:title" content="funstuff.app — DustyTrails: Salt Lake City Air Quality" />
   <meta name="twitter:description" content="Real-time air quality map for Salt Lake City and the Wasatch Front." />
+  <meta name="twitter:image" content="https://dustytrails.funstuff.app/icon-512.png" />
 
   <link rel="canonical" href="https://funstuff.app/" />
+  <meta name="theme-color" content="#008080" />
+  <link rel="icon" href="https://dustytrails.funstuff.app/icon-512.png" type="image/png" />
+  <link rel="manifest" href="manifest.json" />
 
-  <!-- Structured Data -->
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -61,11 +62,12 @@
 
   <div class="page">
 
+    <div class="app-window" id="app-window">
     <!-- ─── Title Bar ─── -->
     <header class="window titlebar">
       <div class="titlebar-left">
         <span class="titlebar-icon">&#128190;</span>
-        <span class="titlebar-text">C:\FUNSTUFF\</span>
+        <span class="titlebar-text">C:\FUNSTUFF\DUSTYTRAILS\</span>
       </div>
       <div class="titlebar-buttons">
         <button class="tb-btn" aria-label="Minimize">_</button>
@@ -79,7 +81,7 @@
 
       <div class="hero">
         <h1 class="site-title">funstuff<span class="dot">.</span>app</h1>
-        <p class="tagline">named after the funstuff folder on early Windows machines. you know the one.</p>
+        <p class="tagline">named after the FUNSTUFF folder on early 90's PC machines. you know the one.</p>
       </div>
 
       <hr class="divider" />
@@ -88,8 +90,22 @@
       <section class="project-section" id="dustytrails">
         <div class="project-header">
           <div class="folder-icon" aria-hidden="true">
-            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
-              <path d="M4 12 C4 10 6 8 8 8 L18 8 L22 12 L40 12 C42 12 44 14 44 16 L44 38 C44 40 42 42 40 42 L8 42 C6 42 4 40 4 38 Z" fill="#e8a735" stroke="#c4881d" stroke-width="1.5"/>
+            <svg width="48" height="48" viewBox="0 0 48 48" shape-rendering="crispEdges">
+              <rect x="4" y="4" width="40" height="40" rx="3" fill="#111826"/>
+              <rect x="20" y="8" width="8" height="3" fill="#6cc3ff"/>
+              <rect x="17" y="11" width="3" height="8" fill="#6cc3ff"/>
+              <rect x="28" y="11" width="3" height="8" fill="#6cc3ff"/>
+              <rect x="20" y="19" width="8" height="3" fill="#6cc3ff"/>
+              <rect x="22" y="22" width="4" height="4" fill="#6cc3ff"/>
+              <rect x="20" y="12" width="8" height="6" fill="#4ade80"/>
+              <rect x="10" y="30" width="8" height="3" fill="#6cc3ff"/>
+              <rect x="15" y="33" width="3" height="3" fill="#6cc3ff"/>
+              <rect x="18" y="33" width="8" height="3" fill="#6cc3ff"/>
+              <rect x="26" y="33" width="3" height="3" fill="#6cc3ff"/>
+              <rect x="29" y="36" width="8" height="3" fill="#6cc3ff"/>
+              <rect x="9" y="29" width="5" height="5" fill="#4ade80"/>
+              <rect x="20" y="32" width="5" height="5" fill="#facc15"/>
+              <rect x="33" y="35" width="5" height="5" fill="#ef4444"/>
             </svg>
           </div>
           <div>
@@ -104,9 +120,11 @@
           </p>
           <p>
             DustyTrails is a real-time air quality map for Salt Lake City and the Wasatch Front.
-            It shows PM2.5, ozone, and NO₂ readings from several sources:
+            Mobile sensors show PM2.5, PM10 (dust), ozone, and NO₂ readings and more.
+            This way ou see smoke and dust storms immediately as they happen, hours before the traditional fixed monitors update.
+            It's like having a network of mini weather stations all around the city. Except they tell you when it's safe to breathe the air.
           </p>
-
+<!-- 
           <ul class="source-list">
             <li>
               <strong>Utah DAQ mobile sensor buses</strong> — government-operated vehicles that drive around the Salt Lake Valley collecting air quality measurements in real time. Data provided by the University of Utah.
@@ -118,42 +136,51 @@
               <strong>EPA / DAQ fixed monitoring stations</strong> — the traditional fixed-location monitors you see on AirNow, but integrated into the same map alongside mobile data.
             </li>
             <li>
-              <strong>PurpleAir community sensors</strong> — crowdsourced, community-operated sensors. More real-time than the government sensors. (API token limitations mean I can't update these as frequently as I'd like.)
+              <strong>PurpleAir community sensors</strong> — crowdsourced, community-operated sensors. More real-time than the government sensors. (API token cost limitations mean I can't update these as frequently as I'd like.)
             </li>
-          </ul>
+          </ul> -->
 
           <p>
-            This is a personal project. I live in Salt Lake City and I breathe this air. It's not a startup. It's not a product. I don't have an LLC. The sensor data terms don't allow profiting off it anyway, and I wouldn't want to — this is just something I wanted to exist.
+            This is a personal project. I live in Salt Lake City and I breathe this air. It's not a startup. It's not a product. This is just something I wanted to exist.
           </p>
 
           <!-- ─── Map Preview ─── -->
-          <div class="demo-window">
+          <div class="demo-window" id="demo-dustytrails">
             <div class="demo-titlebar">
               <span class="demo-titlebar-icon">&#127758;</span>
               <span class="demo-titlebar-text">DustyTrails — Live Map Preview</span>
-              <div class="demo-titlebar-buttons">
-                <span class="demo-tb-btn">_</span>
-                <span class="demo-tb-btn">&#9633;</span>
-                <span class="demo-tb-btn demo-tb-close">&#10005;</span>
-              </div>
             </div>
             <div class="demo-viewport map-viewport">
               <iframe
-                src="https://dustytrails.funstuff.app/"
+                id="map-iframe"
+                data-src="https://dustytrails.funstuff.app/"
                 title="DustyTrails real-time air quality map for Salt Lake City"
-                loading="lazy"
                 sandbox="allow-scripts allow-same-origin"
               ></iframe>
               <div class="demo-overlay" aria-hidden="true">
-                <span class="demo-overlay-label">Live preview — click to open full app</span>
+                <span class="demo-overlay-label" id="demo-overlay-label">Click to open full app</span>
               </div>
+              <div class="snapshot-indicator" id="snapshot-indicator"></div>
             </div>
           </div>
+          <p class="purpleair-credit">powered by <a href="https://www.purpleair.com" target="_blank" rel="noopener">PurpleAir</a></p>
 
-          <a href="https://dustytrails.funstuff.app/" class="launch-btn" rel="noopener">
-            <span class="btn-icon">&#9654;</span>
-            Open DustyTrails
-          </a>
+          <div class="launch-row">
+            <a href="https://dustytrails.funstuff.app/" class="launch-btn" target="_blank" rel="noopener">
+              <span class="btn-icon">&#9654;</span>
+              Open DustyTrails
+            </a>
+
+            <details class="disclosures">
+              <summary>Data Sources &amp; Disclosures</summary>
+              <div class="disclosures-body">
+                <p><strong>Mobile &amp; Fixed Sensors:</strong> Data courtesy of the <strong>Utah Division of Air Quality</strong> and the <strong>EPA AirNow program</strong>. Data are provided by federal, state, local, and tribal air quality agencies. This project is independent and not endorsed by the Utah DAQ, the University of Utah, or the EPA.</p>
+                <p>AirNow observational data are not fully verified or validated and are considered <strong>preliminary</strong>. Data are disseminated as received without alteration. Not for regulatory, medical, or emergency response use. Official regulatory data must be obtained from <a href="https://www.epa.gov/aqs" target="_blank" rel="noopener">EPA's Air Quality System (AQS)</a>.</p>
+                <p class="disclosures-legal">&copy; 2026 funstuff.wtf. All rights reserved. This software is provided "as-is" without warranty of any kind. Air quality data is not quality-assured and is subject to change. This application has no university affiliation.</p>
+              </div>
+            </details>
+          </div>
+
         </div>
       </section>
 
@@ -183,23 +210,21 @@
             Same sensor readings, tabulated. Updates live. This is what it looks like if your monitor is 80 columns wide and you think GUIs were a mistake.
           </p>
 
-          <div class="demo-window terminal-window">
-            <div class="demo-titlebar terminal-titlebar">
+          <div class="demo-window" id="demo-tui">
+            <div class="demo-titlebar">
               <span class="demo-titlebar-icon">&#9618;</span>
-              <span class="demo-titlebar-text">C:\DUSTYTRAILS\TUI.EXE</span>
-              <div class="demo-titlebar-buttons">
-                <span class="demo-tb-btn">_</span>
-                <span class="demo-tb-btn">&#9633;</span>
-                <span class="demo-tb-btn demo-tb-close">&#10005;</span>
-              </div>
+              <span class="demo-titlebar-text">C:\FUNSTUFF\DUSTYTRAILS\TUI.EXE</span>
             </div>
             <div class="demo-viewport tui-viewport">
               <iframe
+                id="tui-iframe"
                 src="https://dustytrails.funstuff.app/tui.html"
                 title="DustyTrails TUI — text-mode air quality dashboard"
-                loading="lazy"
                 sandbox="allow-scripts allow-same-origin"
               ></iframe>
+              <div class="demo-overlay tui-overlay" id="tui-overlay" aria-hidden="true">
+                <span class="demo-overlay-label">Click to interact</span>
+              </div>
             </div>
           </div>
         </div>
@@ -208,8 +233,29 @@
       <hr class="divider" />
 
       <!-- ─── About / SLC Context ─── -->
-      <section class="info-section" id="about">
-        <h3>Why Salt Lake City?</h3>
+      <section class="project-section" id="about">
+        <div class="project-header">
+          <div class="folder-icon" aria-hidden="true">
+            <svg width="48" height="48" viewBox="0 0 48 48" shape-rendering="crispEdges">
+              <rect x="4" y="4" width="40" height="40" rx="3" fill="#000080"/>
+              <rect x="14" y="8" width="20" height="3" fill="#c0c0c0"/>
+              <rect x="11" y="11" width="3" height="22" fill="#c0c0c0"/>
+              <rect x="34" y="11" width="3" height="22" fill="#c0c0c0"/>
+              <rect x="14" y="33" width="20" height="3" fill="#c0c0c0"/>
+              <rect x="21" y="14" width="6" height="3" fill="#fff"/>
+              <rect x="24" y="17" width="3" height="3" fill="#fff"/>
+              <rect x="21" y="20" width="6" height="3" fill="#fff"/>
+              <rect x="21" y="23" width="3" height="3" fill="#fff"/>
+              <rect x="21" y="28" width="3" height="3" fill="#fff"/>
+            </svg>
+          </div>
+          <div>
+            <h2 class="project-name">Why Salt Lake City?</h2>
+            <p class="project-sub">inversions, mountains, and mobile sensors</p>
+          </div>
+        </div>
+
+        <div class="project-body">
         <p>
           Salt Lake City has a unique air quality situation. The valley is surrounded by mountains on three sides (the Wasatch Range, the Oquirrhs, the Traverse Range) which trap inversions — cold air sinking into the valley and sitting there, accumulating pollution. Winter inversions are the worst. Some days the air quality in the valley is among the worst in the country while the mountains above are pristine.
         </p>
@@ -217,8 +263,9 @@
           The state of Utah and the University of Utah have invested in mobile sensor platforms — buses and trains that measure air quality as they move through the valley. This is unusual. Most cities only have fixed monitoring stations. The mobile sensors give a much more granular picture of what's happening block by block, hour by hour.
         </p>
         <p>
-          If your city has similar mobile air quality sensor programs and you'd like to see your data on a map like this, <a href="mailto:contact@funstuff.app">get in touch</a>. I'd be interested in hearing about it.
+          If your city has similar mobile air quality sensor programs and you'd like to see your data on a map like this, <a href="mailto:matt@funstuff.app">get in touch</a>. I'd be interested in hearing about it.
         </p>
+        </div>
       </section>
 
       <hr class="divider" />
@@ -231,21 +278,115 @@
         </p>
       </section>
 
-    </main>
+      <div class="window-footer">
+        <span>&copy; 2026 funstuff.wtf &middot; All rights reserved.</span>
+      </div>
 
-    <!-- ─── Taskbar ─── -->
-    <footer class="taskbar">
-      <div class="start-btn">
-        <span class="start-icon">&#9776;</span>
-        <span class="start-text">Start</span>
-      </div>
-      <div class="taskbar-tray">
-        <span class="tray-item" id="tray-clock"></span>
-      </div>
-    </footer>
+    </main>
+    </div>
 
   </div>
 
+  <!-- ─── Taskbar ─── -->
+  <footer class="taskbar" id="taskbar">
+
+      <nav class="start-menu" id="start-menu" aria-label="Start menu" aria-hidden="true">
+        <div class="start-menu-banner" aria-hidden="true">
+          <span class="start-menu-banner-text">funstuff.wtf</span>
+        </div>
+        <div class="start-menu-items">
+          <div class="start-menu-folder" id="sm-funstuff-folder">
+            <button class="start-menu-item start-menu-folder-btn">
+              <span class="sm-icon">
+                <svg width="16" height="16" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><rect x="1" y="4" width="14" height="10" rx="1" fill="#e8c946"/><rect x="1" y="3" width="6" height="2" rx="1" fill="#d4a017"/><rect x="1" y="4" width="14" height="2" fill="#f5d960"/></svg>
+              </span>
+              <span>FUNSTUFF</span>
+              <span class="sm-arrow"><svg width="8" height="10" viewBox="0 0 8 10" aria-hidden="true"><polygon points="0,0 8,5 0,10" fill="currentColor"/></svg></span>
+            </button>
+            <div class="start-submenu" id="sm-funstuff-sub">
+              <a class="start-menu-item" href="https://dos.zone/hover/" target="_blank" rel="noopener">
+                <span class="sm-icon">
+                  <svg width="16" height="16" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><rect x="2" y="10" width="12" height="2" fill="#808080"/><rect x="4" y="8" width="8" height="2" fill="#c0c0c0"/><rect x="6" y="5" width="4" height="3" fill="#ff0"/><rect x="7" y="3" width="2" height="2" fill="#ff0"/><rect x="3" y="12" width="2" height="2" fill="#333"/><rect x="11" y="12" width="2" height="2" fill="#333"/></svg>
+                </span>
+                <span>HOVER</span>
+              </a>
+              <a class="start-menu-item" id="sm-instagram" href="https://www.instagram.com/saveourgreatsaltlake" target="_blank" rel="noopener">
+                <span class="sm-icon">
+                  <svg width="16" height="16" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><rect x="1" y="1" width="14" height="14" rx="2" fill="#1a1a2e" stroke="#c0c0c0" stroke-width="1"/><rect x="4" y="3" width="8" height="6" fill="#444"/><rect x="5" y="4" width="6" height="4" fill="#6a6a6a"/><circle cx="8" cy="6" r="2" fill="#999" stroke="#c0c0c0" stroke-width="0.5"/><rect x="10" y="3" width="2" height="2" fill="#ff0"/><rect x="3" y="11" width="10" height="2" rx="1" fill="#808080"/></svg>
+                </span>
+                <span>PICTURES</span>
+              </a>
+              <button class="start-menu-item" id="sm-videos">
+                <span class="sm-icon">
+                  <svg width="16" height="16" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><rect x="1" y="3" width="14" height="10" rx="1" fill="#1a1a2e" stroke="#c0c0c0" stroke-width="1"/><polygon points="6,5 6,11 12,8" fill="#c0c0c0"/></svg>
+                </span>
+                <span>VIDEOS</span>
+              </button>
+            </div>
+          </div>
+          <button class="start-menu-item" id="sm-pipes">
+            <span class="sm-icon">
+              <svg width="16" height="16" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><rect width="16" height="16" fill="#000"/><rect x="3" y="2" width="3" height="8" fill="#c00000"/><rect x="6" y="7" width="6" height="3" fill="#c00000"/><rect x="9" y="5" width="3" height="8" fill="#2e8b57"/><rect x="1" y="10" width="8" height="3" fill="#2e8b57"/></svg>
+            </span>
+            <span>Pipes</span>
+          </button>
+          <button class="start-menu-item" id="sm-flowerbox">
+            <span class="sm-icon">
+              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect width="16" height="16" fill="#000"/><polygon points="8,2 14,8 8,14 2,8" fill="#0cc" stroke="#f0f" stroke-width="1"/><polygon points="8,4 12,8 8,12 4,8" fill="#ff0" stroke="#00f" stroke-width="0.5"/></svg>
+            </span>
+            <span>FlowerBox</span>
+          </button>
+          <button class="start-menu-item" id="sm-winamp">
+            <span class="sm-icon">
+              <svg width="16" height="16" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><rect width="16" height="16" rx="1" fill="#1a1a2e"/><rect x="2" y="6" width="3" height="5" fill="#f90"/><rect x="6" y="4" width="3" height="9" fill="#f90"/><rect x="10" y="2" width="4" height="12" fill="#f90"/></svg>
+            </span>
+            <span>Winamp</span>
+          </button>
+          <div class="start-menu-sep" role="separator"></div>
+          <button class="start-menu-item start-menu-item-shutdown" id="sm-shutdown">
+            <span class="sm-icon">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="9" r="5" stroke="#333" stroke-width="2" fill="none"/><rect x="7" y="3" width="2" height="5" fill="#c0c0c0"/><rect x="7" y="4" width="2" height="4" fill="#333"/></svg>
+            </span>
+            <span>Shut Down...</span>
+          </button>
+        </div>
+      </nav>
+
+      <button class="start-btn" id="start-btn" aria-haspopup="true" aria-expanded="false" aria-controls="start-menu">
+        <span class="start-icon">&#9776;</span>
+        <span class="start-text">Start</span>
+      </button>
+
+      <div class="taskbar-apps" id="taskbar-apps">
+        <button class="taskbar-app-btn active" id="tb-main" title="C:\FUNSTUFF\DUSTYTRAILS">
+          <svg class="tb-icon" width="14" height="14" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="#1a6eb5"/><rect x="5" y="3" width="2" height="3" fill="#2e8b57"/><rect x="9" y="3" width="3" height="2" fill="#2e8b57"/><rect x="3" y="6" width="3" height="3" fill="#2e8b57"/><rect x="7" y="5" width="2" height="2" fill="#2e8b57"/><rect x="10" y="6" width="2" height="2" fill="#2e8b57"/><rect x="4" y="10" width="4" height="2" fill="#2e8b57"/><rect x="9" y="9" width="3" height="3" fill="#2e8b57"/></svg>
+          <span>funstuff.app</span>
+        </button>
+        <button class="taskbar-app-btn" id="tb-dustytrails" title="DustyTrails">
+          <svg class="tb-icon" width="14" height="14" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><rect width="16" height="16" rx="1" fill="#111826"/><rect x="6" y="2" width="4" height="2" fill="#6cc3ff"/><rect x="5" y="4" width="1" height="3" fill="#6cc3ff"/><rect x="10" y="4" width="1" height="3" fill="#6cc3ff"/><rect x="6" y="7" width="4" height="1" fill="#6cc3ff"/><rect x="7" y="8" width="2" height="2" fill="#6cc3ff"/><rect x="6" y="4" width="4" height="3" fill="#4ade80"/><rect x="2" y="11" width="4" height="2" fill="#6cc3ff"/><rect x="6" y="11" width="2" height="2" fill="#6cc3ff"/><rect x="8" y="13" width="4" height="2" fill="#6cc3ff"/><rect x="2" y="11" width="3" height="3" fill="#4ade80"/><rect x="7" y="12" width="3" height="3" fill="#facc15"/><rect x="11" y="12" width="3" height="3" fill="#ef4444"/></svg>
+          <span>DustyTrails</span>
+        </button>
+        <button class="taskbar-app-btn" id="tb-tui" title="Terminal View">
+          <svg class="tb-icon" width="14" height="14" viewBox="0 0 48 48" fill="none" aria-hidden="true"><rect x="4" y="6" width="40" height="36" rx="2" fill="#1a1a2e" stroke="#444" stroke-width="2"/><text x="24" y="30" font-family="monospace" font-size="16" fill="#0f0" text-anchor="middle">&gt;_</text></svg>
+          <span>Terminal View</span>
+        </button>
+        <button class="taskbar-app-btn" id="tb-about" title="About">
+          <svg class="tb-icon" width="14" height="14" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><rect width="16" height="16" rx="1" fill="#000080"/><rect x="3" y="2" width="10" height="1" fill="#c0c0c0"/><rect x="2" y="3" width="1" height="9" fill="#c0c0c0"/><rect x="13" y="3" width="1" height="9" fill="#c0c0c0"/><rect x="3" y="12" width="10" height="1" fill="#c0c0c0"/><rect x="6" y="4" width="4" height="2" fill="#fff"/><rect x="8" y="6" width="2" height="1" fill="#fff"/><rect x="6" y="7" width="4" height="1" fill="#fff"/><rect x="6" y="8" width="2" height="1" fill="#fff"/><rect x="6" y="10" width="2" height="1" fill="#fff"/></svg>
+          <span>About</span>
+        </button>
+      </div>
+
+      <div class="taskbar-tray">
+        <span class="tray-item" id="tray-clock"></span>
+    </div>
+  </footer>
+
+  <script src="pipes.js"></script>
+  <script src="flowerbox.js"></script>
   <script src="fun.js"></script>
+  <script type="module">
+    import Webamp from "https://unpkg.com/webamp@^2";
+    window._WebampClass = Webamp;
+  </script>
 </body>
 </html>

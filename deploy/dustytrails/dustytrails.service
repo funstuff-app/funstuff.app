@@ -1,0 +1,44 @@
+[Unit]
+Description=Dusty Trails - MobileAir Dashboard Server
+Documentation=https://funstuff.app/dustytrails
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jpark
+Group=jpark
+WorkingDirectory=/opt/dustytrails
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+# Data directory: ~/.mobileair (i.e., /home/jpark/.mobileair)
+# Contains: road graphs, snapshots, sensor names, history, caches
+Environment="HOME=/home/jpark"
+
+# Run the dashboard server
+# --host 0.0.0.0 allows connections from reverse proxy
+# --port 8766 is the internal port
+ExecStart=/opt/dustytrails/venv/bin/python /opt/dustytrails/dashboard_server.py --host 0.0.0.0 --port 8766
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/dustytrails/data
+
+# Resource limits (adjust for Pi model)
+MemoryMax=256M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dustytrails
+
+[Install]
+WantedBy=multi-user.target

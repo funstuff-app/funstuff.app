@@ -1,0 +1,20 @@
+# Cloudflare tunnel configuration
+# Copy to tunnel.config and customize for your setup
+#
+# This is used by setup_tunnel.sh (one-time setup),
+# NOT by deploy_landing.sh (regular deploys).
+
+# Pi connection (same as deploy.config)
+PI_HOST="raspberrypi.local"
+PI_USER="pi"
+
+# Tunnel name (created with: cloudflared tunnel create <name>)
+TUNNEL_NAME="my-tunnel"
+
+# Hostnames → local services
+DASHBOARD_DOMAIN="dashboard.example.com"
+DASHBOARD_PORT="8766"
+
+LANDING_DOMAIN="example.com"
+LANDING_DOMAIN_WWW="www.example.com"
+LANDING_PORT="8767"
