@@ -186,7 +186,6 @@
       appWindow.style.transition = "";
       appWindow.style.transform = "";
     }, 220);
-    if (tbMainBtn) tbMainBtn.classList.remove("active");
   }
 
   function restoreWindow() {
@@ -201,7 +200,6 @@
         appWindow.style.transform = "";
       });
     });
-    if (tbMainBtn) tbMainBtn.classList.add("active");
     if (mainWindow) mainWindow.scrollTop = 0;
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -219,34 +217,85 @@
     });
   }
 
-  /* Taskbar main-window button: toggle */
+  /* Taskbar main-window button: part of the same group */
   if (tbMainBtn) {
     tbMainBtn.addEventListener("click", function () {
       if (appWindow && appWindow.style.display === "none") {
         restoreWindow();
+      }
+      _setActiveSection(null);
+      if (mainWindow) mainWindow.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  }
+
+  /* ── Taskbar DustyTrails / TUI / About buttons (scroll to section) ── */
+  var tbDustyTrails = document.getElementById("tb-dustytrails");
+  var tbTui         = document.getElementById("tb-tui");
+  var tbAbout       = document.getElementById("tb-about");
+
+  // Map observed section IDs to taskbar buttons + scroll targets
+  var _sectionBtns = {
+    dustytrails: tbDustyTrails,
+    "tui-demo": tbTui,
+    about: tbAbout
+  };
+  // Scroll targets: app buttons scroll to their embedded windows, About scrolls to section
+  var _scrollTargets = {
+    dustytrails: "demo-dustytrails",
+    "tui-demo": "demo-tui",
+    about: "about"
+  };
+  var _activeSection = null;
+
+  function _setActiveSection(id) {
+    _activeSection = id;
+    // All buttons are one group — only one active at a time
+    // null means funstuff.app (top of page) is active
+    if (tbMainBtn) {
+      if (id === null) {
+        tbMainBtn.classList.add("active");
       } else {
-        minimizeWindow();
+        tbMainBtn.classList.remove("active");
+      }
+    }
+    Object.keys(_sectionBtns).forEach(function (key) {
+      var btn = _sectionBtns[key];
+      if (btn) {
+        if (key === id) {
+          btn.classList.add("active");
+        } else {
+          btn.classList.remove("active");
+        }
       }
     });
   }
 
-  /* ── Taskbar DustyTrails / TUI buttons (scroll to section) ── */
-  var tbDustyTrails = document.getElementById("tb-dustytrails");
-  var tbTui         = document.getElementById("tb-tui");
-
   function scrollToSection(id) {
     var wasHidden = appWindow && appWindow.style.display === "none";
     if (wasHidden) restoreWindow();
+    var targetId = _scrollTargets[id] || id;
     setTimeout(function () {
-      var el = document.getElementById(id);
+      var el = document.getElementById(targetId);
       if (el && mainWindow) {
         el.scrollIntoView({ behavior: "smooth", block: "start" });
       }
     }, wasHidden ? 260 : 0);
   }
 
-  if (tbDustyTrails) tbDustyTrails.addEventListener("click", function () { scrollToSection("dustytrails"); });
-  if (tbTui)         tbTui.addEventListener("click",         function () { scrollToSection("tui-demo"); });
+  function _handleTaskbarBtn(id) {
+    if (_activeSection === id) {
+      // Toggle off — scroll to top
+      _setActiveSection(null);
+      if (mainWindow) mainWindow.scrollTo({ top: 0, behavior: "smooth" });
+    } else {
+      _setActiveSection(id);
+      scrollToSection(id);
+    }
+  }
+
+  if (tbDustyTrails) tbDustyTrails.addEventListener("click", function () { _handleTaskbarBtn("dustytrails"); });
+  if (tbTui)         tbTui.addEventListener("click",         function () { _handleTaskbarBtn("tui-demo"); });
+  if (tbAbout)       tbAbout.addEventListener("click",       function () { _handleTaskbarBtn("about"); });
 
   /* ── Start Menu ── */
   var startBtn  = document.getElementById("start-btn");
@@ -275,22 +324,11 @@
   });
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeStartMenu(); });
 
-  var smShutdown    = document.getElementById("sm-shutdown");
-  var smDustyTrails  = document.getElementById("sm-dustytrails");
-  var smTui          = document.getElementById("sm-tui");
-  var smAbout        = document.getElementById("sm-about");
+  var smShutdown = document.getElementById("sm-shutdown");
+  var smInstagram = document.getElementById("sm-instagram");
 
-  if (smDustyTrails) smDustyTrails.addEventListener("click", function () {
+  if (smInstagram) smInstagram.addEventListener("click", function () {
     closeStartMenu();
-    scrollToSection("dustytrails");
-  });
-  if (smTui) smTui.addEventListener("click", function () {
-    closeStartMenu();
-    scrollToSection("tui-demo");
-  });
-  if (smAbout) smAbout.addEventListener("click", function () {
-    closeStartMenu();
-    scrollToSection("about");
   });
   if (smShutdown) smShutdown.addEventListener("click", function () {
     closeStartMenu();
@@ -301,18 +339,6 @@
   /* ── PWA install ── */
   var _installPrompt = null;
 
-  function showPwaTaskbarButtons() {
-    if (tbDustyTrails) tbDustyTrails.style.display = "";
-    if (tbTui)         tbTui.style.display = "";
-    localStorage.setItem("funstuff_pwa_installed", "1");
-  }
-
-  /* Already installed on a previous visit? */
-  if (localStorage.getItem("funstuff_pwa_installed") === "1" ||
-      window.matchMedia("(display-mode: standalone)").matches) {
-    showPwaTaskbarButtons();
-  }
-
   window.addEventListener("beforeinstallprompt", function (e) {
     e.preventDefault();
     _installPrompt = e;
@@ -320,7 +346,6 @@
 
   window.addEventListener("appinstalled", function () {
     _installPrompt = null;
-    showPwaTaskbarButtons();
   });
 
 })();
