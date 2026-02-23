@@ -25,13 +25,13 @@
     var PIPE_R = 0.22;
     var JOINT_R = 0.34;
 
-    /* "classic" = fixed perspective filling viewport, "rotate" = orbiting */
+    /* "classic" = near-frontal, filling viewport like Win95, "rotate" = orbiting */
     var mode = (opts && opts.mode) || "classic";
 
-    /* Classic-mode fixed angles (like the Win95 screensaver — slight perspective,
-       looking down from above-right, zoomed in so pipes fill the whole window) */
-    var CLASSIC_RY = 0.62;
-    var CLASSIC_RX = 0.50;
+    /* Classic-mode: 3/4 view with close camera so pipes fill the
+       viewport and near ones look huge — like the original screensaver */
+    var CLASSIC_RY = 0.55;
+    var CLASSIC_RX = 0.45;
 
     var PALETTE = [
       [220, 40, 40],
@@ -49,6 +49,20 @@
       [0, 1, 0], [0, -1, 0],
       [0, 0, 1], [0, 0, -1],
     ];
+
+    /* Fixed world-space light direction (upper-left-front), normalized */
+    var LIGHT = [0.48, -0.64, 0.6];
+
+    /* For a cylinder along axis D with light L:
+       brightness = sqrt(1 - dot(D,L)^2)
+       This is how much light hits the curved surface.
+       Precompute for all 6 directions. */
+    var DIR_BRIGHT = [];
+    for (var _di = 0; _di < 6; _di++) {
+      var _d = DIRS[_di];
+      var _dot = _d[0] * LIGHT[0] + _d[1] * LIGHT[1] + _d[2] * LIGHT[2];
+      DIR_BRIGHT.push(Math.sqrt(1 - _dot * _dot));
+    }
 
     function rgb(c, f) {
       f = f === undefined ? 1 : f;
@@ -78,7 +92,7 @@
 
     function fitCamera(ry, rx, margin) {
       /* project all 8 corners with a test fov, then scale to fill */
-      var testCamD = Math.max(GX, GY, GZ) * GRID_SPACING * 1.6;
+      var testCamD = Math.max(GX, GY, GZ) * GRID_SPACING * 0.8;
       var testFov = 100;
       var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
       for (var i = 0; i < 8; i++) {
@@ -125,7 +139,7 @@
       cz = (GZ - 1) * GRID_SPACING / 2;
 
       /* Fit cameras so grid fills the viewport */
-      var cf = fitCamera(CLASSIC_RY, CLASSIC_RX, -0.4);
+      var cf = fitCamera(CLASSIC_RY, CLASSIC_RX, -1.0);
       _classicCamD = cf.camD;
       _classicFov = cf.fov;
       var of = fitCamera(rotY, rotX, 0.12);
@@ -219,93 +233,122 @@
 
     /* ── Rendering ── */
 
-    function drawBall(px, py, sz, c) {
+    function drawBall(px, py, sz, zd, c) {
       var r = sz * 0.22;
       if (r < 2) r = 2;
+      var fog = Math.max(0.35, Math.min(1.0, 1.0 - zd * 0.04));
       var g = ctx.createRadialGradient(px - r * 0.3, py - r * 0.3, r * 0.05, px, py, r);
-      g.addColorStop(0, rgb(c, 1.8));
-      g.addColorStop(0.4, rgb(c, 1.0));
-      g.addColorStop(1, rgb(c, 0.3));
+      g.addColorStop(0, rgb(c, 1.8 * fog));
+      g.addColorStop(0.4, rgb(c, 1.0 * fog));
+      g.addColorStop(1, rgb(c, 0.3 * fog));
       ctx.fillStyle = g;
       ctx.beginPath();
       ctx.arc(px, py, r, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    function strokePath(pts, style, width) {
-      ctx.strokeStyle = style;
-      ctx.lineWidth = width;
+    function drawSegLine(pf, pt, c, bright) {
+      /* Per-endpoint radius for perspective-correct tapering */
+      var rf = pf.s * 0.15;
+      var rt = pt.s * 0.15;
+      if (rf < 1.5) rf = 1.5;
+      if (rt < 1.5) rt = 1.5;
+
+      var dx = pt.x - pf.x;
+      var dy = pt.y - pf.y;
+      var len = Math.sqrt(dx * dx + dy * dy) || 1;
+      /* Unit vectors: along the segment and perpendicular */
+      var tx = dx / len;
+      var ty = dy / len;
+      var nx = -ty;
+      var ny = tx;
+
+      /* Extend each end slightly along the segment direction to overlap
+         adjacent segments and hide seams */
+      var ext = Math.max(rf, rt) * 0.4;
+      var fx = pf.x - tx * ext, fy = pf.y - ty * ext;
+      var ex = pt.x + tx * ext, ey = pt.y + ty * ext;
+
+      /* Depth fog: attenuate far segments */
+      var avgZ = (pf.z + pt.z) / 2;
+      var fog = Math.max(0.35, Math.min(1.0, 1.0 - avgZ * 0.04));
+      var b = bright * fog;
+
+      /* Cross-section gradient modulated by computed brightness */
+      var avgR = (rf + rt) / 2;
+      var grad = ctx.createLinearGradient(
+        fx + nx * avgR, fy + ny * avgR,
+        fx - nx * avgR, fy - ny * avgR
+      );
+      grad.addColorStop(0, rgb(c, 0.15 * b));
+      grad.addColorStop(0.25, rgb(c, 0.6 * b));
+      grad.addColorStop(0.5, rgb(c, 1.4 * b));
+      grad.addColorStop(0.75, rgb(c, 0.6 * b));
+      grad.addColorStop(1, rgb(c, 0.15 * b));
+
+      ctx.fillStyle = grad;
       ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-      ctx.stroke();
-    }
-
-    function drawPipeContinuous(pipeObj) {
-      var sIds = pipeObj.segs;
-      var c = pipeObj.color;
-      var pts = [];
-      var elbows = [];
-      var caps = [];
-
-      for (var i = 0; i < sIds.length; i++) {
-        var s = segments[sIds[i]];
-        var pf = project(s.fx, s.fy, s.fz);
-        if (s.cap) { caps.push(pf); continue; }
-        var pt = project(s.tx, s.ty, s.tz);
-        if (pts.length === 0) pts.push(pf);
-        pts.push(pt);
-        if (s.elbow) elbows.push(pf);
-      }
-
-      if (pts.length >= 2) {
-        var totalS = 0;
-        for (var k = 0; k < pts.length; k++) totalS += pts[k].s;
-        var avgS = totalS / pts.length;
-        var r = avgS * 0.15;
-        if (r < 1.5) r = 1.5;
-
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-
-        /* 3-pass cylinder shading on the whole continuous path */
-        strokePath(pts, rgb(c, 0.3), r * 2);
-        strokePath(pts, rgb(c, 0.85), r * 1.5);
-        strokePath(pts, rgb(c, 1.5), r * 0.6);
-      }
-
-      for (var e = 0; e < elbows.length; e++)
-        drawBall(elbows[e].x, elbows[e].y, elbows[e].s, c);
-      for (var f = 0; f < caps.length; f++)
-        drawBall(caps[f].x, caps[f].y, caps[f].s, c);
+      ctx.moveTo(fx + nx * rf, fy + ny * rf);
+      ctx.lineTo(ex + nx * rt, ey + ny * rt);
+      ctx.lineTo(ex - nx * rt, ey - ny * rt);
+      ctx.lineTo(fx - nx * rf, fy - ny * rf);
+      ctx.closePath();
+      ctx.fill();
     }
 
     function draw() {
       ctx.fillStyle = "#000";
       ctx.fillRect(0, 0, W, H);
 
-      /* Sort whole pipes by average z — farthest first */
-      var order = [];
+      /* Collect ALL drawable items from all pipes, then depth-sort */
+      var items = []; /* { type, z, ... } */
+
       for (var i = 0; i < pipes.length; i++) {
-        var sIds = pipes[i].segs;
-        var tz = 0;
+        var pObj = pipes[i];
+        var c = pObj.color;
+        var sIds = pObj.segs;
+
         for (var j = 0; j < sIds.length; j++) {
           var s = segments[sIds[j]];
-          tz += project(s.fx, s.fy, s.fz).z;
-        }
-        order.push({ idx: i, z: sIds.length ? tz / sIds.length : 0 });
-      }
-      order.sort(function (a, b) { return b.z - a.z; });
+          var pf = project(s.fx, s.fy, s.fz);
 
-      for (var k = 0; k < order.length; k++) {
-        drawPipeContinuous(pipes[order[k].idx]);
+          if (s.cap) {
+            /* Bias ball z closer to camera so it draws after adjacent segments */
+            items.push({ type: "ball", p: pf, c: c, z: pf.z - 0.5 });
+            continue;
+          }
+
+          var pt = project(s.tx, s.ty, s.tz);
+          var midZ = (pf.z + pt.z) / 2;
+          var bright = DIR_BRIGHT[s.dir] || 0.7;
+          items.push({ type: "seg", pf: pf, pt: pt, c: c, z: midZ, bright: bright });
+
+          if (s.elbow) {
+            items.push({ type: "ball", p: pf, c: c, z: pf.z - 0.5 });
+          }
+        }
+      }
+
+      /* Sort farthest first (painter's algorithm) */
+      items.sort(function (a, b) { return b.z - a.z; });
+
+      for (var k = 0; k < items.length; k++) {
+        var it = items[k];
+        if (it.type === "seg") {
+          drawSegLine(it.pf, it.pt, it.c, it.bright);
+        } else {
+          drawBall(it.p.x, it.p.y, it.p.s, it.p.z, it.c);
+        }
       }
     }
 
     /* ── Main loop ── */
 
+    var paused = false;
+
     function loop(ts) {
       if (stopped) return;
+      if (paused) return;
       if (!lastTs) lastTs = ts;
       stepAccum += ts - lastTs;
       lastTs = ts;
@@ -328,7 +371,34 @@
 
     return {
       stop: function () { stopped = true; if (animId) cancelAnimationFrame(animId); },
-      resize: function () { if (!stopped) init(); },
+      pause: function () {
+        paused = true;
+        if (animId) { cancelAnimationFrame(animId); animId = null; }
+      },
+      resume: function () {
+        if (stopped) return;
+        paused = false;
+        lastTs = 0;
+        stepAccum = 0;
+        /* Reinit canvas dimensions in case they were invalidated */
+        var dpr = window.devicePixelRatio > 1 ? 1.5 : 1;
+        var ow = canvas.offsetWidth;
+        var oh = canvas.offsetHeight;
+        if (ow && oh) {
+          W = canvas.width = ow * dpr;
+          H = canvas.height = oh * dpr;
+          canvas.style.width = ow + "px";
+          canvas.style.height = oh + "px";
+          var cf = fitCamera(CLASSIC_RY, CLASSIC_RX, -0.4);
+          _classicCamD = cf.camD;
+          _classicFov = cf.fov;
+          var of2 = fitCamera(rotY, rotX, 0.12);
+          _orbitCamD = of2.camD;
+          _orbitFov = of2.fov;
+        }
+        animId = requestAnimationFrame(loop);
+      },
+      resize: function () { if (!stopped && !paused) init(); },
       setMode: function (m) { mode = m; },
       getMode: function () { return mode; },
     };

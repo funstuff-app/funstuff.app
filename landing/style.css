@@ -66,6 +66,8 @@ body {
 
 /* ─── Page layout ─── */
 .page {
+  position: relative;
+  z-index: 300;
   width: 100%;
   max-width: var(--window-max);
   margin: 0 auto;
@@ -399,16 +401,7 @@ body {
 }
 
 /* ─── TUI terminal viewport ─── */
-.terminal-window {
-  background: #0a0a0a;
-  max-width: 640px;
-  margin-left: auto;
-  margin-right: auto;
-}
-
-.terminal-titlebar {
-  background: linear-gradient(90deg, #1a1a2e, #2d2d44);
-}
+/* (terminal-window styles removed — uses shared demo-window) */
 
 .tui-viewport {
   height: 380px;
@@ -590,7 +583,7 @@ body {
   font-family: 'VT323', monospace;
   font-size: 0.95rem;
   user-select: none;
-  z-index: 200;
+  z-index: 10000;
   flex-shrink: 0;
   width: 100%;
 }
@@ -720,7 +713,7 @@ body {
 .start-submenu {
   display: none;
   position: absolute;
-  left: 100%;
+  left: calc(100% + 4px);
   top: -3px;
   background: var(--win-silver);
   border: 2px solid;
@@ -730,8 +723,8 @@ body {
   padding: 3px 0;
   z-index: 1000;
 }
-.start-menu-folder:hover > .start-submenu,
-.start-menu-folder:focus-within > .start-submenu {
+/* Submenu open/close controlled by JS debounce — remove CSS :hover trigger */
+.start-menu-folder.submenu-open > .start-submenu {
   display: block;
 }
 

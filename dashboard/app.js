@@ -13,6 +13,18 @@ const _ownerTok = (() => {
   return localStorage.getItem(KEY) || "";
 })();
 
+/** Update the page title to reflect live or snapshot mode.
+ *  "DustyTrails — Live" or "DustyTrails — Friday 2026-02-21" */
+function _updatePageTitle(dateStr) {
+  if (!dateStr || dateStr === "live") {
+    document.title = "DustyTrails \u2014 Live";
+  } else {
+    const d = new Date(dateStr + "T12:00:00");
+    const dayName = d.toLocaleDateString("en-US", { weekday: "long" });
+    document.title = `DustyTrails \u2014 ${dayName} ${dateStr}`;
+  }
+}
+
 /** Append owner token to a URL (if set). */
 function _tokUrl(url) {
   if (!_ownerTok) return url;
@@ -2604,6 +2616,7 @@ function main() {
         statusEl.classList.add("live");
         statusEl.classList.remove("offline");
       }
+      _updatePageTitle("live");
       updateSaveButtonState();
       // Trigger an immediate live poll to get fresh data
       setTimeout(tick, 100);
@@ -2693,6 +2706,7 @@ function main() {
         statusEl.textContent = `Snapshot: ${dateStr}`;
         statusEl.classList.remove("live");
       }
+      _updatePageTitle(dateStr);
       
       updatePlaybackUi();
       
@@ -2945,6 +2959,7 @@ function main() {
         statusEl.textContent = `Snapshot: ${dateStr}`;
         statusEl.classList.remove("live");
       }
+      _updatePageTitle(dateStr);
       
       updatePlaybackUi();
       map.drawOverlay(window._historicalState);
@@ -3843,6 +3858,7 @@ function main() {
         statusEl.textContent = "Live";
         statusEl.classList.remove("offline");
         statusEl.classList.add("live");
+        _updatePageTitle("live");
       }
     }
     const bestMs = newestReadingMsFromState(st);

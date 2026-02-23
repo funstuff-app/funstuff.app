@@ -197,9 +197,11 @@
       posY = (Math.random() * 2 - 1) * maxY * 0.6;
     }
 
+    var paused = false;
+
     /* ── Render ── */
     function render() {
-      if (stopped) return;
+      if (stopped || paused) return;
 
       time += dt;
       posX += speedX;
@@ -281,7 +283,17 @@
 
     return {
       stop: function () { stopped = true; if (animId) cancelAnimationFrame(animId); },
-      resize: function () { if (!stopped) init(); },
+      pause: function () {
+        paused = true;
+        if (animId) { cancelAnimationFrame(animId); animId = null; }
+      },
+      resume: function () {
+        if (stopped) return;
+        paused = false;
+        init();
+        animId = requestAnimationFrame(render);
+      },
+      resize: function () { if (!stopped && !paused) init(); },
     };
   };
 })();

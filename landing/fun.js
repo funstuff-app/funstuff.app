@@ -161,7 +161,7 @@
       "A fatal exception 0E has occurred at 0028:C0011E36<br><br>" +
       "* Click to return to funstuff.app<br>" +
       "* CTRL+ALT+DEL to pretend this didn't happen<br><br>" +
-      "Press any key to continue _";
+      "Press the any key to continue _";
     document.body.appendChild(bsod);
     function dismiss() {
       bsod.remove();
@@ -186,6 +186,29 @@
       appWindow.style.transition = "";
       appWindow.style.transform = "";
     }, 220);
+    /* Mark as minimized in the z-stack */
+    var mw = _deskWins["__main"];
+    if (mw) {
+      mw.minimized = true;
+      if (mw.tbBtn) mw.tbBtn.classList.remove("active");
+    }
+    /* Deactivate all section buttons */
+    Object.keys(_sectionBtns).forEach(function (key) {
+      var btn = _sectionBtns[key];
+      if (btn) btn.classList.remove("active");
+    });
+    if (_focusedWin === "__main") {
+      _focusedWin = null;
+      var bestId = null, bestZ = -1;
+      Object.keys(_deskWins).forEach(function (wid) {
+        var dw = _deskWins[wid];
+        if (wid !== "__main" && !dw.minimized) {
+          var z = parseInt(dw.el.style.zIndex, 10) || 0;
+          if (z > bestZ) { bestZ = z; bestId = wid; }
+        }
+      });
+      if (bestId) _bringToFront(bestId);
+    }
   }
 
   function restoreWindow() {
@@ -202,6 +225,9 @@
     });
     if (mainWindow) mainWindow.scrollTop = 0;
     window.scrollTo({ top: 0, behavior: "smooth" });
+    var mw = _deskWins["__main"];
+    if (mw) mw.minimized = false;
+    _bringToFront("__main");
   }
 
   /* ── Maximize button ── */
@@ -223,6 +249,7 @@
       if (appWindow && appWindow.style.display === "none") {
         restoreWindow();
       }
+      _bringToFront("__main");
       _setActiveSection(null);
       if (mainWindow) mainWindow.scrollTo({ top: 0, behavior: "smooth" });
     });
@@ -283,6 +310,8 @@
   }
 
   function _handleTaskbarBtn(id) {
+    /* Always bring the main window to front first */
+    _bringToFront("__main");
     if (_activeSection === id) {
       // Toggle off — scroll to top
       _setActiveSection(null);
@@ -312,6 +341,9 @@
     startMenu.classList.remove("open");
     startMenu.setAttribute("aria-hidden", "true");
     if (startBtn) { startBtn.classList.remove("open"); startBtn.setAttribute("aria-expanded", "false"); }
+    /* Also close any open submenus */
+    var openFolders = startMenu.querySelectorAll(".submenu-open");
+    for (var k = 0; k < openFolders.length; k++) openFolders[k].classList.remove("submenu-open");
   }
 
   if (startBtn) startBtn.addEventListener("click", function (e) {
@@ -342,6 +374,53 @@
     subMenuLinks[i].addEventListener("click", function () { closeStartMenu(); });
   }
 
+  /* ── Submenu hover debounce ── */
+  (function () {
+    var folders = document.querySelectorAll(".start-menu-folder");
+    var OPEN_DELAY = 250;
+    var CLOSE_DELAY = 350;
+
+    for (var fi = 0; fi < folders.length; fi++) {
+      (function (folder) {
+        var openTimer = null;
+        var closeTimer = null;
+        var sub = folder.querySelector(".start-submenu");
+
+        function cancelTimers() {
+          if (openTimer) { clearTimeout(openTimer); openTimer = null; }
+          if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }
+        }
+
+        folder.addEventListener("mouseenter", function () {
+          cancelTimers();
+          openTimer = setTimeout(function () {
+            folder.classList.add("submenu-open");
+          }, OPEN_DELAY);
+        });
+
+        folder.addEventListener("mouseleave", function () {
+          cancelTimers();
+          closeTimer = setTimeout(function () {
+            folder.classList.remove("submenu-open");
+          }, CLOSE_DELAY);
+        });
+
+        /* Keep submenu open while hovering it */
+        if (sub) {
+          sub.addEventListener("mouseenter", function () {
+            cancelTimers();
+          });
+          sub.addEventListener("mouseleave", function () {
+            cancelTimers();
+            closeTimer = setTimeout(function () {
+              folder.classList.remove("submenu-open");
+            }, CLOSE_DELAY);
+          });
+        }
+      })(folders[fi]);
+    }
+  })();
+
   /* ── PWA install ── */
   var _installPrompt = null;
 
@@ -364,18 +443,45 @@
   var _lastWinY = null;
   var CASCADE_OFFSET = 28;
 
+  /* Register the main app-window (.page) in the z-stack */
+  var _pageEl = document.querySelector(".page");
+  if (_pageEl && appWindow) {
+    _deskWins["__main"] = {
+      el: _pageEl,
+      tbBtn: tbMainBtn,
+      minimized: false,
+      isMain: true,
+    };
+    /* Clicking anywhere in the main window brings it to front */
+    appWindow.addEventListener("mousedown", function () { _bringToFront("__main"); });
+  }
+
   function _bringToFront(id) {
     _topZ++;
     var w = _deskWins[id];
     if (w) w.el.style.zIndex = _topZ;
     _focusedWin = id;
+
+    /* Update all taskbar button active states */
     Object.keys(_deskWins).forEach(function (wid) {
       var dw = _deskWins[wid];
-      if (dw.tbBtn) {
-        if (wid === id && !dw.minimized) dw.tbBtn.classList.add("active");
-        else dw.tbBtn.classList.remove("active");
-      }
+      if (!dw.tbBtn) return;
+      if (wid === id && !dw.minimized) dw.tbBtn.classList.add("active");
+      else dw.tbBtn.classList.remove("active");
     });
+
+    /* When main window is focused, re-highlight the active section button.
+       When any other window is focused, deactivate all section buttons. */
+    if (id === "__main") {
+      _setActiveSection(_activeSection);
+    } else {
+      /* Deactivate main button and all section buttons */
+      if (tbMainBtn) tbMainBtn.classList.remove("active");
+      Object.keys(_sectionBtns).forEach(function (key) {
+        var btn = _sectionBtns[key];
+        if (btn) btn.classList.remove("active");
+      });
+    }
   }
 
   function _toggleDeskMin(id) {
@@ -385,7 +491,9 @@
       w.el.style.display = "";
       w.minimized = false;
       _bringToFront(id);
+      if (w.onRestore) w.onRestore();
     } else {
+      if (w.onMinimize) w.onMinimize();
       w.el.style.display = "none";
       w.minimized = true;
       if (w.tbBtn) w.tbBtn.classList.remove("active");
@@ -559,6 +667,8 @@
       tbBtn: tbBtn,
       minimized: false,
       onClose: opts.onClose,
+      onRestore: opts.onRestore,
+      onMinimize: opts.onMinimize,
     };
     _bringToFront(opts.id);
 
@@ -628,6 +738,12 @@
       onClose: function () {
         if (_pipesInst) { _pipesInst.stop(); _pipesInst = null; }
       },
+      onMinimize: function () {
+        if (_pipesInst) _pipesInst.pause();
+      },
+      onRestore: function () {
+        if (_pipesInst) _pipesInst.resume();
+      },
       onOpen: function () {
         setTimeout(function () {
           if (typeof PipesScreensaver === "function") {
@@ -680,6 +796,12 @@
       bodyEl: canvas,
       onClose: function () {
         if (_flowerboxInst) { _flowerboxInst.stop(); _flowerboxInst = null; }
+      },
+      onMinimize: function () {
+        if (_flowerboxInst) _flowerboxInst.pause();
+      },
+      onRestore: function () {
+        if (_flowerboxInst) _flowerboxInst.resume();
       },
       onOpen: function () {
         setTimeout(function () {
