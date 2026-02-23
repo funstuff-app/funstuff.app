@@ -10,7 +10,9 @@
 
   function _snapshotDate(idx) {
     var now = new Date();
-    var day = now.getDay();
+    /* 5 AM–5 AM day boundaries */
+    var adjusted = new Date(now.getTime() - 5 * 60 * 60 * 1000);
+    var day = adjusted.getDay();
     var daysSinceLastFriday = (day === 6) ? 1 : 2;
     var daysBack = daysSinceLastFriday + idx;
     var target = new Date(now);
@@ -64,7 +66,10 @@
 
   (function setMapIframeSrc() {
     var now = new Date();
-    var day = now.getDay();
+    /* Use 5 AM–5 AM day boundaries instead of midnight–midnight.
+       Subtracting 5 hours means e.g. Saturday 3 AM still counts as Friday. */
+    var adjusted = new Date(now.getTime() - 5 * 60 * 60 * 1000);
+    var day = adjusted.getDay();
     if (day === 0 || day === 6) {
       // Always load the most recent Friday (idx 0); cycling disabled for now
       var idx = 0;
@@ -858,7 +863,7 @@
 
     openDesktopWindow({
       id: "videos",
-      title: "Weezer — Buddy Holly",
+      title: "Videos",
       icon: "&#9654;",
       tbIconSVG: VIDEOS_TB_ICON,
       width: w,
@@ -983,7 +988,15 @@
         { metaData: { artist: "The Incredible Machine", title: "Hip Hop (Reprise)"            }, url: "mp3s/20_Hip_Hop_(Reprise).mp3" },
       ],
       zIndex: 300,
+      windowLayout: {
+        main:      { position: { top: 0, left: 0 } },
+        equalizer: { position: { top: 116, left: 0 } },
+        playlist:  { position: { top: 232, left: 0 } },
+      },
     });
+
+    /* Expose to devtools for exploration */
+    window._webamp = _webampInst;
 
     _webampInst.renderWhenReady(_webampContainer).then(function () {
       /* Webamp inserts its actual UI as a new direct child of <body>,
@@ -994,6 +1007,32 @@
         webampEl.addEventListener("mousedown", function () {
           _focusWinamp();
         }, true);
+
+        /* Tell Webamp's internal Redux store that the viewport stops
+           at the taskbar.  Its built-in drag-snap logic will then
+           prevent windows from going below the taskbar. */
+        var taskbar = document.querySelector(".taskbar");
+        var store = _webampInst.store;
+        function correctBounds() {
+          if (!taskbar || !store) return;
+          var maxH = window.innerHeight - taskbar.offsetHeight;
+          var state = store.getState();
+          var bws = state.windows && state.windows.browserWindowSize;
+          if (bws && bws.height > maxH) {
+            store.dispatch({
+              type: "BROWSER_WINDOW_SIZE_CHANGED",
+              width: bws.width,
+              height: maxH,
+            });
+          }
+        }
+        store.subscribe(correctBounds);
+        correctBounds();
+        var onResize = function () { correctBounds(); };
+        window.addEventListener("resize", onResize);
+        _webampInst.onClose(function () {
+          window.removeEventListener("resize", onResize);
+        });
       }
     });
 
@@ -1013,6 +1052,7 @@
       if (_winampTbBtn) { _winampTbBtn.remove(); _winampTbBtn = null; }
       if (_focusedWin === "__winamp") _focusedWin = null;
       _webampInst = null;
+      window._webamp = null;
       _webampEl = null;
       _recalcLastWinPos();
     });
