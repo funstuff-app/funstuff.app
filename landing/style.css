@@ -41,6 +41,7 @@ body {
   background: var(--win-bg);
   color: var(--text);
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -703,6 +704,36 @@ body {
   margin: 4px 4px;
 }
 
+/* ─── Start menu folder + submenu ─── */
+.start-menu-folder {
+  position: relative;
+}
+.start-menu-folder-btn {
+  width: 100%;
+}
+.sm-arrow {
+  margin-left: auto;
+  font-size: 0.6rem;
+  opacity: 0.6;
+}
+.start-submenu {
+  display: none;
+  position: absolute;
+  left: 100%;
+  top: -3px;
+  background: var(--win-silver);
+  border: 2px solid;
+  border-color: var(--win-btn-highlight) var(--win-btn-shadow) var(--win-btn-shadow) var(--win-btn-highlight);
+  box-shadow: 3px 3px 10px rgba(0,0,0,0.35);
+  min-width: 150px;
+  padding: 3px 0;
+  z-index: 1000;
+}
+.start-menu-folder:hover > .start-submenu,
+.start-menu-folder:focus-within > .start-submenu {
+  display: block;
+}
+
 /* ─── Taskbar app buttons ─── */
 .taskbar-apps {
   flex: 1;
@@ -765,6 +796,18 @@ body {
   }
   .main-window {
     padding: 16px 14px;
+  }
+  .taskbar {
+    padding: 3px max(12px, env(safe-area-inset-left, 12px));
+    padding-right: max(12px, env(safe-area-inset-right, 12px));
+    padding-bottom: max(3px, env(safe-area-inset-bottom, 3px));
+  }
+  .taskbar-app-btn span {
+    display: none;
+  }
+  .taskbar-app-btn {
+    padding: 2px 5px;
+    max-width: none;
   }
   .site-title {
     font-size: 2.4rem;

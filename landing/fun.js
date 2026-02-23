@@ -336,6 +336,12 @@
     setTimeout(showBSOD, 250);
   });
 
+  /* Close start menu when any submenu link is clicked */
+  var subMenuLinks = document.querySelectorAll(".start-submenu a");
+  for (var i = 0; i < subMenuLinks.length; i++) {
+    subMenuLinks[i].addEventListener("click", function () { closeStartMenu(); });
+  }
+
   /* ── PWA install ── */
   var _installPrompt = null;
 
