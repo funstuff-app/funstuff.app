@@ -388,8 +388,20 @@
     } else {
       w.el.style.display = "none";
       w.minimized = true;
-      _focusedWin = null;
       if (w.tbBtn) w.tbBtn.classList.remove("active");
+      if (_focusedWin === id) {
+        /* Focus the next topmost non-minimized window */
+        _focusedWin = null;
+        var bestId = null, bestZ = -1;
+        Object.keys(_deskWins).forEach(function (wid) {
+          var dw = _deskWins[wid];
+          if (wid !== id && !dw.minimized) {
+            var z = parseInt(dw.el.style.zIndex, 10) || 0;
+            if (z > bestZ) { bestZ = z; bestId = wid; }
+          }
+        });
+        if (bestId) _bringToFront(bestId);
+      }
     }
   }
 
@@ -633,6 +645,52 @@
     '<polygon points="6,5 6,11 12,8" fill="#c0c0c0"/>' +
     '</svg>';
 
+  /* ── FlowerBox screensaver window ── */
+  var _flowerboxInst = null;
+
+  var FLOWERBOX_TB_ICON =
+    '<svg class="tb-icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">' +
+    '<rect width="16" height="16" fill="#000"/>' +
+    '<polygon points="8,2 14,8 8,14 2,8" fill="#0cc" stroke="#f0f" stroke-width="1"/>' +
+    '</svg>';
+
+  function openFlowerBoxWindow() {
+    closeStartMenu();
+    if (_deskWins.flowerbox) {
+      if (_deskWins.flowerbox.minimized) _toggleDeskMin("flowerbox");
+      _bringToFront("flowerbox");
+      return;
+    }
+
+    var w = Math.min(500, window.innerWidth - 40);
+    var h = Math.min(380, window.innerHeight - 120);
+
+    var canvas = document.createElement("canvas");
+    canvas.style.width = "100%";
+    canvas.style.height = h + "px";
+    canvas.style.display = "block";
+    canvas.style.background = "#000";
+
+    openDesktopWindow({
+      id: "flowerbox",
+      title: "3D FlowerBox",
+      icon: "&#10022;",
+      tbIconSVG: FLOWERBOX_TB_ICON,
+      width: w,
+      bodyEl: canvas,
+      onClose: function () {
+        if (_flowerboxInst) { _flowerboxInst.stop(); _flowerboxInst = null; }
+      },
+      onOpen: function () {
+        setTimeout(function () {
+          if (typeof FlowerBoxScreensaver === "function") {
+            _flowerboxInst = FlowerBoxScreensaver(canvas);
+          }
+        }, 60);
+      },
+    });
+  }
+
   function openVideosWindow() {
     closeStartMenu();
     if (_deskWins.videos) {
@@ -661,11 +719,16 @@
 
   /* ── Wire up Start Menu items ── */
   var smPipes = document.getElementById("sm-pipes");
+  var smFlowerbox = document.getElementById("sm-flowerbox");
   var smVideos = document.getElementById("sm-videos");
 
   if (smPipes) smPipes.addEventListener("click", function (e) {
     e.preventDefault();
     openPipesWindow();
+  });
+  if (smFlowerbox) smFlowerbox.addEventListener("click", function (e) {
+    e.preventDefault();
+    openFlowerBoxWindow();
   });
   if (smVideos) smVideos.addEventListener("click", function (e) {
     e.preventDefault();
