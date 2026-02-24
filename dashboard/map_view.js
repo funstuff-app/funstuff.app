@@ -1,3 +1,5 @@
+const _isLite = new URLSearchParams(window.location.search).get('lite') === '1';
+
 class MapView {
   constructor(tilesCanvas, overlayCanvas) {
     this.tilesCanvas = tilesCanvas;
@@ -8,7 +10,7 @@ class MapView {
     this.octx = overlayCanvas.getContext("2d", { willReadFrequently: false });
 
     // fractional zoom for smooth pinch / button zooming
-    this.zoom = 12;
+    this.zoom = 12.58; // 50% more zoomed in than the original 12 (log2 scale: +log2(1.5))
     this._zoomMin = 3;
     this._zoomMax = 18;
     this._pinchAnchor = null; // { lat, lon, sx, sy, lastTs }
@@ -5205,21 +5207,24 @@ class MapView {
           ctx.lineWidth = isSel ? 1.8 : 1.2;
           ctx.stroke();
         } else {
+          const _fHalo2   = _isLite ? 10 : 15;
+          const _fCircle2 = _isLite ?  8 : 12;
+          const _fFont2   = _isLite ? 10 : 15;
           if (isSel) {
             ctx.beginPath();
             ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
-            ctx.arc(sp.x, sp.y, 20, 0, Math.PI*2);
+            ctx.arc(sp.x, sp.y, _fHalo2, 0, Math.PI*2);
             ctx.fill();
           }
           ctx.beginPath();
           ctx.fillStyle = "rgba(16, 20, 28, 0.68)";
-          ctx.arc(sp.x, sp.y, 16, 0, Math.PI * 2);
+          ctx.arc(sp.x, sp.y, _fCircle2, 0, Math.PI * 2);
           ctx.fill();
           ctx.strokeStyle = isSel ? "#5bb8f5" : safeHex((pr && pr.color) || color);
           ctx.lineWidth = isSel ? 2.4 : 2.0;
           ctx.stroke();
 
-          ctx.font = "20px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif";
+          ctx.font = `${_fFont2}px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif`;
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
           ctx.fillText(emoji, sp.x, sp.y);
@@ -6566,22 +6571,25 @@ class MapView {
           ctx.lineWidth = isSel ? 1.8 : 1.2;
           ctx.stroke();
         } else {
+          const _fHalo   = _isLite ? 10 : 15;
+          const _fCircle = _isLite ?  8 : 12;
+          const _fEmoji  = _isLite ? 10 : 15;
           if (isSel) {
             ctx.beginPath();
             ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
-            ctx.arc(sp.x, sp.y, 20, 0, Math.PI*2);
+            ctx.arc(sp.x, sp.y, _fHalo, 0, Math.PI*2);
             ctx.fill();
           }
           ctx.beginPath();
           ctx.fillStyle = "rgba(16, 20, 28, 0.68)";
-          ctx.arc(sp.x, sp.y, 16, 0, Math.PI*2);
+          ctx.arc(sp.x, sp.y, _fCircle, 0, Math.PI*2);
           ctx.fill();
           ctx.strokeStyle = isSel ? "#5bb8f5" : safeHex((pr && pr.color) || color);
           ctx.lineWidth = isSel ? 2.4 : 2.0;
           ctx.stroke();
 
-          const fixedEmojiC = getEmojiCanvas(emoji, 20);
-          ctx.drawImage(fixedEmojiC, sp.x - 10, sp.y - 10, 20, 20);
+          const fixedEmojiC = getEmojiCanvas(emoji, _fEmoji);
+          ctx.drawImage(fixedEmojiC, sp.x - _fEmoji/2, sp.y - _fEmoji/2, _fEmoji, _fEmoji);
         }
 
         const showLabel = isPurpleAir ? this.showPublicLabels : this.showFixedLabels;
@@ -6729,16 +6737,21 @@ class MapView {
       const spx = sp.x;
       const spy = sp.y + liftY;
 
+      // Marker sizes: lite mode (embedded widget) vs normal
+      const _mHalo   = _isLite ? 11 : 16;
+      const _mCircle = _isLite ?  9 : 13;
+      const _mEmoji  = _isLite ? 11 : 16;
+
       // halo
       ctx.beginPath();
       if (this.selectedId === key) {
         ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
-        ctx.arc(spx, spy, 22 * liftScale, 0, Math.PI*2);
+        ctx.arc(spx, spy, _mHalo * liftScale, 0, Math.PI*2);
         ctx.fill();
         ctx.beginPath();
       }
       ctx.fillStyle = "rgba(16, 20, 28, 0.68)";
-      ctx.arc(spx, spy, 18 * liftScale, 0, Math.PI*2);
+      ctx.arc(spx, spy, _mCircle * liftScale, 0, Math.PI*2);
       ctx.fill();
       // Border matches AQI color (selected gets brighter ring)
       ctx.strokeStyle = (this.selectedId === key) ? "#5bb8f5" : safeHex(prColorUse);
@@ -6747,17 +6760,17 @@ class MapView {
 
       // emoji (pre-rendered to offscreen canvas; drawImage is ~10x faster than
       // fillText with color-emoji fonts on iOS Safari)
-      const emojiC = getEmojiCanvas(emoji, 22);
-      const emojiHalf = 11; // 22px / 2
+      const emojiC = getEmojiCanvas(emoji, _mEmoji);
+      const emojiHalf = _mEmoji / 2;
       ctx.save();
       if (this.traceMode || this.playbackMode) {
         ctx.translate(spx, spy);
         if (liftScale !== 1.0) ctx.scale(liftScale, liftScale);
         if (flipX) ctx.scale(-1, 1);
         ctx.rotate(angle);
-        ctx.drawImage(emojiC, -emojiHalf, -emojiHalf, 22, 22);
+        ctx.drawImage(emojiC, -emojiHalf, -emojiHalf, _mEmoji, _mEmoji);
       } else {
-        ctx.drawImage(emojiC, spx - emojiHalf, spy - emojiHalf, 22, 22);
+        ctx.drawImage(emojiC, spx - emojiHalf, spy - emojiHalf, _mEmoji, _mEmoji);
       }
       ctx.restore();
 

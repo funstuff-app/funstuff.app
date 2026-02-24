@@ -37,6 +37,34 @@ fetchData();
 
 document.addEventListener('keydown', handleKeydown);
 
+const _leftPaneEl = document.getElementById('left-pane');
+const _rawPaneEl = document.getElementById('raw-data-pane');
+
+function _activateBothPanes() {
+    if (_leftPaneEl) _leftPaneEl.classList.add('scroll-active');
+    if (_rawPaneEl) _rawPaneEl.classList.add('scroll-active');
+}
+function _deactivateBothPanes() {
+    if (_leftPaneEl) _leftPaneEl.classList.remove('scroll-active');
+    if (_rawPaneEl) _rawPaneEl.classList.remove('scroll-active');
+}
+
+// Start both active
+_activateBothPanes();
+
+// Clicking either pane activates both; capture phase on left pane so it fires before renderList() clears DOM
+document.addEventListener('click', (e) => {
+    if (_rawPaneEl && _rawPaneEl.contains(e.target)) _activateBothPanes();
+});
+if (_leftPaneEl) {
+    _leftPaneEl.addEventListener('click', _activateBothPanes, true /* capture */);
+}
+
+const bottomPane = document.getElementById('bottom-pane');
+if (bottomPane) {
+    bottomPane.addEventListener('mouseleave', _deactivateBothPanes);
+}
+
 // Initialize footer clicks
 document.querySelectorAll('.key-binding').forEach(el => {
     el.addEventListener('click', () => {
@@ -114,6 +142,7 @@ async function fetchData() {
             
         document.getElementById('update-time').textContent = dateStr;
         
+        renderStatusBar();
         renderList();
         renderDetails();
         renderJson();
@@ -179,15 +208,19 @@ function maybeShowOutlierToast(state) {
 function getAllSensors() {
     // Use pre-formatted TUI state if available (already sorted and filtered)
     if (tuiState && tuiState.sensors && tuiState.sensors.length > 0) {
-        return tuiState.sensors;
+        // tui_format.py doesn't pass purpleair field through, so cross-reference appState.fixed
+        const purpleairIds = new Set((appState.fixed || []).filter(f => f.purpleair).map(f => String(f.id)));
+        return tuiState.sensors.filter(s => s.id !== 'Home' && !purpleairIds.has(String(s.id)));
     }
     
     // Fallback to raw state processing
     const mobile = appState.mobile.map(s => ({...s, type: 'mobile'}));
     const fixed = appState.fixed.map(s => ({...s, type: 'fixed'}));
     
-    // Filter fixed to SLC area
+    // Filter fixed to SLC area (exclude Home and PurpleAir sensors)
     const filteredFixed = fixed.filter(s => {
+        if (s.id === 'Home') return false;
+        if (s.purpleair) return false;
         const lat = s.lat;
         const lon = s.lon;
         return (lat >= 40.4 && lat <= 41.0 && lon >= -112.25 && lon <= -111.7);
@@ -209,6 +242,24 @@ function getAllSensors() {
     });
     
     return all;
+}
+
+function renderStatusBar() {
+    const sensors = getAllSensors();
+    const mobile = sensors.filter(s => s.type === 'mobile');
+    const fixed = sensors.filter(s => s.type === 'fixed');
+    const active = sensors.filter(s => !s.ghosted);
+
+    const summaryEl = document.getElementById('summary-widget');
+    if (summaryEl) {
+        summaryEl.textContent = `${active.length} active (${mobile.length}M / ${fixed.length}F)`;
+    }
+
+    const regionEl = document.getElementById('region-widget');
+    if (regionEl && tuiState && tuiState.meta) {
+        const region = tuiState.meta.region || '';
+        regionEl.textContent = region;
+    }
 }
 
 function renderList() {
@@ -780,7 +831,6 @@ function renderJson() {
         const pre = document.createElement('pre');
         pre.id = 'json-content-inner';
         pre.style.margin = '0';
-        pre.style.overflow = 'auto';
         pre.style.flex = '1';
         box.appendChild(pre);
         

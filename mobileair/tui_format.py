@@ -234,6 +234,7 @@ def format_sensor_for_list(sensor: dict[str, Any], sensor_type: str = "mobile") 
         "type_label": "Fixed Station" if sensor_type == "fixed" else "Mobile",
         "lat": lat,
         "lon": lon,
+        "purpleair": bool(sensor.get("purpleair", False)),
         "columns": get_pollutant_columns(sensor.get("readings", {})),
         # Pass through raw readings for detail views that need history
         "readings": sensor.get("readings", {}),
