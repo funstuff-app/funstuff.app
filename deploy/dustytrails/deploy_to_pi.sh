@@ -408,6 +408,7 @@ EOF
     # Build secrets drop-in (only lines that have a value)
     local override_lines="[Service]"
     [[ -n "${DUSTY_PURPLEAIR_API_KEY:-}" ]] && override_lines+=$'\n'"Environment=\"DUSTY_PURPLEAIR_API_KEY=${DUSTY_PURPLEAIR_API_KEY}\""
+    [[ -n "${AIRNOW_API_KEY:-}" ]]           && override_lines+=$'\n'"Environment=\"AIRNOW_API_KEY=${AIRNOW_API_KEY}\""
     [[ -n "${DUSTY_OWNER_TOKEN:-}" ]]       && override_lines+=$'\n'"Environment=\"DUSTY_OWNER_TOKEN=${DUSTY_OWNER_TOKEN}\""
 
     # Try to install service with sudo (will prompt for password)
