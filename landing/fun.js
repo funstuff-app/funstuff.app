@@ -82,7 +82,7 @@
       if (overlayLabel) overlayLabel.textContent = "Recorded snapshot \u2014 click to open live app";
     } else {
       var iframe = document.getElementById("map-iframe");
-      if (iframe) iframe.src = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
+      if (iframe) iframe.src = (iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/") + "?lite=1";
       var overlayLabel = document.getElementById("demo-overlay-label");
       if (overlayLabel) overlayLabel.textContent = "Live preview \u2014 click to open full app";
       var indicator = document.getElementById("snapshot-indicator");
