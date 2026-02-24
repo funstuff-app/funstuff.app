@@ -68,6 +68,14 @@ function main() {
     document.body.classList.add('lite');
   }
 
+  // Force repaint of fixed elements on bfcache restore (fixes footer jumping to top on alt-tab)
+  window.addEventListener('pageshow', function(e) {
+    if (e.persisted) {
+      var footer = document.getElementById('appFooter');
+      if (footer) { footer.style.display = 'none'; footer.offsetHeight; footer.style.display = ''; }
+    }
+  });
+
   let selectedId = null; // key: "mobile:ID" or "fixed:ID"
 
   const TAB_STORAGE_KEY = "mobileair.sidebarTab";

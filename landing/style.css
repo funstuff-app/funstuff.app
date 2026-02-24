@@ -367,7 +367,7 @@ body {
   display: flex;
   align-items: flex-end;
   justify-content: center;
-  padding-bottom: 14px;
+  padding-bottom: 50px;
   background: linear-gradient(
     to bottom,
     transparent 60%,
