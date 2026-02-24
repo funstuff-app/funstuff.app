@@ -5,7 +5,7 @@
 # NOT by deploy_landing.sh (regular deploys).
 
 # Pi connection (same as deploy.config)
-PI_HOST="raspberrypi.local"
+PI_HOST="raspi.local"
 PI_USER="pi"
 
 # Tunnel name (created with: cloudflared tunnel create <name>)

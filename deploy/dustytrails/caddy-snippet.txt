@@ -17,7 +17,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # funstuff.app {
 #     handle_path /dustytrails/* {
-#         reverse_proxy home-pi.local:8766 {
+#         reverse_proxy raspi.local:8766 {
 #             # Or use the Pi's IP address if DNS doesn't resolve
 #             # reverse_proxy 192.168.1.XXX:8766
 #         }
@@ -45,7 +45,7 @@
 # nginx alternative (if not using Caddy)
 # ─────────────────────────────────────────────────────────────────────────────
 # location /dustytrails/ {
-#     proxy_pass http://home-pi.local:8766/;
+#     proxy_pass http://raspi.local:8766/;
 #     proxy_http_version 1.1;
 #     proxy_set_header Upgrade $http_upgrade;
 #     proxy_set_header Connection "upgrade";

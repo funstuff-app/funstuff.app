@@ -5,7 +5,7 @@
 # Builds locally (prepares runtime files) and deploys over SSH.
 # Does NOT send the git repo - only necessary runtime files.
 #
-# Target: jpark@home-pi.local
+# Target: pi@raspi.local
 # Service: dustytrails (exposed via reverse proxy)
 #
 # Usage:

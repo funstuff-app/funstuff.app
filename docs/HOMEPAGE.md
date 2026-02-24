@@ -17,7 +17,7 @@ Both services run as systemd units on a Raspberry Pi at `192.168.1.xxx` (user `p
 
 - **Files:** `landing/index.html`, `landing/style.css`, `landing/fun.js`, `landing/robots.txt`, `landing/sitemap.xml`
 - **Server:** `landing_server.py` (root of repo), serves from `landing/` dir
-- **Design:** Windows 95 aesthetic — teal desktop, beveled window chrome, VT323 monospace font, CRT scanlines, taskbar with clock, BSOD easter egg on close button
+- **Design:** Windows 95 aesthetic — teal desktop, beveled window chrome, VT323 monospace font, CRT scanlines, taskbar with clock, BSOD easter egg on shutdown
 - **Deploy:** `deploy/landing/deploy_landing.sh`, service file at `deploy/landing/funstuff-landing.service`
 - Quick redeploy: `./deploy_landing.sh --files-only` or just `rsync` individual files to `/home/pi/funstuff/landing/`
 

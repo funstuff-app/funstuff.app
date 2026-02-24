@@ -4,8 +4,8 @@ Deploys the MobileAir dashboard to a Raspberry Pi as a systemd service named "du
 
 ## Target
 
-- **Pi Host**: `home-pi.local`
-- **Pi User**: `jpark`
+- **Pi Host**: `raspi.local`
+- **Pi User**: `pi`
 - **Install Path**: `/opt/dustytrails`
 - **Service Name**: `dustytrails`
 - **Internal Port**: `8766`
@@ -43,7 +43,7 @@ This will:
 ./deploy_to_pi.sh --setup-only
 
 # Override host/user
-./deploy_to_pi.sh --host raspberrypi.local --user pi
+./deploy_to_pi.sh --host raspi.local --user pi
 ```
 
 ## Prerequisites
@@ -59,7 +59,7 @@ This will:
 
 ## Reverse Proxy Setup
 
-The dashboard runs on port 8766. To expose it at `funstuff.app/dustytrails`, 
+The dashboard runs on port 8766. To expose it at `dustytrails.funstuff.app`, 
 configure your reverse proxy. See `caddy-snippet.txt` for examples.
 
 ### With Caddy
@@ -67,7 +67,7 @@ configure your reverse proxy. See `caddy-snippet.txt` for examples.
 ```caddy
 funstuff.app {
     handle_path /dustytrails/* {
-        reverse_proxy home-pi.local:8766
+        reverse_proxy raspberrypilocal.local:8766
     }
 }
 ```
@@ -76,7 +76,7 @@ funstuff.app {
 
 ```nginx
 location /dustytrails/ {
-    proxy_pass http://home-pi.local:8766/;
+    proxy_pass http://raspi.local:8766/;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
@@ -91,16 +91,16 @@ location /dustytrails/ {
 
 ```bash
 # View logs
-ssh jpark@home-pi.local 'sudo journalctl -u dustytrails -f'
+ssh -t pi@raspi.local 'sudo journalctl -u dustytrails -f'
 
 # Check status
-ssh jpark@home-pi.local 'sudo systemctl status dustytrails'
+ssh -t pi@raspi.local 'sudo systemctl status dustytrails'
 
 # Restart
-ssh jpark@home-pi.local 'sudo systemctl restart dustytrails'
+ssh -t pi@raspi.local 'sudo systemctl restart dustytrails'
 
 # Stop
-ssh jpark@home-pi.local 'sudo systemctl stop dustytrails'
+ssh -t pi@raspi.local 'sudo systemctl stop dustytrails'
 ```
 
 ## Files Deployed
@@ -130,9 +130,9 @@ Only runtime files are deployed (no git repo, no tests):
 └── venv/                   # Python virtual environment (created on Pi)
 ```
 
-### Data (`/home/jpark/.mobileair/`)
+### Data (`/home/pi/.mobileair/`)
 ```
-/home/jpark/.mobileair/
+/home/pi/.mobileair/
 ├── fixed_history.json      # Historical fixed sensor data
 ├── sensor_names.json       # Custom sensor names
 ├── pinned_sensors.json     # Pinned sensors list
@@ -154,7 +154,7 @@ Only runtime files are deployed (no git repo, no tests):
 ### Can't connect to Pi
 ```bash
 # Test SSH connection
-ssh jpark@home-pi.local 'echo ok'
+ssh pi@raspi.local 'echo ok'
 
 # If that fails, check:
 # - Pi is on and connected to network
@@ -165,7 +165,7 @@ ssh jpark@home-pi.local 'echo ok'
 ### Service won't start
 ```bash
 # Check logs
-ssh jpark@home-pi.local 'sudo journalctl -u dustytrails -n 50'
+ssh pi@raspi.local 'sudo journalctl -u dustytrails -n 50'
 
 # Common issues:
 # - Python dependencies failed to install

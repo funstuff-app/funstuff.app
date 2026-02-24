@@ -1,5 +1,5 @@
 # Personal deployment configuration for funstuff-landing
 # Copy to deploy.config and customize for your environment
 
-PI_HOST="raspberrypi.local"
+PI_HOST="raspi.local"
 PI_USER="pi"

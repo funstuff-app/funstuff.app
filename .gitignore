@@ -13,6 +13,11 @@ dist/
 # IDE
 .vscode/
 .idea/
+.cursor/
+
+# AI assistants
+.claude
+.github
 
 # Coverage
 .coverage
@@ -35,3 +40,6 @@ deploy/*/tunnel.config
 
 # Static files
 landing/mp3s/
+
+# Private docs
+DOCS/

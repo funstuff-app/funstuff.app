@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Runtime stage - minimal image
 FROM python:3.11-slim
 
-LABEL maintainer="Joshua Parker"
+LABEL maintainer="Matthew Parker"
 LABEL description="DustyTrails - Real-time air quality monitoring dashboard"
 
 WORKDIR /app
