@@ -44,7 +44,7 @@
     var baseSrc = iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/";
     var target = _snapshotDate(idx);
     var dateStr = _formatDate(target);
-    iframe.src = baseSrc + "?" + _snapshotParamStr(dateStr) + "&lite=1";
+    iframe.src = baseSrc + "?" + _snapshotParamStr(dateStr) + "&lite=1&fresh=1";
     _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
     _widgetLoadTime = Date.now();
     _snapshotIdx = idx;
@@ -90,7 +90,7 @@
       if (overlayLabel) overlayLabel.textContent = "Recorded snapshot \u2014 click to open live app";
     } else {
       var iframe = document.getElementById("map-iframe");
-      if (iframe) iframe.src = (iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/") + "?lite=1";
+      if (iframe) iframe.src = (iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/") + "?lite=1&fresh=1";
       var overlayLabel = document.getElementById("demo-overlay-label");
       if (overlayLabel) overlayLabel.textContent = "Live preview \u2014 click to open full app";
       var indicator = document.getElementById("snapshot-indicator");

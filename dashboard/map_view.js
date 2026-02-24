@@ -252,6 +252,7 @@ class MapView {
   }
 
   _canRunAutoCamera() {
+    if (_isLite) return false;
     const now = performance.now();
     if (this._touchActive || this._mouseDragging || this._pinchZooming) return false;
     return now >= (this._autoCameraSuppressedUntilPerfMs || 0);

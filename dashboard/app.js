@@ -653,6 +653,7 @@ function main() {
 
   function _commitViewToStorage() {
     try {
+      if (new URLSearchParams(window.location.search).get('fresh') === '1') return;
       const lat = Number(map.center?.lat);
       const lon = Number(map.center?.lon);
       const zoom = Number(map.zoom);
@@ -694,6 +695,7 @@ function main() {
   };
 
   function restoreViewIfAny() {
+    if (new URLSearchParams(window.location.search).get('fresh') === '1') return false;
     try {
       const raw = localStorage.getItem(VIEW_STORAGE_KEY);
       if (!raw) return false;
@@ -1133,6 +1135,7 @@ function main() {
   // Smoothly animate back to the user's stored view (from localStorage) when no
   // meaningful vehicle movement is detected. Acts as a screensaver-like idle return.
   function _animateToStoredView(durationMs) {
+    if (new URLSearchParams(window.location.search).get('fresh') === '1') return;
     if (!map || typeof map._canRunAutoCamera !== "function") return;
     if (!map._canRunAutoCamera()) {
       // User is interacting — defer until interaction + easing finishes.
