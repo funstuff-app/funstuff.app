@@ -62,6 +62,12 @@ function main() {
   const map = new MapView(tiles, overlay);
   window.__map = map;  // Expose for updateSidebarPlaybackValues
 
+  // Lite mode: hide all chrome (sidebar, controls, legend, menu button)
+  const _liteParam = new URLSearchParams(window.location.search).get('lite') === '1';
+  if (_liteParam) {
+    document.body.classList.add('lite');
+  }
+
   let selectedId = null; // key: "mobile:ID" or "fixed:ID"
 
   const TAB_STORAGE_KEY = "mobileair.sidebarTab";

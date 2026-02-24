@@ -1352,4 +1352,24 @@ button#pbPlay.isLive {
   #details { display: none; }
 }
 
+/* ── Lite mode: embedded preview, hide all chrome ── */
+body.lite #topbar,
+body.lite #playbackBar,
+body.lite #sidebar,
+body.lite #menuBtn,
+body.lite .controls,
+body.lite #legend,
+body.lite #legendToggle,
+body.lite .pbMenuBtn,
+html.lite #topbar,
+html.lite #playbackBar,
+html.lite #sidebar,
+html.lite #menuBtn,
+html.lite .controls,
+html.lite #legend,
+html.lite #legendToggle,
+html.lite .pbMenuBtn {
+  display: none !important;
+}
+
 
