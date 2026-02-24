@@ -116,7 +116,7 @@ body {
     overflow: visible;
     display: flex;
     flex-direction: column;
-    padding: 16px 12px 8px 12px; /* top pad accommodates tui-box title overhang */
+    padding: 8px 12px; /* top pad accommodates tui-box title overhang */
     position: relative;
     cursor: pointer;
     transition: border-color 0.15s ease;

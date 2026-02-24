@@ -2,6 +2,14 @@
 (function () {
   "use strict";
 
+  /* ── Persist scroll position across reloads ── */
+  var _mainWin = document.querySelector(".main-window");
+  if (_mainWin) {
+    _mainWin.addEventListener("scroll", function () {
+      try { sessionStorage.setItem("_scrollY", _mainWin.scrollTop); } catch (e) {}
+    }, { passive: true });
+  }
+
   /* ── Weekend snapshot logic for embedded map widget ── */
   var _widgetLoadTime = Date.now();
   var _widgetSnapshotParams = null;
@@ -332,6 +340,39 @@
   if (tbDustyTrails) tbDustyTrails.addEventListener("click", function () { _handleTaskbarBtn("dustytrails"); });
   if (tbTui)         tbTui.addEventListener("click",         function () { _handleTaskbarBtn("tui-demo"); });
   if (tbAbout)       tbAbout.addEventListener("click",       function () { _handleTaskbarBtn("about"); });
+
+  /* ── Update active taskbar button on scroll ── */
+  (function () {
+    var _sections = [
+      { id: "dustytrails", el: document.getElementById("dustytrails") },
+      { id: "tui-demo",    el: document.getElementById("tui-demo") },
+      { id: "about",       el: document.getElementById("about") }
+    ];
+    var _scrollRaf = null;
+
+    function _updateFromScroll() {
+      _scrollRaf = null;
+      if (!mainWindow) return;
+      var mwTop = mainWindow.getBoundingClientRect().top;
+      var halfH = mainWindow.clientHeight * 0.49;
+      var active = null;
+      /* Backward scan: deepest qualifying section wins */
+      for (var i = _sections.length - 1; i >= 0; i--) {
+        var sec = _sections[i];
+        if (!sec.el) continue;
+        var relTop = sec.el.getBoundingClientRect().top - mwTop;
+        var threshold = (i === 0) ? 10 : halfH; /* dustytrails: top; tui-demo & about: halfway */
+        if (relTop <= threshold) { active = sec.id; break; }
+      }
+      if (active !== _activeSection) _setActiveSection(active);
+    }
+
+    if (mainWindow) {
+      mainWindow.addEventListener("scroll", function () {
+        if (!_scrollRaf) _scrollRaf = requestAnimationFrame(_updateFromScroll);
+      }, { passive: true });
+    }
+  }());
 
   /* ── Start Menu ── */
   var startBtn  = document.getElementById("start-btn");
@@ -1080,5 +1121,27 @@
     e.preventDefault();
     openWinampWindow();
   });
+
+  /* ── On load: derive active taskbar button from restored scroll position ── */
+  /* Stateless — no stored state; just read where we are and set the button once. */
+  (function () {
+    if (!mainWindow) return;
+    var sections = [
+      { id: "dustytrails", el: document.getElementById("demo-dustytrails") },
+      { id: "tui-demo",    el: document.getElementById("demo-tui") },
+      { id: "about",       el: document.getElementById("about") }
+    ];
+    var mwTop = mainWindow.getBoundingClientRect().top;
+    var threshold = 120; /* section counts as active if its top is within this many px of the window top */
+    var active = null;
+    for (var i = 0; i < sections.length; i++) {
+      var sec = sections[i];
+      if (!sec.el) continue;
+      if (sec.el.getBoundingClientRect().top - mwTop <= threshold) {
+        active = sec.id;
+      }
+    }
+    _setActiveSection(active);
+  }());
 
 })();
