@@ -18,18 +18,34 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
-PI_HOST="${PI_HOST:-home-pi.local}"
-PI_USER="${PI_USER:-jpark}"
-PI_TARGET="${PI_USER}@${PI_HOST}"
-
 SERVICE_NAME="dustytrails"
-INSTALL_DIR="/home/${PI_USER}/dustytrails"
 DASHBOARD_PORT="8766"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 STAGING_DIR="$SCRIPT_DIR/.staging"
 LOCAL_DATA_DIR="${HOME}/.mobileair"
+
+# Source local deploy config (sets PI_HOST, PI_USER, secrets)
+if [[ -f "$SCRIPT_DIR/deploy.config" ]]; then
+    # shellcheck source=deploy.config.example
+    source "$SCRIPT_DIR/deploy.config"
+else
+    echo -e "\033[0;31m[ERROR]\033[0m deploy.config not found."
+    echo -e "        Copy deploy.config.example to deploy.config and fill in your values."
+    exit 1
+fi
+
+# Validate required config
+if [[ -z "${PI_HOST:-}" || -z "${PI_USER:-}" ]]; then
+    echo -e "\033[0;31m[ERROR]\033[0m deploy.config must set PI_HOST and PI_USER"
+    exit 1
+fi
+
+PI_TARGET="${PI_USER}@${PI_HOST}"
+
+# Derived paths (depend on PI_USER from config)
+INSTALL_DIR="/home/${PI_USER}/dustytrails"
 REMOTE_DATA_DIR="/home/${PI_USER}/.mobileair"
 
 # Colors
@@ -158,6 +174,8 @@ while [[ $# -gt 0 ]]; do
         --user)
             PI_USER="$2"
             PI_TARGET="${PI_USER}@${PI_HOST}"
+            INSTALL_DIR="/home/${PI_USER}/dustytrails"
+            REMOTE_DATA_DIR="/home/${PI_USER}/.mobileair"
             shift 2
             ;;
         -h|--help)
@@ -168,8 +186,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --data-only    Only sync ~/.mobileair data directory"
             echo "  --skip-data    Skip syncing ~/.mobileair (faster for code-only updates)"
             echo "  --setup-only   Only setup service (assumes files already deployed)"
-            echo "  --host HOST    Pi hostname (default: home-pi.local)"
-            echo "  --user USER    Pi username (default: jpark)"
+            echo "  --host HOST    Override PI_HOST from deploy.config"
+            echo "  --user USER    Override PI_USER from deploy.config"
             echo "  -h, --help     Show this help"
             exit 0
             ;;
@@ -362,8 +380,6 @@ WorkingDirectory=${INSTALL_DIR}
 # Environment
 Environment="PYTHONUNBUFFERED=1"
 Environment="HOME=/home/${PI_USER}"
-Environment="DUSTY_PURPLEAIR_API_KEY=${DUSTY_PURPLEAIR_API_KEY:-}"
-Environment="DUSTY_OWNER_TOKEN=${DUSTY_OWNER_TOKEN:-}"
 
 # Run the dashboard server
 ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/dashboard_server.py --host 0.0.0.0 --port 8766
@@ -388,12 +404,21 @@ EOF
     
     # Write service file to Pi
     echo "$service_content" | ssh "$PI_TARGET" "cat > $INSTALL_DIR/dustytrails.service"
-    
+
+    # Build secrets drop-in (only lines that have a value)
+    local override_lines="[Service]"
+    [[ -n "${DUSTY_PURPLEAIR_API_KEY:-}" ]] && override_lines+=$'\n'"Environment=\"DUSTY_PURPLEAIR_API_KEY=${DUSTY_PURPLEAIR_API_KEY}\""
+    [[ -n "${DUSTY_OWNER_TOKEN:-}" ]]       && override_lines+=$'\n'"Environment=\"DUSTY_OWNER_TOKEN=${DUSTY_OWNER_TOKEN}\""
+
     # Try to install service with sudo (will prompt for password)
     log_info "Installing systemd service (may prompt for password)..."
-    ssh -t "$PI_TARGET" bash << REMOTE_SUDO
+    # Pass override content via env var to avoid heredoc quoting issues
+    OVERRIDE_CONTENT="$override_lines" ssh -t "$PI_TARGET" bash << REMOTE_SUDO
 set -e
 sudo cp "$INSTALL_DIR/dustytrails.service" /etc/systemd/system/dustytrails.service
+sudo mkdir -p /etc/systemd/system/dustytrails.service.d
+printf '%s\n' "\$OVERRIDE_CONTENT" | sudo tee /etc/systemd/system/dustytrails.service.d/secrets.conf > /dev/null
+sudo chmod 600 /etc/systemd/system/dustytrails.service.d/secrets.conf
 sudo systemctl daemon-reload
 sudo systemctl enable dustytrails
 sudo systemctl restart dustytrails

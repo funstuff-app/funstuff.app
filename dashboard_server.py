@@ -1785,7 +1785,7 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
 # PurpleAir Integration
 # ─────────────────────────────────────────────────────────────────────────────
 
-PURPLEAIR_API_KEY = os.environ.get("DUSTY_PURPLEAIR_API_KEY", "C2922794-0519-11F1-B596-4201AC1DC123")
+PURPLEAIR_API_KEY = os.environ.get("DUSTY_PURPLEAIR_API_KEY", "").strip()
 
 # Owner token: when set, the Home sensor is only included in /api/state
 # responses that carry a matching ?tok= query parameter.
@@ -1819,6 +1819,9 @@ def _fetch_purpleair_sensors(fields: str = "pm2.5,last_seen",
         }
     qs = "&".join(f"{k}={v}" for k, v in params.items())
     url = f"{PURPLEAIR_API_URL}?{qs}"
+    if not PURPLEAIR_API_KEY:
+        _log("[PurpleAir] DUSTY_PURPLEAIR_API_KEY not set — skipping fetch")
+        return []
     try:
         resp = stdlib_get(url, timeout=10, headers={
             "X-API-Key": PURPLEAIR_API_KEY,
