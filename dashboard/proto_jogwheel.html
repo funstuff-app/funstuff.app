@@ -374,21 +374,49 @@
      *    Slot occlusion darkens the top/bottom.
      * ═══════════════════════════════════════════════════════════════════════════ */
 
-    /* Toroid dimensions (in abstract units, mapped to pixels) */
-    const MAJOR_R  = 1.0;   // center of tube to barrel axis (horizontal sweep)
-    const MINOR_R  = 0.42;  // tube radius (vertical cross-section)
-    const GROOVE_DEPTH = 0.045; // how deep grooves cut (shallower = smoother)
+    /* Toroid dimensions — wide barrel, small cross-section */
+    const MAJOR_R  = 6.0;   // barrel length (horizontal sweep radius)
+    const MINOR_R  = 0.42;  // tube radius (cross-section, what you see vertically)
+    const GROOVE_DEPTH = 0.07; // how far ridges extrude / valleys recess
+    const NORMAL_STRENGTH = 1.2; // normal tilt strength for lighting
 
-    /* Groove height profile: smooth cosine wave.
-     *  Ridge tops at u=0 and u=1, valley at u=0.5.
-     *  Raised cosine: depth = 0.5(1 - cos(2πu))
-     *  This gives perfectly smooth transitions — no flat zones, no hard edges.
-     *  The derivative feeds the normal map for lighting.
+    /* Groove height profile: gear-tooth / plateau shape.
+     *  Wide flat ridge top (the "tooth"), narrow valley (the "gap").
+     *  Curved rounded slopes connect them (smoothstep transitions).
+     *
+     *  Period layout (u ∈ [0, 1]):
+     *    [0.00, 0.38]  ridge top (flat, depth=0)      — 38%
+     *    [0.38, 0.48]  left slope (rounded descent)   — 10%
+     *    [0.48, 0.52]  valley floor (flat, depth=1)    —  4%
+     *    [0.52, 0.62]  right slope (rounded ascent)   — 10%
+     *    [0.62, 1.00]  ridge top (flat, depth=0)      — 38%
+     *
+     *  ~76% ridge, ~4% valley, ~20% slopes.
      */
     function grooveProfile(u) {
-      const TWO_PI = 2 * Math.PI;
-      const depth = 0.5 * (1 - Math.cos(TWO_PI * u));
-      const ddepth = Math.PI * Math.sin(TWO_PI * u);  // d/du of depth
+      const slopeW = 0.10;
+      const ls = 0.38;             // left slope start
+      const le = ls + slopeW;     // left slope end = 0.48
+      const rs = 0.52;             // right slope start
+      const re = rs + slopeW;     // right slope end = 0.62
+      let depth, ddepth;
+
+      if (u < ls) {
+        depth = 0; ddepth = 0;
+      } else if (u < le) {
+        const t = (u - ls) / slopeW;
+        depth = t * t * (3 - 2 * t);
+        ddepth = 6 * t * (1 - t) / slopeW;
+      } else if (u < rs) {
+        depth = 1; ddepth = 0;
+      } else if (u < re) {
+        const t = (u - rs) / slopeW;
+        depth = 1 - t * t * (3 - 2 * t);
+        ddepth = -6 * t * (1 - t) / slopeW;
+      } else {
+        depth = 0; ddepth = 0;
+      }
+
       return { depth, ddepth };
     }
 
@@ -412,104 +440,129 @@
       const data = imageData.data;
       const barrelAngle = getBarrelAngle();
 
-      // Light direction: from mouse X position, slightly above, toward viewer
+      // Light direction
       const lx = lightX * 1.2;
       const ly = 0.55;
       const lz = 0.65;
       const lLen = Math.sqrt(lx*lx + ly*ly + lz*lz);
       const Lx = lx/lLen, Ly = ly/lLen, Lz = lz/lLen;
 
-      // View direction: straight at the screen
-      const Vz = 1;
-
-      // Half-height of barrel in pixels (the toroid minor radius maps to this)
       const barrelHalfH = H * 0.5;
+      const cy = H * 0.5;
 
-      for (let x = 0; x < W; x++) {
-        const xf = x / (W - 1);  // 0..1
+      /* ── Toroidal projection ──
+       *  On a toroid viewed from the front:
+       *    screen_x = (R + r·cosφ)·sinθ
+       *    screen_y = r·sinφ
+       *
+       *  So for a given screen position, the barrel angle θ depends on y:
+       *    sinθ = screen_x / (R + r·cosφ)
+       *
+       *  At y=0 (center, cosφ=1): sinθ = x/(R+r)  → widest range
+       *  At y=±r (top/bottom, cosφ=0): sinθ = x/R  → narrower range
+       *
+       *  This means ridge lines BOW OUTWARD at top and bottom,
+       *  creating visible curvature that sells the 3D shape.
+       */
 
-        // Cylindrical projection → barrel angle θ
-        const sinT = xf * 2 - 1;
-        if (sinT < -0.998 || sinT > 0.998) continue;
-        const cosT = Math.sqrt(1 - sinT * sinT);
+      for (let y = 0; y < H; y++) {
+        const yNormGlobal = (y - cy) / barrelHalfH;  // -1..1 across full barrel
+        // Skip rows clearly outside barrel
+        if (yNormGlobal < -1.15 || yNormGlobal > 1.15) {
+          for (let x = 0; x < W; x++) {
+            const idx = (y * W + x) * 4;
+            data[idx] = 2; data[idx+1] = 4; data[idx+2] = 6; data[idx+3] = 255;
+          }
+          continue;
+        }
 
-        // Groove phase at this barrel angle
-        const absAngle = Math.asin(sinT) + barrelAngle;
-        const rawPhase = ((absAngle / GROOVE_SPACING) % 1 + 1) % 1;
-        const gp = grooveProfile(rawPhase);
+        // Clamp yNorm to valid range for asin
+        const yNC = Math.max(-0.999, Math.min(0.999, yNormGlobal));
+        const phi = Math.asin(-yNC);
+        const cosPhi = Math.cos(phi);
+        const sinPhi = Math.sin(phi);
 
-        // Effective minor radius at this point (ridges full, valleys recessed)
-        const effR = MINOR_R - gp.depth * GROOVE_DEPTH;
+        // Effective horizontal radius at this row (toroid cross-section)
+        // At center (cosPhi=1): R+r. At top/bottom (cosPhi=0): R.
+        const hRadius = MAJOR_R + MINOR_R * cosPhi;
+        // How this maps to screen width: sinθ = screenX / hRadius
+        // At center row, sinT range ±1 maps to θ via hRadius = R+r
+        // At top/bottom, same sinT range maps via hRadius = R (more angle per pixel)
 
-        // How tall is the barrel at this column (in pixels)
-        const colHalfH = effR / MINOR_R * barrelHalfH;
-        const cy = H * 0.5; // center y
+        const yClip = y / (H - 1);
+        const topOcc = yClip < 0.10 ? (1 - yClip / 0.10) * 0.65 : 0;
+        const botOcc = yClip > 0.85 ? ((yClip - 0.85) / 0.15) * 0.50 : 0;
+        const occlusion = 1 - topOcc - botOcc;
 
-        // Groove foreshortened screen width
-        const grooveScreenW = GROOVE_SPACING * cosT * (W / 2);
+        for (let x = 0; x < W; x++) {
+          // Map screen x to barrel angle θ at THIS row's effective radius
+          const screenX = (x / (W - 1)) * 2 - 1;  // -1..1
+          // Scale by center radius to get base sinθ
+          const centerR = MAJOR_R + MINOR_R;
+          const sinT = screenX;  // -1..1 across the visible barrel
 
-        for (let y = 0; y < H; y++) {
-          // Distance from center of barrel cross-section
-          const dy = y - cy;
-          const yNorm = dy / colHalfH; // -1 at top, +1 at bottom
+          if (sinT < -0.998 || sinT > 0.998) continue;
+          const cosT = Math.sqrt(1 - sinT * sinT);
 
-          // Outside the barrel surface → transparent (shows slot behind)
-          if (yNorm < -1.0 || yNorm > 1.0) {
+          // The actual barrel angle shifts with y because of the toroid:
+          // sinθ_actual = screenX * centerR / hRadius
+          const sinT_actual = screenX * centerR / hRadius;
+          // If this exceeds ±1, this pixel is past the barrel edge at this y
+          if (sinT_actual < -1.0 || sinT_actual > 1.0) {
+            const idx = (y * W + x) * 4;
+            data[idx] = 2; data[idx+1] = 4; data[idx+2] = 6; data[idx+3] = 255;
+            continue;
+          }
+          const cosT_actual = Math.sqrt(1 - sinT_actual * sinT_actual);
+
+          // Groove phase at the ACTUAL toroidal angle
+          const toroidAngle = Math.asin(sinT_actual) + barrelAngle;
+          const rawPhase = ((toroidAngle / GROOVE_SPACING) % 1 + 1) % 1;
+          const gp = grooveProfile(rawPhase);
+
+          // Effective minor radius (ridge vs valley)
+          const effR = MINOR_R - gp.depth * GROOVE_DEPTH;
+
+          // Is this pixel within the barrel surface at this column?
+          const colHalfH = effR / MINOR_R * barrelHalfH;
+          const yNormLocal = (y - cy) / colHalfH;
+          if (yNormLocal < -1.0 || yNormLocal > 1.0) {
             const idx = (y * W + x) * 4;
             data[idx] = 2; data[idx+1] = 4; data[idx+2] = 6; data[idx+3] = 255;
             continue;
           }
 
-          // ── Toroid normal computation ──
-          // Cross-section angle φ: top = π/2, center = 0, bottom = -π/2
-          const phi = Math.asin(-yNorm);
-          const cosPhi = Math.cos(phi);
-          const sinPhi = Math.sin(phi);
+          // ── Normal computation using actual toroidal angle ──
+          const tilt = gp.ddepth * GROOVE_DEPTH * NORMAL_STRENGTH / GROOVE_SPACING;
 
-          // Base toroid normal (no grooves):
-          //   N = (sinθ·cosPhi, sinPhi, cosθ·cosPhi)
-          // This is the outward direction from the tube surface.
-
-          // Groove normal perturbation:
-          // The groove depth varies with barrel angle θ, so the surface
-          // tilts in the tangential direction (around the barrel).
-          // The tilt = d(depth)/dθ = ddepth / GROOVE_SPACING
-          // Tangent vector T = (cosθ, 0, -sinθ)
-          // Perturbed normal: N' = N - tilt × cosPhi × T
-          const tilt = gp.ddepth * GROOVE_DEPTH / GROOVE_SPACING;
-
-          let nx = sinT * cosPhi - tilt * cosPhi * cosT;
+          let nx = sinT_actual * cosPhi - tilt * cosPhi * cosT_actual;
           let ny = sinPhi;
-          let nz = cosT * cosPhi + tilt * cosPhi * sinT;
+          let nz = cosT_actual * cosPhi + tilt * cosPhi * sinT_actual;
 
-          // Normalize
           const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
           nx /= nLen; ny /= nLen; nz /= nLen;
 
-          // ── Diffuse: dot(N, L) ──
+          // ── Diffuse ──
           const NdL = nx*Lx + ny*Ly + nz*Lz;
           const diffuse = NdL > 0 ? NdL : 0;
 
-          // ── Specular: Phong reflection ──
-          // R = 2(N·L)N - L, spec = max(0, R·V)^n
+          // ── Specular: Phong ^12 ──
           const rz = 2 * NdL * nz - Lz;
           const sp = rz > 0 ? rz : 0;
           const sp2 = sp * sp;
           const sp4 = sp2 * sp2;
           const sp8 = sp4 * sp4;
-          const specular = sp8 * sp4; // ^12
+          const specular = sp8 * sp4;
 
-          // ── Slot occlusion: the physical slot lip blocks light ──
-          // Near the top/bottom of the CLIP REGION (not the barrel)
-          const yClip = y / (H - 1);
-          const topOcc = yClip < 0.10 ? (1 - yClip / 0.10) * 0.65 : 0;
-          const botOcc = yClip > 0.85 ? ((yClip - 0.85) / 0.15) * 0.50 : 0;
-          const occlusion = 1 - topOcc - botOcc;
+          // ── Valley self-shadow ──
+          // Compute tangential light component at this barrel position.
+          // Tangent T = (cosθ, 0, -sinθ). L_tan = L·T = Lx·cosθ - Lz·sinθ.
+          // If |L_tan| is large relative to groove opening, ridge walls block light.
+          const L_tan = Lx * cosT_actual - Lz * sinT_actual;
+          const valleyShadow = gp.depth * Math.min(1, Math.abs(L_tan) * 3.5) * 0.7;
+          const aoValley = Math.max(0, 1 - gp.depth * 0.20 - valleyShadow);
 
-          // ── Ridge ambient occlusion: valleys are slightly darker ──
-          const aoValley = 1 - gp.depth * 0.15;
-
-          // ── Horizontal falloff: barrel edges curve away ──
+          // ── Edge falloff ──
           const hFalloff = 0.18 + 0.82 * cosT * cosT;
 
           // ── Combine ──
@@ -517,12 +570,10 @@
           let brightness = (ambient + diffuse * 0.70) * occlusion * aoValley * hFalloff;
           if (brightness < 0) brightness = 0;
 
-          // ── Color ──
           let r = 6  + brightness * 58;
           let g = 10 + brightness * 82;
           let b = 18 + brightness * 128;
 
-          // Specular highlight: additive blue-white
           const sv = specular * 0.45 * occlusion * hFalloff;
           r += sv * 150;
           g += sv * 170;
