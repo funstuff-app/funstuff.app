@@ -153,10 +153,35 @@
           <div class="pbRow1">
             <button id="pbPlay" type="button" title="Play/Pause">Live</button>
             <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" class="srOnly" />
+            <!-- Classic CSS jog wheel (A) -->
             <div class="jogWheel" id="pbJogWheel">
               <div class="jogRidges"></div>
               <div class="jogSheen"></div>
               <div class="jogPlayhead"></div>
+            </div>
+            <!-- Canvas barrel jog wheel (B) — hidden until toggled -->
+            <div class="jogBarrel hidden" id="pbJogBarrel">
+              <svg width="0" height="0" style="position:absolute">
+                <defs>
+                  <clipPath id="barrelClip" clipPathUnits="objectBoundingBox">
+                    <path d="
+                      M 0.00, 0.50
+                      C 0.00, 0.12  0.04, 0.00  0.10, 0.00
+                      L 0.90, 0.00
+                      C 0.96, 0.00  1.00, 0.12  1.00, 0.50
+                      C 1.00, 0.88  0.96, 1.00  0.90, 1.00
+                      L 0.10, 1.00
+                      C 0.04, 1.00  0.00, 0.88  0.00, 0.50
+                      Z
+                    " />
+                  </clipPath>
+                </defs>
+              </svg>
+              <div class="jogBarrelSlot"></div>
+              <div class="jogBarrelClip" id="pbBarrelClip">
+                <canvas class="jogBarrelCanvas" id="pbBarrelCanvas"></canvas>
+              </div>
+              <div class="jogBarrelPlayhead"></div>
             </div>
             <label class="pbSpeed" title="Playback speed">
               <span>Speed</span>
@@ -168,6 +193,14 @@
                 <option value="60">60×</option>
               </select>
             </label>
+          </div>
+          <!-- A/B toggle for jog wheel style -->
+          <div class="pbRow0" id="pbRow0">
+            <label class="iosToggle" title="Switch between classic and barrel jog wheel">
+              <input type="checkbox" id="pbBarrelToggle" />
+              <span class="iosToggleTrack"><span class="iosToggleThumb"></span></span>
+            </label>
+            <span class="pbToggleLabel">Barrel</span>
           </div>
           <div class="pbRow2">
             <button id="pbPagePrev" type="button" class="pbPageBtn" title="Previous hour" aria-label="Previous hour">◂</button>
@@ -246,6 +279,7 @@
   <script src="data_utils.js?v=20260224a"></script>
   <script src="map_view.js?v=20260224a"></script>
   <script src="sidebar_ui.js?v=20260224a"></script>
+  <script src="jog_wheel.js?v=20260227a"></script>
   <script src="app.js?v=20260224a"></script>
 </body>
 </html>
