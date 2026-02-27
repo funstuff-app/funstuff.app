@@ -558,9 +558,9 @@ function valueToAqi(pollutantKey, value) {
     else if (key === 'ozne' || key === 'ozone' || key === 'o3') key = 'ozone';
 
     // Normalize units + apply EPA truncation rules.
-    // OZNE feed values are typically in ppb (e.g. 20-40). Breakpoints are in ppm.
+    // OZNE feed values are always in ppb. Breakpoints are in ppm. Always convert.
     if (key === 'ozone') {
-        if (val > 1.0) val = val / 1000.0; // ppb -> ppm
+        val = val / 1000.0; // ppb -> ppm (always; matches Python backend)
         val = Math.floor(val * 1000.0) / 1000.0; // truncate to 3 decimals
     } else if (key === 'pm2.5') {
         val = Math.floor(val * 10.0) / 10.0; // truncate to 1 decimal

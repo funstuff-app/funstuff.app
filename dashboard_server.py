@@ -506,6 +506,31 @@ def load_fixed_history(app_state: AppState, data_dir: Path) -> None:
         if isinstance(pols, dict):
             for wk in _WEATHER_KEYS:
                 pols.pop(wk, None)
+    # Deduplicate each history list by time key.  The fixed_history.json can
+    # accumulate duplicate timestamp entries when the server restarts and
+    # re-fetches already-cached hours (the previous dedup only checked the
+    # last list entry, so out-of-order re-inserts slipped through).  Scrub on
+    # load so front-ends never see the sawtooth pattern in stored data.
+    deduped_any = False
+    for sensor_id, pols in app_state.fixed_history.items():
+        if not isinstance(pols, dict):
+            continue
+        for param, entries in pols.items():
+            if not isinstance(entries, list):
+                continue
+            seen: dict[str, dict] = {}
+            for e in entries:
+                t = e.get("time")
+                if t:
+                    seen[t] = e  # later entry wins (most recent correction)
+                else:
+                    # no time key — keep via a unique fallback key
+                    seen[f"__no_time_{id(e)}"] = e
+            if len(seen) != len(entries):
+                pols[param] = list(seen.values())
+                deduped_any = True
+    if deduped_any:
+        app_state.fixed_history_dirty = True  # flush scrubbed version to disk
 
 
 def save_fixed_history(app_state: AppState) -> None:

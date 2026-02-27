@@ -5084,7 +5084,7 @@ class MapView {
       let base = p._cachedColor;
       if (base === undefined) {
         const pr = primaryReadingFromPoint(p);
-        base = safeHex(pr?.color);
+        base = safeHex(pr?.ci != null ? pr.ci : pr?.color);
         try { p._cachedColor = base; } catch {}
       }
       

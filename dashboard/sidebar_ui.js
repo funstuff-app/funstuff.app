@@ -44,7 +44,7 @@ function generateItemHTML(item, type, order) {
   rowsHTML += `<div class="row2">`;
   for (const k of show) {
     const val = readings[k]?.value ?? "—";
-    const c = safeHex(readings[k]?.color);
+    const c = safeHex(readings[k]?.ci != null ? readings[k].ci : readings[k]?.color);
     const outC = isParked ? dimHex(c, 0.65) : c;
     rowsHTML += `<div class="reading">`;
     rowsHTML += `<span class="k">${escapeHtml(k)}</span>`;
@@ -346,7 +346,7 @@ function renderDetails(state, selectedId) {
     const renderOrder = (ordered.length === keys.length) ? ordered : keys;
     for (const k of renderOrder) {
       const v = readings[k]?.value ?? "—";
-      const c = safeHex(readings[k]?.color);
+      const c = safeHex(readings[k]?.ci != null ? readings[k].ci : readings[k]?.color);
       // Key stays neutral; value carries the color signal.
       html += `<div class="kv"><div class="k">${escapeHtml(k)}</div><div class="v" style="color:${c}">${escapeHtml(String(v))}</div></div>`;
     }
