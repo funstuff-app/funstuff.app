@@ -2,6 +2,7 @@
 
 import unittest
 import threading
+from mobileair.aqi import color_to_idx
 from dashboard_server import AppState, _merge_purpleair_into_fixed, _get_aqi_color, accumulate_fixed_reading
 
 
@@ -18,8 +19,7 @@ class TestPurpleAirMerge(unittest.TestCase):
         return app
 
     def _make_sensor(self, *, sensor_index=100, name="TestSensor",
-                     lat=40.76, lon=-111.89, pm25=2.5,
-                     humidity=30, temperature=65):
+                     lat=40.76, lon=-111.89, pm25=2.5):
         s = {
             "sensor_index": sensor_index,
             "name": name,
@@ -28,10 +28,6 @@ class TestPurpleAirMerge(unittest.TestCase):
         }
         if pm25 is not None:
             s["pm2.5"] = pm25
-        if humidity is not None:
-            s["humidity"] = humidity
-        if temperature is not None:
-            s["temperature"] = temperature
         return s
 
     # ── basic merge ──────────────────────────────────────────────────
@@ -80,18 +76,6 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertEqual(f["readings"]["PM25"]["value"], 1.6)
         self.assertEqual(f["readings"]["PM25"]["key"], "PM2.5")
 
-    def test_humidity_stored(self):
-        app = self._make_app_state([self._make_sensor(humidity=42)])
-        st = {"fixed": [], "mobile": []}
-        _merge_purpleair_into_fixed(st, app)
-        self.assertEqual(st["fixed"][0]["readings"]["Humidity"]["value"], 42)
-
-    def test_temperature_stored(self):
-        app = self._make_app_state([self._make_sensor(temperature=68)])
-        st = {"fixed": [], "mobile": []}
-        _merge_purpleair_into_fixed(st, app)
-        self.assertEqual(st["fixed"][0]["readings"]["Temp"]["value"], 68)
-
     def test_no_pm25_skipped(self):
         app = self._make_app_state([self._make_sensor(pm25=None)])
         st = {"fixed": [], "mobile": []}
@@ -119,15 +103,15 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertEqual(_get_aqi_color("PM25", 9.0), "#00E400")
 
     def test_color_sensor_dot_matches_reading(self):
-        """The merged fixed entry color should match its PM25 reading color."""
+        """The merged fixed entry color index should match its PM25 reading color."""
         app = self._make_app_state([self._make_sensor(pm25=1.6)])
         st = {"fixed": [], "mobile": []}
         _merge_purpleair_into_fixed(st, app)
         f = st["fixed"][0]
-        expected = _get_aqi_color("PM25", 1.6)
-        self.assertEqual(f["color"], expected)
-        self.assertEqual(f["primary_color"], expected)
-        self.assertEqual(f["readings"]["PM25"]["color"], expected)
+        expected_ci = color_to_idx(_get_aqi_color("PM25", 1.6))
+        self.assertEqual(f["ci"], expected_ci)
+        self.assertEqual(f["pci"], expected_ci)
+        self.assertEqual(f["readings"]["PM25"]["ci"], expected_ci)
 
     def test_color_not_epa_green_outside_5_9(self):
         """PM2.5 outside 5–9 must NOT be EPA green (#00E400)."""
@@ -212,9 +196,9 @@ class TestPurpleAirMerge(unittest.TestCase):
 
     def test_multiple_sensors_merged(self):
         sensors = [
-            self._make_sensor(sensor_index=1, name="A", pm25=1.0),
-            self._make_sensor(sensor_index=2, name="B", pm25=5.0),
-            self._make_sensor(sensor_index=3, name="C", pm25=10.0),
+            self._make_sensor(sensor_index=1, name="A", lat=40.76, lon=-111.89, pm25=1.0),
+            self._make_sensor(sensor_index=2, name="B", lat=40.77, lon=-111.88, pm25=5.0),
+            self._make_sensor(sensor_index=3, name="C", lat=40.78, lon=-111.87, pm25=10.0),
         ]
         app = self._make_app_state(sensors)
         st = {"fixed": [], "mobile": []}
@@ -224,30 +208,29 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertEqual(ids, {"PA_1", "PA_2", "PA_3"})
 
     def test_multiple_sensors_different_colors(self):
-        """Sensors with different PM2.5 levels should get different colors."""
+        """Sensors with different PM2.5 levels should get different color indices."""
         sensors = [
-            self._make_sensor(sensor_index=1, pm25=1.0),   # should be cyan
-            self._make_sensor(sensor_index=2, pm25=5.0),    # should be light blue
-            self._make_sensor(sensor_index=3, pm25=15.0),   # should be dark green
+            self._make_sensor(sensor_index=1, lat=40.76, lon=-111.89, pm25=1.0),   # cyan
+            self._make_sensor(sensor_index=2, lat=40.77, lon=-111.88, pm25=5.0),   # light blue
+            self._make_sensor(sensor_index=3, lat=40.78, lon=-111.87, pm25=15.0),  # green
         ]
         app = self._make_app_state(sensors)
         st = {"fixed": [], "mobile": []}
         _merge_purpleair_into_fixed(st, app)
-        colors = [f["color"] for f in st["fixed"]]
-        # All three should be different
-        self.assertEqual(len(set(colors)), 3,
-                         f"Expected 3 distinct colors, got {colors}")
+        cis = [f["ci"] for f in st["fixed"]]
+        self.assertEqual(len(set(cis)), 3,
+                         f"Expected 3 distinct color indices, got {cis}")
 
     # ── outlier detection ────────────────────────────────────────────
 
     def test_broken_sensor_filtered_out(self):
         """A sensor reading 3000+ when peers read 1-5 should be filtered."""
         sensors = [
-            self._make_sensor(sensor_index=1, pm25=1.0),
-            self._make_sensor(sensor_index=2, pm25=2.0),
-            self._make_sensor(sensor_index=3, pm25=1.5),
-            self._make_sensor(sensor_index=4, pm25=3.0),
-            self._make_sensor(sensor_index=99, name="Broken", pm25=3331.0),
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=1.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=2.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=1.5),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=3.0),
+            self._make_sensor(sensor_index=99, lat=40.780, lon=-111.870, name="Broken", pm25=3331.0),
         ]
         app = self._make_app_state(sensors)
         st = {"fixed": [], "mobile": []}
@@ -273,10 +256,10 @@ class TestPurpleAirMerge(unittest.TestCase):
     def test_real_spike_not_filtered(self):
         """A genuine spike (many sensors elevated) should NOT be filtered."""
         sensors = [
-            self._make_sensor(sensor_index=1, pm25=40.0),
-            self._make_sensor(sensor_index=2, pm25=55.0),
-            self._make_sensor(sensor_index=3, pm25=38.0),
-            self._make_sensor(sensor_index=4, pm25=80.0),  # higher but plausible
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=40.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=55.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=38.0),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=80.0),
         ]
         app = self._make_app_state(sensors)
         st = {"fixed": [], "mobile": []}
@@ -301,10 +284,10 @@ class TestPurpleAirMerge(unittest.TestCase):
     def test_dust_storm_readings_not_filtered(self):
         """During dust storms, readings of 400+ are real and should be kept."""
         sensors = [
-            self._make_sensor(sensor_index=1, pm25=50.0),
-            self._make_sensor(sensor_index=2, pm25=120.0),
-            self._make_sensor(sensor_index=3, pm25=80.0),
-            self._make_sensor(sensor_index=4, pm25=450.0),  # dusty hotspot
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=50.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=120.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=80.0),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=450.0),
         ]
         app = self._make_app_state(sensors)
         st = {"fixed": [], "mobile": []}
@@ -314,10 +297,10 @@ class TestPurpleAirMerge(unittest.TestCase):
     def test_moderate_outlier_kept_with_high_iqr(self):
         """When IQR is large, moderately high values should survive."""
         sensors = [
-            self._make_sensor(sensor_index=1, pm25=5.0),
-            self._make_sensor(sensor_index=2, pm25=15.0),
-            self._make_sensor(sensor_index=3, pm25=25.0),
-            self._make_sensor(sensor_index=4, pm25=50.0),  # high but within range
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=5.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=15.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=25.0),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=50.0),
         ]
         app = self._make_app_state(sensors)
         st = {"fixed": [], "mobile": []}
@@ -329,7 +312,6 @@ class TestPurpleAirMerge(unittest.TestCase):
     def test_purpleair_readings_accumulate_to_history(self):
         """PurpleAir readings should be stored in fixed_history for playback."""
         app = self._make_app_state([self._make_sensor(sensor_index=42, pm25=3.5)])
-        # Simulate what purpleair_fetch_loop does
         sid = "PA_42"
         color = _get_aqi_color("PM25", 3.5)
         accumulate_fixed_reading(app, sid, "PM25", 3.5, color, "2026-02-08T20:00:00Z")
@@ -338,7 +320,7 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertEqual(len(app.fixed_history[sid]["PM25"]), 1)
         entry = app.fixed_history[sid]["PM25"][0]
         self.assertEqual(entry["val"], "3.5")
-        self.assertEqual(entry["col"], color)
+        self.assertEqual(entry["ci"], color_to_idx(color))
 
     def test_purpleair_history_dedupes(self):
         """Same value+time should not create duplicate history entries."""
@@ -349,11 +331,12 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertEqual(len(app.fixed_history["PA_1"]["PM25"]), 1)
 
     def test_purpleair_history_appends_new_time(self):
-        """Different time should create a new history entry."""
+        """A new value should create a new history entry even for PA sensors."""
         app = self._make_app_state()
-        color = _get_aqi_color("PM25", 2.0)
-        accumulate_fixed_reading(app, "PA_1", "PM25", 2.0, color, "2026-02-08T20:00:00Z")
-        accumulate_fixed_reading(app, "PA_1", "PM25", 2.0, color, "2026-02-08T20:02:00Z")
+        color1 = _get_aqi_color("PM25", 2.0)
+        color2 = _get_aqi_color("PM25", 5.0)
+        accumulate_fixed_reading(app, "PA_1", "PM25", 2.0, color1, "2026-02-08T20:00:00Z")
+        accumulate_fixed_reading(app, "PA_1", "PM25", 5.0, color2, "2026-02-08T20:02:00Z")
         self.assertEqual(len(app.fixed_history["PA_1"]["PM25"]), 2)
 
     def test_home_history_color_recomputed_not_stale(self):

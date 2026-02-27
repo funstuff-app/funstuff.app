@@ -421,7 +421,7 @@ function renderColumnsFromRawReadings(container, readings) {
             const val = document.createElement('span');
             val.className = 'reading-value';
             val.textContent = parseFloat(reading.value).toFixed(1).padStart(VALUE_WIDTH);
-            val.style.color = reading.color;
+            val.style.color = safeHex(reading.ci);
             
             const trend = document.createElement('span');
             trend.className = 'reading-trend';
@@ -727,7 +727,7 @@ function renderDetails() {
                 label: key,
                 value: reading.value,
                 formatted: parseFloat(reading.value).toFixed(1).padStart(VALUE_WIDTH),
-                color: reading.color,
+                color: safeHex(reading.ci),
                 has_value: true,
                 trend_symbol: getTrendSymbol(reading, key),
                 trend_color: '#888888',
@@ -789,7 +789,7 @@ function renderDetails() {
         histEl.className = 'p-history';
         if (reading && reading.history && reading.history.length) {
             const points = reading.history.slice(-20);
-            const colors = reading.history_colors ? reading.history_colors.slice(-20) : [];
+            const colors = reading.hci ? reading.hci.slice(-20) : [];
             
             points.forEach((pt, i) => {
                 const hBar = document.createElement('div');
@@ -799,7 +799,7 @@ function renderDetails() {
                 let hPct = sparkPct(points, pt) * scale;
                 if (hPct > 0 && hPct < 2) hPct = 2;
                 hBar.style.height = hPct + '%';
-                hBar.style.backgroundColor = colors[i] || col.color;
+                hBar.style.backgroundColor = safeHex(colors[i] != null ? colors[i] : (col.ci ?? col.color));
                 histEl.appendChild(hBar);
             });
         } else {
@@ -860,7 +860,7 @@ function renderJson() {
             
             view[k] = {
                 value: r.value,
-                color: r.color,
+                color: safeHex(r.ci),
                 unit: r.unit || "ug/m3", // Assuming unit
                 history_tail: last5,
                 history_count: histLen

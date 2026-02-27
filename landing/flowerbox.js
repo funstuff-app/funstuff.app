@@ -22,6 +22,10 @@
     var speedR = 88;
     var sz = 0.65;
 
+    /* Wall-clock time reference — keeps time truly framerate-independent */
+    var _t0 = null;          /* performance.now() at start/resume        */
+    var _timeAtPause = 0.625; /* value of `time` when last paused/started */
+
     /* ── Subdivision ── */
     var SUBDIV = 13;
 
@@ -178,6 +182,7 @@
 
     /* ── Init ── */
     function init() {
+      if (animId) { cancelAnimationFrame(animId); animId = null; }
       W = canvas.width = canvas.offsetWidth * (window.devicePixelRatio > 1 ? 1.5 : 1);
       H = canvas.height = canvas.offsetHeight * (window.devicePixelRatio > 1 ? 1.5 : 1);
       canvas.style.width = canvas.offsetWidth + "px";
@@ -198,14 +203,33 @@
     }
 
     var paused = false;
+    var lastTs = null;
+    var TARGET_FPS = 30;
+    var FRAME_MS = 1000 / TARGET_FPS;
 
     /* ── Render ── */
-    function render() {
+    function render(now) {
+      animId = null;
       if (stopped || paused) return;
 
-      time += dt;
-      posX += speedX;
-      posY += speedY;
+      /* Cap to TARGET_FPS — skip draw if not enough time has passed */
+      if (lastTs !== null && now - lastTs < FRAME_MS - 1) {
+        animId = requestAnimationFrame(render);
+        return;
+      }
+
+      /* time derived from wall clock — identical on 60 Hz, 120 Hz, any Hz */
+      if (_t0 === null) { _t0 = now; lastTs = now; }
+      var DT_PER_SEC = dt * 60; /* time units per real second (= dt @ 60 fps) */
+      time = _timeAtPause + (now - _t0) * 0.001 * DT_PER_SEC;
+
+      /* position still uses delta-time (stateful bounce) */
+      var elapsed = now - lastTs;
+      lastTs = now;
+      var norm = Math.min(elapsed, 100) / (1000 / 60);
+
+      posX += speedX * norm;
+      posY += speedY * norm;
       if (posX > maxX)  { posX = maxX;  speedX = -Math.abs(speedX); }
       if (posX < -maxX) { posX = -maxX; speedX =  Math.abs(speedX); }
       if (posY > maxY)  { posY = maxY;  speedY = -Math.abs(speedY); }
@@ -285,11 +309,15 @@
       stop: function () { stopped = true; if (animId) cancelAnimationFrame(animId); },
       pause: function () {
         paused = true;
+        _timeAtPause = time;  /* freeze time so resume continues from here */
+        _t0 = null;
         if (animId) { cancelAnimationFrame(animId); animId = null; }
       },
       resume: function () {
         if (stopped) return;
         paused = false;
+        _t0 = null;    /* will be set to `now` on first render tick */
+        lastTs = null;
         init();
         animId = requestAnimationFrame(render);
       },

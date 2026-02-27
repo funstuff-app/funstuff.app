@@ -6,7 +6,8 @@
   window.PipesScreensaver = function (canvas, opts) {
     var ctx = canvas.getContext("2d");
     var W, H;
-    var grid, segments, pipe, animId, lastTs, stepAccum;
+    var grid, segments, pipe, animId, lastTs, stepAccum, drawLastTs;
+    var DRAW_MS = 1000 / 30;
     var pipes; /* array of pipe objects: { color, segs: [indices into segments] } */
     var pipeId;
     var colorIdx;
@@ -154,6 +155,7 @@
       pipe = null;
       stepAccum = 0;
       lastTs = 0;
+      drawLastTs = 0;
       spawn();
     }
 
@@ -356,13 +358,17 @@
       while (stepAccum >= STEP_MS && steps < 4) {
         step(); stepAccum -= STEP_MS; steps++;
       }
-      if (mode === "rotate") {
-        rotY += 0.0007;
-        var of = fitCamera(rotY, rotX, 0.12);
-        _orbitCamD = of.camD;
-        _orbitFov = of.fov;
+      if (!drawLastTs) drawLastTs = ts;
+      if (ts - drawLastTs >= DRAW_MS - 1) {
+        drawLastTs = ts;
+        if (mode === "rotate") {
+          rotY += 0.0007;
+          var of = fitCamera(rotY, rotX, 0.12);
+          _orbitCamD = of.camD;
+          _orbitFov = of.fov;
+        }
+        draw();
       }
-      draw();
       animId = requestAnimationFrame(loop);
     }
 
@@ -380,6 +386,7 @@
         paused = false;
         lastTs = 0;
         stepAccum = 0;
+        drawLastTs = 0;
         /* Reinit canvas dimensions in case they were invalidated */
         var dpr = window.devicePixelRatio > 1 ? 1.5 : 1;
         var ow = canvas.offsetWidth;

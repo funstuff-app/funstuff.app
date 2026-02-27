@@ -156,6 +156,34 @@ def color_for_value(pollutant_key: str, value: float | str | None) -> str:
     return "#cccccc"
 
 
+# ── Color palette ──────────────────────────────────────────────────────────────
+# Integer indices sent on the wire instead of 7-char hex strings.
+# Client expands via AQI_PALETTE[idx].  Index 0 = unknown / no-data.
+# Must stay in sync with dashboard/colors.js AQI_PALETTE.
+
+AQI_COLOR_PALETTE: list[str] = [
+    "#cccccc",  # 0  unknown / no data
+    "#00FFFF",  # 1  cyan    – Good (very low)   PM2.5 ≤2, PM10 ≤15
+    "#00CCFF",  # 2  lt-blue – Good              PM2.5 ≤5, PM10 ≤30, O3/NO2/CO low
+    "#0099FF",  # 3  blue    – Good              PM10 ≤40, O3 ≤25, NO2 ≤35, CO ≤3
+    "#00E400",  # 4  green   – Good              PM2.5 ≤9, PM10 ≤54, NO2 ≤53, CO ≤4.4
+    "#009900",  # 5  dk-green– O3 Good           O3 ≤35
+    "#006600",  # 6  dkr-green–O3 Good           O3 ≤54
+    "#FFFF00",  # 7  yellow  – Moderate
+    "#FF7E00",  # 8  orange  – USG
+    "#FF0000",  # 9  red     – Unhealthy
+    "#8F3F97",  # 10 purple  – Very Unhealthy
+    "#7E0023",  # 11 maroon  – Hazardous
+]
+
+_COLOR_TO_IDX: dict[str, int] = {c.upper(): i for i, c in enumerate(AQI_COLOR_PALETTE)}
+
+
+def color_to_idx(hex_color: str) -> int:
+    """Return the palette index for a hex color string.  Returns 0 (unknown) if not found."""
+    return _COLOR_TO_IDX.get((hex_color or "").upper(), 0)
+
+
 def trend_threshold(pollutant_key: str) -> float:
     """Get the trend detection threshold for a pollutant."""
     return TREND_THRESHOLDS.get(pollutant_key.lower(), TREND_THRESHOLDS["default"])

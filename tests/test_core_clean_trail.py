@@ -3,11 +3,6 @@ from mobileair_core import normalize_state_for_dashboard
 import time
 
 class TestCleanTrail(unittest.TestCase):
-    def setUp(self):
-        self.data_dir = "/tmp"
-        self.mobile_url = "http://mobile.test"
-        self.fixed_url = "http://fixed.test"
-
     def _get_trail(self, lats, lons, times):
         combined = {
             "mobile": {
@@ -23,12 +18,7 @@ class TestCleanTrail(unittest.TestCase):
             },
             "fixed": {}
         }
-        st = normalize_state_for_dashboard(
-            combined,
-            mobile_url=self.mobile_url,
-            fixed_url=self.fixed_url,
-            data_dir=self.data_dir
-        )
+        st = normalize_state_for_dashboard(combined)
         return st["mobile"][0]["trail"]
 
     def test_dedup_consecutive_points(self):

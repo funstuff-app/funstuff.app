@@ -49,6 +49,7 @@ from mobileair import (
     normalize_state_for_dashboard,
     stdlib_get,
     coerce_float,
+    color_to_idx,
     MOBILE_URL,
     FIXED_URL,
     HEADERS,
@@ -412,6 +413,11 @@ class AppState:
     # next /api/state poll as a "new data" event even if timestamps/trails are unchanged.
     force_refresh_seq: int = 0
 
+    # Monotonic counter bumped on EVERY state mutation (fetch loop, PurpleAir,
+    # Home sensor, force-refresh).  Used as the ETag so clients skip unchanged
+    # payloads via 304 regardless of which subsystem triggered the change.
+    state_seq: int = 0
+
     # Server-authoritative "since last update" window for mobile trail timestamps.
     # Values are epoch milliseconds (UTC).
     last_mobile_max_ms: int | None = None
@@ -438,6 +444,7 @@ def bump_force_refresh_seq(app_state: AppState) -> int:
     """
     try:
         app_state.force_refresh_seq = int(getattr(app_state, "force_refresh_seq", 0) or 0) + 1
+        app_state.state_seq = int(getattr(app_state, "state_seq", 0) or 0) + 1
     except Exception:
         try:
             app_state.force_refresh_seq = 1
@@ -860,6 +867,12 @@ def accumulate_fixed_reading(
             elapsed = now_ts - (last.get("recorded_at") or 0)
             if last.get("val") == str(value) and elapsed < 300:
                 return
+        elif sensor_id.startswith("AIRNOW_"):
+            # AirNow: deduplicate by time across the entire list to prevent
+            # re-fetched hours (e.g. after restart) from creating sawtooth
+            # duplicates at historic positions.
+            if time_utc and any(e.get("time") == time_utc for e in hist):
+                return
         else:
             if last.get("val") == str(value) and last.get("time") == time_utc:
                 return
@@ -867,7 +880,7 @@ def accumulate_fixed_reading(
     # Append new reading
     hist.append({
         "val": str(value) if value is not None else None,
-        "col": color,
+        "ci": color_to_idx(color),
         "time": time_utc,
         "recorded_at": now_ts,
     })
@@ -993,7 +1006,7 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
             # Only include entries from today — never inject stale history
             # from previous days that lingers in fixed_history.json
             history_values = []
-            history_colors = []
+            hci = []
             history_times = []
 
             for entry in hist_entries:
@@ -1008,11 +1021,11 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
                 except (ValueError, TypeError):
                     fval = None
                 history_values.append(fval)
-                history_colors.append(_get_aqi_color(pollutant, fval) if fval is not None else "#cccccc")
+                hci.append(color_to_idx(_get_aqi_color(pollutant, fval)) if fval is not None else 0)
                 history_times.append(t)
 
             reading["history"] = history_values
-            reading["history_colors"] = history_colors
+            reading["hci"] = hci
             reading["history_times"] = history_times
 
 
@@ -1061,7 +1074,7 @@ def _reinject_offline_fixed_sensors(app_state: AppState, st: dict[str, Any]) -> 
             if pollutant in _WEATHER_KEYS:
                 continue
             history_values = []
-            history_colors = []
+            hci = []
             history_times = []
             for entry in hist_entries:
                 v = entry.get("val")
@@ -1072,10 +1085,10 @@ def _reinject_offline_fixed_sensors(app_state: AppState, st: dict[str, Any]) -> 
                 except (TypeError, ValueError):
                     fv = None
                 history_values.append(fv)
-                history_colors.append(_get_aqi_color(pollutant, fv) if fv is not None else "#cccccc")
+                hci.append(color_to_idx(_get_aqi_color(pollutant, fv)) if fv is not None else 0)
                 history_times.append(entry.get("time"))
             last_val = history_values[-1] if history_values else None
-            last_col = _get_aqi_color(pollutant, last_val) if last_val is not None else "#cccccc"
+            last_ci = color_to_idx(_get_aqi_color(pollutant, last_val)) if last_val is not None else 0
             display_val = last_val
             if display_val is not None:
                 try:
@@ -1084,8 +1097,8 @@ def _reinject_offline_fixed_sensors(app_state: AppState, st: dict[str, Any]) -> 
                 except (ValueError, TypeError):
                     pass
             readings[pollutant] = {
-                "value": display_val, "color": last_col,
-                "history": history_values, "history_colors": history_colors,
+                "value": display_val, "ci": last_ci,
+                "history": history_values, "hci": hci,
                 "history_times": history_times,
             }
 
@@ -1098,10 +1111,10 @@ def _reinject_offline_fixed_sensors(app_state: AppState, st: dict[str, Any]) -> 
             "id": sensor_id, "name": name, "pinned": False, "emoji": "📍",
             "lat": lat, "lon": lon,
             "readings": readings,
-            "color": worst.get("color") or "#cccccc",
+            "ci": worst.get("ci", 0),
             "primary_key": worst.get("key"),
             "primary_value": worst.get("value"),
-            "primary_color": worst.get("color"),
+            "pci": worst.get("ci"),
             "primary_aqi": worst.get("aqi"),
             "offline": True,  # marker for UI: sensor is offline from upstream
         })
@@ -1124,9 +1137,6 @@ def build_state(
         custom_names=custom_names if isinstance(custom_names, dict) else {},
         pinned_sensors=pinned,
         max_points=max_points,
-        mobile_url=MOBILE_URL,
-        fixed_url=FIXED_URL,
-        data_dir=str(data_dir),
         road_graph=get_cached_road_graph(),
         tram_line_graph=get_cached_tram_line_graph(),
     )
@@ -1667,6 +1677,7 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
 
         # CPU Optimization: Bake JSON bytes once here
         app_state.state = st
+        app_state.state_seq += 1
         app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
 
 
@@ -1756,6 +1767,8 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
             # Add as new AirNow-only sensor
             if site_id not in added_airnow_sites:
                 added_airnow_sites.add(site_id)
+                _pk = _pick_primary_key(airnow_readings_dict)
+                _pci = airnow_readings_dict.get(_pk, {}).get("ci", 0) if _pk else 0
                 fixed_list.append({
                     "id": f"AIRNOW_{site_id}",
                     "name": site_name,
@@ -1764,11 +1777,11 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
                     "lat": lat,
                     "lon": lon,
                     "readings": airnow_readings_dict,
-                    "color": _pick_color_from_readings(airnow_readings_dict),
+                    "ci": _pci,
                     "airnow_source": True,
-                    "primary_key": _pick_primary_key(airnow_readings_dict),
+                    "primary_key": _pk,
                     "primary_value": None,
-                    "primary_color": _pick_color_from_readings(airnow_readings_dict),
+                    "pci": _pci,
                     "primary_aqi": None,
                 })
     
@@ -1918,7 +1931,7 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
         readings = {
             "PM25": {
                 "value": round(pm25_val, 1),
-                "color": color,
+                "ci": color_to_idx(color),
                 "key": "PM2.5",
             }
         }
@@ -1931,11 +1944,11 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
             "lat": lat,
             "lon": lon,
             "readings": readings,
-            "color": color,
+            "ci": color_to_idx(color),
             "purpleair": True,
             "primary_key": "PM25",
             "primary_value": round(pm25_val, 1),
-            "primary_color": color,
+            "pci": color_to_idx(color),
             "primary_aqi": None,
         })
 
@@ -2001,8 +2014,8 @@ def purpleair_fetch_loop(
     """
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
-    META_INTERVAL       = 21600.0  # 6 hours
-    DATA_INTERVAL_DAY   = 600.0    # 10 min during day
+    META_INTERVAL       = 10800.0  # 3 hours
+    DATA_INTERVAL_DAY   = 300.0    # 5 min during day
     DATA_INTERVAL_NIGHT = 1800.0   # 30 min during night (1 AM – 6 AM MST)
     NEIGHBOR_RADIUS_DEG = 0.018    # ~2 km grid cell side length
 
@@ -2102,7 +2115,9 @@ def purpleair_fetch_loop(
         if isinstance(app_state.state, dict):
             _merge_purpleair_into_fixed(app_state.state, app_state)
             _inject_fixed_history(app_state, app_state.state)
+            app_state.state.setdefault("meta", {})["state_seq"] = app_state.state_seq
             app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
+            app_state.state_seq += 1
 
     # Write initial debug file
     try:
@@ -2285,9 +2300,13 @@ def _build_airnow_history(
     """
     result: dict[str, dict[str, Any]] = {}
     
-    # Collect all readings for this site across all cached hours
-    # Structure: param -> [(datetime, value), ...]
-    param_history: dict[str, list[tuple[datetime, float]]] = {}
+    # Collect all readings for this site across all cached hours.
+    # Key by datetime to deduplicate: the same (site, param, hour) can appear
+    # in multiple hour files (late arrivals, AirNow corrections).  Iterating in
+    # sorted hour order means the last file wins, which is always the most
+    # recent correction.
+    # Structure: param -> {datetime: value}
+    param_history: dict[str, dict[datetime, float]] = {}
     
     for hour_key in sorted(app_state.airnow_readings_by_hour.keys()):
         readings = app_state.airnow_readings_by_hour[hour_key]
@@ -2311,35 +2330,36 @@ def _build_airnow_history(
             value = r.get("value")
             if param and value is not None and param in AIRNOW_PARAM_MAP:
                 if param not in param_history:
-                    param_history[param] = []
-                param_history[param].append((dt, float(value)))
+                    param_history[param] = {}
+                # Overwrite keeps the latest file's value (correction wins)
+                param_history[param][dt] = float(value)
     
     # Build readings dict with history arrays
-    for param, history_list in param_history.items():
-        # Sort by time
-        history_list.sort(key=lambda x: x[0])
+    for param, dt_value_map in param_history.items():
+        # Sort by time (dict keys are datetime objects)
+        history_list = sorted(dt_value_map.items(), key=lambda x: x[0])
         
         # Get mapped parameter name
         mapped_key = AIRNOW_PARAM_MAP.get(param, param)
         
         # Extract values, times, and compute colors
-        history_values = [v for dt, v in history_list]
-        history_times = [dt.isoformat() + "Z" for dt, v in history_list]  # UTC ISO strings
-        history_colors = [_get_aqi_color(mapped_key, v) for v in history_values]
+        history_values = [v for _, v in history_list]
+        history_times = [dt.isoformat() + "Z" for dt, _ in history_list]  # UTC ISO strings
+        hci = [color_to_idx(_get_aqi_color(mapped_key, v)) for v in history_values]
         
         # Latest value
         if history_values:
             latest_value = history_values[-1]
-            latest_color = history_colors[-1]
+            latest_ci = hci[-1]
         else:
             continue
         
         result[mapped_key] = {
             "value": latest_value,
-            "color": latest_color,
+            "ci": latest_ci,
             "history": history_values,
             "history_times": history_times,  # UTC timestamps for playback interpolation
-            "history_colors": history_colors,
+            "hci": hci,
             "scrubbed": 0,  # No outlier filtering for AirNow data (already QC'd)
         }
     
@@ -2375,7 +2395,7 @@ def _airnow_to_readings_dict(
         
         result[mapped_key] = {
             "value": value,
-            "color": color,
+            "ci": color_to_idx(color),
         }
     
     return result
@@ -2659,6 +2679,8 @@ def _update_home_sensor_in_state(app_state: AppState) -> None:
                             reading["history_times"] = old_readings[key].get("history_times", [])
                     home_entry["readings"] = new_readings
                     st["fixed"][i] = home_entry
+                    app_state.state_seq += 1
+                    app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
                     break
     except Exception as e:
         _log(f"[HomeSensor] Update error: {e}")
@@ -2750,9 +2772,10 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
         attempt_ts = time.time()
         
         # Poll Home sensor frequently regardless of AirNow timing
-        if attempt_ts - last_home_poll >= HOME_POLL_INTERVAL:
-            _update_home_sensor_in_state(app_state)
-            last_home_poll = attempt_ts
+        # DISABLED — Home sensor polling is too frequent and not needed.
+        # if attempt_ts - last_home_poll >= HOME_POLL_INTERVAL:
+        #     _update_home_sensor_in_state(app_state)
+        #     last_home_poll = attempt_ts
         
         # Auto-save snapshot every 5 minutes to prevent data loss on crash/restart
         if attempt_ts - last_snapshot_save >= SNAPSHOT_SAVE_INTERVAL:
@@ -2778,7 +2801,7 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
             meta["server_revision"] = revision
             # Include adaptive polling info in meta
             meta["polling_predicted_interval_s"] = poller.predicted_interval
-            meta["client_poll_in_s"] = poller.get_next_poll_delay()
+            meta["client_poll_in_s"] = 120  # 2-min client poll (PA updates every ~2 min)
             if poller.last_change_ts:
                 time_since_change = time.time() - poller.last_change_ts
                 meta["polling_time_since_change_s"] = int(time_since_change)
@@ -2818,21 +2841,16 @@ def fetch_loop(*, app_state: AppState, data_dir: Path, interval_s: float, stop_e
                     except Exception:
                         pass
         
-        # Use adaptive polling delay, but wake up every 30s to poll Home sensor
+        # Use adaptive polling delay
         next_delay = poller.get_next_poll_delay()
-        next_airnow_poll = time.time() + next_delay
+        next_fetch = time.time() + next_delay
         
-        while not stop_event.is_set() and time.time() < next_airnow_poll:
-            # Poll Home sensor every 30 seconds
-            if time.time() - last_home_poll >= HOME_POLL_INTERVAL:
-                _update_home_sensor_in_state(app_state)
-                last_home_poll = time.time()
-            
-            # Sleep until next Home poll or AirNow poll, whichever is sooner
-            time_to_airnow = next_airnow_poll - time.time()
-            time_to_home = HOME_POLL_INTERVAL - (time.time() - last_home_poll)
-            sleep_time = max(1.0, min(time_to_airnow, time_to_home))
-            stop_event.wait(sleep_time)
+        while not stop_event.is_set() and time.time() < next_fetch:
+            # Home sensor polling DISABLED — sleep until next main fetch (mobile/fixed from CHPC).
+            # AirNow and PurpleAir each run on their own threads independently.
+            # To re-enable Home sensor, uncomment the _update_home_sensor_in_state calls above
+            # and restore the HOME_POLL_INTERVAL-based sleep logic.
+            stop_event.wait(max(1.0, next_fetch - time.time()))
 
 
 def airnow_fetch_loop(
@@ -3193,18 +3211,15 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 # TLS handshake failed - common with untrusted certs
                 pass
         
-        def _send(self, code: int, body: bytes, content_type: str, cache_control: str | None = None):
-            """Send HTTP response with optional cache control.
+        def _send(self, code: int, body: bytes, content_type: str, cache_control: str | None = None, etag: str | None = None):
+            """Send HTTP response with optional cache control and ETag.
             
             Args:
                 code: HTTP status code
                 body: Response body bytes
                 content_type: Content-Type header value
                 cache_control: Optional Cache-Control header value. If None, defaults to "no-store, max-age=0".
-                              For CDN caching, use values like:
-                              - "public, max-age=30, s-maxage=30" for API data (30s edge cache)
-                              - "public, max-age=300" for config (5min cache)
-                              - "public, max-age=86400, immutable" for static assets with cache-busting
+                etag: Optional ETag value (include quotes, e.g. '"rev-42"').
             """
             if cache_control is None:
                 cache_control = "no-store, max-age=0"
@@ -3213,6 +3228,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", cache_control)
+                if etag:
+                    self.send_header("ETag", etag)
                 # Connection: close helps Safari/iOS release connections properly
                 self.send_header("Connection", "close")
                 # Allow cross-origin requests (useful for dev/testing)
@@ -3221,6 +3238,18 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client disconnected while we were sending - ignore
+                pass
+
+        def _send_304(self, etag: str, cache_control: str):
+            """Send 304 Not Modified (no body)."""
+            try:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", cache_control)
+                self.send_header("Connection", "close")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
         def do_GET(self):
@@ -3291,35 +3320,67 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 body = json.dumps(server_config).encode("utf-8")
                 return self._send(200, body, "application/json", cache_control="public, max-age=300")
             if self.path.startswith("/api/state"):
-                # Short edge cache - data must stay fresh
                 with app_state.lock:
                     _ensure_force_refresh_seq_cached(app_state)
-                    # If an owner token is configured, strip the Home sensor
-                    # from responses that don't carry the matching ?tok= param.
+                    # ETag from state_seq (bumped by ANY state mutation:
+                    # fetch loop, PurpleAir, Home sensor, force-refresh)
+                    _etag = f'"s{app_state.state_seq}"'
+                    _cc_public = "public, max-age=0, s-maxage=30, stale-while-revalidate=5"
+
+                    # Owner token path: no ETag, no CDN cache (debug gets full fresh data)
                     if OWNER_TOKEN:
                         from urllib.parse import urlparse, parse_qs
                         qs = parse_qs(urlparse(self.path).query)
                         tok = (qs.get("tok") or [""])[0]
-                        # Both owner and non-owner responses must be no-store
-                        # to prevent Cloudflare (or any CDN) from caching one
-                        # variant and serving it to the other audience.
-                        if tok != OWNER_TOKEN:
+                        if tok == OWNER_TOKEN:
                             st_copy = json.loads(app_state.cached_json_bytes)
                             if isinstance(st_copy.get("fixed"), list):
                                 st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
                             return self._send(200, json.dumps(st_copy).encode("utf-8"),
                                               "application/json", cache_control="private, no-store")
-                        # Owner token matched — still strip Home from browser
-                        st_copy = json.loads(app_state.cached_json_bytes)
-                        if isinstance(st_copy.get("fixed"), list):
-                            st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
-                        return self._send(200, json.dumps(st_copy).encode("utf-8"),
-                                          "application/json", cache_control="private, no-store")
-                    # No owner token — still strip Home from browser responses
+
+                    # Public path: ETag / 304 conditional GET
+                    inm = self.headers.get("If-None-Match", "")
+                    if inm == _etag:
+                        return self._send_304(_etag, _cc_public)
+
                     st_copy = json.loads(app_state.cached_json_bytes)
                     if isinstance(st_copy.get("fixed"), list):
                         st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
-                    return self._send(200, json.dumps(st_copy).encode("utf-8"), "application/json", cache_control="public, max-age=15, s-maxage=30")
+
+                    # Delta delivery: if client sends ?since_ms=<ts>, strip trail
+                    # points the client already has (timestamp <= since_ms).
+                    from urllib.parse import urlparse, parse_qs as _pqs
+                    _qs = _pqs(urlparse(self.path).query)
+                    _since_raw = (_qs.get("since_ms") or [None])[0]
+                    if _since_raw is not None:
+                        try:
+                            _since_ms = int(_since_raw)
+                        except (TypeError, ValueError):
+                            _since_ms = None
+                        if _since_ms is not None and isinstance(st_copy.get("mobile"), list):
+                            for _mv in st_copy["mobile"]:
+                                if not isinstance(_mv, dict):
+                                    continue
+                                _trail = _mv.get("trail")
+                                if not isinstance(_trail, list):
+                                    continue
+                                # Keep only points with timestamp > since_ms.
+                                # Trails are chronological; binary-search the cut point.
+                                _cut = 0
+                                for _ti, _tp in enumerate(_trail):
+                                    _tt = _tp.get("t") if isinstance(_tp, dict) else None
+                                    if isinstance(_tt, str):
+                                        _tdt = parse_utc_timestamp(_tt)
+                                        if _tdt is not None and int(_tdt.timestamp() * 1000) <= _since_ms:
+                                            _cut = _ti + 1
+                                        else:
+                                            break
+                                _mv["trail"] = _trail[_cut:]
+                            st_copy.setdefault("meta", {})["delta"] = True
+
+                    return self._send(200, json.dumps(st_copy).encode("utf-8"),
+                                      "application/json", cache_control=_cc_public, etag=_etag)
             if self.path.startswith("/api/fixed"):
                 # Return just the fixed sensor array (lightweight for TUI remote mode)
                 with app_state.lock:
@@ -3348,12 +3409,80 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._handle_list_snapshots()
             if self.path.startswith("/api/snapshot/load"):
                 return self._handle_load_snapshot()
+            if self.path.startswith("/api/prefs/log"):
+                return self._handle_prefs_log()
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
+            if self.path.startswith("/api/prefs/sync"):
+                return self._handle_prefs_sync()
             if self.path.startswith("/api/snapshot/save"):
                 return self._handle_save_snapshot()
             return self._send(404, b"not found", "text/plain")
+
+        def _handle_prefs_sync(self):
+            """Append a prefs snapshot to prefs_log.ndjson (one JSON line per entry).
+
+            Body: {"client_ts": <epoch_ms>, "prefs": {"dusty_...": "...", ...}}
+            Token validated via ?tok= query param (same as snapshot/save).
+            """
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            tok = (qs.get("tok") or [""])[0]
+            if OWNER_TOKEN and tok != OWNER_TOKEN:
+                return self._send(403, b'{"error": "forbidden"}', "application/json")
+            content_length = int(self.headers.get("Content-Length", 0))
+            if not (0 < content_length <= 8192):
+                return self._send(400, b'{"error": "bad length"}', "application/json")
+            try:
+                raw = self.rfile.read(content_length)
+                incoming = json.loads(raw)
+                if not isinstance(incoming.get("prefs"), dict):
+                    raise ValueError("missing prefs")
+                entry = {
+                    "ts": time.time(),
+                    "client_ts": int(incoming.get("client_ts") or 0),
+                    "prefs": {k: v for k, v in incoming["prefs"].items()
+                               if isinstance(k, str) and
+                               (k.startswith("dusty_") or k.startswith("mobileair.")) and
+                               not k.endswith(".__cfgv")},
+                }
+                log_path = Path(data_dir) / "prefs_log.ndjson"
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+                return self._send(200, b'{"ok": true}', "application/json")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode()
+                return self._send(500, body, "application/json")
+
+        def _handle_prefs_log(self):
+            """Return last N entries from prefs_log.ndjson as a JSON array.
+
+            Query params:
+              n=<int>   — number of tail entries to return (default 100, max 10000)
+            """
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            tok = (qs.get("tok") or [""])[0]
+            if OWNER_TOKEN and tok != OWNER_TOKEN:
+                return self._send(403, b'{"error": "forbidden"}', "application/json")
+            try:
+                n = min(int((qs.get("n") or ["100"])[0]), 10000)
+            except (ValueError, TypeError):
+                n = 100
+            log_path = Path(data_dir) / "prefs_log.ndjson"
+            entries = []
+            if log_path.exists():
+                lines = log_path.read_text(encoding="utf-8").splitlines()
+                for line in lines[-n:]:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+            body = json.dumps(entries).encode("utf-8")
+            return self._send(200, body, "application/json")
 
         def _handle_tui_state(self):
             """Return state formatted for TUI rendering (shared format for terminal and web)."""

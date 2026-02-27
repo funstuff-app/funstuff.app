@@ -9,7 +9,27 @@ import sys
 import unittest
 import os
 import subprocess
+import types
 from pathlib import Path
+
+# ── Stub out optional hardware dependencies that are intentionally disabled ──
+# `dirigera` (IKEA hub) is not installed in CI / dev environments.
+# Insert a minimal fake before any test module is imported so that
+# `from dirigera import Hub` and the module-level Hub() instantiation in
+# dirigera_home.py don't crash the entire test run.
+if "dirigera" not in sys.modules:
+    _dirigera_stub = types.ModuleType("dirigera")
+    class _FakeAttrs:
+        current_p_m25 = 0.0
+    class _FakeSensor:
+        attributes = _FakeAttrs()
+    class _HubStub:
+        def __init__(self, **kwargs): pass
+        def get_environment_sensors(self): return [_FakeSensor()]
+    _dirigera_stub.Hub = _HubStub
+    sys.modules["dirigera"] = _dirigera_stub
+
+os.environ.setdefault("DIRIGERA_TOKEN", "_test_stub_")
 
 
 def _colors_enabled(stream) -> bool:

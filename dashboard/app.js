@@ -20,14 +20,138 @@ function _tokUrl(url) {
   return `${url}${sep}tok=${encodeURIComponent(_ownerTok)}`;
 }
 
+// ── Prefs sync ──────────────────────────────────────────────────────────────
+// Collects all owner-namespaced localStorage keys and POSTs them to the
+// server on page hide/unload. The server appends each entry as an NDJSON
+// line to prefs_log.ndjson — a replay-able history of UI state over time.
+// Only fires when the owner token is present; zero bytes sent otherwise.
+function _syncPrefsToServer() {
+  if (!_ownerTok) return;
+  const prefs = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && (k.startsWith("dusty_") || k.startsWith("mobileair."))) {
+      prefs[k] = localStorage.getItem(k);
+    }
+  }
+  const payload = JSON.stringify({ client_ts: Date.now(), prefs });
+  navigator.sendBeacon(_tokUrl("/api/prefs/sync"),
+    new Blob([payload], { type: "application/json" }));
+}
+
+// visibilitychange covers tab switches, window minimize, and most close gestures.
+// pagehide is the reliable iOS Safari / bfcache signal.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") _syncPrefsToServer();
+});
+window.addEventListener("pagehide", _syncPrefsToServer);
+
+// ETag for conditional polling — avoids re-downloading unchanged payloads.
+let _stateEtag = null;
+let _stateCached = null;
+
+// Delta delivery: track newest trail timestamp so subsequent polls
+// only receive new trail points (the server strips old ones via ?since_ms=).
+let _newestTrailMs = null;
+// Accumulated full state (trails grow across polls).
+let _accumulatedState = null;
+
+/** Extract the newest trail timestamp (epoch ms) from a state object. */
+function _extractNewestTrailMs(st) {
+  let best = null;
+  const mobiles = Array.isArray(st?.mobile) ? st.mobile : [];
+  for (const m of mobiles) {
+    const trail = Array.isArray(m?.trail) ? m.trail : [];
+    for (let i = trail.length - 1; i >= 0; i--) {
+      const t = trail[i]?.t;
+      if (typeof t === "string") {
+        const ms = parseUtcMs(t);
+        if (ms != null && (best == null || ms > best)) { best = ms; break; }
+      }
+    }
+  }
+  return best;
+}
+
+/** Merge a delta state into the accumulated state.
+ *  - Mobile trails: append new points to existing vehicles.
+ *  - Fixed sensors / meta: replace entirely (always current).
+ */
+function _mergeStateDelta(acc, delta) {
+  // Replace top-level fields the server always sends in full.
+  acc.ts = delta.ts;
+  acc.meta = delta.meta;
+  acc.fixed = delta.fixed;
+
+  // Merge mobile trails.
+  const deltaM = Array.isArray(delta.mobile) ? delta.mobile : [];
+  const accById = new Map();
+  const accMobiles = Array.isArray(acc.mobile) ? acc.mobile : [];
+  for (const m of accMobiles) {
+    if (m && m.id != null) accById.set(String(m.id), m);
+  }
+
+  for (const dm of deltaM) {
+    if (!dm || dm.id == null) continue;
+    const id = String(dm.id);
+    const existing = accById.get(id);
+    if (!existing) {
+      // New vehicle — add as-is.
+      accMobiles.push(dm);
+      accById.set(id, dm);
+      continue;
+    }
+    // Append new trail points.
+    const newPts = Array.isArray(dm.trail) ? dm.trail : [];
+    if (newPts.length > 0) {
+      const oldTrail = Array.isArray(existing.trail) ? existing.trail : [];
+      existing.trail = oldTrail.concat(newPts);
+    }
+    // Update non-trail fields (readings, ghosted, color, etc.)
+    for (const k of Object.keys(dm)) {
+      if (k !== "trail" && k !== "id") existing[k] = dm[k];
+    }
+  }
+
+  // Remove vehicles that disappeared from the server response.
+  const deltaIds = new Set(deltaM.map(m => m && m.id != null ? String(m.id) : null).filter(Boolean));
+  acc.mobile = accMobiles.filter(m => m && m.id != null && deltaIds.has(String(m.id)));
+
+  return acc;
+}
+
 async function fetchState() {
-  const url = _tokUrl(`${appConfig.apiBaseUrl}/state`);
+  let url = _tokUrl(`${appConfig.apiBaseUrl}/state`);
+  // Delta delivery: ask the server to strip trail points we already have.
+  if (_newestTrailMs != null) {
+    const sep = url.includes("?") ? "&" : "?";
+    url = `${url}${sep}since_ms=${_newestTrailMs}`;
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15000); // 15s timeout
   try {
-    const res = await fetch(url, { cache: "no-store", signal: controller.signal });
+    const headers = {};
+    if (_stateEtag) headers["If-None-Match"] = _stateEtag;
+    const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers });
+    if (res.status === 304 && _accumulatedState) return _accumulatedState;
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
+    _stateEtag = res.headers.get("ETag") || null;
+    const payload = await res.json();
+
+    // Merge or replace accumulated state.
+    if (payload.meta?.delta && _accumulatedState) {
+      _mergeStateDelta(_accumulatedState, payload);
+    } else {
+      // First fetch or full payload — replace entirely.
+      _accumulatedState = payload;
+    }
+
+    // Track newest trail timestamp for next delta request.
+    const nms = _extractNewestTrailMs(_accumulatedState);
+    if (nms != null) _newestTrailMs = nms;
+
+    _stateCached = _accumulatedState;
+    return _accumulatedState;
   } finally {
     clearTimeout(timer);
   }
@@ -3765,7 +3889,7 @@ function main() {
     });
   }
 
-  const POLL_MS = 30000;  // fallback poll interval (ms) if server doesn't specify
+  const POLL_MS = 120000;  // 2-min fallback poll interval (PurpleAir updates ~every 2 min)
   let _tickTimeout = null; // dynamic poll scheduler handle
   let _tickInFlight = false;
   let _tickInFlightSince = 0;  // perf timestamp when _tickInFlight was set

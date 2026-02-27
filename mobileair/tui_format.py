@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .aqi import AQI_COLOR_PALETTE
+
 
 # Pollutant display order - always show in this exact order
 POLLUTANT_ORDER = ["PM25", "PM10", "OZNE"]
@@ -161,7 +163,7 @@ def get_pollutant_columns(readings: dict[str, Any]) -> list[dict[str, Any]]:
         
         if reading and isinstance(reading, dict):
             value = reading.get("value")
-            color = reading.get("color", "#888888")
+            color = AQI_COLOR_PALETTE[reading.get("ci", 0)]
             has_value = value is not None
             formatted = format_value(value)
             trend_symbol, trend_color = get_trend_symbol(reading, pollutant)

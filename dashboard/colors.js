@@ -1,4 +1,22 @@
+// AQI color palette — must stay in sync with mobileair/aqi.py AQI_COLOR_PALETTE.
+// Server sends integer indices; safeHex() expands them to hex strings.
+const AQI_PALETTE = [
+  "#cccccc",  // 0  unknown / no data
+  "#00FFFF",  // 1  cyan    – Good (very low)
+  "#00CCFF",  // 2  lt-blue – Good
+  "#0099FF",  // 3  blue    – Good
+  "#00E400",  // 4  green   – Good
+  "#009900",  // 5  dk-green– O3 Good
+  "#006600",  // 6  dkr-green–O3 Good
+  "#FFFF00",  // 7  yellow  – Moderate
+  "#FF7E00",  // 8  orange  – USG
+  "#FF0000",  // 9  red     – Unhealthy
+  "#8F3F97",  // 10 purple  – Very Unhealthy
+  "#7E0023",  // 11 maroon  – Hazardous
+];
+
 function safeHex(c) {
+  if (typeof c === "number") return AQI_PALETTE[c] || "#cccccc";
   if (!c) return "#3388ff";
   let s = String(c).trim();
   if (s.startsWith("dim ")) s = s.slice(4).trim();

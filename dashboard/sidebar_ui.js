@@ -184,7 +184,7 @@ function updateSidebarPlaybackValues() {
         if (vEl.textContent !== newVal) {
           vEl.textContent = newVal;
         }
-        const newColor = safeHex(r.color);
+        const newColor = safeHex(r.ci);
         if (vEl.style.color !== newColor) {
           vEl.style.color = newColor;
         }
@@ -284,7 +284,7 @@ function renderDetails(state, selectedId) {
   const metrics = [];
   for (const k of keys) {
     const val = readings[k]?.value;
-    const col = safeHex(readings[k]?.color);
+    const col = safeHex(readings[k]?.ci);
     const aqi = valueToAqi(k, val);
     const lvl = aqiLevel(aqi);
     metrics.push({

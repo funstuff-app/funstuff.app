@@ -504,6 +504,27 @@
     appWindow.addEventListener("mousedown", function () { _bringToFront("__main"); });
   }
 
+  /* Transparent click-guard overlays over each iframe viewport.
+     When main is not the focused window, the guards intercept the first
+     mousedown, call _bringToFront("__main"), then get out of the way.
+     This is purely parent-side and works in all browsers including Safari. */
+  var _iframeGuards = [];
+  document.querySelectorAll(".demo-viewport").forEach(function (vp) {
+    var guard = document.createElement("div");
+    guard.style.cssText = "position:absolute;inset:0;z-index:10;pointer-events:none;";
+    guard.addEventListener("mousedown", function () {
+      _bringToFront("__main");
+    });
+    vp.appendChild(guard);
+    _iframeGuards.push(guard);
+  });
+
+  function _setIframeGuards(active) {
+    for (var i = 0; i < _iframeGuards.length; i++) {
+      _iframeGuards[i].style.pointerEvents = active ? "auto" : "none";
+    }
+  }
+
   function _bringToFront(id) {
     _topZ++;
     var w = _deskWins[id];
@@ -532,6 +553,7 @@
        When any other window is focused, deactivate all section buttons. */
     if (id === "__main") {
       _setActiveSection(_activeSection);
+      _setIframeGuards(false); /* main is active — let clicks reach iframes directly */
     } else {
       /* Deactivate main button and all section buttons */
       if (tbMainBtn) tbMainBtn.classList.remove("active");
@@ -539,6 +561,7 @@
         var btn = _sectionBtns[key];
         if (btn) btn.classList.remove("active");
       });
+      _setIframeGuards(true); /* main is inactive — intercept next iframe click */
     }
   }
 

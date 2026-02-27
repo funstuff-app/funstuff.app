@@ -219,7 +219,7 @@ class TestTracksAndDashboardState(unittest.TestCase):
         self.assertEqual(len(tracks["BUS1"]), 2)
         self.assertEqual(tracks["BUS1"][0]["t"], "2025-12-12 10:00:00 UTC")
         self.assertIn("readings", tracks["BUS1"][0])
-        self.assertEqual(tracks["BUS1"][0]["readings"]["PM25"]["color"], "#00FFFF")
+        self.assertEqual(tracks["BUS1"][0]["readings"]["PM25"]["ci"], 1)  # #00FFFF = palette index 1
 
     def test_normalize_state_for_dashboard_has_mobile_and_trail(self):
         combined = {
@@ -241,9 +241,6 @@ class TestTracksAndDashboardState(unittest.TestCase):
             custom_names={"BUS13": "Demo"},
             pinned_sensors={"BUS13"},
             max_points=200,
-            mobile_url="m",
-            fixed_url="f",
-            data_dir="/tmp",
         )
         self.assertIn("mobile", st)
         self.assertEqual(len(st["mobile"]), 1)
@@ -272,11 +269,7 @@ class TestTracksAndDashboardState(unittest.TestCase):
             combined,
             custom_names={},
             pinned_sensors=set(),
-
             max_points=200,
-            mobile_url="m",
-            fixed_url="f",
-            data_dir="/tmp",
         )
         self.assertIn("meta", st)
         ts = st["meta"].get("last_position_change_ts")
@@ -313,16 +306,12 @@ class TestTracksAndDashboardState(unittest.TestCase):
             combined,
             custom_names={},
             pinned_sensors=set(),
-
             max_points=200,
-            mobile_url="m",
-            fixed_url="f",
-            data_dir="/tmp",
         )
         m = st["mobile"][0]
         self.assertEqual(m["primary_key"], "OZNE")
         self.assertEqual(m["primary_value"], "70")
-        self.assertEqual(m["primary_color"], "#FFFF00")
+        self.assertEqual(m["pci"], 7)  # #FFFF00 = palette index 7 (yellow – Moderate)
 
     def test_marker_primary_prefers_pm10_when_it_has_higher_aqi(self):
         # Repro for the dashboard issue: ozone in ppb (32) is "Good", but PM10 in the 400s is Hazardous.
@@ -354,9 +343,6 @@ class TestTracksAndDashboardState(unittest.TestCase):
             custom_names={},
             pinned_sensors=set(),
             max_points=200,
-            mobile_url="m",
-            fixed_url="f",
-            data_dir="/tmp",
         )
         m = st["mobile"][0]
         self.assertEqual(m["primary_key"], "PM10")
@@ -416,9 +402,6 @@ class TestTracksAndDashboardState(unittest.TestCase):
             custom_names={},
             pinned_sensors=set(),
             max_points=200,
-            mobile_url="m",
-            fixed_url="f",
-            data_dir="/tmp",
         )
         self.assertEqual(st["mobile"][0]["emoji"], "🚃")
 
@@ -466,9 +449,6 @@ class TestTracksAndDashboardState(unittest.TestCase):
             custom_names={},
             pinned_sensors=set(),
             max_points=200,
-            mobile_url="m",
-            fixed_url="f",
-            data_dir="/tmp",
         )
         self.assertTrue(st["mobile"])
         m = st["mobile"][0]
@@ -521,9 +501,6 @@ class TestTracksAndDashboardState(unittest.TestCase):
             custom_names={},
             pinned_sensors=set(),
             max_points=200,
-            mobile_url="m",
-            fixed_url="f",
-            data_dir="/tmp",
         )
         self.assertTrue(st["mobile"])
         m = next((x for x in st["mobile"] if x.get("id") == "BUS10"), None)

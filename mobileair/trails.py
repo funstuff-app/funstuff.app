@@ -10,7 +10,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
-from .aqi import color_for_value
+from .aqi import color_for_value, color_to_idx
 from .utils import parse_utc_timestamp, haversine_distance, coerce_float, median
 
 
@@ -95,7 +95,7 @@ def extract_mobile_tracks(
                     # Always compute color from value using our EPA 2024 scale.
                     # API ValueColor uses Utah AQ's own scale which differs.
                     color = color_for_value(pollutant_key, v)
-                    s_map[key]["readings"][str(pollutant_key)] = {"value": v, "color": color}
+                    s_map[key]["readings"][str(pollutant_key)] = {"value": v, "ci": color_to_idx(color)}
 
     out: dict[str, list[dict[str, Any]]] = {}
     for sensor_id, m in per_sensor.items():

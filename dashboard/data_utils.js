@@ -36,7 +36,7 @@ function primaryReadingKeyedFromPoint(p) {
   const w = pickWorstReadingKey(readings);
   if (!w || !w.key || !readings[w.key]) return null;
   const r = readings[w.key];
-  return { key: w.key, value: r?.value, color: safeHex(r?.color), aqi: w.aqi };
+  return { key: w.key, value: r?.value, color: safeHex(r?.ci), aqi: w.aqi };
 }
 
 function primaryReadingForSensor(s) {
@@ -46,12 +46,12 @@ function primaryReadingForSensor(s) {
   if (w && w.key && readings[w.key]) {
     // Always trust the actual readings (same source used for trail coloring & details panel).
     // Server primary_key can be stale/mismatched vs readings and causes “ozone wins” labels.
-    return { key: w.key, value: readings[w.key].value, color: safeHex(readings[w.key].color), aqi: w.aqi };
+    return { key: w.key, value: readings[w.key].value, color: safeHex(readings[w.key].ci), aqi: w.aqi };
   }
 
   // Fallback: if AQI couldn't be computed, use server hint if present.
   if (s && s.primary_key != null) {
-    return { key: s.primary_key, value: s.primary_value, color: safeHex(s.primary_color) };
+    return { key: s.primary_key, value: s.primary_value, color: safeHex(s.pci) };
   }
   return { key: null, value: null, color: "#ffffff" };
 }
@@ -99,7 +99,7 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
     
     const times = r.history_times;
     const values = r.history;
-    const colors = r.history_colors || [];
+    const colors = r.hci || [];
 
     // Cache parsed/filtered timeline on the reading object to avoid re-parsing
     // parseUtcMs + filtering on every frame. The source arrays are immutable
@@ -116,7 +116,7 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
         if (v == null) continue;
         timesMs.push(tMs);
         valuesF.push(v);
-        colorsF.push(colors[i] || r.color || "#cccccc");
+        colorsF.push(colors[i] != null ? colors[i] : (r.ci ?? 0));
       }
       r._parsedTimeline = { timesMs, valuesF, colorsF, _srcLen: times.length };
     }
@@ -150,11 +150,11 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
     
     result[key] = {
       value: valuesF[idx],
-      color: colorsF[idx] || r.color || "#cccccc",
+      color: colorsF[idx] ?? r.ci ?? 0,
       // Keep original arrays for sparklines
       history: values,
       history_times: times,
-      history_colors: colors,
+      hci: colors,
       scrubbed: r.scrubbed || 0,
     };
   }

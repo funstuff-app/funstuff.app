@@ -68,9 +68,6 @@ class TestStalenessGhosting(unittest.TestCase):
             custom_names={},
             pinned_sensors=set(),
             max_points=200,
-            mobile_url="test://mobile",
-            fixed_url="test://fixed", 
-            data_dir="/tmp",
         )
         
         mobile_sensors = result.get("mobile", [])
@@ -126,9 +123,6 @@ class TestStalenessGhosting(unittest.TestCase):
             custom_names={},
             pinned_sensors=set(),
             max_points=200,
-            mobile_url="test://mobile",
-            fixed_url="test://fixed",
-            data_dir="/tmp",
         )
         
         mobile_sensors = result.get("mobile", [])

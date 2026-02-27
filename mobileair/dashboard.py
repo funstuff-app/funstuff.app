@@ -14,6 +14,8 @@ from .aqi import (
     value_to_aqi,
     aqi_level,
     color_for_value,
+    color_to_idx,
+    AQI_COLOR_PALETTE,
     filter_history_outliers,
     normalize_pollutant_key,
 )
@@ -30,17 +32,17 @@ if TYPE_CHECKING:
     from .roads import RoadGraph
 
 
-def _pick_primary_reading_color(readings: dict[str, Any]) -> str:
-    """Pick a color from readings, preferring PM25, then PM10, then OZNE."""
+def _pick_primary_reading_color(readings: dict[str, Any]) -> int:
+    """Pick a color index from readings, preferring PM25, then PM10, then OZNE."""
     priority = ["PM25", "PM2.5", "PM10", "OZNE", "Ozone", "NO2", "CO"]
     for k in priority:
         v = readings.get(k)
-        if isinstance(v, dict) and isinstance(v.get("color"), str):
-            return v["color"]
+        if isinstance(v, dict) and isinstance(v.get("ci"), int):
+            return v["ci"]
     for v in readings.values():
-        if isinstance(v, dict) and isinstance(v.get("color"), str):
-            return v["color"]
-    return "#3388ff"
+        if isinstance(v, dict) and isinstance(v.get("ci"), int):
+            return v["ci"]
+    return 0
 
 
 def _pick_primary_pollutant_key(readings: dict[str, Any]) -> str | None:
@@ -74,13 +76,13 @@ def _pick_worst_reading_by_aqi(readings: dict[str, Any]) -> dict[str, Any]:
     Returns {key, value, color, aqi} (aqi may be None).
     Filters out implausible values (sensor noise) before picking.
     """
-    best = {"key": None, "value": None, "color": "#ffffff", "aqi": None}
+    best = {"key": None, "value": None, "ci": 0, "aqi": None}
     best_aqi = -1.0
     for k, v in readings.items():
         if not isinstance(v, dict):
             continue
         val = v.get("value")
-        col = v.get("color") or "#ffffff"
+        ci = v.get("ci", 0)
         
         # Skip implausible values (sensor noise like OZNE=1472)
         if not _is_plausible_value(k, val):
@@ -93,13 +95,13 @@ def _pick_worst_reading_by_aqi(readings: dict[str, Any]) -> dict[str, Any]:
             aqi_f = -1.0
         if aqi_f > best_aqi:
             best_aqi = aqi_f
-            best = {"key": str(k), "value": val, "color": col, "aqi": aqi_f if aqi_f >= 0 else None}
+            best = {"key": str(k), "value": val, "ci": ci, "aqi": aqi_f if aqi_f >= 0 else None}
 
     # If no AQI could be computed, fall back to priority key ordering.
     if best["key"] is None:
         k0 = _pick_primary_pollutant_key(readings)
         if k0 and isinstance(readings.get(k0), dict):
-            return {"key": k0, "value": readings[k0].get("value"), "color": readings[k0].get("color") or "#ffffff", "aqi": None}
+            return {"key": k0, "value": readings[k0].get("value"), "ci": readings[k0].get("ci", 0), "aqi": None}
     return best
 
 
@@ -109,9 +111,6 @@ def normalize_state_for_dashboard(
     custom_names: dict[str, str] | None = None,
     pinned_sensors: set[str] | None = None,
     max_points: int = 200,
-    mobile_url: str,
-    fixed_url: str,
-    data_dir: str,
     road_graph: "RoadGraph | None" = None,
     tram_line_graph: "RoadGraph | None" = None,
 ) -> dict[str, Any]:
@@ -122,9 +121,6 @@ def normalize_state_for_dashboard(
         custom_names: Custom display names for sensors.
         pinned_sensors: Set of sensor IDs that are pinned.
         max_points: Maximum trail points per sensor.
-        mobile_url: URL for mobile data (for metadata).
-        fixed_url: URL for fixed data (for metadata).
-        data_dir: Data directory path (for metadata).
         road_graph: Optional RoadGraph instance for map matching (buses, etc).
         tram_line_graph: Optional RoadGraph for TRAX/tram vehicles (built from GPS traces).
 
@@ -373,9 +369,9 @@ def normalize_state_for_dashboard(
                         )
                     readings[str(pollutant_key)] = {
                         "value": v,
-                        "color": color_for_value(str(pollutant_key), v),
+                        "ci": color_to_idx(color_for_value(str(pollutant_key), v)),
                         "history": filtered_vals,
-                        "history_colors": [color_for_value(str(pollutant_key), hv) for hv in filtered_vals],
+                        "hci": [color_to_idx(color_for_value(str(pollutant_key), hv)) for hv in filtered_vals],
                         "scrubbed": len(removed_vals),
                     }
 
@@ -403,10 +399,10 @@ def normalize_state_for_dashboard(
                 "forced_active": forced_active,
                 "ghosted": ghosted,
                 "stale": stale,
-                "color": _pick_primary_reading_color(readings),
+                "ci": _pick_primary_reading_color(readings),
                 "primary_key": worst.get("key"),
                 "primary_value": worst.get("value"),
-                "primary_color": worst.get("color"),
+                "pci": worst.get("ci"),
                 "primary_aqi": worst.get("aqi"),
             }
         )
@@ -434,7 +430,7 @@ def normalize_state_for_dashboard(
                 if lat_f is None or lon_f is None:
                     continue
                 entry = fixed_by_sensor.setdefault(sensor_id, {"id": sensor_id, "lat": lat_f, "lon": lon_f, "readings": {}})
-                entry["readings"][str(pollutant_key)] = {"value": s_data.get("Value"), "color": color_for_value(str(pollutant_key), s_data.get("Value"))}
+                entry["readings"][str(pollutant_key)] = {"value": s_data.get("Value"), "ci": color_to_idx(color_for_value(str(pollutant_key), s_data.get("Value")))}
         
         for s_id, entry in fixed_by_sensor.items():
             name = custom_names.get(s_id) or ""
@@ -449,10 +445,10 @@ def normalize_state_for_dashboard(
                     "lat": entry.get("lat"),
                     "lon": entry.get("lon"),
                     "readings": readings,
-                    "color": _pick_primary_reading_color(readings),
+                    "ci": _pick_primary_reading_color(readings),
                     "primary_key": worst.get("key"),
                     "primary_value": worst.get("value"),
-                    "primary_color": worst.get("color"),
+                    "pci": worst.get("ci"),
                     "primary_aqi": worst.get("aqi"),
                 }
             )
@@ -485,9 +481,6 @@ def normalize_state_for_dashboard(
 
     meta: dict[str, Any] = {
         "max_points": max_points,
-        "mobile_url": mobile_url,
-        "fixed_url": fixed_url,
-        "data_dir": data_dir,
         "last_position_change_ts": ui_ts,
         "fixed_outliers": sorted(list(fixed_outliers)) if fixed_outliers else [],
     }

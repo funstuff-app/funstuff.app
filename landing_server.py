@@ -67,11 +67,11 @@ class LandingHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
 
-        # Cache: HTML short, assets longer
+        # Cache: HTML short, assets shorter for dev iteration
         if mime == "text/html":
             self.send_header("Cache-Control", "public, max-age=300")
         else:
-            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Cache-Control", "public, max-age=3600")
 
         # Security headers
         self.send_header("X-Content-Type-Options", "nosniff")

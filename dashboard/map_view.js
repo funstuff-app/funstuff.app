@@ -1987,10 +1987,20 @@ class MapView {
     }
 
     // hit test markers (emoji halo radius ~18), mobile + fixed
+    // Search in reverse render order so the topmost (last-drawn) marker wins.
+    // Render order (bottom→top): PurpleAir fixed → other fixed → non-selected mobiles → selected mobile.
+    // Hit-test order is the exact reverse.
     let hit = null;
+    const selParsed = parseKey(this.selectedId);
+    const selMobileId = (selParsed && selParsed.type === "mobile") ? String(selParsed.id) : null;
+    const allMobileCands = mobiles.map(m => ({ type: "mobile", ...m }));
+    const topMobileCand = selMobileId ? allMobileCands.find(m => String(m.id) === selMobileId) : null;
+    const otherMobileCands = selMobileId ? allMobileCands.filter(m => String(m.id) !== selMobileId) : [...allMobileCands];
     const candidates = [
-      ...mobiles.map(m => ({ type: "mobile", ...m })),
-      ...fixed.map(f => ({ type: "fixed", ...f })),
+      ...(topMobileCand ? [topMobileCand] : []),
+      ...[...otherMobileCands].reverse(),
+      ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
+      ...[...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
     ];
     for (const m of candidates) {
       let lat = Number(m.lat), lon = Number(m.lon);
@@ -2029,10 +2039,19 @@ class MapView {
     const mobiles = st && Array.isArray(st.mobile) ? st.mobile : [];
     const fixed = st && Array.isArray(st.fixed) ? st.fixed : [];
 
+    // Search in reverse render order so the topmost (last-drawn) marker wins.
+    // Render order (bottom→top): PurpleAir fixed → other fixed → non-selected mobiles → selected mobile.
     let hit = null;
+    const tapSelParsed = parseKey(this.selectedId);
+    const tapSelMobileId = (tapSelParsed && tapSelParsed.type === "mobile") ? String(tapSelParsed.id) : null;
+    const tapAllMobileCands = mobiles.map(m => ({ type: "mobile", ...m }));
+    const tapTopMobileCand = tapSelMobileId ? tapAllMobileCands.find(m => String(m.id) === tapSelMobileId) : null;
+    const tapOtherMobileCands = tapSelMobileId ? tapAllMobileCands.filter(m => String(m.id) !== tapSelMobileId) : [...tapAllMobileCands];
     const candidates = [
-      ...mobiles.map(m => ({ type: "mobile", ...m })),
-      ...fixed.map(f => ({ type: "fixed", ...f })),
+      ...(tapTopMobileCand ? [tapTopMobileCand] : []),
+      ...[...tapOtherMobileCands].reverse(),
+      ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
+      ...[...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
     ];
     for (const m of candidates) {
       let lat = Number(m.lat), lon = Number(m.lon);
@@ -2683,7 +2702,7 @@ class MapView {
       const pinChanged = (Boolean(prevPin) !== Boolean(nextPin))
         || (prevPin && nextPin && (haversineMeters(prevPin.lat, prevPin.lon, nextPin.lat, nextPin.lon) > 1.0));
 
-      const nextColor = safeHex(m.color);
+      const nextColor = safeHex(m.ci);
       const metaChanged = (prev.color !== nextColor) || (prev.ghosted !== nextGhosted) || (prevParked !== nextParked);
 
       if (appendedCount > 0 || metaChanged || pinChanged) {
@@ -5178,7 +5197,7 @@ class MapView {
         const isSel = (this.selectedId === keyF);
         const emoji = f.purpleair ? "" : (f.emoji || "📍");
         const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id;
-        const color = safeHex(f.color);
+        const color = safeHex(f.ci);
         const pr = primaryReadingForFixedAtTime(f, this.getPlaybackTimeMs());
 
         ctx.save();
@@ -6523,7 +6542,7 @@ class MapView {
         const isSel = (this.selectedId === key);
         const emoji = f.purpleair ? "" : (f.emoji || "📍");
         const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id;
-        const color = safeHex(f.color);
+        const color = safeHex(f.ci);
         let pr;
         const interpCacheKey = (fixedPbTimeMs != null && isFinite(fixedPbTimeMs))
           ? `${f.id}|${Math.round(fixedPbTimeMs / 1000)}`
@@ -6689,7 +6708,7 @@ class MapView {
 
       const emoji = m.emoji || "🚌";
       const label = (m.name && m.name.length && String(m.name) !== String(m.id)) ? m.name : m.id;
-      const color0 = safeHex(m.color);
+      const color0 = safeHex(m.ci);
       const color = isParked ? dimHex(color0, 0.65) : color0;
       // Base reading: worst AQI from the *full* sensor readings snapshot.
       // Important: trail points often carry only a subset of pollutants (commonly ozone-only),
