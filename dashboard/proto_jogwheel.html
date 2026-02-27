@@ -1,0 +1,777 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Proto B — Jog Wheel Shuttle</title>
+  <style>
+    :root {
+      --bg: #0c121c;
+      --glass-bg: rgba(12, 18, 28, 0.86);
+      --border: rgba(255,255,255,0.10);
+      --accent: #6cc3ff;
+      --accent-glow: rgba(108,195,255,0.35);
+      --accent-dim: rgba(108,195,255,0.12);
+      --muted: rgba(147,164,186,0.92);
+      --btn-bg: rgba(17,24,38,0.80);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+      background: var(--bg);
+      background-image: radial-gradient(circle at 50% 60%, rgba(108,195,255,0.02) 0%, transparent 50%);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      align-items: center;
+      padding-bottom: 60px;
+      overflow: hidden;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    .playback-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: var(--glass-bg);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      width: 720px;
+      max-width: calc(100% - 24px);
+      touch-action: none;
+    }
+
+    .row-main {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .btn-play {
+      height: 44px;
+      min-width: 56px;
+      padding: 0 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--btn-bg);
+      color: rgba(232,238,247,0.92);
+      font-size: 13px;
+      cursor: pointer;
+      flex-shrink: 0;
+      font-family: inherit;
+    }
+    .btn-play:hover { border-color: rgba(255,255,255,0.18); }
+
+    .speed-ctl select {
+      height: 44px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--btn-bg);
+      color: rgba(232,238,247,0.92);
+      padding: 0 10px;
+      font-size: 12px;
+      font-family: inherit;
+    }
+
+    /* ─── Jog Wheel ─── */
+    .jog-wrap {
+      flex: 1;
+      min-width: 0;
+      position: relative;
+      height: 44px;
+      overflow: visible;
+      cursor: grab;
+      touch-action: none;
+    }
+    .jog-wrap:active { cursor: grabbing; }
+
+    /* Slot recess — the channel the barrel sits in */
+    .jog-slot {
+      position: absolute;
+      inset: 0;
+      border-radius: 8px;
+      background: #020406;
+      box-shadow: inset 0 1px 3px rgba(0,0,0,0.6), inset 0 -1px 2px rgba(0,0,0,0.3);
+    }
+
+    /* Barrel clip — inset to show slot edges */
+    .jog-clip {
+      position: absolute;
+      left: 0; right: 0;
+      top: 3px; bottom: 3px;
+      overflow: hidden;
+      clip-path: url(#barrelClip);
+    }
+
+    .jog-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Playhead */
+    .jog-playhead {
+      position: absolute;
+      left: 50%; top: 0; bottom: 0;
+      width: 2px;
+      transform: translateX(-50%);
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent-glow), 0 0 4px var(--accent-glow);
+      z-index: 3;
+      pointer-events: none;
+    }
+    .jog-playhead::before {
+      content: '';
+      position: absolute;
+      top: -1px; left: 50%; transform: translateX(-50%);
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-top: 5px solid var(--accent);
+      filter: drop-shadow(0 0 3px var(--accent-glow));
+    }
+    .jog-playhead::after {
+      content: '';
+      position: absolute;
+      bottom: -1px; left: 50%; transform: translateX(-50%);
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-bottom: 5px solid var(--accent);
+      filter: drop-shadow(0 0 3px var(--accent-glow));
+    }
+
+    .jog-progress {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      height: 2px; z-index: 2;
+      pointer-events: none;
+    }
+    .jog-progress-fill {
+      height: 100%; width: 0%;
+      background: var(--accent-dim);
+      transition: width 0.06s linear;
+    }
+
+    .ghost-dots {
+      position: absolute;
+      top: -22px; left: 50%;
+      transform: translateX(-50%);
+      display: flex; gap: 8px;
+      z-index: 10;
+      pointer-events: none;
+      opacity: 0;
+    }
+    .ghost-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 35%,
+        rgba(108,195,255,0.55),
+        rgba(108,195,255,0.20) 60%,
+        rgba(108,195,255,0.05) 100%
+      );
+      box-shadow: 0 0 10px rgba(108,195,255,0.30);
+      transition: transform 0.08s ease-out;
+    }
+    .ghost-dots::before {
+      content: '';
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 14px; height: 1px;
+      background: rgba(108,195,255,0.18);
+      border-radius: 1px;
+    }
+
+    .row-time {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: var(--muted);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      padding: 0 68px;
+      gap: 2px;
+    }
+    .row-time .sep { opacity: 0.35; }
+    .row-time .now { color: var(--accent); opacity: 0.85; }
+
+    .debug-bar {
+      position: fixed;
+      top: 16px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 24px;
+      font-family: "SF Mono", "Menlo", monospace;
+      font-size: 11px;
+      color: rgba(147,164,186,0.35);
+      font-variant-numeric: tabular-nums;
+    }
+    .proto-label {
+      position: fixed; top: 16px; left: 20px;
+      color: rgba(147,164,186,0.45);
+      font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase;
+    }
+    .replay-btn {
+      position: fixed; top: 14px; right: 20px;
+      background: var(--btn-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      padding: 6px 14px; font-size: 12px;
+      cursor: pointer; font-family: inherit;
+    }
+    .replay-btn:hover { border-color: rgba(255,255,255,0.2); color: #fff; }
+  </style>
+</head>
+<body>
+  <span class="proto-label">Proto B — Jog Wheel</span>
+  <button class="replay-btn" id="replayBtn">↻ Replay Hint</button>
+
+  <div class="debug-bar">
+    <span>vel <span id="dbgVel">0.00</span></span>
+    <span>pos <span id="dbgPos">50.0%</span></span>
+    <span>coast <span id="dbgCoast">—</span></span>
+    <span>light <span id="dbgLight">●</span></span>
+  </div>
+
+  <div class="playback-bar" id="bar">
+    <div class="row-main">
+      <button class="btn-play" id="btnPlay">Live</button>
+
+      <div class="jog-wrap" id="jogWrap">
+        <svg width="0" height="0" style="position:absolute">
+          <defs>
+            <clipPath id="barrelClip" clipPathUnits="objectBoundingBox">
+              <path d="
+                M 0.00, 0.50
+                C 0.00, 0.12  0.04, 0.00  0.10, 0.00
+                L 0.90, 0.00
+                C 0.96, 0.00  1.00, 0.12  1.00, 0.50
+                C 1.00, 0.88  0.96, 1.00  0.90, 1.00
+                L 0.10, 1.00
+                C 0.04, 1.00  0.00, 0.88  0.00, 0.50
+                Z
+              " />
+            </clipPath>
+          </defs>
+        </svg>
+
+        <div class="jog-slot"></div>
+        <div class="jog-clip" id="jogClip">
+          <canvas class="jog-canvas" id="jogCanvas"></canvas>
+        </div>
+        <div class="jog-playhead" id="jogPlayhead"></div>
+        <div class="jog-progress"><div class="jog-progress-fill" id="jogProgress"></div></div>
+
+        <div class="ghost-dots" id="ghostDots">
+          <span class="ghost-dot"></span>
+          <span class="ghost-dot"></span>
+        </div>
+      </div>
+
+      <div class="speed-ctl">
+        <select>
+          <option>1×</option>
+          <option selected>5×</option>
+          <option>10×</option>
+          <option>20×</option>
+          <option>60×</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row-time">
+      <span id="tLeft">11:00 AM</span>
+      <span class="sep">·</span>
+      <span id="tNow" class="now">12:00 PM</span>
+      <span class="sep">·</span>
+      <span id="tRight">1:00 PM</span>
+    </div>
+  </div>
+
+  <script>
+    /* ═══════════════════════════════════════════════════════════════════════════
+     *  JOG WHEEL — painted layer by layer like a game artist would.
+     *
+     *  Layer 1: Barrel body — vertical gradient for cylinder curvature.
+     *           Bright specular band near top, dark underside.
+     *  Layer 2: Slot shadow — hard dark bands at top/bottom edges where
+     *           the slot lip occludes light from reaching the barrel.
+     *  Layer 3: Ridges — repeating vertical pattern. Each ridge has a
+     *           bright edge (lit) and dark edge (shadow). Which side is
+     *           which depends on light direction.
+     *  Layer 4: Horizontal light position — barrel is brighter toward the
+     *           light and darker away from it.
+     *  Layer 5: Edge foreshortening — barrel curves away at left/right.
+     *
+     *  Mouse X position controls where the light is coming from.
+     *  This shifts: specular band position, ridge shadow direction,
+     *  and the horizontal brightness distribution.
+     * ═══════════════════════════════════════════════════════════════════════════ */
+
+    const jogWrap     = document.getElementById('jogWrap');
+    const jogClip     = document.getElementById('jogClip');
+    const jogCanvas   = document.getElementById('jogCanvas');
+    const jogPlayhead = document.getElementById('jogPlayhead');
+    const jogProgress = document.getElementById('jogProgress');
+    const ghostDots   = document.getElementById('ghostDots');
+    const dbgVel      = document.getElementById('dbgVel');
+    const dbgPos      = document.getElementById('dbgPos');
+    const dbgCoast    = document.getElementById('dbgCoast');
+    const dbgLight    = document.getElementById('dbgLight');
+    const tNow        = document.getElementById('tNow');
+    const ctx         = jogCanvas.getContext('2d');
+
+    const TIMELINE_MS    = 2 * 60 * 60 * 1000;
+    const TIMELINE_START = new Date();
+    TIMELINE_START.setHours(11, 0, 0, 0);
+
+    const _pbFriction          = 0.997;
+    const _pbWheelFriction     = 0.985;
+    const _pbVelocityThreshold = 0.1;
+    const _pbWheelImpulse      = 1.0;
+    const _pbWheelDecay        = 0.8;
+
+    const BARREL_ROTATIONS     = 10;
+    const GROOVE_SPACING        = 0.11;
+
+    /* Light X: -0.5 (left) to +0.5 (right). Updated by mouse. */
+    let lightX = 0.08;
+
+    let _pbVelocity = 0, _pbWheelAccum = 0, _pbIsWheelCoasting = false;
+    let _pbLastPerf = 0, _pbScrubbing = false;
+    let position = 0.5;
+    let lastPtrX = 0, lastPtrTime = 0, dragVelocity = 0;
+    let hintDismissed = false;
+
+    function getBarrelAngle() {
+      return -position * BARREL_ROTATIONS * 2 * Math.PI;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════════
+     *  TOROID MODEL with machined radial grooves + normal-mapped lighting.
+     *
+     *  Geometry:
+     *    The barrel is a squat toroid (donut cross-section). For each pixel
+     *    we compute the actual 3D surface point and normal.
+     *
+     *    Grooves reduce the toroid's minor radius at regular angular intervals,
+     *    creating valleys between raised ridges. This means:
+     *      - Ridge tops have full radius → they stick OUT at the top/bottom
+     *        silhouette edges (like the ridges on a quarter).
+     *      - Valleys are recessed → the silhouette dips inward there.
+     *      - Groove walls have tilted normals → they catch/shadow the light
+     *        consistently during rotation, making the motion readable.
+     *
+     *  Lighting:
+     *    Point light positioned by mouse X. Per-pixel diffuse + specular
+     *    from the actual surface normal (toroid curvature + groove perturbation).
+     *    Slot occlusion darkens the top/bottom.
+     * ═══════════════════════════════════════════════════════════════════════════ */
+
+    /* Toroid dimensions (in abstract units, mapped to pixels) */
+    const MAJOR_R  = 1.0;   // center of tube to barrel axis (horizontal sweep)
+    const MINOR_R  = 0.42;  // tube radius (vertical cross-section)
+    const GROOVE_DEPTH = 0.12; // how deep grooves cut into the minor radius
+    const GROOVE_WALL  = 0.06; // fraction of groove period that is wall (each side)
+
+    /* Groove height profile: maps groovePhase (0..1) to radius reduction (0..1).
+     *  0 = ridge top (full radius), 1 = valley floor (reduced by GROOVE_DEPTH).
+     *  Includes the derivative for normal perturbation.
+     */
+    function grooveProfile(u) {
+      // Ridge top: u in [0, 0.35] and [0.95, 1.0]
+      // Left wall: u in [0.35, 0.35+GROOVE_WALL]
+      // Valley:    u in [0.35+GROOVE_WALL, 0.65-GROOVE_WALL]
+      // Right wall: u in [0.65-GROOVE_WALL, 0.65]
+      // Ridge top: u in [0.65, 0.95]
+      const wl = 0.35, wr = 0.65;
+      const gw = GROOVE_WALL;
+      let depth, ddepth; // depth and derivative
+
+      if (u < wl) {
+        depth = 0; ddepth = 0; // ridge top
+      } else if (u < wl + gw) {
+        // Left wall: smooth descent (cosine ease)
+        const t = (u - wl) / gw;
+        const s = t * t * (3 - 2 * t); // smoothstep
+        depth = s;
+        ddepth = 6 * t * (1 - t) / gw; // derivative of smoothstep
+      } else if (u < wr - gw) {
+        depth = 1; ddepth = 0; // valley floor
+      } else if (u < wr) {
+        // Right wall: smooth ascent
+        const t = (u - (wr - gw)) / gw;
+        const s = t * t * (3 - 2 * t);
+        depth = 1 - s;
+        ddepth = -6 * t * (1 - t) / gw;
+      } else {
+        depth = 0; ddepth = 0; // ridge top
+      }
+
+      return { depth, ddepth };
+    }
+
+    function renderBarrel() {
+      const elW = jogClip.offsetWidth;
+      const elH = jogClip.offsetHeight;
+      if (elW < 10 || elH < 5) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      const W = Math.round(elW * dpr);
+      const H = Math.round(elH * dpr);
+
+      if (jogCanvas.width !== W || jogCanvas.height !== H) {
+        jogCanvas.width = W;
+        jogCanvas.height = H;
+        jogCanvas.style.width  = elW + 'px';
+        jogCanvas.style.height = elH + 'px';
+      }
+
+      const imageData = ctx.createImageData(W, H);
+      const data = imageData.data;
+      const barrelAngle = getBarrelAngle();
+
+      // Light direction: from mouse X position, slightly above, toward viewer
+      const lx = lightX * 1.2;
+      const ly = 0.55;
+      const lz = 0.65;
+      const lLen = Math.sqrt(lx*lx + ly*ly + lz*lz);
+      const Lx = lx/lLen, Ly = ly/lLen, Lz = lz/lLen;
+
+      // View direction: straight at the screen
+      const Vz = 1;
+
+      // Half-height of barrel in pixels (the toroid minor radius maps to this)
+      const barrelHalfH = H * 0.5;
+
+      for (let x = 0; x < W; x++) {
+        const xf = x / (W - 1);  // 0..1
+
+        // Cylindrical projection → barrel angle θ
+        const sinT = xf * 2 - 1;
+        if (sinT < -0.998 || sinT > 0.998) continue;
+        const cosT = Math.sqrt(1 - sinT * sinT);
+
+        // Groove phase at this barrel angle
+        const absAngle = Math.asin(sinT) + barrelAngle;
+        const rawPhase = ((absAngle / GROOVE_SPACING) % 1 + 1) % 1;
+        const gp = grooveProfile(rawPhase);
+
+        // Effective minor radius at this point (ridges full, valleys recessed)
+        const effR = MINOR_R - gp.depth * GROOVE_DEPTH;
+
+        // How tall is the barrel at this column (in pixels)
+        const colHalfH = effR / MINOR_R * barrelHalfH;
+        const cy = H * 0.5; // center y
+
+        // Groove foreshortened screen width
+        const grooveScreenW = GROOVE_SPACING * cosT * (W / 2);
+
+        for (let y = 0; y < H; y++) {
+          // Distance from center of barrel cross-section
+          const dy = y - cy;
+          const yNorm = dy / colHalfH; // -1 at top, +1 at bottom
+
+          // Outside the barrel surface → transparent (shows slot behind)
+          if (yNorm < -1.0 || yNorm > 1.0) {
+            const idx = (y * W + x) * 4;
+            data[idx] = 2; data[idx+1] = 4; data[idx+2] = 6; data[idx+3] = 255;
+            continue;
+          }
+
+          // ── Toroid normal computation ──
+          // Cross-section angle φ: top = π/2, center = 0, bottom = -π/2
+          const phi = Math.asin(-yNorm);
+          const cosPhi = Math.cos(phi);
+          const sinPhi = Math.sin(phi);
+
+          // Base toroid normal (no grooves):
+          //   N = (sinθ·cosPhi, sinPhi, cosθ·cosPhi)
+          // This is the outward direction from the tube surface.
+
+          // Groove normal perturbation:
+          // The groove depth varies with barrel angle θ, so the surface
+          // tilts in the tangential direction (around the barrel).
+          // The tilt = d(depth)/dθ = ddepth / GROOVE_SPACING
+          // Tangent vector T = (cosθ, 0, -sinθ)
+          // Perturbed normal: N' = N - tilt × cosPhi × T
+          const tilt = gp.ddepth * GROOVE_DEPTH / GROOVE_SPACING;
+
+          let nx = sinT * cosPhi - tilt * cosPhi * cosT;
+          let ny = sinPhi;
+          let nz = cosT * cosPhi + tilt * cosPhi * sinT;
+
+          // Normalize
+          const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+          nx /= nLen; ny /= nLen; nz /= nLen;
+
+          // ── Diffuse: dot(N, L) ──
+          const NdL = nx*Lx + ny*Ly + nz*Lz;
+          const diffuse = NdL > 0 ? NdL : 0;
+
+          // ── Specular: Phong reflection ──
+          // R = 2(N·L)N - L, spec = max(0, R·V)^n
+          const rz = 2 * NdL * nz - Lz;
+          const sp = rz > 0 ? rz : 0;
+          const sp2 = sp * sp;
+          const sp4 = sp2 * sp2;
+          const sp8 = sp4 * sp4;
+          const specular = sp8 * sp4; // ^12
+
+          // ── Slot occlusion: the physical slot lip blocks light ──
+          // Near the top/bottom of the CLIP REGION (not the barrel)
+          const yClip = y / (H - 1);
+          const topOcc = yClip < 0.10 ? (1 - yClip / 0.10) * 0.65 : 0;
+          const botOcc = yClip > 0.85 ? ((yClip - 0.85) / 0.15) * 0.50 : 0;
+          const occlusion = 1 - topOcc - botOcc;
+
+          // ── Ridge ambient occlusion: valleys are slightly darker ──
+          const aoValley = 1 - gp.depth * 0.15;
+
+          // ── Horizontal falloff: barrel edges curve away ──
+          const hFalloff = 0.18 + 0.82 * cosT * cosT;
+
+          // ── Combine ──
+          const ambient = 0.14;
+          let brightness = (ambient + diffuse * 0.70) * occlusion * aoValley * hFalloff;
+          if (brightness < 0) brightness = 0;
+
+          // ── Color ──
+          let r = 6  + brightness * 58;
+          let g = 10 + brightness * 82;
+          let b = 18 + brightness * 128;
+
+          // Specular highlight: additive blue-white
+          const sv = specular * 0.45 * occlusion * hFalloff;
+          r += sv * 150;
+          g += sv * 170;
+          b += sv * 200;
+
+          if (r > 255) r = 255;
+          if (g > 255) g = 255;
+          if (b > 255) b = 255;
+
+          const idx = (y * W + x) * 4;
+          data[idx]     = r | 0;
+          data[idx + 1] = g | 0;
+          data[idx + 2] = b | 0;
+          data[idx + 3] = 255;
+        }
+      }
+
+      ctx.putImageData(imageData, 0, 0);
+    }
+
+    /* ═══ Ghost Hint ═══ */
+    let hintActive = false, hintStartPerf = 0, hintStartPos = 0.5;
+    let hintPhase = 'idle', hintPosX = 0, hintDotScale = 1;
+
+    function startHint() {
+      if (hintDismissed) return;
+      hintActive = true;
+      hintStartPerf = performance.now();
+      hintPhase = 'fadeIn';
+      hintPosX = 0;
+      hintDotScale = 1;
+      hintStartPos = position;
+      ghostDots.style.opacity = '0';
+      ghostDots.style.transform = 'translateX(-50%) translateY(4px)';
+      _pbVelocity = 0;
+      _pbWheelAccum = 0;
+    }
+
+    function tickHint(now) {
+      if (!hintActive) return;
+      const t = now - hintStartPerf;
+      const DRAG_PX = 100;
+      if (t < 200) {
+        ghostDots.style.opacity = String(t/200);
+        ghostDots.style.transform = `translateX(-50%) translateY(${4*(1-t/200)}px)`;
+      } else if (t < 350) {
+        ghostDots.style.opacity = '1';
+        ghostDots.style.transform = 'translateX(-50%) translateY(0)';
+        hintDotScale = 1 + 0.2 * Math.sin((t-200)/150 * Math.PI);
+        applyDotScale();
+      } else if (t < 1100) {
+        hintPhase = 'dragRight';
+        const ease = 1 - Math.pow(1 - (t-350)/750, 3);
+        const target = ease * DRAG_PX;
+        shiftPosition(target - hintPosX);
+        hintPosX = target;
+        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(0)`;
+        hintDotScale = 1.12;
+        applyDotScale();
+      } else if (t < 2100) {
+        if (hintPhase !== 'dragLeft') _pbVelocity = 0;
+        hintPhase = 'dragLeft';
+        const ease = 1 - Math.pow(1 - (t-1100)/1000, 3);
+        const target = DRAG_PX - ease * DRAG_PX * 2;
+        shiftPosition(target - hintPosX);
+        hintPosX = target;
+        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(0)`;
+        hintDotScale = 1.12;
+        applyDotScale();
+      } else if (t < 2250) {
+        hintDotScale = 1.05;
+        applyDotScale();
+      } else if (t < 2900) {
+        hintPhase = 'release';
+        const ease = 1 - Math.pow(1 - (t-2250)/650, 2);
+        const target = -DRAG_PX * (1 - ease);
+        shiftPosition(target - hintPosX);
+        hintPosX = target;
+        hintDotScale = 1;
+        applyDotScale();
+        const p = (t-2250)/650;
+        ghostDots.style.opacity = String(1-p);
+        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(${-5*p}px)`;
+      } else {
+        ghostDots.style.opacity = '0';
+        hintActive = false;
+        position = hintStartPos;
+      }
+    }
+
+    function applyDotScale() {
+      ghostDots.querySelectorAll('.ghost-dot')
+        .forEach(d => d.style.transform = `scale(${hintDotScale})`);
+    }
+
+    function dismissHint() {
+      if (hintActive) { hintActive = false; ghostDots.style.opacity = '0'; }
+      hintDismissed = true;
+    }
+
+    /* ═══ Input ═══ */
+    jogWrap.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      dismissHint();
+      _pbIsWheelCoasting = true;
+      const PAGE_MS = 15 * 60 * 1000;
+      const isH = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
+      const isMW = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
+      const delta = isH ? e.deltaX : (isMW ? e.deltaY : -e.deltaY) * 0.15;
+      _pbVelocity -= (delta / 1000) * (PAGE_MS / 480);
+      if (!_pbLastPerf) _pbLastPerf = performance.now();
+    }, { passive: false });
+
+    jogWrap.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); dismissHint();
+      _pbScrubbing = true; _pbVelocity = 0; _pbWheelAccum = 0;
+      _pbIsWheelCoasting = false;
+      lastPtrX = e.clientX; lastPtrTime = performance.now();
+      dragVelocity = 0;
+      jogWrap.setPointerCapture(e.pointerId);
+    });
+
+    window.addEventListener('pointermove', (e) => {
+      // Always update light position, even during drag
+      lightX = (e.clientX / window.innerWidth - 0.5);
+      if (dbgLight) {
+        const arrow = lightX < -0.1 ? '←' : lightX > 0.1 ? '→' : '●';
+        dbgLight.textContent = `${arrow} ${lightX.toFixed(2)}`;
+      }
+      if (!_pbScrubbing) return;
+      const dx = e.clientX - lastPtrX;
+      shiftPosition(dx);
+      dragVelocity = (dx / Math.max(1, performance.now() - lastPtrTime)) * 16;
+      lastPtrX = e.clientX;
+      lastPtrTime = performance.now();
+    });
+
+    window.addEventListener('pointerup', () => {
+      if (!_pbScrubbing) return;
+      _pbScrubbing = false;
+      _pbVelocity = (dragVelocity / (jogWrap.offsetWidth * 8) * TIMELINE_MS) / 16;
+      _pbIsWheelCoasting = false;
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight') { _pbVelocity += 6; _pbIsWheelCoasting = false; }
+      if (e.key === 'ArrowLeft')  { _pbVelocity -= 6; _pbIsWheelCoasting = false; }
+      dismissHint();
+    });
+
+    /* Mouse controls the light X position */
+    document.addEventListener('mousemove', (e) => {
+      lightX = (e.clientX / window.innerWidth - 0.5);
+      if (dbgLight) {
+        const arrow = lightX < -0.1 ? '←' : lightX > 0.1 ? '→' : '●';
+        dbgLight.textContent = `${arrow} ${lightX.toFixed(2)}`;
+      }
+    });
+
+    function shiftPosition(dx) {
+      position = clamp(position + dx / (jogWrap.offsetWidth * 8), 0, 1);
+    }
+
+    /* ═══ Main Loop ═══ */
+    function tick(now) {
+      const dt = (_pbLastPerf > 0) ? (now - _pbLastPerf) : 0;
+      _pbLastPerf = now;
+      tickHint(now);
+
+      if (!_pbScrubbing && !hintActive) {
+        if (Math.abs(_pbWheelAccum) > 0.1) {
+          _pbVelocity += _pbWheelAccum * _pbWheelImpulse;
+          _pbWheelAccum *= _pbWheelDecay;
+          if (Math.abs(_pbWheelAccum) < 0.1) _pbWheelAccum = 0;
+        }
+        if (Math.abs(_pbVelocity) > _pbVelocityThreshold && dt > 0) {
+          _pbVelocity *= Math.pow(_pbIsWheelCoasting ? _pbWheelFriction : _pbFriction, dt);
+        }
+        if (Math.abs(_pbVelocity) < _pbVelocityThreshold && _pbVelocity !== 0) {
+          _pbVelocity = 0; _pbIsWheelCoasting = false;
+        }
+        if (Math.abs(_pbVelocity) > 0 && dt > 0) {
+          position = clamp(position + (_pbVelocity * dt) / TIMELINE_MS, 0, 1);
+        }
+        if (position <= 0 && _pbVelocity < 0) { _pbVelocity = 0; position = 0; }
+        if (position >= 1 && _pbVelocity > 0) { _pbVelocity = 0; position = 1; }
+      }
+
+      renderBarrel();
+
+      jogProgress.style.width = `${position * 100}%`;
+      const absV = Math.abs(_pbVelocity);
+      const speed = Math.min(1, absV / 40);
+      jogPlayhead.style.boxShadow =
+        `0 0 ${10+speed*14}px rgba(108,195,255,${0.35+speed*0.45}), ` +
+        `0 0 4px rgba(108,195,255,${(0.35+speed*0.45)*0.8})`;
+      tNow.textContent = fmtTime(TIMELINE_START.getTime() + position * TIMELINE_MS);
+      dbgVel.textContent = _pbVelocity.toFixed(2);
+      dbgPos.textContent = (position * 100).toFixed(1) + '%';
+      dbgCoast.textContent = _pbIsWheelCoasting ? 'wheel' : (absV > _pbVelocityThreshold ? 'drag' : '—');
+      requestAnimationFrame(tick);
+    }
+
+    function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+    function fmtTime(ms) {
+      const d = new Date(ms);
+      let h = d.getHours();
+      const m = String(d.getMinutes()).padStart(2, '0');
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      return `${(h % 12) || 12}:${m} ${ampm}`;
+    }
+
+    function replayHint() {
+      hintDismissed = false; position = 0.5; _pbVelocity = 0; startHint();
+    }
+    document.getElementById('replayBtn').addEventListener('click', replayHint);
+
+    document.getElementById('tLeft').textContent  = fmtTime(TIMELINE_START.getTime());
+    document.getElementById('tRight').textContent = fmtTime(TIMELINE_START.getTime() + TIMELINE_MS);
+    tNow.textContent = fmtTime(TIMELINE_START.getTime() + 0.5 * TIMELINE_MS);
+
+    renderBarrel();
+    setTimeout(startHint, 600);
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>
