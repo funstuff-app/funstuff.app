@@ -338,7 +338,7 @@
     const _pbWheelDecay        = 0.8;
 
     const BARREL_ROTATIONS     = 10;
-    const GROOVE_SPACING        = 0.11;
+    const GROOVE_SPACING        = 0.14;   // tooth-to-tooth angular spacing
 
     /* Light X: -0.5 (left) to +0.5 (right). Updated by mouse. */
     let lightX = 0.08;
@@ -377,42 +377,42 @@
     /* Toroid dimensions — wide barrel, small cross-section */
     const MAJOR_R  = 6.0;   // barrel length (horizontal sweep radius)
     const MINOR_R  = 0.42;  // tube radius (cross-section, what you see vertically)
-    const GROOVE_DEPTH = 0.07; // how far ridges extrude / valleys recess
-    const NORMAL_STRENGTH = 1.2; // normal tilt strength for lighting
+    const GROOVE_DEPTH = 0.06; // deep enough for visible tooth silhouette
+    const NORMAL_STRENGTH = 1.4; // strong wall lighting without deep physical cut
 
-    /* Groove height profile: gear-tooth / plateau shape.
-     *  Wide flat ridge top (the "tooth"), narrow valley (the "gap").
-     *  Curved rounded slopes connect them (smoothstep transitions).
+    /* Sprocket tooth profile:
+     *  Flat-topped trapezoidal teeth with angled walls and
+     *  a narrow valley notch between them.
      *
      *  Period layout (u ∈ [0, 1]):
-     *    [0.00, 0.38]  ridge top (flat, depth=0)      — 38%
-     *    [0.38, 0.48]  left slope (rounded descent)   — 10%
-     *    [0.48, 0.52]  valley floor (flat, depth=1)    —  4%
-     *    [0.52, 0.62]  right slope (rounded ascent)   — 10%
-     *    [0.62, 1.00]  ridge top (flat, depth=0)      — 38%
+     *    [0.00, 0.38]  tooth top (flat, depth=0)      — 38%
+     *    [0.38, 0.45]  left wall (angled descent)     —  7%
+     *    [0.45, 0.55]  valley floor (flat, depth=1)   — 10%
+     *    [0.55, 0.62]  right wall (angled ascent)     —  7%
+     *    [0.62, 1.00]  tooth top (flat, depth=0)      — 38%
      *
-     *  ~76% ridge, ~4% valley, ~20% slopes.
+     *  76% tooth, 10% valley, 14% walls.
      */
     function grooveProfile(u) {
-      const slopeW = 0.10;
-      const ls = 0.38;             // left slope start
-      const le = ls + slopeW;     // left slope end = 0.48
-      const rs = 0.52;             // right slope start
-      const re = rs + slopeW;     // right slope end = 0.62
+      const wallW = 0.07;
+      const ls = 0.38;
+      const le = ls + wallW;     // 0.45
+      const rs = 0.55;
+      const re = rs + wallW;     // 0.62
       let depth, ddepth;
 
       if (u < ls) {
         depth = 0; ddepth = 0;
       } else if (u < le) {
-        const t = (u - ls) / slopeW;
+        const t = (u - ls) / wallW;
         depth = t * t * (3 - 2 * t);
-        ddepth = 6 * t * (1 - t) / slopeW;
+        ddepth = 6 * t * (1 - t) / wallW;
       } else if (u < rs) {
         depth = 1; ddepth = 0;
       } else if (u < re) {
-        const t = (u - rs) / slopeW;
+        const t = (u - rs) / wallW;
         depth = 1 - t * t * (3 - 2 * t);
-        ddepth = -6 * t * (1 - t) / slopeW;
+        ddepth = -6 * t * (1 - t) / wallW;
       } else {
         depth = 0; ddepth = 0;
       }
@@ -616,6 +616,14 @@
       if (!hintActive) return;
       const t = now - hintStartPerf;
       const DRAG_PX = 100;
+
+      // Simulate mouse position → move the light with the ghost dots
+      // Real mouse: lightX = clientX / innerWidth - 0.5
+      // Ghost dots are offset from barrel center. Barrel center is at ~50% of viewport.
+      const barrelRect = jogWrap.getBoundingClientRect();
+      const simClientX = barrelRect.left + barrelRect.width * 0.5 + hintPosX;
+      lightX = simClientX / window.innerWidth - 0.5;
+
       if (t < 200) {
         ghostDots.style.opacity = String(t/200);
         ghostDots.style.transform = `translateX(-50%) translateY(${4*(1-t/200)}px)`;
@@ -661,6 +669,7 @@
         ghostDots.style.opacity = '0';
         hintActive = false;
         position = hintStartPos;
+        lightX = 0.08; // reset to default
       }
     }
 
