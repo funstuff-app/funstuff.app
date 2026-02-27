@@ -432,6 +432,160 @@ button#pbPlay.isLive {
   touch-action: none;
 }
 
+/* Screen-reader-only: hide the native slider visually, keep for a11y + JS */
+.playbackBar .srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0,0,0,0);
+  border: 0;
+}
+
+/* ── Jog Wheel ─────────────────────────────────────────────── */
+.jogWheel {
+  flex: 1;
+  position: relative;
+  height: 36px;
+  min-width: 140px;
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: grab;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: none;
+  background: rgba(8, 12, 20, 0.55);
+  box-shadow:
+    inset 0 2px 6px rgba(0, 0, 0, 0.40),
+    inset 0 -1px 3px rgba(0, 0, 0, 0.22),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.06),
+    0 0.5px 0 rgba(255, 255, 255, 0.04);
+  transition: box-shadow 0.2s ease;
+}
+
+.jogWheel:hover {
+  box-shadow:
+    inset 0 2px 6px rgba(0, 0, 0, 0.40),
+    inset 0 -1px 3px rgba(0, 0, 0, 0.22),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.12),
+    0 0.5px 0 rgba(255, 255, 255, 0.07);
+}
+
+.jogWheel:active {
+  cursor: grabbing;
+}
+
+/* Convex surface — light on top, shadow on bottom (cylinder feel) */
+.jogWheel::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.035) 0%,
+    transparent 30%,
+    transparent 70%,
+    rgba(0, 0, 0, 0.10) 100%
+  );
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* Edge fades — suggest infinite scroll */
+.jogWheel::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    rgba(8, 12, 20, 0.75) 0%,
+    transparent 7%,
+    transparent 93%,
+    rgba(8, 12, 20, 0.75) 100%
+  );
+  pointer-events: none;
+  z-index: 4;
+}
+
+/* Ridges — the knurled texture */
+.jogRidges {
+  position: absolute;
+  inset: 0;
+  background:
+    /* minor ridges: every 8px */
+    repeating-linear-gradient(
+      90deg,
+      transparent 0px,
+      transparent 7px,
+      rgba(255, 255, 255, 0.04) 7px,
+      rgba(255, 255, 255, 0.04) 8px
+    ),
+    /* major ridges: every 40px */
+    repeating-linear-gradient(
+      90deg,
+      transparent 0px,
+      transparent 39px,
+      rgba(255, 255, 255, 0.07) 39px,
+      rgba(255, 255, 255, 0.07) 40px
+    );
+  animation: jogNudge 2.6s cubic-bezier(0.4, 0, 0.2, 1) 1.2s 3 both;
+  z-index: 1;
+}
+
+/* Sheen — specular highlight sweep ("I rotate") */
+.jogSheen {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    105deg,
+    transparent 0%,
+    transparent 38%,
+    rgba(255, 255, 255, 0.05) 44%,
+    rgba(255, 255, 255, 0.09) 50%,
+    rgba(255, 255, 255, 0.05) 56%,
+    transparent 62%,
+    transparent 100%
+  );
+  background-size: 250% 100%;
+  animation: jogSheen 2s ease-in-out 0.4s 2 both;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Playhead — current position indicator */
+.jogPlayhead {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 50%;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  opacity: 0.6;
+  box-shadow:
+    0 0 8px rgba(108, 195, 255, 0.35),
+    0 0 3px rgba(108, 195, 255, 0.55);
+  pointer-events: none;
+  z-index: 5;
+  transition: left 0.08s ease-out, opacity 0.3s ease;
+}
+
+/* ── Jog Wheel Animations ──────────────────────────────────── */
+@keyframes jogNudge {
+  0%, 100% { transform: translateX(0); }
+  25%      { transform: translateX(6px); }
+  75%      { transform: translateX(-6px); }
+}
+
+@keyframes jogSheen {
+  0%   { background-position: 140% 0; }
+  100% { background-position: -40% 0; }
+}
+
 
 .pbSpeed {
   display: inline-flex;

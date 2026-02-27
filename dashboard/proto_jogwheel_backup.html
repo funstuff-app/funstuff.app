@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Proto B — Jog Wheel Shuttle</title>
+  <style>
+    :root {
+      --bg: #0c121c;
+      --glass-bg: rgba(12, 18, 28, 0.86);
+      --border: rgba(255,255,255,0.10);
+      --accent: #6cc3ff;
+      --accent-glow: rgba(108,195,255,0.35);
+      --accent-dim: rgba(108,195,255,0.12);
+      --muted: rgba(147,164,186,0.92);
+      --btn-bg: rgba(17,24,38,0.80);
+
+      /* Jog wheel — clip-path + gradient, no surface vars needed */
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+      background: var(--bg);
+      background-image: radial-gradient(circle at 50% 60%, rgba(108,195,255,0.02) 0%, transparent 50%);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      align-items: center;
+      padding-bottom: 60px;
+      overflow: hidden;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    /* ─── Playback Bar Shell ─── */
+    .playback-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: var(--glass-bg);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      width: 720px;
+      max-width: calc(100% - 24px);
+      touch-action: none;
+    }
+
+    /* Row: Play + Jog Wheel + Speed */
+    .row-main {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .btn-play {
+      height: 44px;
+      min-width: 56px;
+      padding: 0 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--btn-bg);
+      color: rgba(232,238,247,0.92);
+      font-size: 13px;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: border-color 0.15s;
+      font-family: inherit;
+    }
+    .btn-play:hover { border-color: rgba(255,255,255,0.18); }
+
+    .speed-ctl select {
+      height: 44px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--btn-bg);
+      color: rgba(232,238,247,0.92);
+      padding: 0 10px;
+      font-size: 12px;
+      font-family: inherit;
+    }
+
+    /* ─── Jog Wheel ─── */
+    .jog-wrap {
+      flex: 1;
+      min-width: 0;
+      position: relative;
+      height: 44px;
+      overflow: visible;
+      cursor: grab;
+      touch-action: none;
+    }
+    .jog-wrap:active { cursor: grabbing; }
+
+    /*
+     * Barrel shape: straight top/bottom through the middle 80%,
+     * with the left/right ~10% curving inward (narrower at ends).
+     * This is a cylinder viewed from the side after sanding the edges.
+     * SVG clip-path draws the exact outline.
+     */
+    .jog-clip {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      /* Barrel outline: flat top/bottom, curved ends */
+      clip-path: url(#barrelClip);
+    }
+
+    /* Metal surface — cylindrical curvature gradient */
+    .jog-body {
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(to bottom,
+        #030609      0%,
+        #0c1320      8%,
+        #151f32     20%,
+        #1f2d45     35%,
+        #243352     48%,
+        #243352     52%,
+        #1f2d45     65%,
+        #151f32     80%,
+        #0c1320     92%,
+        #030609    100%
+      );
+    }
+
+    /* Specular arc — overhead light on the upper curve */
+    .jog-body::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(to bottom,
+        transparent             0%,
+        rgba(140,185,255,0.04) 15%,
+        rgba(180,210,255,0.09) 27%,
+        rgba(220,240,255,0.07) 34%,
+        transparent             44%,
+        transparent            100%
+      );
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    /*
+     * Grooves: machined V-notches cut into the barrel surface.
+     * Each groove is a dark shadow wall + bright lit wall pair.
+     * Wide flat metal between grooves. Bold and visible.
+     *
+     * Per 28px period:
+     *   0-21px:  flat metal (transparent)
+     *   21-24px: shadow wall (deep dark cut)
+     *   24-27px: lit wall (light catches the edge)
+     *   27-28px: transition back to flat
+     */
+    .jog-ridges {
+      position: absolute;
+      left: -2000px;
+      top: 0;
+      width: 5000px;
+      height: 100%;
+      background: repeating-linear-gradient(to right,
+        transparent              0px,
+        transparent             21px,
+        rgba(0,0,0,0.55)       21px,
+        rgba(0,0,0,0.45)       23.5px,
+        rgba(140,180,230,0.18) 23.5px,
+        rgba(140,180,230,0.12) 26px,
+        transparent            26px,
+        transparent            28px
+      );
+      /* Grooves vanish at the foreshortened top/bottom edges */
+      -webkit-mask-image: linear-gradient(to bottom,
+        rgba(0,0,0,0)    0%,
+        rgba(0,0,0,0.3) 18%,
+        rgba(0,0,0,1)   38%,
+        rgba(0,0,0,1)   62%,
+        rgba(0,0,0,0.3) 82%,
+        rgba(0,0,0,0)  100%
+      );
+      mask-image: linear-gradient(to bottom,
+        rgba(0,0,0,0)    0%,
+        rgba(0,0,0,0.3) 18%,
+        rgba(0,0,0,1)   38%,
+        rgba(0,0,0,1)   62%,
+        rgba(0,0,0,0.3) 82%,
+        rgba(0,0,0,0)  100%
+      );
+      will-change: transform;
+      pointer-events: none;
+    }
+
+    /* Edge darkening — barrel recedes into shadow at both ends */
+    .jog-edge-fade {
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(to right,
+        rgba(2,4,6,0.9)   0%,
+        rgba(2,4,6,0.4)   5%,
+        transparent       12%,
+        transparent       88%,
+        rgba(2,4,6,0.4)  95%,
+        rgba(2,4,6,0.9) 100%
+      );
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    /* Center playhead notch — fixed position */
+    .jog-playhead {
+      position: absolute;
+      left: 50%;
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      transform: translateX(-50%);
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent-glow), 0 0 4px var(--accent-glow);
+      z-index: 3;
+      pointer-events: none;
+      transition: box-shadow 0.1s ease;
+    }
+    /* Top notch ▼ */
+    .jog-playhead::before {
+      content: '';
+      position: absolute;
+      top: -1px;
+      left: 50%;
+      transform: translateX(-50%);
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-top: 5px solid var(--accent);
+      filter: drop-shadow(0 0 3px var(--accent-glow));
+    }
+    /* Bottom notch ▲ */
+    .jog-playhead::after {
+      content: '';
+      position: absolute;
+      bottom: -1px;
+      left: 50%;
+      transform: translateX(-50%);
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-bottom: 5px solid var(--accent);
+      filter: drop-shadow(0 0 3px var(--accent-glow));
+    }
+
+    /* Thin progress strip along bottom */
+    .jog-progress {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      height: 2px;
+      z-index: 2;
+      pointer-events: none;
+    }
+    .jog-progress-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent-dim);
+      transition: width 0.06s linear;
+    }
+
+    /* ─── Ghost Hint Dots ─── */
+    .ghost-dots {
+      position: absolute;
+      top: -22px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 8px;
+      z-index: 10;
+      pointer-events: none;
+      opacity: 0;
+    }
+    .ghost-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 35%,
+        rgba(108,195,255,0.55),
+        rgba(108,195,255,0.20) 60%,
+        rgba(108,195,255,0.05) 100%
+      );
+      box-shadow: 0 0 10px rgba(108,195,255,0.30);
+      transition: transform 0.08s ease-out;
+    }
+
+    /* Connection line between dots — like a trackpad gesture diagram */
+    .ghost-dots::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 14px;
+      height: 1px;
+      background: rgba(108,195,255,0.18);
+      border-radius: 1px;
+    }
+
+    /* ─── Time Labels ─── */
+    .row-time {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: var(--muted);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      padding: 0 68px;
+      gap: 2px;
+    }
+    .row-time .sep { opacity: 0.35; }
+    .row-time .now { color: var(--accent); opacity: 0.85; }
+
+    /* ─── Debug / Iteration ─── */
+    .debug-bar {
+      position: fixed;
+      top: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 24px;
+      font-family: "SF Mono", "Menlo", monospace;
+      font-size: 11px;
+      color: rgba(147,164,186,0.35);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .proto-label {
+      position: fixed;
+      top: 16px;
+      left: 20px;
+      color: rgba(147,164,186,0.45);
+      font-size: 11px;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    .replay-btn {
+      position: fixed;
+      top: 14px;
+      right: 20px;
+      background: var(--btn-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      padding: 6px 14px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .replay-btn:hover { border-color: rgba(255,255,255,0.2); color: #fff; }
+  </style>
+</head>
+<body>
+  <span class="proto-label">Proto B — Jog Wheel</span>
+  <button class="replay-btn" id="replayBtn">↻ Replay Hint</button>
+
+  <div class="debug-bar">
+    <span>vel <span id="dbgVel">0.00</span></span>
+    <span>pos <span id="dbgPos">50.0%</span></span>
+    <span>coast <span id="dbgCoast">—</span></span>
+  </div>
+
+  <div class="playback-bar" id="bar">
+    <div class="row-main">
+      <button class="btn-play" id="btnPlay">Live</button>
+
+      <!-- Jog Wheel -->
+      <div class="jog-wrap" id="jogWrap">
+        <!-- SVG clip-path: barrel outline with straight center, curved ends -->
+        <svg width="0" height="0" style="position:absolute">
+          <defs>
+            <clipPath id="barrelClip" clipPathUnits="objectBoundingBox">
+              <!-- Barrel: flat top/bottom through middle, ends curve in.
+                   Top edge: starts narrow at left, widens to flat, narrows at right.
+                   Bottom edge: mirror. The inset at the ends is ~20% of height. -->
+              <path d="
+                M 0.00, 0.50
+                C 0.00, 0.15  0.04, 0.00  0.10, 0.00
+                L 0.90, 0.00
+                C 0.96, 0.00  1.00, 0.15  1.00, 0.50
+                C 1.00, 0.85  0.96, 1.00  0.90, 1.00
+                L 0.10, 1.00
+                C 0.04, 1.00  0.00, 0.85  0.00, 0.50
+                Z
+              " />
+            </clipPath>
+          </defs>
+        </svg>
+
+        <div class="jog-clip">
+          <div class="jog-body"></div>
+          <div class="jog-ridges" id="jogRidges"></div>
+          <div class="jog-edge-fade"></div>
+        </div>
+        <div class="jog-playhead" id="jogPlayhead"></div>
+        <div class="jog-progress"><div class="jog-progress-fill" id="jogProgress"></div></div>
+
+        <!-- Ghost hint: two dots that "drag" the wheel on load -->
+        <div class="ghost-dots" id="ghostDots">
+          <span class="ghost-dot"></span>
+          <span class="ghost-dot"></span>
+        </div>
+      </div>
+
+      <div class="speed-ctl">
+        <select>
+          <option>1×</option>
+          <option selected>5×</option>
+          <option>10×</option>
+          <option>20×</option>
+          <option>60×</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row-time">
+      <span id="tLeft">11:00 AM</span>
+      <span class="sep">·</span>
+      <span id="tNow" class="now">12:00 PM</span>
+      <span class="sep">·</span>
+      <span id="tRight">1:00 PM</span>
+    </div>
+  </div>
+
+  <script>
+    /* ═══════════════════════════════════════════════════════════════════════════
+     *  REAL APP PHYSICS — ported from app.js playbackLoop
+     *
+     *  Constants match the production app exactly. The simulation loop uses the
+     *  same per-ms friction model: velocityDecay = Math.pow(friction, dt).
+     * ═══════════════════════════════════════════════════════════════════════════ */
+
+    const jogWrap     = document.getElementById('jogWrap');
+    const jogRidges   = document.getElementById('jogRidges');
+    const jogPlayhead = document.getElementById('jogPlayhead');
+    const jogProgress = document.getElementById('jogProgress');
+    const ghostDots   = document.getElementById('ghostDots');
+    const dbgVel      = document.getElementById('dbgVel');
+    const dbgPos      = document.getElementById('dbgPos');
+    const dbgCoast    = document.getElementById('dbgCoast');
+    const tNow        = document.getElementById('tNow');
+
+    /* Simulated 2-hour timeline */
+    const TIMELINE_MS    = 2 * 60 * 60 * 1000;
+    const TIMELINE_START = new Date();
+    TIMELINE_START.setHours(11, 0, 0, 0);
+
+    /* ═══ Physics constants — verbatim from app.js ═══ */
+    const _pbFriction          = 0.997;    // velocity decay per ms when coasting (drag inertia)
+    const _pbWheelFriction     = 0.985;    // velocity decay per ms for wheel scroll (stops faster)
+    const _pbVelocityThreshold = 0.1;      // below this, considered "at rest"
+    const _pbWheelImpulse      = 1.0;      // velocity added per wheel tick
+    const _pbWheelDecay        = 0.8;      // wheel accumulator decay per frame
+    const _pbPlaybackSpeed     = 1.0;      // target velocity when playing forward
+    const RIDGE_SPACING        = 28;       // px, groove period
+
+    let _pbVelocity    = 0;       // playback velocity (ms-of-timeline per ms-of-wall)
+    let _pbWheelAccum   = 0;       // accumulated wheel delta
+    let _pbIsWheelCoasting = false; // current coast is from wheel (use faster friction)
+    let _pbLastPerf     = 0;       // last animation frame timestamp
+    let _pbScrubbing    = false;   // pointer is down on the wheel
+    let position        = 0.5;     // 0..1 normalised timeline position
+    let ridgeOffset     = 0;       // visual offset of ridge pattern (px)
+
+    let lastPtrX        = 0;
+    let lastPtrTime     = 0;
+    let dragVelocity    = 0;
+    let hintDismissed   = false;
+
+    /* ════════════════════════════════════════════════════════════════════════
+     *  GHOST HINT: Two-finger dots that "drag" the jog wheel on load
+     *
+     *  Timeline (all times in ms from page load):
+     *  0-300     dots fade in, descend onto the wheel
+     *  300-600   dots "press" (subtle scale) and rest for a beat
+     *  600-1800  drag RIGHT — dots move, ridges follow
+     *  1800-2100 dots pause — wheel decelerates (real physics)
+     *  2100-3100 drag LEFT — dots move, ridges follow
+     *  3100-3600 dots lift off, wheel coasts to stop
+     *  3600-4200 dots fade out and rise
+     * ════════════════════════════════════════════════════════════════════════ */
+
+    let hintActive    = false;
+    let hintStartPerf = 0;
+    let hintPhase     = 'idle'; // idle | fadeIn | pressDown | dragRight | pause | dragLeft | release | fadeOut
+    let hintBaseX     = 0;      // base CSS left of dots center (px, relative to jog-wrap)
+    let hintPosX      = 0;      // animated offset from hintBaseX
+    let hintDotScale  = 1;
+
+    function startHint() {
+      if (hintDismissed) return;
+      hintActive    = true;
+      hintStartPerf = performance.now();
+      hintPhase     = 'fadeIn';
+      hintPosX      = 0;
+      hintDotScale  = 1;
+      hintBaseX     = jogWrap.offsetWidth / 2;
+      ghostDots.style.opacity = '0';
+      ghostDots.style.transform = `translateX(-50%) translateY(4px)`;
+      _pbVelocity = 0;
+      _pbWheelAccum = 0;
+    }
+
+    function tickHint(now) {
+      if (!hintActive) return;
+      const t = now - hintStartPerf;
+
+      // Phase machine
+      if (t < 300) {
+        // Fade in: 0 → 1 opacity, drift down from +4px to 0
+        const p = t / 300;
+        ghostDots.style.opacity = String(p);
+        ghostDots.style.transform = `translateX(-50%) translateY(${4 * (1 - p)}px)`;
+        hintPhase = 'fadeIn';
+      }
+      else if (t < 550) {
+        // Press down: dots scale up slightly, brief rest
+        ghostDots.style.opacity = '1';
+        ghostDots.style.transform = `translateX(-50%) translateY(0)`;
+        const p = (t - 300) / 250;
+        hintDotScale = 1 + 0.25 * Math.sin(p * Math.PI); // bulge 1.0 → 1.25 → 1.0
+        applyDotScale();
+        hintPhase = 'pressDown';
+      }
+      else if (t < 1700) {
+        // Drag RIGHT: ease-out sweep
+        hintPhase = 'dragRight';
+        const p = (t - 550) / 1150;
+        const ease = 1 - Math.pow(1 - p, 3); // easeOutCubic
+        const dx = ease * 120; // px to the right
+        const prevX = hintPosX;
+        hintPosX = dx;
+        // Drive the wheel — ridges track 1:1 with the ghost drag
+        const delta = hintPosX - prevX;
+        ridgeOffset += delta;
+        shiftPosition(delta);
+        applyRidgeTransform();
+        // Position dots
+        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(0)`;
+        hintDotScale = 1.15; // slightly pressed
+        applyDotScale();
+      }
+      else if (t < 2050) {
+        // Pause: dots rest, wheel decelerates via physics
+        // Set initial coast velocity on entering this phase
+        if (hintPhase !== 'pause') {
+          _pbVelocity = 3.5; // forward momentum from the drag
+          _pbIsWheelCoasting = false;
+        }
+        hintPhase = 'pause';
+        hintDotScale = 1.05;
+        applyDotScale();
+        // Dots hold position while wheel decays
+        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(0)`;
+      }
+      else if (t < 3200) {
+        // Drag LEFT: ease-out sweep in opposite direction
+        if (hintPhase !== 'dragLeft') {
+          _pbVelocity = 0; // cancel coast — dots retake control
+        }
+        hintPhase = 'dragLeft';
+        const p = (t - 2050) / 1150;
+        const ease = 1 - Math.pow(1 - p, 3);
+        const targetX = 120 - ease * 260; // from +120 to -140
+        const prevX = hintPosX;
+        hintPosX = targetX;
+        const delta = hintPosX - prevX;
+        ridgeOffset += delta;
+        shiftPosition(delta);
+        applyRidgeTransform();
+        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(0)`;
+        hintDotScale = 1.15;
+        applyDotScale();
+      }
+      else if (t < 3600) {
+        // Release: dots lift, wheel gets momentum
+        if (hintPhase !== 'release') {
+          _pbVelocity = -5; // backward coast momentum
+          _pbIsWheelCoasting = false;
+          hintDotScale = 1;
+          applyDotScale();
+        }
+        hintPhase = 'release';
+        const p = (t - 3200) / 400;
+        ghostDots.style.opacity = String(1 - p);
+        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(${-6 * p}px)`;
+      }
+      else {
+        // Done
+        hintPhase = 'fadeOut';
+        ghostDots.style.opacity = '0';
+        hintActive = false;
+      }
+    }
+
+    function applyDotScale() {
+      const dots = ghostDots.querySelectorAll('.ghost-dot');
+      dots.forEach(d => d.style.transform = `scale(${hintDotScale})`);
+    }
+
+    function dismissHint() {
+      if (hintActive) {
+        hintActive = false;
+        ghostDots.style.opacity = '0';
+      }
+      hintDismissed = true;
+    }
+
+    /* ═══ Input: Scroll wheel — VERBATIM from app.js pbScrubEl wheel handler ═══ */
+    jogWrap.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      dismissHint();
+      _pbIsWheelCoasting = true;
+
+      // Two-finger swipe (deltaX) or vertical scroll wheel (deltaY): scrub through time.
+      // deltaX > 0 = swipe right = backward; deltaY > 0 = scroll down = forward.
+      const durMs = TIMELINE_MS;
+      const isHorizontal = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
+      const isMouseWheel = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
+      // Mouse wheel: flip direction (scroll down = forward). Trackpad swipe: keep native.
+      const delta = isHorizontal ? e.deltaX : (isMouseWheel ? e.deltaY : -e.deltaY) * 0.15;
+      const nudge = (delta / 1000) * (durMs / 480);
+      _pbVelocity -= nudge;
+
+      if (!_pbLastPerf) _pbLastPerf = performance.now();
+    }, { passive: false });
+
+    /* ═══ Input: Pointer drag ═══ */
+    jogWrap.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      dismissHint();
+      _pbScrubbing    = true;
+      _pbVelocity     = 0;
+      _pbWheelAccum   = 0;
+      _pbIsWheelCoasting = false;
+      lastPtrX        = e.clientX;
+      lastPtrTime     = performance.now();
+      dragVelocity    = 0;
+      jogWrap.setPointerCapture(e.pointerId);
+    });
+
+    window.addEventListener('pointermove', (e) => {
+      if (!_pbScrubbing) return;
+      const dx = e.clientX - lastPtrX;
+      const dt = Math.max(1, performance.now() - lastPtrTime);
+
+      /* Direct manipulation — ridges track 1:1 with pointer */
+      ridgeOffset += dx;
+      shiftPosition(dx);
+      applyRidgeTransform();
+
+      /* Track velocity for momentum on release (normalise to ~16ms frame) */
+      dragVelocity = (dx / dt) * 16;
+      lastPtrX     = e.clientX;
+      lastPtrTime  = performance.now();
+    });
+
+    window.addEventListener('pointerup', () => {
+      if (!_pbScrubbing) return;
+      _pbScrubbing = false;
+      _pbVelocity = dragVelocity;
+      _pbIsWheelCoasting = false;
+    });
+
+    /* ═══ Input: Keyboard ═══ */
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight') { _pbVelocity += 6; _pbIsWheelCoasting = false; }
+      if (e.key === 'ArrowLeft')  { _pbVelocity -= 6; _pbIsWheelCoasting = false; }
+      dismissHint();
+    });
+
+    /* ═══ Position logic ═══ */
+    function shiftPosition(dx) {
+      /* Sensitivity: ~8 wheel-widths of drag ≈ full timeline */
+      const dPos = dx / (jogWrap.offsetWidth * 8);
+      position = clamp(position + dPos, 0, 1);
+    }
+
+    /* ═══ Rubber band at edges ═══ — removed; edges now hard-clamped in tick()
+       matching app.js behavior (velocity zeroed at bounds) */
+
+    /* ═══ Render ═══ */
+    function applyRidgeTransform() {
+      ridgeOffset = ((ridgeOffset % RIDGE_SPACING) + RIDGE_SPACING) % RIDGE_SPACING;
+      jogRidges.style.transform = `translateX(${ridgeOffset}px)`;
+    }
+
+    /* ═══ Main Loop — matches app.js playbackLoop physics EXACTLY ═══
+     *
+     *  From app.js lines 2133-2271:
+     *  1. Apply wheel accumulator to velocity (iPod-style)
+     *  2. If not playing: apply per-ms friction (wheel or drag)
+     *  3. Snap to zero when below threshold
+     *  4. Move playhead by velocity * dt
+     *  5. Clamp to bounds; zero velocity at edges
+     */
+    function tick(now) {
+      const dt = (_pbLastPerf > 0) ? (now - _pbLastPerf) : 0;
+      _pbLastPerf = now;
+
+      /* Ghost hint animation */
+      tickHint(now);
+
+      if (!_pbScrubbing && !hintActive) {
+        /* 1. Apply wheel accumulator → velocity (iPod-style) */
+        if (Math.abs(_pbWheelAccum) > 0.1) {
+          _pbVelocity += _pbWheelAccum * _pbWheelImpulse;
+          _pbWheelAccum *= _pbWheelDecay;
+          if (Math.abs(_pbWheelAccum) < 0.1) _pbWheelAccum = 0;
+        }
+
+        /* 2. Coasting — apply friction (verbatim from app.js line 2236) */
+        if (Math.abs(_pbVelocity) > _pbVelocityThreshold && dt > 0) {
+          const friction = _pbIsWheelCoasting ? _pbWheelFriction : _pbFriction;
+          const frictionFactor = Math.pow(friction, dt);
+          _pbVelocity *= frictionFactor;
+        }
+
+        /* 3. Snap to zero (app.js line 2271) */
+        if (Math.abs(_pbVelocity) < _pbVelocityThreshold && _pbVelocity !== 0) {
+          _pbVelocity = 0;
+          _pbIsWheelCoasting = false;
+        }
+
+        /* 4. Move ridges + position */
+        if (Math.abs(_pbVelocity) > 0) {
+          ridgeOffset += _pbVelocity;
+          shiftPosition(_pbVelocity);
+          applyRidgeTransform();
+        }
+
+        /* 5. Clamp at edges; zero velocity (app.js line 2291) */
+        if (position <= 0 && _pbVelocity < 0) { _pbVelocity = 0; position = 0; }
+        if (position >= 1 && _pbVelocity > 0) { _pbVelocity = 0; position = 1; }
+      }
+      /* During hint drag phases, ridges are driven inside tickHint() */
+      /* During real drag, ridges are driven in pointermove handler */
+
+      /* Progress bar */
+      jogProgress.style.width = `${position * 100}%`;
+
+      /* Playhead glow intensity tracks speed */
+      const absV     = Math.abs(_pbVelocity);
+      const speed    = Math.min(1, absV / 40);
+      const glowR    = 10 + speed * 14;
+      const glowA    = 0.35 + speed * 0.45;
+      jogPlayhead.style.boxShadow =
+        `0 0 ${glowR}px rgba(108,195,255,${glowA}), ` +
+        `0 0 4px rgba(108,195,255,${glowA * 0.8})`;
+
+      /* Time display */
+      const timeMs = TIMELINE_START.getTime() + position * TIMELINE_MS;
+      tNow.textContent = fmtTime(timeMs);
+
+      /* Debug readouts */
+      dbgVel.textContent = _pbVelocity.toFixed(2);
+      dbgPos.textContent = (position * 100).toFixed(1) + '%';
+      dbgCoast.textContent = _pbIsWheelCoasting ? 'wheel' : (absV > _pbVelocityThreshold ? 'drag' : '—');
+
+      requestAnimationFrame(tick);
+    }
+
+    /* ═══ Helpers ═══ */
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    function fmtTime(ms) {
+      const d = new Date(ms);
+      let h = d.getHours();
+      const m = String(d.getMinutes()).padStart(2, '0');
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      h = h % 12 || 12;
+      return `${h}:${m} ${ampm}`;
+    }
+
+    /* Replay hint */
+    function replayHint() {
+      hintDismissed = false;
+      position = 0.5;
+      _pbVelocity = 0;
+      ridgeOffset = 0;
+      applyRidgeTransform();
+      startHint();
+    }
+    document.getElementById('replayBtn').addEventListener('click', replayHint);
+
+    /* Seed time labels */
+    document.getElementById('tLeft').textContent  = fmtTime(TIMELINE_START.getTime());
+    document.getElementById('tRight').textContent = fmtTime(TIMELINE_START.getTime() + TIMELINE_MS);
+    tNow.textContent = fmtTime(TIMELINE_START.getTime() + 0.5 * TIMELINE_MS);
+
+    /* Launch hint after a short delay, then start the physics loop */
+    setTimeout(startHint, 600);
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>

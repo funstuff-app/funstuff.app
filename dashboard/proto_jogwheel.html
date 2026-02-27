@@ -377,43 +377,18 @@
     /* Toroid dimensions (in abstract units, mapped to pixels) */
     const MAJOR_R  = 1.0;   // center of tube to barrel axis (horizontal sweep)
     const MINOR_R  = 0.42;  // tube radius (vertical cross-section)
-    const GROOVE_DEPTH = 0.12; // how deep grooves cut into the minor radius
-    const GROOVE_WALL  = 0.06; // fraction of groove period that is wall (each side)
+    const GROOVE_DEPTH = 0.045; // how deep grooves cut (shallower = smoother)
 
-    /* Groove height profile: maps groovePhase (0..1) to radius reduction (0..1).
-     *  0 = ridge top (full radius), 1 = valley floor (reduced by GROOVE_DEPTH).
-     *  Includes the derivative for normal perturbation.
+    /* Groove height profile: smooth cosine wave.
+     *  Ridge tops at u=0 and u=1, valley at u=0.5.
+     *  Raised cosine: depth = 0.5(1 - cos(2πu))
+     *  This gives perfectly smooth transitions — no flat zones, no hard edges.
+     *  The derivative feeds the normal map for lighting.
      */
     function grooveProfile(u) {
-      // Ridge top: u in [0, 0.35] and [0.95, 1.0]
-      // Left wall: u in [0.35, 0.35+GROOVE_WALL]
-      // Valley:    u in [0.35+GROOVE_WALL, 0.65-GROOVE_WALL]
-      // Right wall: u in [0.65-GROOVE_WALL, 0.65]
-      // Ridge top: u in [0.65, 0.95]
-      const wl = 0.35, wr = 0.65;
-      const gw = GROOVE_WALL;
-      let depth, ddepth; // depth and derivative
-
-      if (u < wl) {
-        depth = 0; ddepth = 0; // ridge top
-      } else if (u < wl + gw) {
-        // Left wall: smooth descent (cosine ease)
-        const t = (u - wl) / gw;
-        const s = t * t * (3 - 2 * t); // smoothstep
-        depth = s;
-        ddepth = 6 * t * (1 - t) / gw; // derivative of smoothstep
-      } else if (u < wr - gw) {
-        depth = 1; ddepth = 0; // valley floor
-      } else if (u < wr) {
-        // Right wall: smooth ascent
-        const t = (u - (wr - gw)) / gw;
-        const s = t * t * (3 - 2 * t);
-        depth = 1 - s;
-        ddepth = -6 * t * (1 - t) / gw;
-      } else {
-        depth = 0; ddepth = 0; // ridge top
-      }
-
+      const TWO_PI = 2 * Math.PI;
+      const depth = 0.5 * (1 - Math.cos(TWO_PI * u));
+      const ddepth = Math.PI * Math.sin(TWO_PI * u);  // d/du of depth
       return { depth, ddepth };
     }
 

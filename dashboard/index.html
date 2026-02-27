@@ -152,7 +152,12 @@
         <div id="playbackBar" class="playbackBar" role="group" aria-label="Playback controls">
           <div class="pbRow1">
             <button id="pbPlay" type="button" title="Play/Pause">Live</button>
-            <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" />
+            <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" class="srOnly" />
+            <div class="jogWheel" id="pbJogWheel">
+              <div class="jogRidges"></div>
+              <div class="jogSheen"></div>
+              <div class="jogPlayhead"></div>
+            </div>
             <label class="pbSpeed" title="Playback speed">
               <span>Speed</span>
               <select id="pbSpeed" aria-label="Playback speed">

@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Proto A — Ghost Hint Overlay</title>
+  <style>
+    :root {
+      --bg: #0c121c;
+      --glass-bg: rgba(12, 18, 28, 0.86);
+      --border: rgba(255,255,255,0.10);
+      --accent: #6cc3ff;
+      --accent-glow: rgba(108,195,255,0.35);
+      --muted: rgba(147,164,186,0.92);
+      --btn-bg: rgba(17,24,38,0.80);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+      background: var(--bg);
+      background-image: radial-gradient(circle at 50% 40%, rgba(108,195,255,0.03) 0%, transparent 60%);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      align-items: center;
+      padding-bottom: 80px;
+      overflow: hidden;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    /* ─── Playback Bar (matches dashboard) ─── */
+    .playback-bar {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--glass-bg);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      width: 680px;
+      max-width: calc(100% - 28px);
+      touch-action: none;
+    }
+
+    .row1 {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .btn-play {
+      height: 30px;
+      min-width: 64px;
+      padding: 0 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--btn-bg);
+      color: rgba(232,238,247,0.92);
+      font-size: 13px;
+      cursor: pointer;
+      line-height: 28px;
+    }
+    .btn-play:hover { border-color: rgba(255,255,255,0.16); }
+
+    .scrub {
+      flex: 1;
+      min-width: 120px;
+      accent-color: var(--accent);
+    }
+
+    .speed select {
+      height: 30px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--btn-bg);
+      color: rgba(232,238,247,0.92);
+      padding: 0 10px;
+      font-size: 12px;
+    }
+
+    .row2 {
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      padding: 0 76px;
+    }
+
+    /* ─── Ghost Hint ─── */
+    .ghost-hint {
+      position: absolute;
+      top: -34px;
+      left: 50%;
+      transform: translateX(-50%);
+
+      /* Pill shape */
+      width: 104px;
+      height: 26px;
+      border-radius: 13px;
+
+      /* Glass material — barely there */
+      background: rgba(12, 18, 28, 0.55);
+      border: 1px solid rgba(255,255,255,0.04);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+
+      /* Lifecycle: fade in, hold, fade out */
+      opacity: 0;
+      animation: hint-lifecycle 5.6s ease forwards;
+    }
+
+    .ghost-hint.dismissed {
+      animation: none !important;
+      opacity: 0 !important;
+      transition: opacity 0.25s ease;
+    }
+
+    /* Track line inside the pill */
+    .g-track {
+      width: 68px;
+      height: 1.5px;
+      border-radius: 1px;
+      background: rgba(255,255,255,0.07);
+      position: relative;
+    }
+
+    /* ── FINE POINTER (trackpad / mouse): two dots ── */
+    .g-pair {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      display: flex;
+      gap: 5px;
+      animation: sweep-fine 4.8s cubic-bezier(.22,.61,.36,1) 0.4s both;
+    }
+    .g-pair .dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--accent);
+      opacity: 0.9;
+      box-shadow: 0 0 6px var(--accent-glow);
+    }
+
+    /* ── COARSE POINTER (touch): single dot with press ── */
+    .g-finger {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      opacity: 0.85;
+      box-shadow: 0 0 8px var(--accent-glow);
+      transform: translate(-50%, -50%) scale(1);
+      display: none;
+      animation: sweep-touch 4.8s cubic-bezier(.22,.61,.36,1) 0.4s both;
+    }
+
+    /* Pointer discrimination */
+    @media (pointer: coarse) {
+      .g-pair   { display: none !important; }
+      .g-finger { display: block !important; }
+    }
+    @media (pointer: fine) {
+      .g-pair   { display: flex !important; }
+      .g-finger { display: none !important; }
+    }
+
+    /* ─── Keyframes ─── */
+
+    /* Container lifecycle: float in ↑, hold, float out ↑ */
+    @keyframes hint-lifecycle {
+      0%   { opacity: 0; transform: translateX(-50%) translateY(5px); }
+      7%   { opacity: 1; transform: translateX(-50%) translateY(0); }
+      86%  { opacity: 1; transform: translateX(-50%) translateY(0); }
+      100% { opacity: 0; transform: translateX(-50%) translateY(-3px); }
+    }
+
+    /*
+     * Fine-pointer sweep — damped oscillation.
+     * Models a flick right, decel, return, flick left, decel, return,
+     * then a smaller second pass for the "momentum" feel.
+     */
+    @keyframes sweep-fine {
+      0%   { transform: translate(-50%,-50%) translateX(0); }
+      /* — first flick right — */
+      10%  { transform: translate(-50%,-50%) translateX(24px); }
+      16%  { transform: translate(-50%,-50%) translateX(20px); }
+      26%  { transform: translate(-50%,-50%) translateX(0); }
+      28%  { transform: translate(-50%,-50%) translateX(-2px); }   /* tiny overshoot */
+      30%  { transform: translate(-50%,-50%) translateX(0); }
+      /* — flick left — */
+      40%  { transform: translate(-50%,-50%) translateX(-24px); }
+      46%  { transform: translate(-50%,-50%) translateX(-20px); }
+      56%  { transform: translate(-50%,-50%) translateX(0); }
+      58%  { transform: translate(-50%,-50%) translateX(2px); }
+      60%  { transform: translate(-50%,-50%) translateX(0); }
+      /* — second pass, smaller — */
+      68%  { transform: translate(-50%,-50%) translateX(14px); }
+      74%  { transform: translate(-50%,-50%) translateX(0); }
+      80%  { transform: translate(-50%,-50%) translateX(-12px); }
+      86%  { transform: translate(-50%,-50%) translateX(0); }
+      100% { transform: translate(-50%,-50%) translateX(0); }
+    }
+
+    /*
+     * Coarse-pointer sweep — same motion but the dot grows on "press"
+     * and shrinks on "release" to communicate touch-drag.
+     */
+    @keyframes sweep-touch {
+      0%   { transform: translate(-50%,-50%) scale(1) translateX(0); }
+      /* press */
+      4%   { transform: translate(-50%,-50%) scale(1.5) translateX(0); }
+      /* drag right */
+      12%  { transform: translate(-50%,-50%) scale(1.3) translateX(24px); }
+      18%  { transform: translate(-50%,-50%) scale(1.3) translateX(20px); }
+      /* release + settle */
+      26%  { transform: translate(-50%,-50%) scale(1) translateX(0); }
+      30%  { transform: translate(-50%,-50%) scale(1) translateX(0); }
+      /* press again */
+      34%  { transform: translate(-50%,-50%) scale(1.5) translateX(0); }
+      /* drag left */
+      42%  { transform: translate(-50%,-50%) scale(1.3) translateX(-24px); }
+      48%  { transform: translate(-50%,-50%) scale(1.3) translateX(-20px); }
+      /* release + settle */
+      56%  { transform: translate(-50%,-50%) scale(1) translateX(0); }
+      /* smaller second pass */
+      62%  { transform: translate(-50%,-50%) scale(1.35) translateX(0); }
+      68%  { transform: translate(-50%,-50%) scale(1.2) translateX(14px); }
+      74%  { transform: translate(-50%,-50%) scale(1) translateX(0); }
+      80%  { transform: translate(-50%,-50%) scale(1.35) translateX(-12px); }
+      86%  { transform: translate(-50%,-50%) scale(1) translateX(0); }
+      100% { transform: translate(-50%,-50%) scale(1) translateX(0); }
+    }
+
+    /* ─── Iteration helpers ─── */
+    .proto-label {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      color: rgba(147,164,186,0.45);
+      font-size: 11px;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .replay-btn {
+      position: fixed;
+      top: 18px;
+      right: 20px;
+      background: var(--btn-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      padding: 6px 14px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .replay-btn:hover { border-color: rgba(255,255,255,0.2); color: #fff; }
+  </style>
+</head>
+<body>
+  <span class="proto-label">Proto A — Ghost Hint</span>
+  <button class="replay-btn" id="replayBtn">↻ Replay</button>
+
+  <div class="playback-bar" id="bar">
+    <!-- Ghost Hint (floats above) -->
+    <div class="ghost-hint" id="ghostHint">
+      <div class="g-track">
+        <div class="g-pair"><span class="dot"></span><span class="dot"></span></div>
+        <div class="g-finger"></div>
+      </div>
+    </div>
+
+    <div class="row1">
+      <button class="btn-play">Live</button>
+      <input type="range" class="scrub" min="0" max="100" value="32" />
+      <div class="speed">
+        <select>
+          <option>1×</option>
+          <option selected>5×</option>
+          <option>10×</option>
+        </select>
+      </div>
+    </div>
+    <div class="row2">
+      <span>11:42 AM</span>
+      <span>12:14 PM</span>
+      <span>12:45 PM</span>
+    </div>
+  </div>
+
+  <script>
+    const hint = document.getElementById('ghostHint');
+    const bar  = document.getElementById('bar');
+
+    /* Dismiss on any interaction with the playback bar */
+    function dismiss() {
+      hint.classList.add('dismissed');
+    }
+    bar.addEventListener('pointerdown', dismiss, { once: true });
+    bar.addEventListener('wheel', dismiss, { once: true });
+
+    /* Replay animation (for design iteration — click button or tap empty background) */
+    function replayHint() {
+      hint.classList.remove('dismissed');
+      /* Reset all animations by toggling display */
+      hint.style.animation = 'none';
+      hint.querySelectorAll('.g-pair, .g-finger').forEach(el => el.style.animation = 'none');
+      void hint.offsetHeight;          // force reflow
+      hint.style.animation = '';
+      hint.querySelectorAll('.g-pair, .g-finger').forEach(el => el.style.animation = '');
+      /* Re-arm dismiss listeners */
+      bar.addEventListener('pointerdown', dismiss, { once: true });
+      bar.addEventListener('wheel', dismiss, { once: true });
+    }
+
+    document.getElementById('replayBtn').addEventListener('click', replayHint);
+    document.body.addEventListener('click', (e) => {
+      if (!bar.contains(e.target) && e.target.id !== 'replayBtn') replayHint();
+    });
+  </script>
+</body>
+</html>
