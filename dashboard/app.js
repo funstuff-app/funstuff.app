@@ -1138,7 +1138,8 @@ function main() {
       }
     }
     // Switch sidebar tab to match selected sensor type (when selected from map)
-    if (sel && !fromPanel) {
+    // PurpleAir sensors: only switch if the user is already on the Community tab
+    if (sel && !fromPanel && !(item && item.purpleair && activeTab !== "public")) {
       let targetTab = sel.type === "mobile" ? "mobile" : (item && item.purpleair ? "public" : "fixed");
       if (activeTab !== targetTab) {
         activeTab = targetTab;
@@ -1150,12 +1151,16 @@ function main() {
     renderDetails(st, selectedId);
 
     // Scroll the selected item into view in the sidebar (only when selected from map)
+    // PurpleAir sensors: only scroll if the user is already on the Community tab
     if (sel && !fromPanel) {
-      const listEl = sel.type === "mobile" ? listMobileEl
-        : (item && item.purpleair ? listPublicEl : listFixedEl);
-      if (listEl) {
-        const selEl = listEl.querySelector(`[data-id="${CSS.escape(sel.id)}"]`);
-        if (selEl) selEl.scrollIntoView({ block: "start", behavior: "smooth" });
+      const isPurpleair = item && item.purpleair;
+      if (!isPurpleair || activeTab === "public") {
+        const listEl = sel.type === "mobile" ? listMobileEl
+          : (isPurpleair ? listPublicEl : listFixedEl);
+        if (listEl) {
+          const selEl = listEl.querySelector(`[data-id="${CSS.escape(sel.id)}"]`);
+          if (selEl) selEl.scrollIntoView({ block: "start", behavior: "smooth" });
+        }
       }
     }
   };
