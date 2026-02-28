@@ -671,6 +671,12 @@ def _trim_trails_to_day(state: dict[str, Any], date_str: str) -> None:
     day_start_utc = day_start_mt.astimezone(timezone.utc)
     day_end_utc   = day_end_mt.astimezone(timezone.utc)
 
+    # Pre-compute boundary ISO strings for fast lexicographic comparison.
+    # This avoids calling parse_utc_timestamp (multi-format strptime with
+    # exception-driven fallback) on every single trail point.
+    lo = day_start_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    hi = day_end_utc.strftime("%Y-%m-%dT%H:%M:%S")
+
     for sensor in (state.get("mobile") or []):
         if not isinstance(sensor, dict):
             continue
@@ -681,10 +687,12 @@ def _trim_trails_to_day(state: dict[str, Any], date_str: str) -> None:
         for p in trail:
             if not isinstance(p, dict):
                 continue
-            dt = parse_utc_timestamp(p.get("t"))
-            if dt is None:
+            t = p.get("t")
+            if not isinstance(t, str) or len(t) < 19:
                 continue
-            if day_start_utc <= dt < day_end_utc:
+            # Normalize separator to 'T' for comparison (handles "YYYY-MM-DD HH:MM:SS")
+            ts = t[:19].replace(" ", "T")
+            if lo <= ts < hi:
                 filtered.append(p)
         sensor["trail"] = filtered
 
@@ -3190,14 +3198,19 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     if file_size > MAX_SNAPSHOT_SIZE_BYTES:
         raise JsonValidationError(f"Snapshot file too large: {file_size} bytes")
     
-    # Read raw bytes and sanitize (never parse without sanitization)
+    # Fast path: snapshots are self-written by this server, so skip the
+    # expensive recursive sanitize walk (parse_and_sanitize_json regex-checks
+    # every string in the entire tree — way too slow on a Pi for multi-MB files).
     raw_bytes = filepath.read_bytes()
-    sanitized = parse_and_sanitize_json(raw_bytes, max_size=MAX_SNAPSHOT_SIZE_BYTES)
+    # sanitized = parse_and_sanitize_json(raw_bytes, max_size=MAX_SNAPSHOT_SIZE_BYTES)
+    state = json.loads(raw_bytes)
+    if not isinstance(state, dict):
+        raise JsonValidationError(f"JSON root must be object, got {type(state).__name__}")
     
     # Validate schema
-    validate_state_schema(sanitized)
+    validate_state_schema(state)
     
-    return sanitized
+    return state
 
 def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, server_config: dict | None = None):
     """Create HTTP request handler with injected dependencies.
@@ -3608,9 +3621,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         _log(f"[Snapshot] Stripping {len(existing_pa)} stale PA sensors from {date_str} (no fixed_history data for that date)")
                         state["fixed"] = [f for f in state["fixed"] if not f.get("purpleair")]
 
-                # Trim data to the requested date's window only (5 AM – 5 AM local)
+                # Trim trails to the requested date's window only (5 AM – 5 AM local)
                 _trim_trails_to_day(state, date_str)
-                _trim_history_to_date(state, date_str)
+                # _trim_history_to_date already applied at save time — skip on load
+                # _trim_history_to_date(state, date_str)
 
                 body = json.dumps(state).encode("utf-8")
                 return self._send(200, body, "application/json")
