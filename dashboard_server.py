@@ -3690,9 +3690,11 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             # Check window cache first (widget requests the same window all day)
             start_hour_raw = query.get("start", [None])[0]
             duration_raw = query.get("duration", [None])[0]
-            if start_hour_raw is not None and duration_raw is not None:
+            if start_hour_raw is not None:
                 try:
-                    cache_key = (date_str, int(start_hour_raw), int(duration_raw))
+                    _sh = int(start_hour_raw)
+                    _dh = int(duration_raw) if duration_raw is not None else 24
+                    cache_key = (date_str, _sh, _dh)
                     cached = self._snapshot_window_cache.get(cache_key)
                     if cached is not None:
                         return self._send(200, cached, "application/json",
@@ -3742,15 +3744,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 _trim_trails_to_day(state, date_str)
                 _trim_history_to_date(state, date_str)
 
-                # If start (hour) and duration (hours) are provided, further trim
-                # to just that window.  Used by the landing page embed widget to
-                # avoid sending the entire day's data for a 2-hour playback loop.
-                start_hour_raw = query.get("start", [None])[0]
-                duration_raw = query.get("duration", [None])[0]
-                if start_hour_raw is not None and duration_raw is not None:
+                # If start (hour) is provided, trim to that window.
+                # Used by the landing page embed widget.
+                if start_hour_raw is not None:
                     try:
                         start_hour = int(start_hour_raw)
-                        duration_h = int(duration_raw)
+                        duration_h = int(duration_raw) if duration_raw is not None else 24
                         if 0 <= start_hour <= 23 and 0 < duration_h <= 24:
                             _day = datetime.strptime(date_str, "%Y-%m-%d")
                             win_start = _day.replace(hour=start_hour, minute=0, second=0,

@@ -3059,11 +3059,11 @@ function main() {
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
       
-      // Build playback points and set time to START
+      // Build playback points and set time to 30 min in (so trails are visible)
       map._ensurePlaybackPoints(window._historicalState);
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
-        map.setPlaybackTimeMs(b.minMs);
+        map.setPlaybackTimeMs(b.minMs + 30 * 60000);
       }
       
       // Store state, render sidebar, draw
