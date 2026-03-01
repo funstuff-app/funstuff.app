@@ -12,6 +12,7 @@ Also integrates AirNow hourly data for fixed EPA monitoring sites.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -358,6 +359,83 @@ def validate_state_schema(state: dict[str, Any]) -> dict[str, Any]:
 
 def default_data_dir() -> Path:
     return Path(os.path.expanduser("~/.mobileair"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Geo-IP visitor logging
+# Logs city/region/country to ~/.mobileair/visitors.log on each unique page load.
+# The raw IP address is NEVER written to disk — only the resolved location.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-memory de-duplicate cache: maps sha256(ip) → last-logged epoch (seconds).
+# Prevents re-logging the same visitor within GEO_IP_CACHE_TTL_S seconds.
+_geo_ip_cache: dict[str, float] = {}
+_geo_ip_cache_lock = threading.Lock()
+GEO_IP_CACHE_TTL_S = 3600  # 1 hour
+
+
+def _resolve_client_ip(headers, client_address: tuple) -> str:
+    """Return the real client IP, preferring X-Forwarded-For (set by Caddy)."""
+    xff = headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    if xff:
+        return xff
+    return client_address[0]
+
+
+def _log_visitor_geo(ip: str, data_dir: Path) -> None:
+    """Background worker: geo-resolve *ip* and append location to visitors.log.
+    The IP address is used only for the API call and is never persisted."""
+    try:
+        import urllib.request
+        import urllib.error
+        # Resolve geo location — city/region/country only, no ISP or ASN.
+        url = f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,timezone"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("status") != "success":
+            return
+        country  = data.get("country", "Unknown")
+        region   = data.get("regionName", "")
+        city     = data.get("city", "")
+        tz       = data.get("timezone", "")
+        # Build a readable location string, omitting empty parts.
+        parts = [p for p in [city, region, country] if p]
+        location = ", ".join(parts) if parts else "Unknown"
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        line = f"{ts}  |  {location}  |  tz:{tz}\n"
+        log_path = data_dir / "visitors.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass  # Never let logging errors affect the server
+
+
+def maybe_log_visitor(headers, client_address: tuple, data_dir: Path) -> None:
+    """Fire-and-forget geo-IP log for a page-load request.
+
+    De-duplicates by IP within GEO_IP_CACHE_TTL_S so one person refreshing
+    the page doesn't spam the log or the upstream API.
+    """
+    ip = _resolve_client_ip(headers, client_address)
+    # Skip loopback / private network hits — those are local/dev.
+    if ip in ("127.0.0.1", "::1") or ip.startswith("192.168.") or ip.startswith("10."):
+        return
+    # Use a hash so the IP never lives in a data structure that could be logged.
+    ip_hash = hashlib.sha256(ip.encode()).hexdigest()
+    now = time.monotonic()
+    with _geo_ip_cache_lock:
+        last = _geo_ip_cache.get(ip_hash, 0.0)
+        if now - last < GEO_IP_CACHE_TTL_S:
+            return
+        _geo_ip_cache[ip_hash] = now
+    # Do the network call off the request thread.
+    threading.Thread(
+        target=_log_visitor_geo,
+        args=(ip, data_dir),
+        daemon=True,
+    ).start()
+
 
 def load_json_file(path: Path, default):
     try:
@@ -3384,6 +3462,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             
             # Static HTML - short cache, may change frequently during development
             if path_no_query in ("/", "/index.html"):
+                maybe_log_visitor(self.headers, self.client_address, data_dir)
                 return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="public, max-age=300")
             # JavaScript assets - serve any .js file from dashboard dir
             # Cache for 1 day (use cache-busting query params like ?v=20260205 for updates)
