@@ -3005,7 +3005,7 @@ function main() {
     document.body.appendChild(modal);
   }
 
-  async function loadSnapshotByDate(dateStr) {
+  async function loadSnapshotByDate(dateStr, extraParams = "") {
     const statusEl = document.getElementById("statusText");
     if (statusEl) {
       statusEl.textContent = "Loading...";
@@ -3017,7 +3017,7 @@ function main() {
     updateSaveButtonState();
     
     try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`);
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}`);
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `HTTP ${resp.status}`);
@@ -3079,9 +3079,12 @@ function main() {
       updatePlaybackUi();
       map.drawOverlay(window._historicalState);
       
-      // Start playback loop
+      // Start playback loop (auto-play)
       _pbLastPerf = 0;
       _pbLastUiPerf = 0;
+      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      map.setPlaybackPlaying(true);
+      updatePlaybackUi();
       _pbRAF = requestAnimationFrame(playbackLoop);
     } catch (e) {
       console.error("Failed to load snapshot:", e);
@@ -4103,12 +4106,61 @@ function main() {
 
   // Load server config before starting data polling
   // This allows the server to control CDN/caching behavior
-  loadConfig().then(() => {
+  loadConfig().then(async () => {
     // Re-apply theme in case config pushed new localStorage defaults
     applyTheme(_currentThemeKey, true);
+
+    // ── Embed / iframe URL parameter handling ────────────────────────────────
+    // The landing page (fun.js) passes ?date=YYYY-MM-DD&start=10&speed=10 etc.
+    // to load a historical snapshot in the embedded widget.
+    const _urlParams = new URLSearchParams(window.location.search);
+    const _urlDate = _urlParams.get('date');
+    console.log("[EmbedParam] search:", window.location.search, "date:", _urlDate);
+    if (_urlDate && /^\d{4}-\d{2}-\d{2}$/.test(_urlDate)) {
+      console.log("[EmbedParam] Valid date, calling loadSnapshotByDate:", _urlDate);
+      try {
+        // Pass start/duration to server so it trims the snapshot before sending
+        const _urlStart = Number(_urlParams.get('start'));
+        const _urlDuration = Number(_urlParams.get('duration'));
+        let _extraParams = "";
+        if (isFinite(_urlStart) && _urlStart >= 0 && isFinite(_urlDuration) && _urlDuration > 0) {
+          _extraParams = `&start=${_urlStart}&duration=${_urlDuration}`;
+        }
+        await loadSnapshotByDate(_urlDate, _extraParams);
+        console.log("[EmbedParam] loadSnapshotByDate resolved. _historicalState:", !!window._historicalState, "playbackMode:", map.playbackMode);
+        _selectedDayValue = _urlDate;
+
+        // Override playhead: start hour + playhead offset in minutes
+        if (isFinite(_urlStart) && _urlStart >= 0 && _urlStart <= 23) {
+          const [_uy, _umo, _ud] = _urlDate.split("-").map(Number);
+          const _urlPlayhead = Number(_urlParams.get('playhead')) || 0;
+          const startMs = new Date(_uy, _umo - 1, _ud, _urlStart, 0, 0, 0).getTime() + (_urlPlayhead * 60000);
+          const b = map.getPlaybackBounds();
+          if (isFinite(b.minMs)) {
+            map.setPlaybackTimeMs(clamp(startMs, b.minMs, b.maxMs));
+          }
+        }
+
+        // Override playback speed (e.g. speed=20 → 20x)
+        const _urlSpeed = Number(_urlParams.get('speed'));
+        if (isFinite(_urlSpeed) && _urlSpeed > 0) {
+          map.setPlaybackSpeed(_urlSpeed);
+          if (pbSpeedEl) pbSpeedEl.value = String(_urlSpeed);
+        }
+
+        updatePlaybackUi();
+        console.log("[EmbedParam] Done. Skipping tick() — snapshot loaded.");
+        return; // Do NOT start live polling when viewing a snapshot
+      } catch (e) {
+        console.error("[EmbedParam] Failed to load snapshot for date:", _urlDate, e);
+        // Fall through to normal live tick
+      }
+    } else if (_urlDate) {
+      console.warn("[EmbedParam] date param failed regex:", _urlDate);
+    }
+
     tick(); // finally block inside tick() schedules all subsequent polls
   });
 }
 
 main();
-

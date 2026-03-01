@@ -409,6 +409,10 @@ class AppState:
     # Structure: { sensor_id: { "lat": float, "lon": float, "name": str } }
     fixed_sensor_locations: dict[str, dict[str, Any]] = field(default_factory=dict)
 
+    # Cached MT-day prefixes for fast history filtering (recomputed once per day)
+    _today_mt_date: str = ""
+    _today_mt_prefixes: tuple[str, ...] = ()
+
     # Bumped on-demand (e.g., from the TUI) to force the web client to treat the
     # next /api/state poll as a "new data" event even if timestamps/trails are unchanged.
     force_refresh_seq: int = 0
@@ -554,7 +558,7 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
     
     Returns True if snapshot was loaded, False otherwise (fails silently).
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     try:
         snapshot = load_snapshot(data_dir, today_str)
         if snapshot is None:
@@ -619,6 +623,25 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         return False
 
 
+def _utc_date_prefixes_for_mt_day(day_mt: datetime) -> tuple[str, ...]:
+    """Return the 1-2 UTC date prefixes that cover a Mountain-time day.
+
+    A single MT day (midnight to midnight) spans at most two UTC dates because
+    MT is UTC-7 (or UTC-6 during DST).  For example, MT March 1 spans
+    2026-03-01T07:00Z to 2026-03-02T07:00Z, so both "2026-03-01" and
+    "2026-03-02" are valid UTC date prefixes.
+
+    Using prefix matching instead of per-entry datetime parsing keeps the
+    hot-path O(1) per entry (critical on Raspberry Pi with thousands of
+    history entries every fetch cycle).
+    """
+    start_utc = day_mt.astimezone(timezone.utc)
+    end_utc = (day_mt + timedelta(days=1)).astimezone(timezone.utc)
+    d1 = start_utc.strftime("%Y-%m-%d")
+    d2 = end_utc.strftime("%Y-%m-%d")
+    return (d1, d2) if d1 != d2 else (d1,)
+
+
 def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
     """Strip history entries from fixed sensors that don't belong to date_str.
 
@@ -626,12 +649,22 @@ def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
     can span multiple days because fixed_history accumulates 48 hours of data.
     Before saving a snapshot we trim them to only the entries from date_str so
     loading a snapshot never shows data from other days.
+
+    Timestamps are UTC but date_str is a Mountain-time date, so we accept any
+    UTC date that falls within the MT day (at most 2 UTC dates due to offset).
     """
+    try:
+        day_mt = datetime.strptime(date_str, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=_MOUNTAIN_TZ)
+    except (ValueError, TypeError):
+        return
+    prefixes = _utc_date_prefixes_for_mt_day(day_mt)
+
     for sensor in (state.get("fixed") or []):
         if not isinstance(sensor, dict):
             continue
         if sensor.get("purpleair"):
-            continue  # PA data is never trimmed — all readings go into the snapshot
+            continue  # PA history is already day-scoped; skip expensive iteration
         for reading in (sensor.get("readings") or {}).values():
             if not isinstance(reading, dict):
                 continue
@@ -640,42 +673,36 @@ def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
             colors = reading.get("history_colors")
             if not isinstance(times, list):
                 continue
-            # Build filtered index list
+            # Fast prefix check: keep entries whose UTC date is one of the
+            # (at most 2) dates that cover this Mountain-time day.
             keep = [i for i, t in enumerate(times)
-                    if isinstance(t, str) and t.startswith(date_str)]
+                    if isinstance(t, str) and t[:10] in prefixes]
             reading["history_times"]  = [times[i]  for i in keep]
             reading["history"]        = [values[i] for i in keep] if isinstance(values, list) and len(values) == len(times) else []
             reading["history_colors"] = [colors[i] for i in keep] if isinstance(colors, list) and len(colors) == len(times) else []
 
 
 def _trim_trails_to_day(state: dict[str, Any], date_str: str) -> None:
-    """Filter mobile sensor trails to the 5 AM – 5 AM local-time window for date_str.
+    """Filter mobile sensor trails to the 5 AM – 5 AM MST window for date_str.
 
-    The "day" for air-quality purposes runs from 5:00 AM local on date_str to
-    5:00 AM local on the following day, matching the client-side live playback
-    window in map_view.js.  Trail point timestamps (``"t"``) are UTC ISO
-    strings; we convert each to local time for comparison.
+    The "day" for air-quality purposes runs from 5:00 AM Mountain on date_str
+    to 5:00 AM Mountain on the following day, matching the client-side live
+    playback window in map_view.js.  Trail timestamps use mixed formats
+    ("2026-02-28 21:08:30 UTC", "2026-02-28T21:08:30Z") so we parse each
+    with parse_utc_timestamp and compare datetimes.
     """
     try:
         requested_date = datetime.strptime(date_str, "%Y-%m-%d")
     except (ValueError, TypeError):
-        return  # Can't parse date, skip trimming
+        return
 
-    # Build the 5 AM – 5 AM window in Mountain Time (Utah sensors are always MT).
-    # Using the server's local tz (.astimezone()) would give the wrong boundary
-    # on UTC servers (Pi, Docker), where "5am local" = "5am UTC" = "11pm MT".
-    day_start_mt = requested_date.replace(hour=5, minute=0, second=0, microsecond=0,
-                                          tzinfo=_MOUNTAIN_TZ)
-    day_end_mt = day_start_mt + timedelta(hours=24)
-
-    day_start_utc = day_start_mt.astimezone(timezone.utc)
-    day_end_utc   = day_end_mt.astimezone(timezone.utc)
-
-    # Pre-compute boundary ISO strings for fast lexicographic comparison.
-    # This avoids calling parse_utc_timestamp (multi-format strptime with
-    # exception-driven fallback) on every single trail point.
-    lo = day_start_utc.strftime("%Y-%m-%dT%H:%M:%S")
-    hi = day_end_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    # 5 AM MT boundaries as UTC datetimes.
+    # Trail timestamps come in multiple formats ("2026-02-28 21:08:30 UTC",
+    # "2026-02-28T21:08:30Z", etc.) so lexicographic string comparison is
+    # unreliable.  Parse each point with parse_utc_timestamp instead.
+    day_start_utc = requested_date.replace(hour=5, minute=0, second=0, microsecond=0,
+                                           tzinfo=_MOUNTAIN_TZ).astimezone(timezone.utc)
+    day_end_utc = (day_start_utc + timedelta(hours=24))
 
     for sensor in (state.get("mobile") or []):
         if not isinstance(sensor, dict):
@@ -687,14 +714,57 @@ def _trim_trails_to_day(state: dict[str, Any], date_str: str) -> None:
         for p in trail:
             if not isinstance(p, dict):
                 continue
-            t = p.get("t")
-            if not isinstance(t, str) or len(t) < 19:
+            dt = parse_utc_timestamp(p.get("t"))
+            if dt is None:
                 continue
-            # Normalize separator to 'T' for comparison (handles "YYYY-MM-DD HH:MM:SS")
-            ts = t[:19].replace(" ", "T")
-            if lo <= ts < hi:
+            if day_start_utc <= dt < day_end_utc:
                 filtered.append(p)
         sensor["trail"] = filtered
+
+
+def _trim_state_to_window(state: dict[str, Any], window_start_utc: datetime, window_end_utc: datetime) -> None:
+    """Trim mobile trails and fixed history to a UTC time window.
+
+    Used by the embed/widget loader to send only the data needed for the
+    requested playback window instead of the entire day's snapshot.
+    """
+    for sensor in (state.get("mobile") or []):
+        if not isinstance(sensor, dict):
+            continue
+        trail = sensor.get("trail")
+        if not isinstance(trail, list):
+            continue
+        filtered = []
+        for p in trail:
+            if not isinstance(p, dict):
+                continue
+            dt = parse_utc_timestamp(p.get("t"))
+            if dt is None:
+                continue
+            if window_start_utc <= dt < window_end_utc:
+                filtered.append(p)
+        sensor["trail"] = filtered
+
+    # Trim fixed sensor history to the window as well
+    for sensor in (state.get("fixed") or []):
+        if not isinstance(sensor, dict):
+            continue
+        for reading in (sensor.get("readings") or {}).values():
+            if not isinstance(reading, dict):
+                continue
+            times = reading.get("history_times")
+            values = reading.get("history")
+            hci = reading.get("hci")
+            if not isinstance(times, list):
+                continue
+            keep = [i for i, t in enumerate(times)
+                    if isinstance(t, str) and
+                    (lambda dt: dt is not None and window_start_utc <= dt < window_end_utc)(parse_utc_timestamp(t))]
+            reading["history_times"] = [times[i] for i in keep]
+            if isinstance(values, list) and len(values) == len(times):
+                reading["history"] = [values[i] for i in keep]
+            if isinstance(hci, list) and len(hci) == len(times):
+                reading["hci"] = [hci[i] for i in keep]
 
 
 def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
@@ -703,7 +773,7 @@ def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
     Called on graceful shutdown to persist the accumulated trail data.
     Returns True if saved successfully, False otherwise.
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     try:
         with app_state.lock:
             state_bytes = app_state.cached_json_bytes
@@ -722,7 +792,9 @@ def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
             _log("[Snapshot] Not enough data to save (fewer than 10 trail points)")
             return False
 
-        # Trim fixed sensor history to today only before saving
+        # Trim everything to today's 5 AM–5 AM MST window before saving
+        # so loaded snapshots are already clean and need no re-filtering.
+        _trim_trails_to_day(state, today_str)
         _trim_history_to_date(state, today_str)
 
         result = save_snapshot(data_dir, today_str, state)
@@ -991,17 +1063,35 @@ def _accumulate_home_sensor_reading(app_state: AppState, st: dict[str, Any]) -> 
         return
 
 
+def _get_today_prefixes(app_state: AppState) -> tuple[str, ...]:
+    """Return cached UTC date prefixes for the current Mountain-time day.
+
+    Recomputes only when the MT date rolls over (once per day).
+    """
+    today_mt_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
+    if today_mt_str != app_state._today_mt_date:
+        day_mt = datetime.now(_MOUNTAIN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        app_state._today_mt_prefixes = _utc_date_prefixes_for_mt_day(day_mt)
+        app_state._today_mt_date = today_mt_str
+    return app_state._today_mt_prefixes
+
+
 def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
     """Inject history arrays into fixed sensor readings from accumulated history.
 
-    Only injects entries from today (local date) so stale multi-day history
-    accumulated in fixed_history.json doesn't bleed into the live state.
+    Only injects entries from today (Mountain time date) so stale multi-day
+    history accumulated in fixed_history.json doesn't bleed into the live state.
+
+    Timestamps are UTC but the "day" boundary is midnight Mountain Time.  A
+    single MT day spans at most 2 UTC dates (e.g. MT March 1 → UTC March 1 +
+    March 2), so we use fast string prefix matching on the first 10 chars
+    instead of per-entry datetime parsing (critical on Raspberry Pi).
     """
     fixed_list = st.get("fixed", [])
     if not isinstance(fixed_list, list):
         return
 
-    today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prefixes = _get_today_prefixes(app_state)
 
     for sensor in fixed_list:
         sensor_id = sensor.get("id")
@@ -1044,7 +1134,7 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
 
             for entry in hist_entries:
                 t = entry.get("time") or ""
-                if not t.startswith(today_prefix):
+                if t[:10] not in prefixes:
                     continue
                 val = entry.get("val")
                 try:
@@ -3004,7 +3094,7 @@ def _fetch_airnow_data(app_state: AppState) -> None:
             try:
                 # Determine URL - try today's folder first, then archive
                 dt = datetime.strptime(hour_key, "%Y%m%d%H")
-                today = datetime.now().strftime("%Y%m%d")
+                today = datetime.now(_MOUNTAIN_TZ).strftime("%Y%m%d")
                 
                 if hour_key.startswith(today):
                     url = f"{FILES_BASE_URL}/today/HourlyData_{hour_key}.dat"
@@ -3172,7 +3262,7 @@ def save_snapshot(data_dir: Path, date_str: str, state: dict[str, Any]) -> dict[
     # Sanitize date string for filename - only allow YYYY-MM-DD format chars
     safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
     if not safe_date or len(safe_date) > 20:
-        safe_date = datetime.now().strftime("%Y-%m-%d")
+        safe_date = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     filepath = snapshots_dir / f"{safe_date}.json"
     filepath.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
     return {"success": True, "filename": filepath.name, "size_bytes": filepath.stat().st_size}
@@ -3198,19 +3288,17 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     if file_size > MAX_SNAPSHOT_SIZE_BYTES:
         raise JsonValidationError(f"Snapshot file too large: {file_size} bytes")
     
-    # Fast path: snapshots are self-written by this server, so skip the
-    # expensive recursive sanitize walk (parse_and_sanitize_json regex-checks
-    # every string in the entire tree — way too slow on a Pi for multi-MB files).
+    # Snapshots are written by our own server — skip expensive sanitization.
+    # Just parse and do a lightweight schema check.
     raw_bytes = filepath.read_bytes()
-    # sanitized = parse_and_sanitize_json(raw_bytes, max_size=MAX_SNAPSHOT_SIZE_BYTES)
-    state = json.loads(raw_bytes)
-    if not isinstance(state, dict):
-        raise JsonValidationError(f"JSON root must be object, got {type(state).__name__}")
-    
-    # Validate schema
-    validate_state_schema(state)
-    
-    return state
+    try:
+        parsed = json.loads(raw_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise JsonValidationError(f"Corrupt snapshot: {e}")
+    if not isinstance(parsed, dict):
+        raise JsonValidationError("Snapshot root must be object")
+    validate_state_schema(parsed)
+    return parsed
 
 def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, server_config: dict | None = None):
     """Create HTTP request handler with injected dependencies.
@@ -3548,8 +3636,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             date_str = query.get("date", [None])[0]
 
             if not date_str:
-                # Default to today's date
-                date_str = datetime.now().strftime("%Y-%m-%d")
+                # Default to today's date (Mountain time — sensors are in Utah)
+                date_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
 
             try:
                 # Read POSTed body
@@ -3566,7 +3654,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                     with app_state.lock:
                         state_to_save = json.loads(app_state.cached_json_bytes.decode("utf-8"))
 
-                # Trim fixed sensor history to the snapshot's date only
+                # Trim to the snapshot's date window (5 AM–5 AM MST)
+                _trim_trails_to_day(state_to_save, date_str)
                 _trim_history_to_date(state_to_save, date_str)
 
                 result = save_snapshot(data_dir, date_str, state_to_save)
@@ -3578,6 +3667,11 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 return self._send(500, body, "application/json")
+
+        # In-memory cache for windowed snapshot responses.
+        # Key: (date_str, start_hour, duration_h)  Value: bytes
+        # Avoids re-parsing the full snapshot JSON on every widget load.
+        _snapshot_window_cache: dict[tuple, bytes] = {}
 
         def _handle_load_snapshot(self):
             """Load a saved snapshot by date.
@@ -3593,6 +3687,21 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             if not date_str:
                 return self._send(400, b'{"error": "date parameter required"}', "application/json")
 
+            # Check window cache first (widget requests the same window all day)
+            start_hour_raw = query.get("start", [None])[0]
+            duration_raw = query.get("duration", [None])[0]
+            if start_hour_raw is not None and duration_raw is not None:
+                try:
+                    cache_key = (date_str, int(start_hour_raw), int(duration_raw))
+                    cached = self._snapshot_window_cache.get(cache_key)
+                    if cached is not None:
+                        return self._send(200, cached, "application/json",
+                                          cache_control="public, max-age=3600")
+                except (ValueError, TypeError):
+                    cache_key = None
+            else:
+                cache_key = None
+
             try:
                 state = load_snapshot(data_dir, date_str)
                 if state is None:
@@ -3604,15 +3713,22 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 # data was injected incorrectly.
                 existing_pa = [f for f in (state.get("fixed") or []) if f.get("purpleair")]
                 if existing_pa:
-                    # Check fixed_history for any PA entry timestamped on this date
-                    date_prefix = date_str  # "YYYY-MM-DD"
+                    # Check fixed_history for any PA entry timestamped on this date.
+                    # date_str is a Mountain-time date but timestamps are UTC, so
+                    # we check both UTC dates that cover this MT day.
+                    try:
+                        _day_mt = datetime.strptime(date_str, "%Y-%m-%d").replace(
+                            hour=0, minute=0, second=0, microsecond=0, tzinfo=_MOUNTAIN_TZ)
+                        _pa_prefixes = _utc_date_prefixes_for_mt_day(_day_mt)
+                    except (ValueError, TypeError):
+                        _pa_prefixes = (date_str,)
                     pa_confirmed = False
                     with app_state.lock:
                         for sensor_id, pollutants in app_state.fixed_history.items():
                             if not sensor_id.startswith("PA_"):
                                 continue
                             for entries in pollutants.values():
-                                if any(e.get("time", "").startswith(date_prefix) for e in entries):
+                                if any(e.get("time", "")[:10] in _pa_prefixes for e in entries):
                                     pa_confirmed = True
                                     break
                             if pa_confirmed:
@@ -3621,12 +3737,39 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         _log(f"[Snapshot] Stripping {len(existing_pa)} stale PA sensors from {date_str} (no fixed_history data for that date)")
                         state["fixed"] = [f for f in state["fixed"] if not f.get("purpleair")]
 
-                # Trim trails to the requested date's window only (5 AM – 5 AM local)
+                # Trim to the requested day's 5 AM–5 AM MST window.
+                # Current saves are pre-trimmed, but older snapshots may not be.
                 _trim_trails_to_day(state, date_str)
-                # _trim_history_to_date already applied at save time — skip on load
-                # _trim_history_to_date(state, date_str)
+                _trim_history_to_date(state, date_str)
+
+                # If start (hour) and duration (hours) are provided, further trim
+                # to just that window.  Used by the landing page embed widget to
+                # avoid sending the entire day's data for a 2-hour playback loop.
+                start_hour_raw = query.get("start", [None])[0]
+                duration_raw = query.get("duration", [None])[0]
+                if start_hour_raw is not None and duration_raw is not None:
+                    try:
+                        start_hour = int(start_hour_raw)
+                        duration_h = int(duration_raw)
+                        if 0 <= start_hour <= 23 and 0 < duration_h <= 24:
+                            _day = datetime.strptime(date_str, "%Y-%m-%d")
+                            win_start = _day.replace(hour=start_hour, minute=0, second=0,
+                                                     microsecond=0, tzinfo=_MOUNTAIN_TZ).astimezone(timezone.utc)
+                            win_end = win_start + timedelta(hours=duration_h)
+                            _trim_state_to_window(state, win_start, win_end)
+                    except (ValueError, TypeError):
+                        pass  # Ignore bad params, serve full day
 
                 body = json.dumps(state).encode("utf-8")
+                # Cache windowed responses so subsequent widget loads are instant
+                if cache_key is not None:
+                    self._snapshot_window_cache[cache_key] = body
+                    # Cap cache size: keep at most 10 entries
+                    if len(self._snapshot_window_cache) > 10:
+                        oldest = next(iter(self._snapshot_window_cache))
+                        del self._snapshot_window_cache[oldest]
+                    return self._send(200, body, "application/json",
+                                      cache_control="public, max-age=3600")
                 return self._send(200, body, "application/json")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
