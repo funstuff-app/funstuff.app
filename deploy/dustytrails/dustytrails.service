@@ -6,15 +6,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=jpark
-Group=jpark
+User=__USER__
+Group=__USER__
 WorkingDirectory=/opt/dustytrails
 
 # Environment
 Environment="PYTHONUNBUFFERED=1"
-# Data directory: ~/.mobileair (i.e., /home/jpark/.mobileair)
+# Data directory: ~/.mobileair (i.e., /home/__USER__/.mobileair)
 # Contains: road graphs, snapshots, sensor names, history, caches
-Environment="HOME=/home/jpark"
+Environment="HOME=/home/__USER__"
 
 # Run the dashboard server
 # --host 0.0.0.0 allows connections from reverse proxy
@@ -30,7 +30,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/dustytrails/data
+ReadWritePaths=/home/__USER__/.mobileair
 
 # Resource limits (adjust for Pi model)
 MemoryMax=256M

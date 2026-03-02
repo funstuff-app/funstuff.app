@@ -2001,9 +2001,11 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
 
 PURPLEAIR_API_KEY = os.environ.get("DUSTY_PURPLEAIR_API_KEY", "").strip()
 
-# Owner token: when set, the Home sensor is only included in /api/state
-# responses that carry a matching ?tok= query parameter.
+# Owner token: when set, write endpoints require a matching token.
+# Token is read from the `dusty_tok` HttpOnly cookie (set via POST /api/auth)
+# or from a ?tok= query param (backward compat for curl / scripts).
 OWNER_TOKEN = os.environ.get("DUSTY_OWNER_TOKEN", "").strip()
+_AUTH_COOKIE_NAME = "dusty_tok"
 PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
 
 
@@ -2378,7 +2380,6 @@ def purpleair_fetch_loop(
                 sentinels = _pick_sentinels(app_state.purpleair_sensors, grid)
             sentinel_ids = [s["sensor_index"] for s in sentinels]
 
-            _log(f"[PurpleAir] Polling {len(sentinel_ids)} sentinels ({len(grid)} grid cells)")
             sentinel_data = _fetch_purpleair_sensors(fields="pm2.5", sensor_indices=sentinel_ids)
             debug_info["calls"].append({"type": "sentinel_poll", "count": len(sentinel_ids)})
 
@@ -2402,9 +2403,6 @@ def purpleair_fetch_loop(
                     with app_state.lock:
                         cluster = _cluster_of(sid, grid, app_state.purpleair_sensors)
                     cluster_ids_to_fetch.update(cluster)
-                    if old_color is not None:
-                        _log(f"[PurpleAir] Sentinel {sid} color {old_color}→{new_color}, "
-                             f"queuing {len(cluster)} cluster members")
 
             # Apply sentinel readings
             with app_state.lock:
@@ -2415,14 +2413,13 @@ def purpleair_fetch_loop(
             cluster_ids_to_fetch -= set(sentinel_ids)
             if cluster_ids_to_fetch:
                 cluster_list = list(cluster_ids_to_fetch)
-                _log(f"[PurpleAir] Fetching {len(cluster_list)} cluster sensors (show_only)")
                 cluster_data = _fetch_purpleair_sensors(fields="pm2.5",
                                                         sensor_indices=cluster_list)
                 debug_info["calls"].append({"type": "cluster_fetch", "count": len(cluster_list)})
                 with app_state.lock:
                     _apply_fetched(cluster_data, now)
             else:
-                _log("[PurpleAir] No color-category changes, no cluster fetches needed")
+                pass  # routine cycle, no color changes — stay quiet
 
             debug_info["sentinel_count"] = len(sentinel_ids)
             debug_info["cluster_sensors_fetched"] = len(cluster_ids_to_fetch)
@@ -3399,11 +3396,18 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
     class Handler(BaseHTTPRequestHandler):
         # Disable keep-alive to avoid Safari/iOS hanging on connections
         protocol_version = "HTTP/1.1"
+        # Hide Python/BaseHTTP version from Server header
+        server_version = "DustyTrails"
+        sys_version = ""
         
         def log_message(self, format, *args):
             # Suppress default logging to avoid cluttering output
             pass
-        
+
+        def do_HEAD(self):
+            """Handle HEAD requests — return same headers as GET, no body."""
+            self.do_GET()
+
         def handle_one_request(self):
             """Override to handle broken pipe errors gracefully (Safari can drop connections)."""
             try:
@@ -3439,7 +3443,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 # Allow cross-origin requests (useful for dev/testing)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != "HEAD":
+                    self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client disconnected while we were sending - ignore
                 pass
@@ -3453,6 +3458,87 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 self.send_header("Connection", "close")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+        def _get_owner_tok(self) -> str:
+            """Read owner token from cookie (preferred) or ?tok= query param (fallback for curl)."""
+            # 1. HttpOnly cookie
+            cookie_header = self.headers.get("Cookie", "")
+            for part in cookie_header.split(";"):
+                part = part.strip()
+                if part.startswith(f"{_AUTH_COOKIE_NAME}="):
+                    return part[len(_AUTH_COOKIE_NAME) + 1:]
+            # 2. Query param fallback
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            return (qs.get("tok") or [""])[0]
+
+        def _is_owner(self) -> bool:
+            """Check if the request carries a valid owner token."""
+            if not OWNER_TOKEN:
+                return False
+            return self._get_owner_tok() == OWNER_TOKEN
+
+        def _require_owner(self) -> bool:
+            """Return True if auth passes.  Sends 403 and returns False if not."""
+            if not OWNER_TOKEN:
+                return True  # no token configured = open
+            if self._get_owner_tok() == OWNER_TOKEN:
+                return True
+            self._send(403, b'{"error": "forbidden"}', "application/json")
+            return False
+
+        def _handle_auth(self):
+            """POST /api/auth — validate token, set HttpOnly cookie.
+            
+            Body: {"token": "<value>"}
+            Response: 200 with Set-Cookie on success, 403 on bad token.
+            """
+            content_length = int(self.headers.get("Content-Length", 0))
+            if not (0 < content_length <= 512):
+                return self._send(400, b'{"error": "bad request"}', "application/json")
+            try:
+                raw = self.rfile.read(content_length)
+                body = json.loads(raw)
+                tok = (body.get("token") or "").strip()
+            except Exception:
+                return self._send(400, b'{"error": "invalid json"}', "application/json")
+
+            if not OWNER_TOKEN or tok != OWNER_TOKEN:
+                return self._send(403, b'{"error": "forbidden"}', "application/json")
+
+            # Set HttpOnly cookie — browser sends it automatically on every request.
+            # SameSite=Strict prevents CSRF; Secure omitted so it works on local HTTP.
+            cookie = f"{_AUTH_COOKIE_NAME}={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000"
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", cookie)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                body_bytes = b'{"ok": true}'
+                self.send_header("Content-Length", str(len(body_bytes)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body_bytes)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+        def _handle_auth_delete(self):
+            """DELETE /api/auth — clear the auth cookie."""
+            cookie = f"{_AUTH_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", cookie)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                body_bytes = b'{"ok": true}'
+                self.send_header("Content-Length", str(len(body_bytes)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body_bytes)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
@@ -3474,23 +3560,22 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             if path_no_query == "/styles.css":
                 return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css", cache_control="public, max-age=86400")
             if path_no_query == "/manifest.json":
-                # Generate manifest dynamically with explicit http:// URL for PWA
-                host_header = self.headers.get("Host", "localhost:8765")
-                base_url = f"http://{host_header}"
+                # Use relative URLs — avoids Host-header injection and works
+                # behind any reverse proxy or CDN without scheme/host mismatch.
                 manifest = {
                     "name": "DustyTrails",
                     "short_name": "DustyTrails",
                     "description": "Real-time air quality monitoring dashboard for Utah mobile and fixed sensors",
-                    "start_url": base_url + "/",
-                    "scope": base_url + "/",
+                    "start_url": "/",
+                    "scope": "/",
                     "display": "standalone",
                     "background_color": "#0b0f14",
                     "theme_color": "#111826",
                     "orientation": "any",
                     "icons": [
-                        {"src": base_url + "/icon-192.png", "sizes": "192x192", "type": "image/png"},
-                        {"src": base_url + "/icon-512.png", "sizes": "512x512", "type": "image/png"},
-                        {"src": base_url + "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+                        {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+                        {"src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
                     ]
                 }
                 return self._send(200, json.dumps(manifest).encode(), "application/manifest+json")
@@ -3533,16 +3618,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                     _cc_public = "public, max-age=0, s-maxage=30, stale-while-revalidate=5"
 
                     # Owner token path: no ETag, no CDN cache (debug gets full fresh data)
-                    if OWNER_TOKEN:
-                        from urllib.parse import urlparse, parse_qs
-                        qs = parse_qs(urlparse(self.path).query)
-                        tok = (qs.get("tok") or [""])[0]
-                        if tok == OWNER_TOKEN:
-                            st_copy = json.loads(app_state.cached_json_bytes)
-                            if isinstance(st_copy.get("fixed"), list):
-                                st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
-                            return self._send(200, json.dumps(st_copy).encode("utf-8"),
-                                              "application/json", cache_control="private, no-store")
+                    if self._is_owner():
+                        st_copy = json.loads(app_state.cached_json_bytes)
+                        if isinstance(st_copy.get("fixed"), list):
+                            st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
+                        return self._send(200, json.dumps(st_copy).encode("utf-8"),
+                                          "application/json", cache_control="private, no-store")
 
                     # Public path: ETag / 304 conditional GET
                     inm = self.headers.get("If-None-Match", "")
@@ -3619,23 +3700,27 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
+            if self.path.startswith("/api/auth"):
+                return self._handle_auth()
             if self.path.startswith("/api/prefs/sync"):
                 return self._handle_prefs_sync()
             if self.path.startswith("/api/snapshot/save"):
                 return self._handle_save_snapshot()
             return self._send(404, b"not found", "text/plain")
 
+        def do_DELETE(self):
+            if self.path.startswith("/api/auth"):
+                return self._handle_auth_delete()
+            return self._send(404, b"not found", "text/plain")
+
         def _handle_prefs_sync(self):
             """Append a prefs snapshot to prefs_log.ndjson (one JSON line per entry).
 
             Body: {"client_ts": <epoch_ms>, "prefs": {"dusty_...": "...", ...}}
-            Token validated via ?tok= query param (same as snapshot/save).
+            Auth via HttpOnly cookie or ?tok= query param.
             """
-            from urllib.parse import urlparse, parse_qs
-            qs = parse_qs(urlparse(self.path).query)
-            tok = (qs.get("tok") or [""])[0]
-            if OWNER_TOKEN and tok != OWNER_TOKEN:
-                return self._send(403, b'{"error": "forbidden"}', "application/json")
+            if not self._require_owner():
+                return
             content_length = int(self.headers.get("Content-Length", 0))
             if not (0 < content_length <= 8192):
                 return self._send(400, b'{"error": "bad length"}', "application/json")
@@ -3666,11 +3751,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             Query params:
               n=<int>   — number of tail entries to return (default 100, max 10000)
             """
+            if not self._require_owner():
+                return
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
-            tok = (qs.get("tok") or [""])[0]
-            if OWNER_TOKEN and tok != OWNER_TOKEN:
-                return self._send(403, b'{"error": "forbidden"}', "application/json")
             try:
                 n = min(int((qs.get("n") or ["100"])[0]), 10000)
             except (ValueError, TypeError):
@@ -3710,8 +3794,11 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
 
         def _handle_save_snapshot(self):
             """Save POSTed state as a snapshot."""
+            if not self._require_owner():
+                return
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
+
             date_str = query.get("date", [None])[0]
 
             if not date_str:
@@ -3933,7 +4020,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             max_lat = float(query.get("maxLat", ["90"])[0])
             min_lon = float(query.get("minLon", ["-180"])[0])
             max_lon = float(query.get("maxLon", ["180"])[0])
-            limit = int(query.get("limit", ["5000"])[0])
+            limit = min(int(query.get("limit", ["5000"])[0]), 50000)
             
             road_graph = get_cached_road_graph()
             if not road_graph:
@@ -3988,7 +4075,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             max_lat = float(query.get("maxLat", ["90"])[0])
             min_lon = float(query.get("minLon", ["-180"])[0])
             max_lon = float(query.get("maxLon", ["180"])[0])
-            limit = int(query.get("limit", ["5000"])[0])
+            limit = min(int(query.get("limit", ["5000"])[0]), 50000)
             
             tram_graph = get_cached_tram_line_graph()
             if not tram_graph:

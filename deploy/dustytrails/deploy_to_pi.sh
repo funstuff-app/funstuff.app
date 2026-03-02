@@ -320,7 +320,9 @@ deploy_data() {
     log_info "Creating data directory on Pi..."
     ssh "$PI_TARGET" "mkdir -p '$REMOTE_DATA_DIR'"
     
-    # Sync data directory, excluding secrets and logs
+    # Sync data directory, excluding secrets, logs, and snapshots.
+    # Snapshots are NOT synced: the Pi saves its own daily and those are
+    # the authoritative copies.  Road graphs and other data files ARE pushed.
     log_info "Syncing data files (this may take a while for road graphs)..."
     rsync -avz \
         --exclude='.env' \
@@ -328,6 +330,8 @@ deploy_data() {
         --exclude='dev-cert.pem' \
         --exclude='dev-key.pem' \
         --exclude='*.pem' \
+        --exclude='prefs_log.ndjson' \
+        --exclude='snapshots/' \
         "$LOCAL_DATA_DIR/" \
         "$PI_TARGET:$REMOTE_DATA_DIR/"
     
@@ -343,90 +347,75 @@ deploy_data() {
 setup_service() {
     log_step "Setting up service on Pi..."
     
-    # First, do the non-sudo parts
-    ssh "$PI_TARGET" bash << REMOTE_SCRIPT
+    # First, do the non-sudo parts: venv + deps
+    ssh "$PI_TARGET" bash <<REMOTE_VENV
 set -euo pipefail
-
-INSTALL_DIR="$INSTALL_DIR"
-SERVICE_NAME="dustytrails"
-
 echo "Creating Python virtual environment..."
-if [[ ! -d "\$INSTALL_DIR/venv" ]]; then
-    python3 -m venv "\$INSTALL_DIR/venv"
-fi
-
+[[ -d "$INSTALL_DIR/venv" ]] || python3 -m venv "$INSTALL_DIR/venv"
 echo "Installing Python dependencies..."
-"\$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q
-"\$INSTALL_DIR/venv/bin/pip" install -r "\$INSTALL_DIR/requirements.txt" -q
-
-echo "Setting permissions..."
-mkdir -p "\$INSTALL_DIR/data"
-chmod -R 755 "\$INSTALL_DIR"
-chmod 700 "\$INSTALL_DIR/data"
-
+"$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q
+"$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
+mkdir -p "$INSTALL_DIR/data"
+chmod -R 755 "$INSTALL_DIR"
+chmod 700 "$INSTALL_DIR/data"
 echo "Python environment ready!"
-REMOTE_SCRIPT
-
+REMOTE_VENV
     log_info "Python environment set up."
-    
-    # Now update the service file with correct path and copy it
-    log_info "Updating service file with correct paths..."
-    local service_content
-    service_content=$(cat << EOF
-[Unit]
-Description=Dusty Trails - MobileAir Dashboard Server
-Documentation=https://github.com/your-repo/dustytrails
-After=network-online.target
-Wants=network-online.target
 
-[Service]
-Type=simple
-User=${PI_USER}
-Group=${PI_USER}
-WorkingDirectory=${INSTALL_DIR}
+    # Template the service file from the repo copy (single source of truth).
+    # Replace the hardcoded user/paths with values from deploy.config.
+    log_info "Templating service file..."
+    local svc_src="$SCRIPT_DIR/dustytrails.service"
+    local svc_tmp
+    svc_tmp="$(mktemp)"
+    sed -e "s|__USER__|${PI_USER}|g" \
+        -e "s|/opt/dustytrails|${INSTALL_DIR}|g" \
+        "$svc_src" > "$svc_tmp"
 
-# Environment
-Environment="PYTHONUNBUFFERED=1"
-Environment="HOME=/home/${PI_USER}"
+    # Copy service file to Pi
+    scp -q "$svc_tmp" "$PI_TARGET:$INSTALL_DIR/dustytrails.service"
+    rm -f "$svc_tmp"
 
-# Run the dashboard server
-ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/dashboard_server.py --host 0.0.0.0 --port 8766
-
-# Restart policy
-Restart=always
-RestartSec=10
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=dustytrails
-
-[Install]
-WantedBy=multi-user.target
-EOF
-)
-    
-    # Write service file to Pi
-    echo "$service_content" | ssh "$PI_TARGET" "cat > $INSTALL_DIR/dustytrails.service"
-
-    # Build secrets drop-in (only lines that have a value)
-    local override_lines="[Service]"
-    [[ -n "${DUSTY_PURPLEAIR_API_KEY:-}" ]] && override_lines+=$'\n'"Environment=\"DUSTY_PURPLEAIR_API_KEY=${DUSTY_PURPLEAIR_API_KEY}\""
-    [[ -n "${AIRNOW_API_KEY:-}" ]]           && override_lines+=$'\n'"Environment=\"AIRNOW_API_KEY=${AIRNOW_API_KEY}\""
-    [[ -n "${DUSTY_OWNER_TOKEN:-}" ]]       && override_lines+=$'\n'"Environment=\"DUSTY_OWNER_TOKEN=${DUSTY_OWNER_TOKEN}\""
-
-    # Try to install service with sudo (will prompt for password)
+    # Install service + build secrets drop-in entirely on the Pi.
+    # API keys are passed as simple args; the owner token is generated
+    # on the Pi and persisted across deploys.
     log_info "Installing systemd service (may prompt for password)..."
-    # Pass override content via env var to avoid heredoc quoting issues
-    OVERRIDE_CONTENT="$override_lines" ssh -t "$PI_TARGET" bash << REMOTE_SUDO
+    local pa_key="${DUSTY_PURPLEAIR_API_KEY:-}"
+    local an_key="${AIRNOW_API_KEY:-}"
+    local ow_tok="${DUSTY_OWNER_TOKEN:-}"
+    ssh -t "$PI_TARGET" bash <<REMOTE_SUDO
 set -e
 sudo cp "$INSTALL_DIR/dustytrails.service" /etc/systemd/system/dustytrails.service
 sudo mkdir -p /etc/systemd/system/dustytrails.service.d
-printf '%s\n' "\$OVERRIDE_CONTENT" | sudo tee /etc/systemd/system/dustytrails.service.d/secrets.conf > /dev/null
+
+# Build secrets.conf on the Pi
+SECRETS="[Service]"
+[[ -n "$pa_key" ]] && SECRETS="\${SECRETS}
+Environment=\"DUSTY_PURPLEAIR_API_KEY=$pa_key\""
+[[ -n "$an_key" ]] && SECRETS="\${SECRETS}
+Environment=\"AIRNOW_API_KEY=$an_key\""
+
+# Token priority: deploy.config > existing on Pi > generate new
+TOKEN="$ow_tok"
+if [[ -z "\$TOKEN" ]]; then
+    TOKEN=\$(grep -oP 'DUSTY_OWNER_TOKEN=\K[^"]+' /etc/systemd/system/dustytrails.service.d/secrets.conf 2>/dev/null || true)
+fi
+if [[ -z "\$TOKEN" ]]; then
+    TOKEN=\$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │  Generated new DUSTY_OWNER_TOKEN:                           │"
+    echo "  │  \$TOKEN"
+    echo "  │                                                             │"
+    echo "  │  Save to deploy.config and set in browser:                  │"
+    echo "  │  /#tok=\$TOKEN"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    echo ""
+fi
+SECRETS="\${SECRETS}
+Environment=\"DUSTY_OWNER_TOKEN=\${TOKEN}\""
+
+printf '%s\n' "\$SECRETS" | sudo tee /etc/systemd/system/dustytrails.service.d/secrets.conf > /dev/null
 sudo chmod 600 /etc/systemd/system/dustytrails.service.d/secrets.conf
 sudo systemctl daemon-reload
 sudo systemctl enable dustytrails

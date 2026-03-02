@@ -1,5 +1,7 @@
 // Owner token: read from URL hash (#tok=...) and persist in localStorage.
-// Appended to API URLs so the server can include the Home sensor for owners.
+// On load, POST to /api/auth to set an HttpOnly cookie so the token is never
+// exposed in URLs, logs, or Referer headers.  All subsequent fetches send the
+// cookie automatically.
 const _ownerTok = (() => {
   const KEY = "dusty_owner_tok";
   const hash = location.hash || "";
@@ -13,12 +15,18 @@ const _ownerTok = (() => {
   return localStorage.getItem(KEY) || "";
 })();
 
-/** Append owner token to a URL (if set). */
-function _tokUrl(url) {
-  if (!_ownerTok) return url;
-  const sep = url.includes("?") ? "&" : "?";
-  return `${url}${sep}tok=${encodeURIComponent(_ownerTok)}`;
-}
+/** Exchange the owner token for an HttpOnly auth cookie. */
+const _authReady = (async () => {
+  if (!_ownerTok) return;
+  try {
+    await fetch("/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: _ownerTok }),
+      credentials: "same-origin",
+    });
+  } catch (_) { /* server may not support it yet — silent fallback */ }
+})();
 
 // ── Prefs sync ──────────────────────────────────────────────────────────────
 // Collects all owner-namespaced localStorage keys and POSTs them to the
@@ -35,8 +43,15 @@ function _syncPrefsToServer() {
     }
   }
   const payload = JSON.stringify({ client_ts: Date.now(), prefs });
-  navigator.sendBeacon(_tokUrl("/api/prefs/sync"),
-    new Blob([payload], { type: "application/json" }));
+  // Use fetch+keepalive instead of sendBeacon so the HttpOnly auth cookie is
+  // sent automatically.  keepalive lets the request survive page unload.
+  fetch("/api/prefs/sync", {
+    method: "POST",
+    body: payload,
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    keepalive: true,
+  }).catch(() => {});
 }
 
 // visibilitychange covers tab switches, window minimize, and most close gestures.
@@ -121,7 +136,7 @@ function _mergeStateDelta(acc, delta) {
 }
 
 async function fetchState() {
-  let url = _tokUrl(`${appConfig.apiBaseUrl}/state`);
+  let url = `${appConfig.apiBaseUrl}/state`;
   // Delta delivery: ask the server to strip trail points we already have.
   if (_newestTrailMs != null) {
     const sep = url.includes("?") ? "&" : "?";
@@ -132,7 +147,7 @@ async function fetchState() {
   try {
     const headers = {};
     if (_stateEtag) headers["If-None-Match"] = _stateEtag;
-    const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers });
+    const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers, credentials: "same-origin" });
     if (res.status === 304 && _accumulatedState) return _accumulatedState;
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     _stateEtag = res.headers.get("ETag") || null;
@@ -2880,26 +2895,18 @@ function main() {
   }
 
   async function saveSnapshot() {
-    if (!canSaveSnapshot()) {
-      console.warn("Cannot save: no valid data loaded");
+    if (map._historicalMode) {
+      console.warn("Cannot save: viewing historical snapshot");
       return;
     }
-    
     const statusEl = document.getElementById("statusText");
     const dateStr = getSnapshotDateStr();
-    
-    // Get the state to save - historical if viewing historical, else live
-    const stateToSave = map._historicalMode ? window._historicalState : window.__lastState;
-    if (!stateToSave) {
-      console.warn("Cannot save: no state data available");
-      return;
-    }
     
     try {
       const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(stateToSave)
+        headers: { "Content-Length": "0" },
+        credentials: "same-origin",
       });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
@@ -3367,15 +3374,27 @@ function main() {
 
     // Save token button
     if (tokenSaveBtn && tokenInput) {
-      tokenSaveBtn.onclick = () => {
+      tokenSaveBtn.onclick = async () => {
         const val = (tokenInput.value || "").trim();
         if (val) {
           localStorage.setItem("dusty_owner_tok", val);
+          // Exchange for HttpOnly cookie immediately
+          try {
+            const res = await fetch("/api/auth", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ token: val }),
+              credentials: "same-origin",
+            });
+            if (tokenStatus) tokenStatus.textContent = res.ok ? "Saved & authenticated. Reload to apply." : "Saved but auth failed — check token.";
+          } catch (_) {
+            if (tokenStatus) tokenStatus.textContent = "Saved. Reload to apply.";
+          }
         } else {
           localStorage.removeItem("dusty_owner_tok");
-        }
-        if (tokenStatus) {
-          tokenStatus.textContent = val ? "Saved. Reload to apply." : "Cleared.";
+          // Clear the auth cookie
+          try { await fetch("/api/auth", { method: "DELETE", credentials: "same-origin" }); } catch (_) {}
+          if (tokenStatus) tokenStatus.textContent = "Cleared.";
         }
       };
     }
@@ -3902,6 +3921,7 @@ function main() {
   let _tickInFlight = false;
   let _tickInFlightSince = 0;  // perf timestamp when _tickInFlight was set
   let _tickLastForceRefreshSeq = null;
+  let _tickConsecutiveFailures = 0; // for exponential backoff on errors
 
   async function tick() {
     // Safety valve: if _tickInFlight has been true for over 60 seconds, force-reset it.
@@ -3931,6 +3951,7 @@ function main() {
     try {
       st = await fetchState();
     } catch (e) {
+      _tickConsecutiveFailures++;
       if (statusEl) {
         statusEl.textContent = "Offline";
         statusEl.classList.remove("live");
@@ -3939,7 +3960,16 @@ function main() {
       // Even if we're offline, keep redrawing the overlay so time-based fades continue.
       try { map.drawOverlay(map.lastState); } catch {}
       _tickInFlight = false;
-      return; // finally block below reschedules
+      // Reset delta/etag state so recovery gets a full refresh
+      // (server may have restarted with different state).
+      _stateEtag = null;
+      _newestTrailMs = null;
+      _accumulatedState = null;
+      // Reschedule with exponential backoff: 5s, 10s, 20s, 40s … capped at POLL_MS.
+      const backoffMs = Math.min(POLL_MS, 5000 * Math.pow(2, Math.min(_tickConsecutiveFailures - 1, 5)));
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      _tickTimeout = setTimeout(tick, backoffMs);
+      return;
     }
 
     try {
@@ -3948,6 +3978,7 @@ function main() {
 
     window.__lastState = st;
     _pbLastServerResponseMs = Date.now();
+    _tickConsecutiveFailures = 0; // reset backoff on success
 
     // Update save button now that we have data
     updateSaveButtonState();
@@ -4107,6 +4138,9 @@ function main() {
   // Load server config before starting data polling
   // This allows the server to control CDN/caching behavior
   loadConfig().then(async () => {
+    // Ensure the auth cookie is set before any API call
+    await _authReady;
+
     // Re-apply theme in case config pushed new localStorage defaults
     applyTheme(_currentThemeKey, true);
 
