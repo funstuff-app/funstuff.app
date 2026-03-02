@@ -21,8 +21,9 @@
     /* 5 AM–5 AM day boundaries */
     var adjusted = new Date(now.getTime() - 5 * 60 * 60 * 1000);
     var day = adjusted.getDay();
-    var daysSinceLastFriday = (day === 6) ? 1 : 2;
-    var daysBack = daysSinceLastFriday + idx;
+    // Skip Friday (often incomplete) — load Thursday as most recent weekday
+    var daysSinceLastThursday = (day === 6) ? 2 : (day === 0) ? 3 : (day <= 4) ? (day + 3) : 1;
+    var daysBack = daysSinceLastThursday + idx;
     var target = new Date(now);
     target.setDate(target.getDate() - daysBack);
     return target;
@@ -35,7 +36,7 @@
   }
 
   function _snapshotParamStr(dateStr) {
-    return "date=" + dateStr + "&start=10&duration=2&playhead=60&speed=20";
+    return "date=" + dateStr + "&start=14&duration=2&playhead=60&speed=10";
   }
 
   function _loadSnapshot(idx) {
@@ -45,7 +46,7 @@
     var target = _snapshotDate(idx);
     var dateStr = _formatDate(target);
     iframe.src = baseSrc + "?" + _snapshotParamStr(dateStr) + "&lite=1&fresh=1";
-    _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
+    _widgetSnapshotParams = { date: dateStr, start: 14, duration: 2, basePlayhead: 60, speed: 20 };
     _widgetLoadTime = Date.now();
     _snapshotIdx = idx;
     _updateIndicator(target);
@@ -67,7 +68,7 @@
     var indicator = document.getElementById("snapshot-indicator");
     if (indicator) {
       indicator.textContent = "\u25B6 " + _dayNames[target.getDay()] + " " +
-        (target.getMonth() + 1) + "/" + target.getDate() + " 11AM";
+        (target.getMonth() + 1) + "/" + target.getDate() + " 3PM";
       indicator.style.display = "block";
     }
   }

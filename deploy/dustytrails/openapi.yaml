@@ -1,0 +1,912 @@
+openapi: "3.0.3"
+info:
+  title: DustyTrails Dashboard API
+  description: >
+    Real-time air quality monitoring dashboard for Utah mobile and fixed
+    sensors. Served from a Raspberry Pi via Cloudflare Tunnel.
+  version: "1.0.0"
+
+servers:
+  - url: https://dustytrails.funstuff.app
+    description: Production (Cloudflare Tunnel)
+
+tags:
+  - name: state
+    description: Live sensor state and configuration
+  - name: snapshots
+    description: Historical day snapshots
+  - name: debug
+    description: Road graph debug overlays (owner-only in practice)
+  - name: prefs
+    description: Client preference persistence
+  - name: static
+    description: Dashboard UI assets
+
+paths:
+
+  # ── UI ──────────────────────────────────────────────────────────────────────
+
+  /:
+    get:
+      summary: Dashboard HTML
+      tags: [static]
+      responses:
+        "200":
+          description: Main dashboard page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /manifest.json:
+    get:
+      summary: PWA web app manifest
+      tags: [static]
+      responses:
+        "200":
+          description: Web app manifest with icons and metadata
+          content:
+            application/manifest+json:
+              schema:
+                $ref: "#/components/schemas/WebAppManifest"
+
+  /sitemap.xml:
+    get:
+      summary: XML sitemap
+      tags: [static]
+      responses:
+        "200":
+          description: Sitemap for search engines
+          content:
+            application/xml:
+              schema:
+                type: string
+
+  # ── Live Data API ────────────────────────────────────────────────────────────
+
+  /api/config:
+    get:
+      summary: Server configuration
+      description: >
+        Returns server-side configuration used by the client for scaling and
+        caching decisions (poll interval, feature flags, etc.).
+        Cached 5 minutes at the CDN edge.
+      tags: [state]
+      responses:
+        "200":
+          description: Server config object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServerConfig"
+
+  /api/state:
+    get:
+      summary: Real-time sensor state
+      description: >
+        Full dashboard state: mobile sensors with trails, fixed EPA/PurpleAir
+        stations, and metadata. Supports conditional GET (ETag / 304),
+        s-maxage=30 CDN caching, and delta delivery via `since_ms`.
+      tags: [state]
+      parameters:
+        - name: since_ms
+          in: query
+          description: >
+            Epoch milliseconds. When provided the response strips trail points
+            with timestamp ≤ since_ms and sets `meta.delta = true`.
+          required: false
+          schema:
+            type: integer
+            format: int64
+            example: 1740000000000
+        - name: tok
+          in: query
+          description: >
+            Owner token. When valid, bypasses CDN caching and includes the
+            Home sensor in the fixed array. Response is `private, no-store`.
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Dashboard state payload
+          headers:
+            ETag:
+              description: Opaque state sequence tag for conditional GET
+              schema:
+                type: string
+                example: '"s142"'
+            Cache-Control:
+              schema:
+                type: string
+                example: "public, max-age=0, s-maxage=30, stale-while-revalidate=5"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardState"
+        "304":
+          description: Not Modified — ETag matches, client cache is current
+          headers:
+            ETag:
+              schema:
+                type: string
+
+  /api/fixed:
+    get:
+      summary: Fixed sensor array
+      description: >
+        Lightweight subset of `/api/state` — only the fixed EPA/PurpleAir
+        sensor array. Used by the TUI remote mode. Cached 15 s at the CDN.
+      tags: [state]
+      responses:
+        "200":
+          description: Array of fixed sensor objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/FixedSensor"
+
+  /api/raw:
+    get:
+      summary: Raw upstream AQ data
+      description: >
+        Raw mobile and fixed readings as received from the upstream data
+        source, before normalization. Intended for TUI remote mode and
+        debugging. No CDN caching.
+      tags: [state]
+      responses:
+        "200":
+          description: Raw sensor data object
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mobile:
+                    type: object
+                    description: Raw mobile sensor data keyed by sensor ID
+                    additionalProperties: true
+                  fixed:
+                    type: object
+                    description: Raw fixed sensor data keyed by sensor ID
+                    additionalProperties: true
+
+  /api/tui:
+    get:
+      summary: TUI-formatted state
+      description: >
+        State pre-formatted for terminal rendering (shared format for the
+        in-process Textual TUI and the web TUI widget).
+      tags: [state]
+      responses:
+        "200":
+          description: TUI state object
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  # ── Snapshots ────────────────────────────────────────────────────────────────
+
+  /api/snapshots:
+    get:
+      summary: List saved snapshots
+      description: Returns metadata for all day snapshots stored on disk.
+      tags: [snapshots]
+      responses:
+        "200":
+          description: Snapshot list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [snapshots]
+                properties:
+                  snapshots:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SnapshotMeta"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/snapshot/load:
+    get:
+      summary: Load a saved snapshot
+      description: >
+        Returns a full day snapshot trimmed to the 5 AM–5 AM Mountain Time
+        window for the requested date. Optional `start`/`duration` params
+        narrow the window further (used by the landing-page embed widget).
+        Windowed responses are cached 1 hour at the CDN.
+      tags: [snapshots]
+      parameters:
+        - name: date
+          in: query
+          required: true
+          description: Snapshot date in `YYYY-MM-DD` format (Mountain Time)
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}-\d{2}$'
+            example: "2026-02-28"
+        - name: start
+          in: query
+          required: false
+          description: Window start hour (0–23, Mountain Time)
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 23
+            example: 7
+        - name: duration
+          in: query
+          required: false
+          description: Window duration in hours (1–24, default 24)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 24
+            example: 12
+      responses:
+        "200":
+          description: Snapshot state payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardState"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/snapshot/save:
+    post:
+      summary: Save a snapshot
+      description: >
+        Saves the server's current live state as a day snapshot. No request
+        body needed — the server writes its in-memory state directly.
+        Requires a valid owner token via HttpOnly cookie (set by POST /api/auth)
+        or ?tok= query param.
+      tags: [snapshots]
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: date
+          in: query
+          required: false
+          description: >
+            Target date in `YYYY-MM-DD` format (Mountain Time). Defaults to
+            today in Mountain Time when omitted.
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}-\d{2}$'
+            example: "2026-02-28"
+      responses:
+        "200":
+          description: Save result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  path:
+                    type: string
+                    description: Relative path of the saved file
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Prefs ────────────────────────────────────────────────────────────────────
+
+  /api/prefs/log:
+    get:
+      summary: Read prefs log
+      description: Returns the last N entries from the prefs log (ndjson on disk).
+      tags: [prefs]
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: n
+          in: query
+          required: false
+          description: Number of tail entries to return (default 100, max 10000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 10000
+            default: 100
+      responses:
+        "200":
+          description: Array of prefs log entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PrefsLogEntry"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/prefs/sync:
+    post:
+      summary: Sync client prefs
+      description: >
+        Appends a prefs snapshot to the server-side prefs log. Keys must be
+        prefixed with `dusty_` or `mobileair.`. Body size is capped at 8 KiB.
+      tags: [prefs]
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PrefsSyncBody"
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Auth ─────────────────────────────────────────────────────────────────────
+
+  /api/auth:
+    post:
+      summary: Exchange token for auth cookie
+      description: >
+        Validates the owner token and sets an HttpOnly cookie (`dusty_tok`)
+        for subsequent authenticated requests. The cookie is SameSite=Strict
+        with a 1-year Max-Age.
+      tags: [prefs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  description: Owner token value
+      responses:
+        "200":
+          description: Token accepted, cookie set
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    delete:
+      summary: Clear auth cookie
+      description: Clears the `dusty_tok` HttpOnly cookie.
+      tags: [prefs]
+      responses:
+        "200":
+          description: Cookie cleared
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+
+  # ── Debug / Road Graph ───────────────────────────────────────────────────────
+
+  /api/road_edges:
+    get:
+      summary: Road graph edges (debug)
+      description: >
+        Returns road graph edges within a bounding box for debug map overlay.
+        No CDN caching. Large responses possible — use `limit` to cap.
+      tags: [debug]
+      parameters:
+        - $ref: "#/components/parameters/minLat"
+        - $ref: "#/components/parameters/maxLat"
+        - $ref: "#/components/parameters/minLon"
+        - $ref: "#/components/parameters/maxLon"
+        - $ref: "#/components/parameters/edgeLimit"
+      responses:
+        "200":
+          description: Road edges within the bounding box
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EdgeCollection"
+
+  /api/tram_line_edges:
+    get:
+      summary: Tram (TRAX) line graph edges (debug)
+      description: >
+        Returns TRAX tram-line graph edges within a bounding box. When the
+        graph includes elevation data the edges include `elev1`/`elev2` fields.
+      tags: [debug]
+      parameters:
+        - $ref: "#/components/parameters/minLat"
+        - $ref: "#/components/parameters/maxLat"
+        - $ref: "#/components/parameters/minLon"
+        - $ref: "#/components/parameters/maxLon"
+        - $ref: "#/components/parameters/edgeLimit"
+      responses:
+        "200":
+          description: Tram line edges within the bounding box
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TramEdgeCollection"
+
+  /api/match_segment:
+    get:
+      summary: Road-match a trail segment (debug)
+      description: >
+        Snaps a trail segment to the road graph (or tram line graph for TRX
+        vehicles) and returns the matched waypoints. Used during map playback
+        to project sensor paths onto known roads.
+      tags: [debug]
+      parameters:
+        - name: sensor
+          in: query
+          required: true
+          description: Sensor ID (e.g. `BUS11`, `TRX3`)
+          schema:
+            type: string
+            example: BUS11
+        - name: trail
+          in: query
+          required: true
+          description: JSON-encoded array of trail point objects `[{lat, lon, t}, ...]`
+          schema:
+            type: string
+        - name: from_ms
+          in: query
+          required: false
+          description: Segment start epoch milliseconds
+          schema:
+            type: integer
+            format: int64
+        - name: to_ms
+          in: query
+          required: false
+          description: Segment end epoch milliseconds
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Matched trail segment
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+# ── Shared Components ──────────────────────────────────────────────────────────
+
+components:
+
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: dusty_tok
+      description: >
+        HttpOnly cookie set by POST /api/auth. Also accepted as a ?tok=
+        query parameter for CLI/curl usage.
+
+  parameters:
+    minLat:
+      name: minLat
+      in: query
+      required: false
+      schema:
+        type: number
+        format: double
+        minimum: -90
+        maximum: 90
+        default: -90
+    maxLat:
+      name: maxLat
+      in: query
+      required: false
+      schema:
+        type: number
+        format: double
+        minimum: -90
+        maximum: 90
+        default: 90
+    minLon:
+      name: minLon
+      in: query
+      required: false
+      schema:
+        type: number
+        format: double
+        minimum: -180
+        maximum: 180
+        default: -180
+    maxLon:
+      name: maxLon
+      in: query
+      required: false
+      schema:
+        type: number
+        format: double
+        minimum: -180
+        maximum: 180
+        default: 180
+    edgeLimit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of edges to return
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50000
+        default: 5000
+
+  responses:
+    BadRequest:
+      description: Bad request — missing or invalid parameter
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+    Forbidden:
+      description: Forbidden — invalid or missing owner token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+    TooLarge:
+      description: Request entity too large
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+
+  schemas:
+
+    ErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: "snapshot not found"
+
+    ServerConfig:
+      type: object
+      description: Server-side feature flags and tuning values consumed by the browser client
+      additionalProperties: true
+      properties:
+        poll_interval_ms:
+          type: integer
+          description: Recommended client poll interval in milliseconds
+          example: 5000
+        version:
+          type: string
+          description: Server version string
+          example: "1.0.0"
+
+    TrailPoint:
+      type: object
+      required: [lat, lon, t]
+      properties:
+        lat:
+          type: number
+          format: double
+          description: WGS-84 latitude
+        lon:
+          type: number
+          format: double
+          description: WGS-84 longitude
+        t:
+          type: string
+          format: date-time
+          description: UTC ISO-8601 timestamp
+        aqi:
+          type: number
+          description: AQI value at this point
+        pm25:
+          type: number
+          description: PM2.5 µg/m³ at this point
+        pm10:
+          type: number
+          description: PM10 µg/m³ at this point
+
+    MobileSensor:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          description: Unique sensor ID
+          example: BUS11
+        lat:
+          type: number
+          format: double
+        lon:
+          type: number
+          format: double
+        aqi:
+          type: number
+          nullable: true
+        pm25:
+          type: number
+          nullable: true
+        pm10:
+          type: number
+          nullable: true
+        speed_mph:
+          type: number
+          nullable: true
+        heading:
+          type: number
+          nullable: true
+          description: Degrees from north (0–360)
+        last_seen:
+          type: string
+          format: date-time
+          nullable: true
+        ghost:
+          type: boolean
+          description: True when sensor has gone offline (stale)
+        trail:
+          type: array
+          items:
+            $ref: "#/components/schemas/TrailPoint"
+
+    FixedSensor:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          example: "EPA_SLC"
+        name:
+          type: string
+          example: "SLC Hawthorne"
+        lat:
+          type: number
+          format: double
+        lon:
+          type: number
+          format: double
+        aqi:
+          type: number
+          nullable: true
+        pm25:
+          type: number
+          nullable: true
+        pm10:
+          type: number
+          nullable: true
+        ozone:
+          type: number
+          nullable: true
+        purpleair:
+          type: boolean
+          description: True if this sensor is a PurpleAir device
+        last_updated:
+          type: string
+          format: date-time
+          nullable: true
+
+    DashboardState:
+      type: object
+      properties:
+        mobile:
+          type: array
+          items:
+            $ref: "#/components/schemas/MobileSensor"
+        fixed:
+          type: array
+          items:
+            $ref: "#/components/schemas/FixedSensor"
+        meta:
+          type: object
+          description: Metadata about the state snapshot
+          properties:
+            generated_at:
+              type: string
+              format: date-time
+            delta:
+              type: boolean
+              description: True when trail points were stripped (delta delivery)
+        fixed_history:
+          type: object
+          description: >
+            Time-series readings for fixed sensors keyed by sensor ID then
+            pollutant name. Only present in snapshot responses.
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: array
+              items:
+                type: object
+                properties:
+                  time:
+                    type: string
+                    format: date-time
+                  value:
+                    type: number
+
+    SnapshotMeta:
+      type: object
+      required: [date]
+      properties:
+        date:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}$'
+          example: "2026-02-28"
+        size_bytes:
+          type: integer
+          example: 184320
+        saved_at:
+          type: string
+          format: date-time
+
+    PrefsLogEntry:
+      type: object
+      required: [ts, prefs]
+      properties:
+        ts:
+          type: number
+          description: Server epoch seconds when the entry was written
+          example: 1740000000.123
+        client_ts:
+          type: integer
+          description: Client epoch milliseconds
+          example: 1740000000000
+        prefs:
+          type: object
+          description: Key-value prefs prefixed with `dusty_` or `mobileair.`
+          additionalProperties:
+            type: string
+
+    PrefsSyncBody:
+      type: object
+      required: [prefs]
+      properties:
+        client_ts:
+          type: integer
+          format: int64
+          description: Client epoch milliseconds
+          example: 1740000000000
+        prefs:
+          type: object
+          description: Prefs to persist. Keys must start with `dusty_` or `mobileair.`
+          additionalProperties:
+            type: string
+
+    Edge:
+      type: object
+      required: [lat1, lon1, lat2, lon2]
+      properties:
+        lat1:
+          type: number
+          format: double
+        lon1:
+          type: number
+          format: double
+        lat2:
+          type: number
+          format: double
+        lon2:
+          type: number
+          format: double
+
+    TramEdge:
+      allOf:
+        - $ref: "#/components/schemas/Edge"
+        - type: object
+          properties:
+            elev1:
+              type: number
+              description: Elevation in metres at node 1 (present when graph has elevation data)
+            elev2:
+              type: number
+              description: Elevation in metres at node 2 (present when graph has elevation data)
+
+    EdgeCollection:
+      type: object
+      required: [edges]
+      properties:
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/Edge"
+
+    TramEdgeCollection:
+      type: object
+      required: [edges, has_elevation]
+      properties:
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/TramEdge"
+        has_elevation:
+          type: boolean
+
+    WebAppManifest:
+      type: object
+      required: [name, start_url]
+      properties:
+        name:
+          type: string
+        short_name:
+          type: string
+        description:
+          type: string
+        start_url:
+          type: string
+        scope:
+          type: string
+        display:
+          type: string
+        background_color:
+          type: string
+        theme_color:
+          type: string
+        orientation:
+          type: string
+        icons:
+          type: array
+          items:
+            type: object
+            properties:
+              src:
+                type: string
+              sizes:
+                type: string
+              type:
+                type: string
+              purpose:
+                type: string

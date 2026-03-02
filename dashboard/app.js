@@ -1,5 +1,7 @@
 // Owner token: read from URL hash (#tok=...) and persist in localStorage.
-// Appended to API URLs so the server can include the Home sensor for owners.
+// On load, POST to /api/auth to set an HttpOnly cookie so the token is never
+// exposed in URLs, logs, or Referer headers.  All subsequent fetches send the
+// cookie automatically.
 const _ownerTok = (() => {
   const KEY = "dusty_owner_tok";
   const hash = location.hash || "";
@@ -13,12 +15,18 @@ const _ownerTok = (() => {
   return localStorage.getItem(KEY) || "";
 })();
 
-/** Append owner token to a URL (if set). */
-function _tokUrl(url) {
-  if (!_ownerTok) return url;
-  const sep = url.includes("?") ? "&" : "?";
-  return `${url}${sep}tok=${encodeURIComponent(_ownerTok)}`;
-}
+/** Exchange the owner token for an HttpOnly auth cookie. */
+const _authReady = (async () => {
+  if (!_ownerTok) return;
+  try {
+    await fetch("/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: _ownerTok }),
+      credentials: "same-origin",
+    });
+  } catch (_) { /* server may not support it yet — silent fallback */ }
+})();
 
 // ── Prefs sync ──────────────────────────────────────────────────────────────
 // Collects all owner-namespaced localStorage keys and POSTs them to the
@@ -35,8 +43,15 @@ function _syncPrefsToServer() {
     }
   }
   const payload = JSON.stringify({ client_ts: Date.now(), prefs });
-  navigator.sendBeacon(_tokUrl("/api/prefs/sync"),
-    new Blob([payload], { type: "application/json" }));
+  // Use fetch+keepalive instead of sendBeacon so the HttpOnly auth cookie is
+  // sent automatically.  keepalive lets the request survive page unload.
+  fetch("/api/prefs/sync", {
+    method: "POST",
+    body: payload,
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    keepalive: true,
+  }).catch(() => {});
 }
 
 // visibilitychange covers tab switches, window minimize, and most close gestures.
@@ -121,7 +136,7 @@ function _mergeStateDelta(acc, delta) {
 }
 
 async function fetchState() {
-  let url = _tokUrl(`${appConfig.apiBaseUrl}/state`);
+  let url = `${appConfig.apiBaseUrl}/state`;
   // Delta delivery: ask the server to strip trail points we already have.
   if (_newestTrailMs != null) {
     const sep = url.includes("?") ? "&" : "?";
@@ -132,7 +147,7 @@ async function fetchState() {
   try {
     const headers = {};
     if (_stateEtag) headers["If-None-Match"] = _stateEtag;
-    const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers });
+    const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers, credentials: "same-origin" });
     if (res.status === 304 && _accumulatedState) return _accumulatedState;
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     _stateEtag = res.headers.get("ETag") || null;
@@ -3013,26 +3028,18 @@ function main() {
   }
 
   async function saveSnapshot() {
-    if (!canSaveSnapshot()) {
-      console.warn("Cannot save: no valid data loaded");
+    if (map._historicalMode) {
+      console.warn("Cannot save: viewing historical snapshot");
       return;
     }
-    
     const statusEl = document.getElementById("statusText");
     const dateStr = getSnapshotDateStr();
-    
-    // Get the state to save - historical if viewing historical, else live
-    const stateToSave = map._historicalMode ? window._historicalState : window.__lastState;
-    if (!stateToSave) {
-      console.warn("Cannot save: no state data available");
-      return;
-    }
     
     try {
       const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(stateToSave)
+        headers: { "Content-Length": "0" },
+        credentials: "same-origin",
       });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
@@ -3138,7 +3145,7 @@ function main() {
     document.body.appendChild(modal);
   }
 
-  async function loadSnapshotByDate(dateStr) {
+  async function loadSnapshotByDate(dateStr, extraParams = "") {
     const statusEl = document.getElementById("statusText");
     if (statusEl) {
       statusEl.textContent = "Loading...";
@@ -3150,7 +3157,7 @@ function main() {
     updateSaveButtonState();
     
     try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`);
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}`);
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `HTTP ${resp.status}`);
@@ -3192,11 +3199,11 @@ function main() {
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
       
-      // Build playback points and set time to START
+      // Build playback points and set time to 30 min in (so trails are visible)
       map._ensurePlaybackPoints(window._historicalState);
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
-        map.setPlaybackTimeMs(b.minMs);
+        map.setPlaybackTimeMs(b.minMs + 30 * 60000);
       }
       
       // Store state, render sidebar, draw
@@ -3212,9 +3219,12 @@ function main() {
       updatePlaybackUi();
       map.drawOverlay(window._historicalState);
       
-      // Start playback loop
+      // Start playback loop (auto-play)
       _pbLastPerf = 0;
       _pbLastUiPerf = 0;
+      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      map.setPlaybackPlaying(true);
+      updatePlaybackUi();
       _pbRAF = requestAnimationFrame(playbackLoop);
     } catch (e) {
       console.error("Failed to load snapshot:", e);
@@ -3497,15 +3507,27 @@ function main() {
 
     // Save token button
     if (tokenSaveBtn && tokenInput) {
-      tokenSaveBtn.onclick = () => {
+      tokenSaveBtn.onclick = async () => {
         const val = (tokenInput.value || "").trim();
         if (val) {
           localStorage.setItem("dusty_owner_tok", val);
+          // Exchange for HttpOnly cookie immediately
+          try {
+            const res = await fetch("/api/auth", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ token: val }),
+              credentials: "same-origin",
+            });
+            if (tokenStatus) tokenStatus.textContent = res.ok ? "Saved & authenticated. Reload to apply." : "Saved but auth failed — check token.";
+          } catch (_) {
+            if (tokenStatus) tokenStatus.textContent = "Saved. Reload to apply.";
+          }
         } else {
           localStorage.removeItem("dusty_owner_tok");
-        }
-        if (tokenStatus) {
-          tokenStatus.textContent = val ? "Saved. Reload to apply." : "Cleared.";
+          // Clear the auth cookie
+          try { await fetch("/api/auth", { method: "DELETE", credentials: "same-origin" }); } catch (_) {}
+          if (tokenStatus) tokenStatus.textContent = "Cleared.";
         }
       };
     }
@@ -4032,6 +4054,7 @@ function main() {
   let _tickInFlight = false;
   let _tickInFlightSince = 0;  // perf timestamp when _tickInFlight was set
   let _tickLastForceRefreshSeq = null;
+  let _tickConsecutiveFailures = 0; // for exponential backoff on errors
 
   async function tick() {
     // Safety valve: if _tickInFlight has been true for over 60 seconds, force-reset it.
@@ -4061,6 +4084,7 @@ function main() {
     try {
       st = await fetchState();
     } catch (e) {
+      _tickConsecutiveFailures++;
       if (statusEl) {
         statusEl.textContent = "Offline";
         statusEl.classList.remove("live");
@@ -4069,7 +4093,16 @@ function main() {
       // Even if we're offline, keep redrawing the overlay so time-based fades continue.
       try { map.drawOverlay(map.lastState); } catch {}
       _tickInFlight = false;
-      return; // finally block below reschedules
+      // Reset delta/etag state so recovery gets a full refresh
+      // (server may have restarted with different state).
+      _stateEtag = null;
+      _newestTrailMs = null;
+      _accumulatedState = null;
+      // Reschedule with exponential backoff: 5s, 10s, 20s, 40s … capped at POLL_MS.
+      const backoffMs = Math.min(POLL_MS, 5000 * Math.pow(2, Math.min(_tickConsecutiveFailures - 1, 5)));
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      _tickTimeout = setTimeout(tick, backoffMs);
+      return;
     }
 
     try {
@@ -4078,6 +4111,7 @@ function main() {
 
     window.__lastState = st;
     _pbLastServerResponseMs = Date.now();
+    _tickConsecutiveFailures = 0; // reset backoff on success
 
     // Update save button now that we have data
     updateSaveButtonState();
@@ -4236,12 +4270,64 @@ function main() {
 
   // Load server config before starting data polling
   // This allows the server to control CDN/caching behavior
-  loadConfig().then(() => {
+  loadConfig().then(async () => {
+    // Ensure the auth cookie is set before any API call
+    await _authReady;
+
     // Re-apply theme in case config pushed new localStorage defaults
     applyTheme(_currentThemeKey, true);
+
+    // ── Embed / iframe URL parameter handling ────────────────────────────────
+    // The landing page (fun.js) passes ?date=YYYY-MM-DD&start=10&speed=10 etc.
+    // to load a historical snapshot in the embedded widget.
+    const _urlParams = new URLSearchParams(window.location.search);
+    const _urlDate = _urlParams.get('date');
+    console.log("[EmbedParam] search:", window.location.search, "date:", _urlDate);
+    if (_urlDate && /^\d{4}-\d{2}-\d{2}$/.test(_urlDate)) {
+      console.log("[EmbedParam] Valid date, calling loadSnapshotByDate:", _urlDate);
+      try {
+        // Pass start/duration to server so it trims the snapshot before sending
+        const _urlStart = Number(_urlParams.get('start'));
+        const _urlDuration = Number(_urlParams.get('duration'));
+        let _extraParams = "";
+        if (isFinite(_urlStart) && _urlStart >= 0 && isFinite(_urlDuration) && _urlDuration > 0) {
+          _extraParams = `&start=${_urlStart}&duration=${_urlDuration}`;
+        }
+        await loadSnapshotByDate(_urlDate, _extraParams);
+        console.log("[EmbedParam] loadSnapshotByDate resolved. _historicalState:", !!window._historicalState, "playbackMode:", map.playbackMode);
+        _selectedDayValue = _urlDate;
+
+        // Override playhead: start hour + playhead offset in minutes
+        if (isFinite(_urlStart) && _urlStart >= 0 && _urlStart <= 23) {
+          const [_uy, _umo, _ud] = _urlDate.split("-").map(Number);
+          const _urlPlayhead = Number(_urlParams.get('playhead')) || 0;
+          const startMs = new Date(_uy, _umo - 1, _ud, _urlStart, 0, 0, 0).getTime() + (_urlPlayhead * 60000);
+          const b = map.getPlaybackBounds();
+          if (isFinite(b.minMs)) {
+            map.setPlaybackTimeMs(clamp(startMs, b.minMs, b.maxMs));
+          }
+        }
+
+        // Override playback speed (e.g. speed=20 → 20x)
+        const _urlSpeed = Number(_urlParams.get('speed'));
+        if (isFinite(_urlSpeed) && _urlSpeed > 0) {
+          map.setPlaybackSpeed(_urlSpeed);
+          if (pbSpeedEl) pbSpeedEl.value = String(_urlSpeed);
+        }
+
+        updatePlaybackUi();
+        console.log("[EmbedParam] Done. Skipping tick() — snapshot loaded.");
+        return; // Do NOT start live polling when viewing a snapshot
+      } catch (e) {
+        console.error("[EmbedParam] Failed to load snapshot for date:", _urlDate, e);
+        // Fall through to normal live tick
+      }
+    } else if (_urlDate) {
+      console.warn("[EmbedParam] date param failed regex:", _urlDate);
+    }
+
     tick(); // finally block inside tick() schedules all subsequent polls
   });
 }
 
 main();
-

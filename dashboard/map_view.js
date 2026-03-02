@@ -4331,6 +4331,36 @@ class MapView {
     // Target distance along raw path based on playback time
     const targetD = this._getTargetDistance(pts, cumDist, totalDist, t);
     
+    // ── SCRUB FAST PATH ──────────────────────────────────────────────────────
+    // When the user is actively scrubbing (slider or barrel drag), skip the
+    // entire autonomous-agent physics pipeline.  The controller owns the
+    // position — just place the marker at targetD and return.
+    if (this._scrubbing) {
+      const phys = this._getPhysicsState(id);
+      phys.d = targetD;
+      phys.lastPlaybackT = t;
+      phys.lastPerfMs = nowPerfMs;
+      phys.v = 0;
+      const smp = this._samplePathAtDistance(pts, cumDist, curvature, targetD);
+      phys.lat = smp.lat;
+      phys.lon = smp.lon;
+      phys.heading = smp.heading;
+      phys.totalDist = totalDist;
+      const nextPt = smp.p1 || pts[Math.min(smp.idx + 1, pts.length - 1)];
+      const reading = primaryReadingKeyedFromPoint(nextPt);
+      const movingFlag = !!(nextPt && (nextPt.m === 1 || nextPt.m === "1" || nextPt.m === true));
+      if (!m._key) m._key = keyFor("mobile", m.id);
+      const opacity = (!movingFlag && !this._pbDebugPath && this.selectedId !== m._key) ? 0.25 : 1.0;
+      // Store debug info so trail reveal still works during scrub
+      if (!this._vehicleRevealDist) this._vehicleRevealDist = new Map();
+      this._vehicleRevealDist.set(id, {
+        d: targetD, visibleEnd: targetD, vehicleD: targetD, vehicleV: 0,
+        vehicleTMs: t, controlScalar: 1, positionError: 0, totalDist
+      });
+      return { lat: smp.lat, lon: smp.lon, angle: smp.heading, flipX: false, speedMps: 0, opacity, reading, beforeFirst: t < tMin };
+    }
+    // ── END SCRUB FAST PATH ──────────────────────────────────────────────────
+    
     // Get physics state and determine reference distance for sliding window
     const phys = this._getPhysicsState(id);
     // Use phys.d if initialized, otherwise use targetD (where we WILL be)
@@ -4354,10 +4384,11 @@ class MapView {
     const vp = this._getVehiclePhysics(id);
     
     // Detect scrubbing: if playback time jumped significantly, snap to new position.
+    // Also snap unconditionally when the user is actively scrubbing (barrel or slider).
     const lastPlaybackT = phys.lastPlaybackT || t;
     const playbackDt = t - lastPlaybackT;
     const scrubThreshold = Math.max(2000, (this._playbackSpeed || 1) * 250);
-    const isScrub = Math.abs(playbackDt) > scrubThreshold;
+    const isScrub = Math.abs(playbackDt) > scrubThreshold || !!this._scrubbing;
     phys.lastPlaybackT = t;
     
     // Wall-clock dt for physics integration

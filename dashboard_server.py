@@ -12,6 +12,7 @@ Also integrates AirNow hourly data for fixed EPA monitoring sites.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -359,6 +360,83 @@ def validate_state_schema(state: dict[str, Any]) -> dict[str, Any]:
 def default_data_dir() -> Path:
     return Path(os.path.expanduser("~/.mobileair"))
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Geo-IP visitor logging
+# Logs city/region/country to ~/.mobileair/visitors.log on each unique page load.
+# The raw IP address is NEVER written to disk — only the resolved location.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-memory de-duplicate cache: maps sha256(ip) → last-logged epoch (seconds).
+# Prevents re-logging the same visitor within GEO_IP_CACHE_TTL_S seconds.
+_geo_ip_cache: dict[str, float] = {}
+_geo_ip_cache_lock = threading.Lock()
+GEO_IP_CACHE_TTL_S = 3600  # 1 hour
+
+
+def _resolve_client_ip(headers, client_address: tuple) -> str:
+    """Return the real client IP, preferring X-Forwarded-For (set by Caddy)."""
+    xff = headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    if xff:
+        return xff
+    return client_address[0]
+
+
+def _log_visitor_geo(ip: str, data_dir: Path) -> None:
+    """Background worker: geo-resolve *ip* and append location to visitors.log.
+    The IP address is used only for the API call and is never persisted."""
+    try:
+        import urllib.request
+        import urllib.error
+        # Resolve geo location — city/region/country only, no ISP or ASN.
+        url = f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,timezone"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("status") != "success":
+            return
+        country  = data.get("country", "Unknown")
+        region   = data.get("regionName", "")
+        city     = data.get("city", "")
+        tz       = data.get("timezone", "")
+        # Build a readable location string, omitting empty parts.
+        parts = [p for p in [city, region, country] if p]
+        location = ", ".join(parts) if parts else "Unknown"
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        line = f"{ts}  |  {location}  |  tz:{tz}\n"
+        log_path = data_dir / "visitors.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass  # Never let logging errors affect the server
+
+
+def maybe_log_visitor(headers, client_address: tuple, data_dir: Path) -> None:
+    """Fire-and-forget geo-IP log for a page-load request.
+
+    De-duplicates by IP within GEO_IP_CACHE_TTL_S so one person refreshing
+    the page doesn't spam the log or the upstream API.
+    """
+    ip = _resolve_client_ip(headers, client_address)
+    # Skip loopback / private network hits — those are local/dev.
+    if ip in ("127.0.0.1", "::1") or ip.startswith("192.168.") or ip.startswith("10."):
+        return
+    # Use a hash so the IP never lives in a data structure that could be logged.
+    ip_hash = hashlib.sha256(ip.encode()).hexdigest()
+    now = time.monotonic()
+    with _geo_ip_cache_lock:
+        last = _geo_ip_cache.get(ip_hash, 0.0)
+        if now - last < GEO_IP_CACHE_TTL_S:
+            return
+        _geo_ip_cache[ip_hash] = now
+    # Do the network call off the request thread.
+    threading.Thread(
+        target=_log_visitor_geo,
+        args=(ip, data_dir),
+        daemon=True,
+    ).start()
+
+
 def load_json_file(path: Path, default):
     try:
         if path.exists():
@@ -408,6 +486,10 @@ class AppState:
     # Cached fixed sensor locations so offline sensors can still be rendered.
     # Structure: { sensor_id: { "lat": float, "lon": float, "name": str } }
     fixed_sensor_locations: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    # Cached MT-day prefixes for fast history filtering (recomputed once per day)
+    _today_mt_date: str = ""
+    _today_mt_prefixes: tuple[str, ...] = ()
 
     # Bumped on-demand (e.g., from the TUI) to force the web client to treat the
     # next /api/state poll as a "new data" event even if timestamps/trails are unchanged.
@@ -554,7 +636,7 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
     
     Returns True if snapshot was loaded, False otherwise (fails silently).
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     try:
         snapshot = load_snapshot(data_dir, today_str)
         if snapshot is None:
@@ -619,6 +701,25 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         return False
 
 
+def _utc_date_prefixes_for_mt_day(day_mt: datetime) -> tuple[str, ...]:
+    """Return the 1-2 UTC date prefixes that cover a Mountain-time day.
+
+    A single MT day (midnight to midnight) spans at most two UTC dates because
+    MT is UTC-7 (or UTC-6 during DST).  For example, MT March 1 spans
+    2026-03-01T07:00Z to 2026-03-02T07:00Z, so both "2026-03-01" and
+    "2026-03-02" are valid UTC date prefixes.
+
+    Using prefix matching instead of per-entry datetime parsing keeps the
+    hot-path O(1) per entry (critical on Raspberry Pi with thousands of
+    history entries every fetch cycle).
+    """
+    start_utc = day_mt.astimezone(timezone.utc)
+    end_utc = (day_mt + timedelta(days=1)).astimezone(timezone.utc)
+    d1 = start_utc.strftime("%Y-%m-%d")
+    d2 = end_utc.strftime("%Y-%m-%d")
+    return (d1, d2) if d1 != d2 else (d1,)
+
+
 def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
     """Strip history entries from fixed sensors that don't belong to date_str.
 
@@ -626,12 +727,22 @@ def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
     can span multiple days because fixed_history accumulates 48 hours of data.
     Before saving a snapshot we trim them to only the entries from date_str so
     loading a snapshot never shows data from other days.
+
+    Timestamps are UTC but date_str is a Mountain-time date, so we accept any
+    UTC date that falls within the MT day (at most 2 UTC dates due to offset).
     """
+    try:
+        day_mt = datetime.strptime(date_str, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=_MOUNTAIN_TZ)
+    except (ValueError, TypeError):
+        return
+    prefixes = _utc_date_prefixes_for_mt_day(day_mt)
+
     for sensor in (state.get("fixed") or []):
         if not isinstance(sensor, dict):
             continue
         if sensor.get("purpleair"):
-            continue  # PA data is never trimmed — all readings go into the snapshot
+            continue  # PA history is already day-scoped; skip expensive iteration
         for reading in (sensor.get("readings") or {}).values():
             if not isinstance(reading, dict):
                 continue
@@ -640,36 +751,36 @@ def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
             colors = reading.get("history_colors")
             if not isinstance(times, list):
                 continue
-            # Build filtered index list
+            # Fast prefix check: keep entries whose UTC date is one of the
+            # (at most 2) dates that cover this Mountain-time day.
             keep = [i for i, t in enumerate(times)
-                    if isinstance(t, str) and t.startswith(date_str)]
+                    if isinstance(t, str) and t[:10] in prefixes]
             reading["history_times"]  = [times[i]  for i in keep]
             reading["history"]        = [values[i] for i in keep] if isinstance(values, list) and len(values) == len(times) else []
             reading["history_colors"] = [colors[i] for i in keep] if isinstance(colors, list) and len(colors) == len(times) else []
 
 
 def _trim_trails_to_day(state: dict[str, Any], date_str: str) -> None:
-    """Filter mobile sensor trails to the 5 AM – 5 AM local-time window for date_str.
+    """Filter mobile sensor trails to the 5 AM – 5 AM MST window for date_str.
 
-    The "day" for air-quality purposes runs from 5:00 AM local on date_str to
-    5:00 AM local on the following day, matching the client-side live playback
-    window in map_view.js.  Trail point timestamps (``"t"``) are UTC ISO
-    strings; we convert each to local time for comparison.
+    The "day" for air-quality purposes runs from 5:00 AM Mountain on date_str
+    to 5:00 AM Mountain on the following day, matching the client-side live
+    playback window in map_view.js.  Trail timestamps use mixed formats
+    ("2026-02-28 21:08:30 UTC", "2026-02-28T21:08:30Z") so we parse each
+    with parse_utc_timestamp and compare datetimes.
     """
     try:
         requested_date = datetime.strptime(date_str, "%Y-%m-%d")
     except (ValueError, TypeError):
-        return  # Can't parse date, skip trimming
+        return
 
-    # Build the 5 AM – 5 AM window in Mountain Time (Utah sensors are always MT).
-    # Using the server's local tz (.astimezone()) would give the wrong boundary
-    # on UTC servers (Pi, Docker), where "5am local" = "5am UTC" = "11pm MT".
-    day_start_mt = requested_date.replace(hour=5, minute=0, second=0, microsecond=0,
-                                          tzinfo=_MOUNTAIN_TZ)
-    day_end_mt = day_start_mt + timedelta(hours=24)
-
-    day_start_utc = day_start_mt.astimezone(timezone.utc)
-    day_end_utc   = day_end_mt.astimezone(timezone.utc)
+    # 5 AM MT boundaries as UTC datetimes.
+    # Trail timestamps come in multiple formats ("2026-02-28 21:08:30 UTC",
+    # "2026-02-28T21:08:30Z", etc.) so lexicographic string comparison is
+    # unreliable.  Parse each point with parse_utc_timestamp instead.
+    day_start_utc = requested_date.replace(hour=5, minute=0, second=0, microsecond=0,
+                                           tzinfo=_MOUNTAIN_TZ).astimezone(timezone.utc)
+    day_end_utc = (day_start_utc + timedelta(hours=24))
 
     for sensor in (state.get("mobile") or []):
         if not isinstance(sensor, dict):
@@ -689,13 +800,58 @@ def _trim_trails_to_day(state: dict[str, Any], date_str: str) -> None:
         sensor["trail"] = filtered
 
 
+def _trim_state_to_window(state: dict[str, Any], window_start_utc: datetime, window_end_utc: datetime) -> None:
+    """Trim mobile trails and fixed history to a UTC time window.
+
+    Used by the embed/widget loader to send only the data needed for the
+    requested playback window instead of the entire day's snapshot.
+    """
+    for sensor in (state.get("mobile") or []):
+        if not isinstance(sensor, dict):
+            continue
+        trail = sensor.get("trail")
+        if not isinstance(trail, list):
+            continue
+        filtered = []
+        for p in trail:
+            if not isinstance(p, dict):
+                continue
+            dt = parse_utc_timestamp(p.get("t"))
+            if dt is None:
+                continue
+            if window_start_utc <= dt < window_end_utc:
+                filtered.append(p)
+        sensor["trail"] = filtered
+
+    # Trim fixed sensor history to the window as well
+    for sensor in (state.get("fixed") or []):
+        if not isinstance(sensor, dict):
+            continue
+        for reading in (sensor.get("readings") or {}).values():
+            if not isinstance(reading, dict):
+                continue
+            times = reading.get("history_times")
+            values = reading.get("history")
+            hci = reading.get("hci")
+            if not isinstance(times, list):
+                continue
+            keep = [i for i, t in enumerate(times)
+                    if isinstance(t, str) and
+                    (lambda dt: dt is not None and window_start_utc <= dt < window_end_utc)(parse_utc_timestamp(t))]
+            reading["history_times"] = [times[i] for i in keep]
+            if isinstance(values, list) and len(values) == len(times):
+                reading["history"] = [values[i] for i in keep]
+            if isinstance(hci, list) and len(hci) == len(times):
+                reading["hci"] = [hci[i] for i in keep]
+
+
 def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
     """Save current state as today's snapshot.
 
     Called on graceful shutdown to persist the accumulated trail data.
     Returns True if saved successfully, False otherwise.
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     try:
         with app_state.lock:
             state_bytes = app_state.cached_json_bytes
@@ -714,7 +870,9 @@ def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
             _log("[Snapshot] Not enough data to save (fewer than 10 trail points)")
             return False
 
-        # Trim fixed sensor history to today only before saving
+        # Trim everything to today's 5 AM–5 AM MST window before saving
+        # so loaded snapshots are already clean and need no re-filtering.
+        _trim_trails_to_day(state, today_str)
         _trim_history_to_date(state, today_str)
 
         result = save_snapshot(data_dir, today_str, state)
@@ -983,17 +1141,35 @@ def _accumulate_home_sensor_reading(app_state: AppState, st: dict[str, Any]) -> 
         return
 
 
+def _get_today_prefixes(app_state: AppState) -> tuple[str, ...]:
+    """Return cached UTC date prefixes for the current Mountain-time day.
+
+    Recomputes only when the MT date rolls over (once per day).
+    """
+    today_mt_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
+    if today_mt_str != app_state._today_mt_date:
+        day_mt = datetime.now(_MOUNTAIN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        app_state._today_mt_prefixes = _utc_date_prefixes_for_mt_day(day_mt)
+        app_state._today_mt_date = today_mt_str
+    return app_state._today_mt_prefixes
+
+
 def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
     """Inject history arrays into fixed sensor readings from accumulated history.
 
-    Only injects entries from today (local date) so stale multi-day history
-    accumulated in fixed_history.json doesn't bleed into the live state.
+    Only injects entries from today (Mountain time date) so stale multi-day
+    history accumulated in fixed_history.json doesn't bleed into the live state.
+
+    Timestamps are UTC but the "day" boundary is midnight Mountain Time.  A
+    single MT day spans at most 2 UTC dates (e.g. MT March 1 → UTC March 1 +
+    March 2), so we use fast string prefix matching on the first 10 chars
+    instead of per-entry datetime parsing (critical on Raspberry Pi).
     """
     fixed_list = st.get("fixed", [])
     if not isinstance(fixed_list, list):
         return
 
-    today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prefixes = _get_today_prefixes(app_state)
 
     for sensor in fixed_list:
         sensor_id = sensor.get("id")
@@ -1036,7 +1212,7 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
 
             for entry in hist_entries:
                 t = entry.get("time") or ""
-                if not t.startswith(today_prefix):
+                if t[:10] not in prefixes:
                     continue
                 val = entry.get("val")
                 try:
@@ -1825,9 +2001,11 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
 
 PURPLEAIR_API_KEY = os.environ.get("DUSTY_PURPLEAIR_API_KEY", "").strip()
 
-# Owner token: when set, the Home sensor is only included in /api/state
-# responses that carry a matching ?tok= query parameter.
+# Owner token: when set, write endpoints require a matching token.
+# Token is read from the `dusty_tok` HttpOnly cookie (set via POST /api/auth)
+# or from a ?tok= query param (backward compat for curl / scripts).
 OWNER_TOKEN = os.environ.get("DUSTY_OWNER_TOKEN", "").strip()
+_AUTH_COOKIE_NAME = "dusty_tok"
 PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
 
 
@@ -2202,7 +2380,6 @@ def purpleair_fetch_loop(
                 sentinels = _pick_sentinels(app_state.purpleair_sensors, grid)
             sentinel_ids = [s["sensor_index"] for s in sentinels]
 
-            _log(f"[PurpleAir] Polling {len(sentinel_ids)} sentinels ({len(grid)} grid cells)")
             sentinel_data = _fetch_purpleair_sensors(fields="pm2.5", sensor_indices=sentinel_ids)
             debug_info["calls"].append({"type": "sentinel_poll", "count": len(sentinel_ids)})
 
@@ -2226,9 +2403,6 @@ def purpleair_fetch_loop(
                     with app_state.lock:
                         cluster = _cluster_of(sid, grid, app_state.purpleair_sensors)
                     cluster_ids_to_fetch.update(cluster)
-                    if old_color is not None:
-                        _log(f"[PurpleAir] Sentinel {sid} color {old_color}→{new_color}, "
-                             f"queuing {len(cluster)} cluster members")
 
             # Apply sentinel readings
             with app_state.lock:
@@ -2239,14 +2413,13 @@ def purpleair_fetch_loop(
             cluster_ids_to_fetch -= set(sentinel_ids)
             if cluster_ids_to_fetch:
                 cluster_list = list(cluster_ids_to_fetch)
-                _log(f"[PurpleAir] Fetching {len(cluster_list)} cluster sensors (show_only)")
                 cluster_data = _fetch_purpleair_sensors(fields="pm2.5",
                                                         sensor_indices=cluster_list)
                 debug_info["calls"].append({"type": "cluster_fetch", "count": len(cluster_list)})
                 with app_state.lock:
                     _apply_fetched(cluster_data, now)
             else:
-                _log("[PurpleAir] No color-category changes, no cluster fetches needed")
+                pass  # routine cycle, no color changes — stay quiet
 
             debug_info["sentinel_count"] = len(sentinel_ids)
             debug_info["cluster_sensors_fetched"] = len(cluster_ids_to_fetch)
@@ -2996,7 +3169,7 @@ def _fetch_airnow_data(app_state: AppState) -> None:
             try:
                 # Determine URL - try today's folder first, then archive
                 dt = datetime.strptime(hour_key, "%Y%m%d%H")
-                today = datetime.now().strftime("%Y%m%d")
+                today = datetime.now(_MOUNTAIN_TZ).strftime("%Y%m%d")
                 
                 if hour_key.startswith(today):
                     url = f"{FILES_BASE_URL}/today/HourlyData_{hour_key}.dat"
@@ -3164,7 +3337,7 @@ def save_snapshot(data_dir: Path, date_str: str, state: dict[str, Any]) -> dict[
     # Sanitize date string for filename - only allow YYYY-MM-DD format chars
     safe_date = "".join(c for c in date_str if c.isalnum() or c == "-")
     if not safe_date or len(safe_date) > 20:
-        safe_date = datetime.now().strftime("%Y-%m-%d")
+        safe_date = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     filepath = snapshots_dir / f"{safe_date}.json"
     filepath.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
     return {"success": True, "filename": filepath.name, "size_bytes": filepath.stat().st_size}
@@ -3190,14 +3363,17 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     if file_size > MAX_SNAPSHOT_SIZE_BYTES:
         raise JsonValidationError(f"Snapshot file too large: {file_size} bytes")
     
-    # Read raw bytes and sanitize (never parse without sanitization)
+    # Snapshots are written by our own server — skip expensive sanitization.
+    # Just parse and do a lightweight schema check.
     raw_bytes = filepath.read_bytes()
-    sanitized = parse_and_sanitize_json(raw_bytes, max_size=MAX_SNAPSHOT_SIZE_BYTES)
-    
-    # Validate schema
-    validate_state_schema(sanitized)
-    
-    return sanitized
+    try:
+        parsed = json.loads(raw_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise JsonValidationError(f"Corrupt snapshot: {e}")
+    if not isinstance(parsed, dict):
+        raise JsonValidationError("Snapshot root must be object")
+    validate_state_schema(parsed)
+    return parsed
 
 def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, server_config: dict | None = None):
     """Create HTTP request handler with injected dependencies.
@@ -3220,11 +3396,18 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
     class Handler(BaseHTTPRequestHandler):
         # Disable keep-alive to avoid Safari/iOS hanging on connections
         protocol_version = "HTTP/1.1"
+        # Hide Python/BaseHTTP version from Server header
+        server_version = "DustyTrails"
+        sys_version = ""
         
         def log_message(self, format, *args):
             # Suppress default logging to avoid cluttering output
             pass
-        
+
+        def do_HEAD(self):
+            """Handle HEAD requests — return same headers as GET, no body."""
+            self.do_GET()
+
         def handle_one_request(self):
             """Override to handle broken pipe errors gracefully (Safari can drop connections)."""
             try:
@@ -3260,7 +3443,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 # Allow cross-origin requests (useful for dev/testing)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != "HEAD":
+                    self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client disconnected while we were sending - ignore
                 pass
@@ -3277,12 +3461,94 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
+        def _get_owner_tok(self) -> str:
+            """Read owner token from cookie (preferred) or ?tok= query param (fallback for curl)."""
+            # 1. HttpOnly cookie
+            cookie_header = self.headers.get("Cookie", "")
+            for part in cookie_header.split(";"):
+                part = part.strip()
+                if part.startswith(f"{_AUTH_COOKIE_NAME}="):
+                    return part[len(_AUTH_COOKIE_NAME) + 1:]
+            # 2. Query param fallback
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            return (qs.get("tok") or [""])[0]
+
+        def _is_owner(self) -> bool:
+            """Check if the request carries a valid owner token."""
+            if not OWNER_TOKEN:
+                return False
+            return self._get_owner_tok() == OWNER_TOKEN
+
+        def _require_owner(self) -> bool:
+            """Return True if auth passes.  Sends 403 and returns False if not."""
+            if not OWNER_TOKEN:
+                return True  # no token configured = open
+            if self._get_owner_tok() == OWNER_TOKEN:
+                return True
+            self._send(403, b'{"error": "forbidden"}', "application/json")
+            return False
+
+        def _handle_auth(self):
+            """POST /api/auth — validate token, set HttpOnly cookie.
+            
+            Body: {"token": "<value>"}
+            Response: 200 with Set-Cookie on success, 403 on bad token.
+            """
+            content_length = int(self.headers.get("Content-Length", 0))
+            if not (0 < content_length <= 512):
+                return self._send(400, b'{"error": "bad request"}', "application/json")
+            try:
+                raw = self.rfile.read(content_length)
+                body = json.loads(raw)
+                tok = (body.get("token") or "").strip()
+            except Exception:
+                return self._send(400, b'{"error": "invalid json"}', "application/json")
+
+            if not OWNER_TOKEN or tok != OWNER_TOKEN:
+                return self._send(403, b'{"error": "forbidden"}', "application/json")
+
+            # Set HttpOnly cookie — browser sends it automatically on every request.
+            # SameSite=Strict prevents CSRF; Secure omitted so it works on local HTTP.
+            cookie = f"{_AUTH_COOKIE_NAME}={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000"
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", cookie)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                body_bytes = b'{"ok": true}'
+                self.send_header("Content-Length", str(len(body_bytes)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body_bytes)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+        def _handle_auth_delete(self):
+            """DELETE /api/auth — clear the auth cookie."""
+            cookie = f"{_AUTH_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", cookie)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                body_bytes = b'{"ok": true}'
+                self.send_header("Content-Length", str(len(body_bytes)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body_bytes)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
         def do_GET(self):
             # Strip query string for path matching (cache-busting params like ?v=123)
             path_no_query = self.path.split('?')[0]
             
             # Static HTML - short cache, may change frequently during development
             if path_no_query in ("/", "/index.html"):
+                maybe_log_visitor(self.headers, self.client_address, data_dir)
                 return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="public, max-age=300")
             # JavaScript assets - serve any .js file from dashboard dir
             # Cache for 1 day (use cache-busting query params like ?v=20260205 for updates)
@@ -3294,23 +3560,22 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             if path_no_query == "/styles.css":
                 return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css", cache_control="public, max-age=86400")
             if path_no_query == "/manifest.json":
-                # Generate manifest dynamically with explicit http:// URL for PWA
-                host_header = self.headers.get("Host", "localhost:8765")
-                base_url = f"http://{host_header}"
+                # Use relative URLs — avoids Host-header injection and works
+                # behind any reverse proxy or CDN without scheme/host mismatch.
                 manifest = {
                     "name": "DustyTrails",
                     "short_name": "DustyTrails",
                     "description": "Real-time air quality monitoring dashboard for Utah mobile and fixed sensors",
-                    "start_url": base_url + "/",
-                    "scope": base_url + "/",
+                    "start_url": "/",
+                    "scope": "/",
                     "display": "standalone",
                     "background_color": "#0b0f14",
                     "theme_color": "#111826",
                     "orientation": "any",
                     "icons": [
-                        {"src": base_url + "/icon-192.png", "sizes": "192x192", "type": "image/png"},
-                        {"src": base_url + "/icon-512.png", "sizes": "512x512", "type": "image/png"},
-                        {"src": base_url + "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+                        {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+                        {"src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
                     ]
                 }
                 return self._send(200, json.dumps(manifest).encode(), "application/manifest+json")
@@ -3353,16 +3618,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                     _cc_public = "public, max-age=0, s-maxage=30, stale-while-revalidate=5"
 
                     # Owner token path: no ETag, no CDN cache (debug gets full fresh data)
-                    if OWNER_TOKEN:
-                        from urllib.parse import urlparse, parse_qs
-                        qs = parse_qs(urlparse(self.path).query)
-                        tok = (qs.get("tok") or [""])[0]
-                        if tok == OWNER_TOKEN:
-                            st_copy = json.loads(app_state.cached_json_bytes)
-                            if isinstance(st_copy.get("fixed"), list):
-                                st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
-                            return self._send(200, json.dumps(st_copy).encode("utf-8"),
-                                              "application/json", cache_control="private, no-store")
+                    if self._is_owner():
+                        st_copy = json.loads(app_state.cached_json_bytes)
+                        if isinstance(st_copy.get("fixed"), list):
+                            st_copy["fixed"] = [f for f in st_copy["fixed"] if f.get("id") != "Home"]
+                        return self._send(200, json.dumps(st_copy).encode("utf-8"),
+                                          "application/json", cache_control="private, no-store")
 
                     # Public path: ETag / 304 conditional GET
                     inm = self.headers.get("If-None-Match", "")
@@ -3439,23 +3700,27 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
+            if self.path.startswith("/api/auth"):
+                return self._handle_auth()
             if self.path.startswith("/api/prefs/sync"):
                 return self._handle_prefs_sync()
             if self.path.startswith("/api/snapshot/save"):
                 return self._handle_save_snapshot()
             return self._send(404, b"not found", "text/plain")
 
+        def do_DELETE(self):
+            if self.path.startswith("/api/auth"):
+                return self._handle_auth_delete()
+            return self._send(404, b"not found", "text/plain")
+
         def _handle_prefs_sync(self):
             """Append a prefs snapshot to prefs_log.ndjson (one JSON line per entry).
 
             Body: {"client_ts": <epoch_ms>, "prefs": {"dusty_...": "...", ...}}
-            Token validated via ?tok= query param (same as snapshot/save).
+            Auth via HttpOnly cookie or ?tok= query param.
             """
-            from urllib.parse import urlparse, parse_qs
-            qs = parse_qs(urlparse(self.path).query)
-            tok = (qs.get("tok") or [""])[0]
-            if OWNER_TOKEN and tok != OWNER_TOKEN:
-                return self._send(403, b'{"error": "forbidden"}', "application/json")
+            if not self._require_owner():
+                return
             content_length = int(self.headers.get("Content-Length", 0))
             if not (0 < content_length <= 8192):
                 return self._send(400, b'{"error": "bad length"}', "application/json")
@@ -3486,11 +3751,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             Query params:
               n=<int>   — number of tail entries to return (default 100, max 10000)
             """
+            if not self._require_owner():
+                return
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
-            tok = (qs.get("tok") or [""])[0]
-            if OWNER_TOKEN and tok != OWNER_TOKEN:
-                return self._send(403, b'{"error": "forbidden"}', "application/json")
             try:
                 n = min(int((qs.get("n") or ["100"])[0]), 10000)
             except (ValueError, TypeError):
@@ -3530,13 +3794,16 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
 
         def _handle_save_snapshot(self):
             """Save POSTed state as a snapshot."""
+            if not self._require_owner():
+                return
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
+
             date_str = query.get("date", [None])[0]
 
             if not date_str:
-                # Default to today's date
-                date_str = datetime.now().strftime("%Y-%m-%d")
+                # Default to today's date (Mountain time — sensors are in Utah)
+                date_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
 
             try:
                 # Read POSTed body
@@ -3553,7 +3820,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                     with app_state.lock:
                         state_to_save = json.loads(app_state.cached_json_bytes.decode("utf-8"))
 
-                # Trim fixed sensor history to the snapshot's date only
+                # Trim to the snapshot's date window (5 AM–5 AM MST)
+                _trim_trails_to_day(state_to_save, date_str)
                 _trim_history_to_date(state_to_save, date_str)
 
                 result = save_snapshot(data_dir, date_str, state_to_save)
@@ -3565,6 +3833,11 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 return self._send(500, body, "application/json")
+
+        # In-memory cache for windowed snapshot responses.
+        # Key: (date_str, start_hour, duration_h)  Value: bytes
+        # Avoids re-parsing the full snapshot JSON on every widget load.
+        _snapshot_window_cache: dict[tuple, bytes] = {}
 
         def _handle_load_snapshot(self):
             """Load a saved snapshot by date.
@@ -3580,6 +3853,23 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             if not date_str:
                 return self._send(400, b'{"error": "date parameter required"}', "application/json")
 
+            # Check window cache first (widget requests the same window all day)
+            start_hour_raw = query.get("start", [None])[0]
+            duration_raw = query.get("duration", [None])[0]
+            if start_hour_raw is not None:
+                try:
+                    _sh = int(start_hour_raw)
+                    _dh = int(duration_raw) if duration_raw is not None else 24
+                    cache_key = (date_str, _sh, _dh)
+                    cached = self._snapshot_window_cache.get(cache_key)
+                    if cached is not None:
+                        return self._send(200, cached, "application/json",
+                                          cache_control="public, max-age=3600")
+                except (ValueError, TypeError):
+                    cache_key = None
+            else:
+                cache_key = None
+
             try:
                 state = load_snapshot(data_dir, date_str)
                 if state is None:
@@ -3591,15 +3881,22 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 # data was injected incorrectly.
                 existing_pa = [f for f in (state.get("fixed") or []) if f.get("purpleair")]
                 if existing_pa:
-                    # Check fixed_history for any PA entry timestamped on this date
-                    date_prefix = date_str  # "YYYY-MM-DD"
+                    # Check fixed_history for any PA entry timestamped on this date.
+                    # date_str is a Mountain-time date but timestamps are UTC, so
+                    # we check both UTC dates that cover this MT day.
+                    try:
+                        _day_mt = datetime.strptime(date_str, "%Y-%m-%d").replace(
+                            hour=0, minute=0, second=0, microsecond=0, tzinfo=_MOUNTAIN_TZ)
+                        _pa_prefixes = _utc_date_prefixes_for_mt_day(_day_mt)
+                    except (ValueError, TypeError):
+                        _pa_prefixes = (date_str,)
                     pa_confirmed = False
                     with app_state.lock:
                         for sensor_id, pollutants in app_state.fixed_history.items():
                             if not sensor_id.startswith("PA_"):
                                 continue
                             for entries in pollutants.values():
-                                if any(e.get("time", "").startswith(date_prefix) for e in entries):
+                                if any(e.get("time", "")[:10] in _pa_prefixes for e in entries):
                                     pa_confirmed = True
                                     break
                             if pa_confirmed:
@@ -3608,11 +3905,36 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         _log(f"[Snapshot] Stripping {len(existing_pa)} stale PA sensors from {date_str} (no fixed_history data for that date)")
                         state["fixed"] = [f for f in state["fixed"] if not f.get("purpleair")]
 
-                # Trim data to the requested date's window only (5 AM – 5 AM local)
+                # Trim to the requested day's 5 AM–5 AM MST window.
+                # Current saves are pre-trimmed, but older snapshots may not be.
                 _trim_trails_to_day(state, date_str)
                 _trim_history_to_date(state, date_str)
 
+                # If start (hour) is provided, trim to that window.
+                # Used by the landing page embed widget.
+                if start_hour_raw is not None:
+                    try:
+                        start_hour = int(start_hour_raw)
+                        duration_h = int(duration_raw) if duration_raw is not None else 24
+                        if 0 <= start_hour <= 23 and 0 < duration_h <= 24:
+                            _day = datetime.strptime(date_str, "%Y-%m-%d")
+                            win_start = _day.replace(hour=start_hour, minute=0, second=0,
+                                                     microsecond=0, tzinfo=_MOUNTAIN_TZ).astimezone(timezone.utc)
+                            win_end = win_start + timedelta(hours=duration_h)
+                            _trim_state_to_window(state, win_start, win_end)
+                    except (ValueError, TypeError):
+                        pass  # Ignore bad params, serve full day
+
                 body = json.dumps(state).encode("utf-8")
+                # Cache windowed responses so subsequent widget loads are instant
+                if cache_key is not None:
+                    self._snapshot_window_cache[cache_key] = body
+                    # Cap cache size: keep at most 10 entries
+                    if len(self._snapshot_window_cache) > 10:
+                        oldest = next(iter(self._snapshot_window_cache))
+                        del self._snapshot_window_cache[oldest]
+                    return self._send(200, body, "application/json",
+                                      cache_control="public, max-age=3600")
                 return self._send(200, body, "application/json")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
@@ -3698,7 +4020,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             max_lat = float(query.get("maxLat", ["90"])[0])
             min_lon = float(query.get("minLon", ["-180"])[0])
             max_lon = float(query.get("maxLon", ["180"])[0])
-            limit = int(query.get("limit", ["5000"])[0])
+            limit = min(int(query.get("limit", ["5000"])[0]), 50000)
             
             road_graph = get_cached_road_graph()
             if not road_graph:
@@ -3753,7 +4075,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             max_lat = float(query.get("maxLat", ["90"])[0])
             min_lon = float(query.get("minLon", ["-180"])[0])
             max_lon = float(query.get("maxLon", ["180"])[0])
-            limit = int(query.get("limit", ["5000"])[0])
+            limit = min(int(query.get("limit", ["5000"])[0]), 50000)
             
             tram_graph = get_cached_tram_line_graph()
             if not tram_graph:

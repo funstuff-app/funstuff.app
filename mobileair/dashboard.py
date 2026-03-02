@@ -464,11 +464,11 @@ def normalize_state_for_dashboard(
     if fixed_outliers:
         fixed_sensors = [s for s in fixed_sensors if str(s.get("id")) not in fixed_outliers]
 
-    # Add home sensor from Dirigera hub
-    from .dirigera_home import get_home_sensor_entry
-    home_entry = get_home_sensor_entry()
-    if home_entry:
-        fixed_sensors.insert(0, home_entry)
+    # DISABLED: Home sensor injection was baking live readings into snapshots
+    # from .dirigera_home import get_home_sensor_entry
+    # home_entry = get_home_sensor_entry()
+    # if home_entry:
+    #     fixed_sensors.insert(0, home_entry)
 
     # Sort mobile sensors
     mobile_sensors.sort(

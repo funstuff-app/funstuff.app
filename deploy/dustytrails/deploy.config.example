@@ -7,4 +7,6 @@ PI_USER="pi"
 # Secrets (injected into systemd service Environment)
 DUSTY_PURPLEAIR_API_KEY="your-purpleair-api-key"
 AIRNOW_API_KEY="your-airnow-api-key"
-#DUSTY_OWNER_TOKEN="optional-owner-token"
+
+# If empty or commented out, deploy will auto-generate one.
+DUSTY_OWNER_TOKEN=""
