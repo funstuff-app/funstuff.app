@@ -199,7 +199,38 @@ class MapView {
     this._wheelPanning = false; // true during trackpad/keyboard-trackpad wheel-pan streams
     this._wheelPanEndTimer = null; // debounce timer to exit wheel-pan mode
 
-    window.addEventListener("resize", () => this.resize());
+    // ResizeObserver fires after layout settles — catches window resize, devtools
+    // show/hide, and fullscreen toggle more reliably than window "resize".
+    // Pass contentRect dimensions directly to avoid reading stale clientHeight:
+    // -webkit-fill-available (used as a PWA fix on html/body) doesn't reflow
+    // reliably in Chrome/Safari when devtools or the browser chrome changes size,
+    // so parent.clientHeight can return the old value even after a layout pass.
+    this._ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        if (width > 0 && height > 0) this.resize(width, height);
+      }
+    });
+    this._ro.observe(this.tilesCanvas.parentElement);
+
+    // Fullscreen change can briefly detach/reattach the parent; re-observe and
+    // force a resize after the browser has committed the new layout.
+    this._onFullscreenChange = () => {
+      const parent = this.tilesCanvas.parentElement;
+      if (parent) this._ro.observe(parent);
+      // Clear cached dimensions so the guard never skips the post-fullscreen resize.
+      this._cssW = 0;
+      this._cssH = 0;
+      // visualViewport gives the true visible area; fall back to innerWidth/Height.
+      const vv = window.visualViewport;
+      requestAnimationFrame(() => {
+        const w = vv ? vv.width : window.innerWidth;
+        const h = vv ? vv.height : window.innerHeight;
+        this.resize(w, h);
+      });
+    };
+    document.addEventListener("fullscreenchange", this._onFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", this._onFullscreenChange);
     
     this.overlayCanvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
     // Safari (macOS) provides native trackpad pinch as gesture events.
@@ -881,8 +912,8 @@ class MapView {
       }
 
       const t = clamp((performance.now() - t0) / dur, 0, 1);
-      // "light" ease-out (cubic)
-      const ease = 1 - Math.pow(1 - t, 3);
+      // smoothstep ease-in-out: zoom and pan arrive together, no swoop
+      const ease = t * t * (3 - 2 * t);
       this.zoom = z0 + (z1 - z0) * ease;
       this.center = { lat: lat0 + (lat1 - lat0) * ease, lon: lon0 + (lon1 - lon0) * ease };
       if (zoomChanging) {
@@ -1836,12 +1867,15 @@ class MapView {
     this._notifyViewChanged();
   }
 
-  resize() {
+  resize(cssW, cssH) {
     const dpr = window.devicePixelRatio || 1;
     const parent = this.tilesCanvas.parentElement;
-    // Use clientWidth/clientHeight (integers) - more stable than getBoundingClientRect
-    const w = Math.max(1, parent.clientWidth);
-    const h = Math.max(1, parent.clientHeight);
+    // Prefer caller-supplied dimensions (e.g. from ResizeObserver contentRect or
+    // visualViewport) over reading clientWidth/clientHeight.  The CSS height chain
+    // (html/body use -webkit-fill-available as a PWA fix) can return a stale value
+    // in Chrome and Safari when devtools or the browser chrome changes size.
+    const w = Math.max(1, cssW != null ? Math.round(cssW) : parent.clientWidth);
+    const h = Math.max(1, cssH != null ? Math.round(cssH) : parent.clientHeight);
 
     // Guard: skip if nothing changed (prevents feedback loops)
     if (w === this._cssW && h === this._cssH && dpr === this._dpr) return;
@@ -4332,10 +4366,32 @@ class MapView {
     const targetD = this._getTargetDistance(pts, cumDist, totalDist, t);
     
     // ── SCRUB FAST PATH ──────────────────────────────────────────────────────
-    // When the user is actively scrubbing (slider or barrel drag), skip the
-    // entire autonomous-agent physics pipeline.  The controller owns the
-    // position — just place the marker at targetD and return.
+    // When the user is actively scrubbing, skip the entire physics pipeline.
+    // The controller owns the position — place marker at targetD and return.
+    //
+    // Also stays active during "cooldown" after a forward scrub ends: the
+    // easing/fling continues advancing playbackTimeMs while physics would be
+    // far behind, causing a lurch. We hold the fast path until the playback
+    // velocity settles to normal speed (targetD stops racing ahead).
     if (this._scrubbing) {
+      // Mark that we're in a scrub — cooldown will continue after release
+      if (!this._scrubCooldownById) this._scrubCooldownById = new Map();
+      this._scrubCooldownById.set(id, { lastTargetD: targetD, lastT: t });
+    }
+    const cooldown = this._scrubCooldownById?.get(id);
+    const inCooldown = !this._scrubbing && cooldown != null
+      && (t - cooldown.lastT) < 1500   // max 1.5s cooldown
+      && (targetD - cooldown.lastTargetD) > 50;  // easing is still racing ahead (>50m jump)
+    if (inCooldown) {
+      // Update cooldown tracking
+      cooldown.lastTargetD = targetD;
+      cooldown.lastT = t;
+    } else if (!this._scrubbing && cooldown != null) {
+      // Cooldown finished — clear it
+      this._scrubCooldownById.delete(id);
+    }
+    
+    if (this._scrubbing || inCooldown) {
       const phys = this._getPhysicsState(id);
       phys.d = targetD;
       phys.lastPlaybackT = t;
@@ -4642,19 +4698,22 @@ class MapView {
     // Steering toward RAW GPS position with damping
     // This ensures vehicle never teleports when speed changes (spline recomputes).
     // Physics provides natural smoothing through steering inertia.
-    const STEER_RATE = 3.0; // How fast to steer toward waypoint (higher = snappier)
-    const steerFactor = 1 - Math.exp(-STEER_RATE * dtS);
-    
-    // Blend current position toward raw GPS sample
-    phys.lat += steerFactor * (rawSample.lat - phys.lat);
-    phys.lon += steerFactor * (rawSample.lon - phys.lon);
-    
-    // Smooth heading toward raw GPS heading
-    let headingDiff = rawSample.heading - phys.heading;
-    // Wrap to [-π, π]
-    while (headingDiff > Math.PI) headingDiff -= 2 * Math.PI;
-    while (headingDiff < -Math.PI) headingDiff += 2 * Math.PI;
-    phys.heading += steerFactor * headingDiff;
+    // Skip steering blend when actively scrubbing — marker must track controller exactly.
+    if (!this._scrubbing) {
+      const STEER_RATE = 3.0; // How fast to steer toward waypoint (higher = snappier)
+      const steerFactor = 1 - Math.exp(-STEER_RATE * dtS);
+      
+      // Blend current position toward raw GPS sample
+      phys.lat += steerFactor * (rawSample.lat - phys.lat);
+      phys.lon += steerFactor * (rawSample.lon - phys.lon);
+
+      // Smooth heading toward raw GPS heading
+      let headingDiff = rawSample.heading - phys.heading;
+      // Wrap to [-π, π]
+      while (headingDiff > Math.PI) headingDiff -= 2 * Math.PI;
+      while (headingDiff < -Math.PI) headingDiff += 2 * Math.PI;
+      phys.heading += steerFactor * headingDiff;
+    }
     
     // Record actual vehicle path for debug visualization
     // This captures the dynamically computed steering path, not the waypoints

@@ -365,13 +365,15 @@ def default_data_dir() -> Path:
 # Geo-IP visitor logging
 # Logs city/region/country to ~/.mobileair/visitors.log on each unique page load.
 # The raw IP address is NEVER written to disk — only the resolved location.
+# Re-logs if the resolved location changes (e.g. client toggled a VPN).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# In-memory de-duplicate cache: maps sha256(ip) → last-logged epoch (seconds).
-# Prevents re-logging the same visitor within GEO_IP_CACHE_TTL_S seconds.
-_geo_ip_cache: dict[str, float] = {}
+# Cache: sha256(ip) → (last_check_monotonic, last_logged_location)
+# last_logged_location is "" when the IP has never been successfully logged.
+_geo_ip_cache: dict[str, tuple[float, str]] = {}
 _geo_ip_cache_lock = threading.Lock()
-GEO_IP_CACHE_TTL_S = 3600  # 1 hour
+# Minimum seconds between geo lookups for the same IP (keeps ip-api.com happy).
+GEO_IP_RECHECK_S = 300  # 5 minutes
 
 
 def _resolve_client_ip(headers, client_address: tuple) -> str:
@@ -382,27 +384,40 @@ def _resolve_client_ip(headers, client_address: tuple) -> str:
     return client_address[0]
 
 
-def _log_visitor_geo(ip: str, data_dir: Path) -> None:
-    """Background worker: geo-resolve *ip* and append location to visitors.log.
-    The IP address is used only for the API call and is never persisted."""
+def _log_visitor_geo(ip: str, ip_hash: str, prev_location: str, data_dir: Path) -> None:
+    """Background worker: geo-resolve *ip* and append to visitors.log if location changed.
+
+    *ip* is used only for the API call and is never persisted.
+    *prev_location* is the last location we logged for this IP hash so we can
+    detect changes (e.g. Apple iCloud Private Relay / VPN toggle).
+    """
     try:
         import urllib.request
-        import urllib.error
         # Resolve geo location — city/region/country only, no ISP or ASN.
         url = f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,timezone"
         with urllib.request.urlopen(url, timeout=5) as resp:
             data = json.loads(resp.read().decode())
         if data.get("status") != "success":
             return
-        country  = data.get("country", "Unknown")
-        region   = data.get("regionName", "")
-        city     = data.get("city", "")
-        tz       = data.get("timezone", "")
-        # Build a readable location string, omitting empty parts.
-        parts = [p for p in [city, region, country] if p]
+        country = data.get("country", "Unknown")
+        region  = data.get("regionName", "")
+        city    = data.get("city", "")
+        tz      = data.get("timezone", "")
+        parts    = [p for p in [city, region, country] if p]
         location = ", ".join(parts) if parts else "Unknown"
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        line = f"{ts}  |  {location}  |  tz:{tz}\n"
+
+        # Always update the cached location so future checks compare correctly.
+        now = time.monotonic()
+        with _geo_ip_cache_lock:
+            _geo_ip_cache[ip_hash] = (now, location)
+
+        # Only write to log if location differs from the last logged value.
+        if location == prev_location:
+            return
+
+        note = f"  [was: {prev_location}]" if prev_location else ""
+        ts   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        line = f"{ts}  |  {location}  |  tz:{tz}{note}\n"
         log_path = data_dir / "visitors.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as fh:
@@ -414,25 +429,26 @@ def _log_visitor_geo(ip: str, data_dir: Path) -> None:
 def maybe_log_visitor(headers, client_address: tuple, data_dir: Path) -> None:
     """Fire-and-forget geo-IP log for a page-load request.
 
-    De-duplicates by IP within GEO_IP_CACHE_TTL_S so one person refreshing
-    the page doesn't spam the log or the upstream API.
+    Rate-limits geo lookups to GEO_IP_RECHECK_S per IP, but always re-logs
+    when the resolved location changes (catches VPN/relay toggles).
     """
     ip = _resolve_client_ip(headers, client_address)
     # Skip loopback / private network hits — those are local/dev.
     if ip in ("127.0.0.1", "::1") or ip.startswith("192.168.") or ip.startswith("10."):
         return
-    # Use a hash so the IP never lives in a data structure that could be logged.
+    # Use a hash so the raw IP never lives in any persistent data structure.
     ip_hash = hashlib.sha256(ip.encode()).hexdigest()
     now = time.monotonic()
     with _geo_ip_cache_lock:
-        last = _geo_ip_cache.get(ip_hash, 0.0)
-        if now - last < GEO_IP_CACHE_TTL_S:
+        last_check, prev_location = _geo_ip_cache.get(ip_hash, (0.0, ""))
+        if now - last_check < GEO_IP_RECHECK_S:
             return
-        _geo_ip_cache[ip_hash] = now
+        # Stamp the check time immediately so parallel requests don't pile up.
+        _geo_ip_cache[ip_hash] = (now, prev_location)
     # Do the network call off the request thread.
     threading.Thread(
         target=_log_visitor_geo,
-        args=(ip, data_dir),
+        args=(ip, ip_hash, prev_location, data_dir),
         daemon=True,
     ).start()
 
@@ -2218,7 +2234,7 @@ def purpleair_fetch_loop(
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
     META_INTERVAL       = 10800.0  # 3 hours
-    DATA_INTERVAL_DAY   = 300.0    # 5 min during day
+    DATA_INTERVAL_DAY   = 120.0    # 2 min during day
     DATA_INTERVAL_NIGHT = 1800.0   # 30 min during night (1 AM – 6 AM MST)
     NEIGHBOR_RADIUS_DEG = 0.018    # ~2 km grid cell side length
 
@@ -3548,7 +3564,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             
             # Static HTML - short cache, may change frequently during development
             if path_no_query in ("/", "/index.html"):
-                maybe_log_visitor(self.headers, self.client_address, data_dir)
+                if not self._is_owner():
+                    maybe_log_visitor(self.headers, self.client_address, data_dir)
                 return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="public, max-age=300")
             # JavaScript assets - serve any .js file from dashboard dir
             # Cache for 1 day (use cache-busting query params like ?v=20260205 for updates)
@@ -3697,6 +3714,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._handle_load_snapshot()
             if self.path.startswith("/api/prefs/log"):
                 return self._handle_prefs_log()
+            if self.path.startswith("/api/view/clients"):
+                return self._handle_view_clients()
+            if self.path.startswith("/api/view/log"):
+                return self._handle_view_log()
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
@@ -3704,6 +3725,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._handle_auth()
             if self.path.startswith("/api/prefs/sync"):
                 return self._handle_prefs_sync()
+            if self.path.startswith("/api/view/sync"):
+                return self._handle_view_sync()
             if self.path.startswith("/api/snapshot/save"):
                 return self._handle_save_snapshot()
             return self._send(404, b"not found", "text/plain")
@@ -3771,6 +3794,85 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         except json.JSONDecodeError:
                             pass
             body = json.dumps(entries).encode("utf-8")
+            return self._send(200, body, "application/json")
+
+        def _handle_view_sync(self):
+            """Append a camera-position entry to view_log.ndjson (open to all visitors).
+
+            Body: {"client_id": "abc123", "lat": 40.76, "lon": -111.89, "zoom": 12.5}
+            No auth required — any visitor can sync their view.
+            """
+            content_length = int(self.headers.get("Content-Length", 0))
+            if not (0 < content_length <= 2048):
+                return self._send(400, b'{"error": "bad length"}', "application/json")
+            try:
+                raw = self.rfile.read(content_length)
+                incoming = json.loads(raw)
+                cid = str(incoming.get("client_id", ""))[:24]
+                lat = float(incoming["lat"])
+                lon = float(incoming["lon"])
+                zoom = float(incoming["zoom"])
+                if not cid or not all(map(math.isfinite, (lat, lon, zoom))):
+                    raise ValueError("invalid fields")
+                entry = {"ts": time.time(), "client_id": cid, "lat": round(lat, 6), "lon": round(lon, 6), "zoom": round(zoom, 3)}
+                log_path = Path(data_dir) / "view_log.ndjson"
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+                return self._send(200, b'{"ok": true}', "application/json")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode()
+                return self._send(400, body, "application/json")
+
+        def _handle_view_clients(self):
+            """Return distinct client IDs with entry counts from view_log.ndjson."""
+            log_path = Path(data_dir) / "view_log.ndjson"
+            counts: dict[str, int] = {}
+            if log_path.exists():
+                for line in log_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        cid = entry.get("client_id", "")
+                        if cid:
+                            counts[cid] = counts.get(cid, 0) + 1
+                    except json.JSONDecodeError:
+                        pass
+            result = [{"client_id": cid, "count": cnt} for cid, cnt in sorted(counts.items(), key=lambda x: -x[1])]
+            body = json.dumps(result).encode("utf-8")
+            return self._send(200, body, "application/json")
+
+        def _handle_view_log(self):
+            """Return view entries for a specific client.
+
+            Query params:
+              client=<str>  — required client ID
+              n=<int>       — max entries (default 500, max 5000)
+            """
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            client_id = (qs.get("client") or [""])[0].strip()
+            if not client_id:
+                return self._send(400, b'{"error": "missing client param"}', "application/json")
+            try:
+                n = min(int((qs.get("n") or ["500"])[0]), 5000)
+            except (ValueError, TypeError):
+                n = 500
+            log_path = Path(data_dir) / "view_log.ndjson"
+            entries = []
+            if log_path.exists():
+                for line in log_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("client_id") == client_id:
+                            entries.append(entry)
+                    except json.JSONDecodeError:
+                        pass
+            body = json.dumps(entries[-n:]).encode("utf-8")
             return self._send(200, body, "application/json")
 
         def _handle_tui_state(self):
@@ -4274,13 +4376,13 @@ def main() -> int:
     except Exception as e:
         _log(f"[PurpleAir] Initial fetch error (will retry in background): {e}")
 
-    # Start PurpleAir fetch loop (10-min daytime / 30-min nighttime)
+    # Start PurpleAir fetch loop (2-min daytime / 30-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
         daemon=True
     ).start()
-    _log("[PurpleAir] SLC sensor integration enabled (10-min daytime / 30-min nighttime, batched requests)")
+    _log("[PurpleAir] SLC sensor integration enabled (2-min daytime / 30-min nighttime, batched requests)")
 
     # History prefetch disabled — Select Day now loads from local snapshots
     # threading.Thread(
@@ -4396,7 +4498,7 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             daemon=True
         ).start()
 
-    # PurpleAir fetch loop with batched requests (10-min daytime / 30-min nighttime)
+    # PurpleAir fetch loop with batched requests (2-min daytime / 30-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),

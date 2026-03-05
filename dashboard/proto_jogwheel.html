@@ -594,82 +594,188 @@
       ctx.putImageData(imageData, 0, 0);
     }
 
-    /* ═══ Ghost Hint ═══ */
+    /* ═══ Ghost Hint — Synthetic Pointer Automation ═══
+     *
+     * The hint dispatches REAL PointerEvents through the same handlers a real
+     * user triggers.  Lighting, barrel rotation, inertial coasting — everything
+     * comes from the actual code paths, not manual animation.
+     *
+     * Sequence:
+     *   1. Fade in ghost dots at barrel center
+     *   2. pointerdown → drag right with ease-in (high velocity at release)
+     *   3. pointerup  → barrel coasts via real friction physics
+     *   4. Inverse-kinematics wait: coast until v < 20% of release velocity
+     *   5. pointerdown → catch the coasting wheel
+     *   6. Drag left past center with ease-in
+     *   7. pointerup  → coast settles
+     *   8. Tween synthetic cursor back to center (light eases naturally)
+     *   9. Fade out ghost dots, restore position
+     */
+
     let hintActive = false, hintStartPerf = 0, hintStartPos = 0.5;
-    let hintPhase = 'idle', hintPosX = 0, hintDotScale = 1;
+    let hintPosX = 0, hintDotScale = 1;
+    let _hintLock = false;          // disables dismissHint during synthetic dispatch
+    let _hintState = 'idle';
+    let _hintStateStart = 0;
+    let _hintReleaseV = 0;          // velocity snapshot at release (for catch timing)
+    let _hintDragLStart = 0;        // hintPosX when left-drag starts
+
+    const HINT_DRAG_PX   = 120;
+    const HINT_DRAG_R_MS = 700;
+    const HINT_DRAG_L_MS = 900;
+    const HINT_FADE_MS   = 250;
+    const HINT_CATCH_V   = 0.20;   // catch when |v| < 20% of release
+
+    /* Dispatch a synthetic pointer event through the real handlers */
+    function _hintFire(type, target, clientX, clientY) {
+      _hintLock = true;
+      const ev = new PointerEvent(type, {
+        clientX, clientY,
+        pointerId: 9999,
+        bubbles: true,
+        cancelable: true,
+        pointerType: 'mouse',
+        view: window,
+      });
+      target.dispatchEvent(ev);
+      _hintLock = false;
+    }
+
+    function _hintCenter() {
+      const r = jogWrap.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }
+
+    function _hintGo(state, now) {
+      _hintState = state;
+      _hintStateStart = now;
+    }
 
     function startHint() {
       if (hintDismissed) return;
       hintActive = true;
       hintStartPerf = performance.now();
-      hintPhase = 'fadeIn';
+      _hintState = 'fadeIn';
+      _hintStateStart = hintStartPerf;
       hintPosX = 0;
       hintDotScale = 1;
       hintStartPos = position;
+      _hintReleaseV = 0;
+      _hintDragLStart = 0;
       ghostDots.style.opacity = '0';
       ghostDots.style.transform = 'translateX(-50%) translateY(4px)';
-      _pbVelocity = 0;
-      _pbWheelAccum = 0;
     }
 
     function tickHint(now) {
-      if (!hintActive) return;
-      const t = now - hintStartPerf;
-      const DRAG_PX = 100;
+      if (!hintActive || _hintState === 'idle') return;
+      const st = now - _hintStateStart;
+      const c  = _hintCenter();
 
-      // Simulate mouse position → move the light with the ghost dots
-      // Real mouse: lightX = clientX / innerWidth - 0.5
-      // Ghost dots are offset from barrel center. Barrel center is at ~50% of viewport.
-      const barrelRect = jogWrap.getBoundingClientRect();
-      const simClientX = barrelRect.left + barrelRect.width * 0.5 + hintPosX;
-      lightX = simClientX / window.innerWidth - 0.5;
+      switch (_hintState) {
 
-      if (t < 200) {
-        ghostDots.style.opacity = String(t/200);
-        ghostDots.style.transform = `translateX(-50%) translateY(${4*(1-t/200)}px)`;
-      } else if (t < 350) {
-        ghostDots.style.opacity = '1';
-        ghostDots.style.transform = 'translateX(-50%) translateY(0)';
-        hintDotScale = 1 + 0.2 * Math.sin((t-200)/150 * Math.PI);
-        applyDotScale();
-      } else if (t < 1100) {
-        hintPhase = 'dragRight';
-        const ease = 1 - Math.pow(1 - (t-350)/750, 3);
-        const target = ease * DRAG_PX;
-        shiftPosition(target - hintPosX);
-        hintPosX = target;
-        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(0)`;
-        hintDotScale = 1.12;
-        applyDotScale();
-      } else if (t < 2100) {
-        if (hintPhase !== 'dragLeft') _pbVelocity = 0;
-        hintPhase = 'dragLeft';
-        const ease = 1 - Math.pow(1 - (t-1100)/1000, 3);
-        const target = DRAG_PX - ease * DRAG_PX * 2;
-        shiftPosition(target - hintPosX);
-        hintPosX = target;
-        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(0)`;
-        hintDotScale = 1.12;
-        applyDotScale();
-      } else if (t < 2250) {
-        hintDotScale = 1.05;
-        applyDotScale();
-      } else if (t < 2900) {
-        hintPhase = 'release';
-        const ease = 1 - Math.pow(1 - (t-2250)/650, 2);
-        const target = -DRAG_PX * (1 - ease);
-        shiftPosition(target - hintPosX);
-        hintPosX = target;
-        hintDotScale = 1;
-        applyDotScale();
-        const p = (t-2250)/650;
-        ghostDots.style.opacity = String(1-p);
-        ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(${-5*p}px)`;
-      } else {
-        ghostDots.style.opacity = '0';
-        hintActive = false;
-        position = hintStartPos;
-        lightX = 0.08; // reset to default
+        /* ── Fade ghost dots in ── */
+        case 'fadeIn': {
+          const p = Math.min(1, st / HINT_FADE_MS);
+          ghostDots.style.opacity = String(p);
+          ghostDots.style.transform = `translateX(-50%) translateY(${4 * (1 - p)}px)`;
+          hintDotScale = 1;
+          applyDotScale();
+          if (p >= 1) {
+            // Press at barrel center — goes through real pointerdown handler
+            _hintFire('pointerdown', jogWrap, c.x, c.y);
+            hintPosX = 0;
+            _hintGo('dragRight', now);
+          }
+          break;
+        }
+
+        /* ── Drag right: quadratic ease-in → high velocity at release ── */
+        case 'dragRight': {
+          const t = Math.min(1, st / HINT_DRAG_R_MS);
+          const eased = t * t;                        // ease-in
+          const px = eased * HINT_DRAG_PX;
+          const cx = c.x + px;
+          // Dispatch real pointermove → updates lightX, shiftPosition, dragVelocity
+          _hintFire('pointermove', window, cx, c.y);
+          hintPosX = px;
+          ghostDots.style.opacity = '1';
+          ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(0)`;
+          hintDotScale = 1.08;
+          applyDotScale();
+          if (t >= 1) {
+            // Release — real pointerup sets _pbVelocity from dragVelocity
+            _hintFire('pointerup', window, cx, c.y);
+            _hintReleaseV = _pbVelocity;              // snapshot for IK
+            _hintGo('coastRight', now);
+          }
+          break;
+        }
+
+        /* ── Coast: real physics decay velocity. Wait to catch. ── */
+        case 'coastRight': {
+          ghostDots.style.opacity = '1';
+          hintDotScale = 1.0;
+          applyDotScale();
+          // Inverse-kinematics: watch the real velocity decay
+          const vRatio = Math.abs(_hintReleaseV) > 0.1
+            ? Math.abs(_pbVelocity / _hintReleaseV)
+            : 0;
+          // Require minimum 300ms coast for visual clarity
+          if (st > 300 && (vRatio < HINT_CATCH_V || st > 900)) {
+            // Catch the coasting wheel — real pointerdown zeros velocity
+            _hintDragLStart = hintPosX;
+            _hintFire('pointerdown', jogWrap, c.x + hintPosX, c.y);
+            _hintGo('dragLeft', now);
+          }
+          break;
+        }
+
+        /* ── Drag left past center: ease-in for release velocity ── */
+        case 'dragLeft': {
+          const t = Math.min(1, st / HINT_DRAG_L_MS);
+          const eased = t * t;
+          // Travel from catch point to slightly past center on the left
+          const travel = -_hintDragLStart - HINT_DRAG_PX * 0.4;
+          const px = _hintDragLStart + eased * travel;
+          const cx = c.x + px;
+          _hintFire('pointermove', window, cx, c.y);
+          hintPosX = px;
+          ghostDots.style.opacity = '1';
+          ghostDots.style.transform = `translateX(calc(-50% + ${hintPosX}px)) translateY(0)`;
+          hintDotScale = 1.08;
+          applyDotScale();
+          if (t >= 1) {
+            _hintFire('pointerup', window, cx, c.y);
+            _hintGo('settle', now);
+          }
+          break;
+        }
+
+        /* ── Settle: coast from left release + tween cursor to center ── */
+        case 'settle': {
+          const dur = 900;
+          const t = Math.min(1, st / dur);
+          const sm = t * t * (3 - 2 * t);             // smoothstep
+
+          // Tween synthetic cursor back to center → light eases via real handler
+          const settleX = hintPosX * (1 - sm);
+          _hintFire('pointermove', window, c.x + settleX, c.y);
+
+          // Fade ghost dots
+          ghostDots.style.opacity = String(1 - sm);
+          ghostDots.style.transform = `translateX(calc(-50% + ${settleX}px)) translateY(${-5 * sm}px)`;
+          hintDotScale = 1;
+          applyDotScale();
+
+          if (t >= 1) {
+            hintActive = false;
+            _hintState = 'idle';
+            ghostDots.style.opacity = '0';
+            position = hintStartPos;
+            _pbVelocity = 0;
+          }
+          break;
+        }
       }
     }
 
@@ -679,7 +785,12 @@
     }
 
     function dismissHint() {
-      if (hintActive) { hintActive = false; ghostDots.style.opacity = '0'; }
+      if (_hintLock) return;                           // don't dismiss during synthetic events
+      if (hintActive) {
+        hintActive = false;
+        _hintState = 'idle';
+        ghostDots.style.opacity = '0';
+      }
       hintDismissed = true;
     }
 
@@ -702,11 +813,10 @@
       _pbIsWheelCoasting = false;
       lastPtrX = e.clientX; lastPtrTime = performance.now();
       dragVelocity = 0;
-      jogWrap.setPointerCapture(e.pointerId);
+      try { jogWrap.setPointerCapture(e.pointerId); } catch {}
     });
 
     window.addEventListener('pointermove', (e) => {
-      // Always update light position, even during drag
       lightX = (e.clientX / window.innerWidth - 0.5);
       if (dbgLight) {
         const arrow = lightX < -0.1 ? '←' : lightX > 0.1 ? '→' : '●';
@@ -733,7 +843,6 @@
       dismissHint();
     });
 
-    /* Mouse controls the light X position */
     document.addEventListener('mousemove', (e) => {
       lightX = (e.clientX / window.innerWidth - 0.5);
       if (dbgLight) {
@@ -752,7 +861,8 @@
       _pbLastPerf = now;
       tickHint(now);
 
-      if (!_pbScrubbing && !hintActive) {
+      // Physics run always (hint drives motion via real events, not gating)
+      if (!_pbScrubbing) {
         if (Math.abs(_pbWheelAccum) > 0.1) {
           _pbVelocity += _pbWheelAccum * _pbWheelImpulse;
           _pbWheelAccum *= _pbWheelDecay;
@@ -779,7 +889,19 @@
       jogPlayhead.style.boxShadow =
         `0 0 ${10+speed*14}px rgba(108,195,255,${0.35+speed*0.45}), ` +
         `0 0 4px rgba(108,195,255,${(0.35+speed*0.45)*0.8})`;
-      tNow.textContent = fmtTime(TIMELINE_START.getTime() + position * TIMELINE_MS);
+
+      // Relative time display
+      const offsetMin = Math.round((position - 0.5) * TIMELINE_MS / 60000);
+      if (Math.abs(offsetMin) < 1) {
+        tNow.textContent = 'now';
+      } else {
+        const sign = offsetMin > 0 ? '+' : '−';
+        const abs = Math.abs(offsetMin);
+        tNow.textContent = abs >= 60
+          ? `${sign}${Math.floor(abs/60)}h ${abs%60}m`
+          : `${sign}${abs}m`;
+      }
+
       dbgVel.textContent = _pbVelocity.toFixed(2);
       dbgPos.textContent = (position * 100).toFixed(1) + '%';
       dbgCoast.textContent = _pbIsWheelCoasting ? 'wheel' : (absV > _pbVelocityThreshold ? 'drag' : '—');
@@ -787,22 +909,15 @@
     }
 
     function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
-    function fmtTime(ms) {
-      const d = new Date(ms);
-      let h = d.getHours();
-      const m = String(d.getMinutes()).padStart(2, '0');
-      const ampm = h >= 12 ? 'PM' : 'AM';
-      return `${(h % 12) || 12}:${m} ${ampm}`;
-    }
 
     function replayHint() {
       hintDismissed = false; position = 0.5; _pbVelocity = 0; startHint();
     }
     document.getElementById('replayBtn').addEventListener('click', replayHint);
 
-    document.getElementById('tLeft').textContent  = fmtTime(TIMELINE_START.getTime());
-    document.getElementById('tRight').textContent = fmtTime(TIMELINE_START.getTime() + TIMELINE_MS);
-    tNow.textContent = fmtTime(TIMELINE_START.getTime() + 0.5 * TIMELINE_MS);
+    document.getElementById('tLeft').textContent  = '−1h';
+    document.getElementById('tRight').textContent = '+1h';
+    tNow.textContent = 'now';
 
     renderBarrel();
     setTimeout(startHint, 600);

@@ -772,6 +772,46 @@ button#pbPlay.isLive {
   left: auto;
 }
 
+.autoCameraBtn {
+  width: 32px;
+  height: 30px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(17,24,38,0.80);
+  color: rgba(232,238,247,0.35);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 6px;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: rgba(0,0,0,0);
+  touch-action: manipulation;
+}
+.autoCameraBtn svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: block;
+}
+.autoCameraBtn:hover {
+  border-color: rgba(255,255,255,0.16);
+  background: rgba(24,32,48,0.92);
+  color: rgba(232,238,247,0.75);
+}
+.autoCameraBtn.active {
+  background: rgba(108,195,255,0.2);
+  border-color: rgba(108,195,255,0.6);
+  color: #6cc3ff;
+  box-shadow: 0 0 8px rgba(108,195,255,0.25);
+}
+.autoCameraBtn.active:hover {
+  background: rgba(108,195,255,0.28);
+  border-color: rgba(108,195,255,0.75);
+  box-shadow: 0 0 12px rgba(108,195,255,0.35);
+}
+
 .shareBtn {
   width: 32px;
   height: 30px;
@@ -1456,6 +1496,83 @@ button#pbPlay.isLive {
   pointer-events: none;
 }
 
+/* Camera history replay button (owner-only, top-right below legend toggle) */
+#camReplayBtn {
+  position: absolute;
+  top: 54px; /* 14px offset + 32px button + 8px gap */
+  right: 14px;
+  z-index: 19;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(12, 18, 28, 0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: var(--muted);
+  font-size: 12px;
+  font-family: inherit;
+  border-radius: 8px;
+  cursor: pointer;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s, width 0.15s;
+  line-height: 1;
+  white-space: nowrap;
+  padding: 0;
+}
+#camReplayBtn.visible {
+  display: flex;
+}
+#camReplayBtn:hover {
+  background: rgba(30, 40, 55, 0.95);
+}
+#camReplayBtn.replaying {
+  color: #d06060;
+  border-color: rgba(200, 70, 70, 0.35);
+  width: auto;
+  padding: 0 7px;
+}
+
+/* Client picker dropdown for cam replay */
+.camClientPicker {
+  position: absolute;
+  top: 54px;
+  right: 50px;
+  z-index: 20;
+  background: rgba(12, 18, 28, 0.92);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 8px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  max-height: 260px;
+  overflow-y: auto;
+  min-width: 140px;
+  padding: 4px 0;
+}
+.camClientPicker.hidden { display: none; }
+.camClientItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  transition: background 0.1s;
+}
+.camClientItem:hover {
+  background: rgba(255,255,255,0.07);
+  color: #eee;
+}
+.camClientItem .count {
+  opacity: 0.5;
+  font-size: 11px;
+}
+
 /* Sidebar panel (integrated, overlays full-bleed map) */
 .sidebarPanel {
   position: absolute;
@@ -1644,6 +1761,7 @@ body.lite #menuBtn,
 body.lite .controls,
 body.lite #legend,
 body.lite #legendToggle,
+body.lite #camReplayBtn,
 body.lite .pbMenuBtn,
 html.lite #topbar,
 html.lite #playbackBar,
@@ -1652,6 +1770,7 @@ html.lite #menuBtn,
 html.lite .controls,
 html.lite #legend,
 html.lite #legendToggle,
+html.lite #camReplayBtn,
 html.lite .pbMenuBtn {
   display: none !important;
 }

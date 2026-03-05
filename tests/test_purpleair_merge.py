@@ -2,8 +2,14 @@
 
 import unittest
 import threading
+from datetime import datetime, timezone, timedelta
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
 from mobileair.aqi import color_to_idx
-from dashboard_server import AppState, _merge_purpleair_into_fixed, _get_aqi_color, accumulate_fixed_reading
+from dashboard_server import (
+    AppState, _merge_purpleair_into_fixed, _get_aqi_color,
+    accumulate_fixed_reading, _inject_fixed_history, _trim_history_to_date,
+)
 
 
 class TestPurpleAirMerge(unittest.TestCase):
@@ -353,6 +359,104 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertEqual(_get_aqi_color("PM25", 2.0), "#00FFFF")
         # Stale color should NOT match
         self.assertNotEqual(_get_aqi_color("PM25", 1.0), "#00E400")
+
+    # ── timezone-correct history injection ───────────────────────────
+
+    def test_inject_fixed_history_utah_format_timestamps(self):
+        """Utah sensors use 'YYYY-MM-DD HH:MM:SS UTC' format — must not be
+        dropped by the today-only filter in _inject_fixed_history."""
+        app = self._make_app_state()
+        # Simulate Utah sensor history with space-separated UTC timestamps.
+        # 18:00 UTC on 2026-03-01 = 11:00 AM MST on 2026-03-01 → same MT day.
+        app.fixed_history["MySensor"] = {"PM25": [
+            {"val": "5", "ci": 1, "time": "2026-03-01 18:00:00 UTC", "recorded_at": 0},
+            {"val": "6", "ci": 1, "time": "2026-03-01 20:00:00 UTC", "recorded_at": 0},
+        ]}
+        st = {"fixed": [{
+            "id": "MySensor", "readings": {"PM25": {"value": 6, "ci": 1}},
+        }]}
+
+        # Mock "now" to 2026-03-01 21:00 UTC = 2:00 PM MST on March 1
+        fake_now = datetime(2026, 3, 1, 21, 0, 0, tzinfo=timezone.utc)
+        mt_tz = ZoneInfo("America/Denver")
+        with patch("dashboard_server.datetime") as mock_dt:
+            mock_dt.now = lambda tz=None: fake_now.astimezone(tz) if tz else fake_now
+            mock_dt.strptime = datetime.strptime
+            mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+            _inject_fixed_history(app, st)
+
+        history = st["fixed"][0]["readings"]["PM25"].get("history", [])
+        self.assertEqual(len(history), 2, "Both Utah-format timestamps should be kept")
+
+    def test_inject_fixed_history_iso_format_timestamps(self):
+        """PA/Home sensors use ISO 'YYYY-MM-DDTHH:MM:SSZ' format — must also work."""
+        app = self._make_app_state()
+        app.fixed_history["PA_1"] = {"PM25": [
+            {"val": "3", "ci": 1, "time": "2026-03-01T18:00:00Z", "recorded_at": 0},
+            {"val": "4", "ci": 1, "time": "2026-03-01T23:00:00Z", "recorded_at": 0},
+        ]}
+        st = {"fixed": [{
+            "id": "PA_1", "purpleair": True,
+            "readings": {"PM25": {"value": 4, "ci": 1}},
+        }]}
+
+        fake_now = datetime(2026, 3, 1, 23, 30, 0, tzinfo=timezone.utc)
+        with patch("dashboard_server.datetime") as mock_dt:
+            mock_dt.now = lambda tz=None: fake_now.astimezone(tz) if tz else fake_now
+            mock_dt.strptime = datetime.strptime
+            mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+            _inject_fixed_history(app, st)
+
+        history = st["fixed"][0]["readings"]["PM25"].get("history", [])
+        self.assertEqual(len(history), 2, "Both ISO-format timestamps should be kept")
+
+    def test_inject_fixed_history_after_utc_midnight(self):
+        """After midnight UTC (5 PM MST), readings from earlier the same MT
+        day must still appear — this was the original timezone bug."""
+        app = self._make_app_state()
+        # 15:00 UTC = 8 AM MST on March 1 (well before 5 PM MST / midnight UTC)
+        app.fixed_history["MySensor"] = {"PM25": [
+            {"val": "7", "ci": 1, "time": "2026-03-01 15:00:00 UTC", "recorded_at": 0},
+        ]}
+        st = {"fixed": [{
+            "id": "MySensor", "readings": {"PM25": {"value": 7, "ci": 1}},
+        }]}
+
+        # "Now" is 2026-03-02 01:00 UTC = 6 PM MST on March 1
+        fake_now = datetime(2026, 3, 2, 1, 0, 0, tzinfo=timezone.utc)
+        with patch("dashboard_server.datetime") as mock_dt:
+            mock_dt.now = lambda tz=None: fake_now.astimezone(tz) if tz else fake_now
+            mock_dt.strptime = datetime.strptime
+            mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+            _inject_fixed_history(app, st)
+
+        history = st["fixed"][0]["readings"]["PM25"].get("history", [])
+        self.assertEqual(len(history), 1,
+                         "Reading from 8 AM MST must survive when clock is 6 PM MST (01:00 UTC next day)")
+
+    def test_trim_history_to_date_mixed_formats(self):
+        """_trim_history_to_date must handle both timestamp formats and
+        exclude entries clearly outside the Mountain-time day."""
+        state = {"fixed": [{
+            "id": "MySensor",
+            "readings": {"PM25": {
+                "history_times": [
+                    "2026-03-01 18:00:00 UTC",   # 11 AM MST Mar 1 → keep
+                    "2026-03-01T23:30:00Z",        # 4:30 PM MST Mar 1 → keep
+                    "2026-03-02T08:00:00Z",        # 1 AM MST Mar 2 → keep (UTC date still overlaps MT day)
+                    "2026-02-28 20:00:00 UTC",     # clearly previous day → drop
+                    "2026-03-03T12:00:00Z",        # clearly two days later → drop
+                ],
+                "history": [5, 6, 7, 8, 9],
+                "history_colors": [1, 1, 1, 1, 1],
+            }},
+        }]}
+        _trim_history_to_date(state, "2026-03-01")
+        r = state["fixed"][0]["readings"]["PM25"]
+        # MT March 1 spans UTC March 1 + March 2, so entries on both UTC dates are kept.
+        # Only entries on completely different UTC dates (Feb 28, Mar 3) are dropped.
+        self.assertEqual(len(r["history_times"]), 3)
+        self.assertEqual(r["history"], [5, 6, 7])
 
 
 if __name__ == "__main__":

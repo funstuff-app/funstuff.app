@@ -420,6 +420,15 @@ sudo chmod 600 /etc/systemd/system/dustytrails.service.d/secrets.conf
 sudo systemctl daemon-reload
 sudo systemctl enable dustytrails
 sudo systemctl restart dustytrails
+
+# Grant passwordless sudo for service management so non-interactive SSH works.
+SUDOERS_LINE="${PI_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload, /usr/bin/systemctl restart dustytrails, /usr/bin/systemctl start dustytrails, /usr/bin/systemctl stop dustytrails, /usr/bin/systemctl status dustytrails *, /usr/bin/journalctl -u dustytrails *"
+echo "\$SUDOERS_LINE" | sudo tee /etc/sudoers.d/dustytrails-deploy > /dev/null
+sudo chmod 440 /etc/sudoers.d/dustytrails-deploy
+
+# Allow reading journals without sudo by adding user to systemd-journal group.
+sudo usermod -aG systemd-journal ${PI_USER}
+
 sleep 2
 sudo systemctl status dustytrails --no-pager || true
 REMOTE_SUDO
@@ -467,9 +476,9 @@ main() {
     echo "  Dashboard:  http://$PI_HOST:$DASHBOARD_PORT/"
     echo ""
     echo "  Commands:"
-    echo "    Logs:    ssh -t $PI_TARGET 'sudo journalctl -u $SERVICE_NAME -f'"
-    echo "    Status:  ssh -t $PI_TARGET 'sudo systemctl status $SERVICE_NAME'"
-    echo "    Restart: ssh -t $PI_TARGET 'sudo systemctl restart $SERVICE_NAME'"
+    echo "    Logs:    ssh $PI_TARGET 'journalctl -u $SERVICE_NAME -f'"
+    echo "    Status:  ssh $PI_TARGET 'systemctl status $SERVICE_NAME'"
+    echo "    Restart: ssh $PI_TARGET 'systemctl restart $SERVICE_NAME'"
     echo ""
 }
 
