@@ -3797,14 +3797,17 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             return self._send(200, body, "application/json")
 
         def _handle_view_sync(self):
-            """Append a camera-position entry to view_log.ndjson (open to all visitors).
+            """Append a camera-position entry to view_log.ndjson (visitors only).
 
             Body: {"client_id": "abc123", "lat": 40.76, "lon": -111.89, "zoom": 12.5}
-            No auth required — any visitor can sync their view.
+            Owner requests are silently dropped — only non-owner visitors are logged.
             """
             content_length = int(self.headers.get("Content-Length", 0))
             if not (0 < content_length <= 2048):
                 return self._send(400, b'{"error": "bad length"}', "application/json")
+            # Silently discard owner's own view — we only want visitor data
+            if self._is_owner():
+                return self._send(200, b'{"ok": true}', "application/json")
             try:
                 raw = self.rfile.read(content_length)
                 incoming = json.loads(raw)
@@ -3825,6 +3828,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
 
         def _handle_view_clients(self):
             """Return distinct client IDs with entry counts from view_log.ndjson."""
+            if not self._require_owner():
+                return
             log_path = Path(data_dir) / "view_log.ndjson"
             counts: dict[str, int] = {}
             if log_path.exists():
@@ -3850,6 +3855,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
               client=<str>  — required client ID
               n=<int>       — max entries (default 500, max 5000)
             """
+            if not self._require_owner():
+                return
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
             client_id = (qs.get("client") or [""])[0].strip()

@@ -15,17 +15,19 @@ const _ownerTok = (() => {
   return localStorage.getItem(KEY) || "";
 })();
 
-/** Exchange the owner token for an HttpOnly auth cookie. */
+/** Exchange the owner token for an HttpOnly auth cookie.
+ * Resolves to true if the server confirms the token is valid, false otherwise. */
 const _authReady = (async () => {
-  if (!_ownerTok) return;
+  if (!_ownerTok) return false;
   try {
-    await fetch("/api/auth", {
+    const res = await fetch("/api/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: _ownerTok }),
       credentials: "same-origin",
     });
-  } catch (_) { /* server may not support it yet — silent fallback */ }
+    return res.ok;
+  } catch (_) { return false; }
 })();
 
 // ── Prefs sync ──────────────────────────────────────────────────────────────
@@ -75,6 +77,7 @@ const _clientId = (() => {
 })();
 
 function _syncViewToServer() {
+  if (_ownerTok) return; // owner's view is not logged
   const raw = localStorage.getItem("mobileair.mapView");
   if (!raw) return;
   let v;
@@ -761,12 +764,13 @@ function main() {
     });
   }
 
-  // ── Camera history replay (visitors only, not owner) ───────────────────────
+  // ── Camera history replay (owner only) ────────────────────────────────────
   // Fetches /api/view/clients, shows a picker of client IDs, and
   // replays the selected client's camera positions on the map.
   const camReplayBtn = document.getElementById("camReplayBtn");
   const camClientPicker = document.getElementById("camClientPicker");
-  if (camReplayBtn && !_ownerTok) {
+  _authReady.then(isOwner => {
+  if (camReplayBtn && isOwner) {
     camReplayBtn.classList.add("visible");
     let _camReplaying = false;
     let _camReplayStopped = false;
@@ -883,6 +887,7 @@ function main() {
       }
     });
   }
+  }); // end _authReady.then
 
   // Tab click behavior:
   // - Click inactive tab: switch to that list, make markers visible if hidden
@@ -1578,6 +1583,8 @@ function main() {
   // Perform a live camera fit: compute bounds from current vehicle/sensor state
   // and animate the camera to frame them. When force=true, bypasses _canRunAutoCamera
   // and signature-dedup guards (used for explicit user action).
+  // In playback mode, uses the time-clipped trail data so the camera frames
+  // where vehicles are at the current scrub time, not the latest data.
   function _performCameraFit({ force = false } = {}) {
     const state = map.lastState;
     const mobiles = state && Array.isArray(state.mobile) ? state.mobile : [];
@@ -1585,19 +1592,49 @@ function main() {
     const logic = (typeof window !== "undefined") ? window.CameraFitLogic : null;
     let bb = null;
 
+    // In playback mode, resolve each vehicle's position at the current playback time
+    // using _playbackPtsById (the same time-sorted data the renderer uses).
+    const pbTimeMs = map.playbackMode ? map.getPlaybackTimeMs() : null;
+    const usePbTime = pbTimeMs != null && isFinite(pbTimeMs) && map._playbackPtsById;
+
     if (logic && typeof logic.collectRobustLiveBounds === "function") {
       const vehicleEntries = [];
       for (const m of mobiles) {
         if (!m || m.ghosted) continue;
-        const trail = Array.isArray(m.trail) ? m.trail : [];
-        if (trail.length === 0) continue;
+        const id = m.id != null ? String(m.id) : "";
+
         let headLat = NaN, headLon = NaN;
-        for (let i = trail.length - 1; i >= 0; i--) {
-          const p = trail[i];
-          if (!p) continue;
-          const lat = Number(p.lat);
-          const lon = Number(p.lon);
-          if (isFinite(lat) && isFinite(lon)) { headLat = lat; headLon = lon; break; }
+        let trail = Array.isArray(m.trail) ? m.trail : [];
+
+        if (usePbTime && id) {
+          // Use playback points clipped to current scrub time
+          const pts = map._playbackPtsById.get(id);
+          if (pts && pts.length > 0) {
+            // Binary search for last point <= pbTimeMs
+            let lo = 0, hi = pts.length - 1;
+            while (lo < hi) {
+              const mid = (lo + hi + 1) >> 1;
+              if (pts[mid].tMs <= pbTimeMs) lo = mid; else hi = mid - 1;
+            }
+            if (pts[lo].tMs <= pbTimeMs) {
+              headLat = pts[lo].lat;
+              headLon = pts[lo].lon;
+              // Build a clipped trail for bounds calculation
+              trail = pts.slice(0, lo + 1).map(p => ({ lat: p.lat, lon: p.lon, t: p.t }));
+            }
+          }
+        }
+
+        // Fallback: walk raw trail backwards (live mode / no playback data)
+        if (!isFinite(headLat) || !isFinite(headLon)) {
+          if (trail.length === 0) continue;
+          for (let i = trail.length - 1; i >= 0; i--) {
+            const p = trail[i];
+            if (!p) continue;
+            const lat = Number(p.lat);
+            const lon = Number(p.lon);
+            if (isFinite(lat) && isFinite(lon)) { headLat = lat; headLon = lon; break; }
+          }
         }
         if (!isFinite(headLat) || !isFinite(headLon)) continue;
         vehicleEntries.push({ id: m.id, lat: headLat, lon: headLon, trail });
@@ -1746,6 +1783,17 @@ function main() {
     const w = rect.width;
     const h = rect.height;
     const pad = map._getOverlayPaddingPx ? map._getOverlayPaddingPx() : { left: 0, right: 0, top: 0, bottom: 0 };
+
+    // Account for the playback bar at the bottom so the camera centers in the visible map area.
+    const pbBarEl = document.getElementById("playbackBar");
+    if (pbBarEl) {
+      const pbRect = pbBarEl.getBoundingClientRect();
+      if (pbRect.height > 0) {
+        const overlap = Math.max(0, rect.bottom - pbRect.top);
+        if (overlap > 0) pad.bottom = Math.max(pad.bottom, overlap + 10);
+      }
+    }
+
     const availW = Math.max(40, w - pad.left - pad.right);
     const availH = Math.max(40, h - pad.top - pad.bottom);
 
@@ -3435,6 +3483,10 @@ function main() {
   const pbDaysSubmenu = document.getElementById("pbDaysSubmenu");
   const shareBtn = document.getElementById("shareBtn");
   const autoCameraBtn = document.getElementById("autoCameraBtn");
+  // Show only after server confirms the token — not based on client-side token presence.
+  _authReady.then(isOwner => {
+    if (isOwner && autoCameraBtn) autoCameraBtn.style.display = "";
+  });
 
   function _updateAutoCameraBtn() {
     if (!autoCameraBtn) return;
