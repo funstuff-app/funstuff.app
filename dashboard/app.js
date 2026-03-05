@@ -15,19 +15,17 @@ const _ownerTok = (() => {
   return localStorage.getItem(KEY) || "";
 })();
 
-/** Exchange the owner token for an HttpOnly auth cookie.
- * Resolves to true if the server confirms the token is valid, false otherwise. */
+/** Exchange the owner token for an HttpOnly auth cookie. */
 const _authReady = (async () => {
-  if (!_ownerTok) return false;
+  if (!_ownerTok) return;
   try {
-    const res = await fetch("/api/auth", {
+    await fetch("/api/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: _ownerTok }),
       credentials: "same-origin",
     });
-    return res.ok;
-  } catch (_) { return false; }
+  } catch (_) { /* server may not support it yet — silent fallback */ }
 })();
 
 // ── Prefs sync ──────────────────────────────────────────────────────────────
@@ -764,13 +762,12 @@ function main() {
     });
   }
 
-  // ── Camera history replay (owner only) ────────────────────────────────────
+  // ── Camera history replay (visitors only, not owner) ───────────────────────
   // Fetches /api/view/clients, shows a picker of client IDs, and
   // replays the selected client's camera positions on the map.
   const camReplayBtn = document.getElementById("camReplayBtn");
   const camClientPicker = document.getElementById("camClientPicker");
-  _authReady.then(isOwner => {
-  if (camReplayBtn && isOwner) {
+  if (camReplayBtn && !_ownerTok) {
     camReplayBtn.classList.add("visible");
     let _camReplaying = false;
     let _camReplayStopped = false;
@@ -887,7 +884,6 @@ function main() {
       }
     });
   }
-  }); // end _authReady.then
 
   // Tab click behavior:
   // - Click inactive tab: switch to that list, make markers visible if hidden
@@ -3483,10 +3479,6 @@ function main() {
   const pbDaysSubmenu = document.getElementById("pbDaysSubmenu");
   const shareBtn = document.getElementById("shareBtn");
   const autoCameraBtn = document.getElementById("autoCameraBtn");
-  // Show only after server confirms the token — not based on client-side token presence.
-  _authReady.then(isOwner => {
-    if (isOwner && autoCameraBtn) autoCameraBtn.style.display = "";
-  });
 
   function _updateAutoCameraBtn() {
     if (!autoCameraBtn) return;

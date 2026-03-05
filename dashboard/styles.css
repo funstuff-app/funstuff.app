@@ -1774,3 +1774,28 @@ html.lite #camReplayBtn,
 html.lite .pbMenuBtn {
   display: none !important;
 }
+
+/* ── Screensaver mode: hide static chrome after inactivity (OLED burn-in protection) ── */
+#topbar,
+#playbackBar,
+#sidebar,
+#menuBtn,
+.controls,
+#legend,
+#legendToggle,
+#camReplayBtn,
+.pbMenuBtn {
+  transition: opacity 2s ease;
+}
+body.screensaver #topbar,
+body.screensaver #playbackBar,
+body.screensaver #sidebar,
+body.screensaver #menuBtn,
+body.screensaver .controls,
+body.screensaver #legend,
+body.screensaver #legendToggle,
+body.screensaver #camReplayBtn,
+body.screensaver .pbMenuBtn {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}

@@ -453,6 +453,19 @@ def maybe_log_visitor(headers, client_address: tuple, data_dir: Path) -> None:
     ).start()
 
 
+def _current_day_window_5am() -> tuple[float, float]:
+    """Return (start_ts, end_ts) for the current 5am–5am day window (local time)."""
+    import datetime
+    now = datetime.datetime.now()
+    if now.hour < 5:
+        # Before 5am: window started yesterday at 5am
+        start = now.replace(hour=5, minute=0, second=0, microsecond=0) - datetime.timedelta(days=1)
+    else:
+        start = now.replace(hour=5, minute=0, second=0, microsecond=0)
+    end = start + datetime.timedelta(days=1)
+    return start.timestamp(), end.timestamp()
+
+
 def load_json_file(path: Path, default):
     try:
         if path.exists():
@@ -3827,9 +3840,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._send(400, body, "application/json")
 
         def _handle_view_clients(self):
-            """Return distinct client IDs with entry counts from view_log.ndjson."""
-            if not self._require_owner():
-                return
+            """Return distinct client IDs active in the current 5am–5am day window."""
+            window_start, window_end = _current_day_window_5am()
             log_path = Path(data_dir) / "view_log.ndjson"
             counts: dict[str, int] = {}
             if log_path.exists():
@@ -3839,24 +3851,25 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         continue
                     try:
                         entry = json.loads(line)
+                        ts = float(entry.get("ts", 0))
+                        if not (window_start <= ts < window_end):
+                            continue
                         cid = entry.get("client_id", "")
                         if cid:
                             counts[cid] = counts.get(cid, 0) + 1
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, ValueError):
                         pass
             result = [{"client_id": cid, "count": cnt} for cid, cnt in sorted(counts.items(), key=lambda x: -x[1])]
             body = json.dumps(result).encode("utf-8")
             return self._send(200, body, "application/json")
 
         def _handle_view_log(self):
-            """Return view entries for a specific client.
+            """Return view entries for a specific client within the current 5am–5am day window.
 
             Query params:
               client=<str>  — required client ID
               n=<int>       — max entries (default 500, max 5000)
             """
-            if not self._require_owner():
-                return
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
             client_id = (qs.get("client") or [""])[0].strip()
@@ -3866,6 +3879,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 n = min(int((qs.get("n") or ["500"])[0]), 5000)
             except (ValueError, TypeError):
                 n = 500
+            window_start, window_end = _current_day_window_5am()
             log_path = Path(data_dir) / "view_log.ndjson"
             entries = []
             if log_path.exists():
@@ -3875,9 +3889,13 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         continue
                     try:
                         entry = json.loads(line)
-                        if entry.get("client_id") == client_id:
-                            entries.append(entry)
-                    except json.JSONDecodeError:
+                        if entry.get("client_id") != client_id:
+                            continue
+                        ts = float(entry.get("ts", 0))
+                        if not (window_start <= ts < window_end):
+                            continue
+                        entries.append(entry)
+                    except (json.JSONDecodeError, ValueError):
                         pass
             body = json.dumps(entries[-n:]).encode("utf-8")
             return self._send(200, body, "application/json")
