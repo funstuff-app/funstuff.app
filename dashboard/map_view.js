@@ -1,5 +1,20 @@
 const _isLite = new URLSearchParams(window.location.search).get('lite') === '1';
 
+/**
+ * PM2.5 concentration → [r, g, b], matching Python color_for_value("pm2.5", v).
+ * Same breakpoints so scalar field colors match dot colors exactly.
+ */
+function _pm25ToRgb(v) {
+  if (v <= 2.0)  return [0x00, 0xFF, 0xFF]; // cyan
+  if (v <= 5.0)  return [0x00, 0xCC, 0xFF]; // lt-blue
+  if (v <= 9.0)  return [0x00, 0xE4, 0x00]; // green
+  if (v <= 35.4) return [0xFF, 0xFF, 0x00]; // yellow
+  if (v <= 55.4) return [0xFF, 0x7E, 0x00]; // orange
+  if (v <= 125.4) return [0xFF, 0x00, 0x00]; // red
+  if (v <= 225.4) return [0x8F, 0x3F, 0x97]; // purple
+  return [0x7E, 0x00, 0x23];                 // maroon
+}
+
 class MapView {
   constructor(tilesCanvas, overlayCanvas) {
     this.tilesCanvas = tilesCanvas;
@@ -1908,6 +1923,7 @@ class MapView {
     this._tilesSnapshotCanvas = null;
     this._tilesSnapshotMeta = null;
     this._paFieldCanvas = null;
+    this._paGrid = null;
     this._invalidateOverlayStatic();
     // Invalidate trail cache on resize
     this._trailCacheCanvas = null;
@@ -5078,69 +5094,121 @@ class MapView {
 
   /**
    * Render PurpleAir scalar field underlay to _paFieldCanvas.
-   * One radial gradient disc per sensor at its exact screen position.
-   * Colors match dot colors exactly (safeHex on palette index via primaryReadingForFixedAtTime).
-   * Cached by view + hour bucket + sensor count; reused until invalidated.
+   * Precipitation-radar style: IDW-interpolate raw PM2.5 values on a coarse
+   * grid, map each to a color via _pm25ToRgb, bilinear-upscale.
+   *
+   * V(P) = Σ(w_i · v_i) / Σ(w_i),  w_i = 1/d_i²   (screen-pixel distance)
+   *
+   * Optimized for real-time scrubbing:
+   *  - IDW in screen-pixel space (no trig per cell)
+   *  - 2-minute time bucket (smooth animation during playback)
+   *  - Reuses tiny canvas + ImageData across frames
+   *  - Separate view key vs time key (pan reuses spatial structure)
    */
   _ensurePaField(state, playbackTimeMs) {
     const cssW = this._cssW || 1;
     const cssH = this._cssH || 1;
+    if (cssW < 2 || cssH < 2) return; // not sized yet
     const dpr = this._dpr || (window.devicePixelRatio || 1);
     const z = Number(this.zoom);
     const clat = Number(this.center?.lat);
     const clon = Number(this.center?.lon);
     const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
 
-    // Collect visible PurpleAir sensors with valid color
+    // ── Collect sensors, project to screen coords ──
     const centerW = latLonToWorld(clat, clon, z);
-    const discR = 50; // CSS pixels — overlap in dense areas, fade in sparse
-    const margin = discR + 10;
     const sensors = [];
     for (const f of fixed) {
       if (!f.purpleair) continue;
       const lat = Number(f.lat), lon = Number(f.lon);
       if (!isFinite(lat) || !isFinite(lon)) continue;
       const pr = primaryReadingForFixedAtTime(f, playbackTimeMs);
-      const color = safeHex(f.ci);
-      const dotColor = safeHex((pr && pr.color) || color);
-      if (!dotColor) continue;
-      // Project to screen
+      const v = pr && pr.value != null ? Number(pr.value) : NaN;
+      if (!isFinite(v) || v < 0) continue;
       const wp = latLonToWorld(lat, lon, z);
       const sx = wp.x - centerW.x + cssW / 2;
       const sy = wp.y - centerW.y + cssH / 2;
-      // Skip if fully off-screen (with margin for disc radius)
-      if (sx < -margin || sy < -margin || sx > cssW + margin || sy > cssH + margin) continue;
-      sensors.push({ sx, sy, hex: darkenHex(dotColor, 0.85) });
+      sensors.push(sx, sy, v); // flat array: [sx0, sy0, v0, sx1, sy1, v1, ...]
     }
-    if (sensors.length === 0) { this._paFieldCanvas = null; return; }
+    const nSensors = sensors.length / 3;
+    if (nSensors === 0) { this._paFieldCanvas = null; return; }
 
-    // Quantize playback time to the hour for caching
-    const hourBucket = (playbackTimeMs != null && isFinite(playbackTimeMs))
-      ? Math.floor(playbackTimeMs / 3600000)
+    // ── Cache key: 2-minute time bucket for smooth scrubbing ──
+    const timeBucket = (playbackTimeMs != null && isFinite(playbackTimeMs))
+      ? Math.floor(playbackTimeMs / 120000) // 2 minutes
       : "live";
-
-    const key = `pa:${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}|h:${hourBucket}|n:${sensors.length}`;
+    const key = `pa:${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}|t:${timeBucket}|n:${nSensors}`;
     if (this._paFieldCanvas && this._paFieldKey === key) return;
     this._paFieldKey = key;
 
+    // ── Grid dimensions ──
+    const cellSize = 16;
+    const gw = Math.ceil(cssW / cellSize);
+    const gh = Math.ceil(cssH / cellSize);
+
+    // ── Cutoff in screen pixels: project 0.15° offset to get pixel distance ──
+    const refW = latLonToWorld(clat, clon + 0.15, z);
+    const cutoffPx = Math.abs(refW.x - centerW.x);
+    const cutoffSq = cutoffPx * cutoffPx;
+    const FIELD_ALPHA = 46; // ~0.18 opacity
+
+    // ── Reuse tiny canvas + ImageData if grid size unchanged ──
+    if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
+      const tc = document.createElement("canvas");
+      tc.width = gw; tc.height = gh;
+      const tctx = tc.getContext("2d");
+      this._paGrid = { tc, tctx, imgData: tctx.createImageData(gw, gh), gw, gh };
+    }
+    const { tc, tctx, imgData } = this._paGrid;
+    const px = imgData.data;
+
+    // ── IDW in screen-pixel space — no trig, no projection per cell ──
+    for (let gy = 0; gy < gh; gy++) {
+      const py = (gy + 0.5) * cellSize;
+      for (let gx = 0; gx < gw; gx++) {
+        const pxx = (gx + 0.5) * cellSize;
+
+        let wSum = 0, vSum = 0;
+        for (let i = 0; i < sensors.length; i += 3) {
+          const dx = pxx - sensors[i];
+          const dy = py  - sensors[i + 1];
+          const d2 = dx * dx + dy * dy;
+          if (d2 > cutoffSq) continue;
+          if (d2 < 1) { wSum = 1; vSum = sensors[i + 2]; break; }
+          const w = 1 / d2;
+          wSum += w;
+          vSum += w * sensors[i + 2];
+        }
+
+        const off = (gy * gw + gx) * 4;
+        if (wSum === 0) {
+          px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
+        } else {
+          const rgb = _pm25ToRgb(vSum / wSum);
+          px[off]   = (rgb[0] * 217) >> 8; // *0.85 via integer math
+          px[off+1] = (rgb[1] * 217) >> 8;
+          px[off+2] = (rgb[2] * 217) >> 8;
+          px[off+3] = FIELD_ALPHA;
+        }
+      }
+    }
+
+    tctx.putImageData(imgData, 0, 0);
+
+    // ── Upscale to full viewport with bilinear smoothing ──
     if (!this._paFieldCanvas) this._paFieldCanvas = document.createElement("canvas");
-    this._paFieldCanvas.width = Math.floor(cssW * dpr);
-    this._paFieldCanvas.height = Math.floor(cssH * dpr);
+    const pw = Math.floor(cssW * dpr), ph = Math.floor(cssH * dpr);
+    if (this._paFieldCanvas.width !== pw || this._paFieldCanvas.height !== ph) {
+      this._paFieldCanvas.width = pw;
+      this._paFieldCanvas.height = ph;
+    }
     const ctx = this._paFieldCanvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
-
-    const centerAlpha = 0.15;
-    for (const s of sensors) {
-      const grad = ctx.createRadialGradient(s.sx, s.sy, 0, s.sx, s.sy, discR);
-      grad.addColorStop(0, hexToRgba(s.hex, centerAlpha));
-      grad.addColorStop(1, hexToRgba(s.hex, 0));
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(s.sx, s.sy, discR, 0, Math.PI * 2);
-      ctx.fill();
-    }
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(tc, 0, 0, cssW, cssH);
   }
 
   _overlayStaticKeyForState(state) {
