@@ -4471,6 +4471,13 @@ def main() -> int:
     except Exception as e:
         _log(f"[PurpleAir] Initial fetch error (will retry in background): {e}")
 
+    # Ensure snapshot-seeded PurpleAir sensors are merged into state even if API failed
+    if app_state.purpleair_sensors and isinstance(app_state.state, dict):
+        with app_state.lock:
+            _merge_purpleair_into_fixed(app_state.state, app_state)
+            _inject_fixed_history(app_state, app_state.state)
+            app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
+
     # Start PurpleAir fetch loop (2-min daytime / 30-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
