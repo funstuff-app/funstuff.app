@@ -61,6 +61,10 @@ class MapView {
     this._overlayStaticKey = "";
     this._overlayStaticDirty = true;
 
+    // PurpleAir scalar field underlay: cached offscreen canvas of radial gradient discs.
+    this._paFieldCanvas = null;
+    this._paFieldKey = "";
+
     // Playback-mode optimization: cache trails to offscreen canvas.
     // Trails only need redrawing when view changes; time advances use incremental updates.
     this._trailCacheCanvas = null;
@@ -299,7 +303,7 @@ class MapView {
 
   _invalidateOverlayStatic() {
     this._overlayStaticDirty = true;
-    this._overlayUnderlayKey = "";
+    this._paFieldKey = "";
   }
 
   setMaxTrailLen(val) {
@@ -1903,6 +1907,7 @@ class MapView {
     // Snapshot is tied to canvas size; reset on resize to avoid distortion.
     this._tilesSnapshotCanvas = null;
     this._tilesSnapshotMeta = null;
+    this._paFieldCanvas = null;
     this._invalidateOverlayStatic();
     // Invalidate trail cache on resize
     this._trailCacheCanvas = null;
@@ -5071,6 +5076,73 @@ class MapView {
     }
   }
 
+  /**
+   * Render PurpleAir scalar field underlay to _paFieldCanvas.
+   * One radial gradient disc per sensor at its exact screen position.
+   * Colors match dot colors exactly (safeHex on palette index via primaryReadingForFixedAtTime).
+   * Cached by view + hour bucket + sensor count; reused until invalidated.
+   */
+  _ensurePaField(state, playbackTimeMs) {
+    const cssW = this._cssW || 1;
+    const cssH = this._cssH || 1;
+    const dpr = this._dpr || (window.devicePixelRatio || 1);
+    const z = Number(this.zoom);
+    const clat = Number(this.center?.lat);
+    const clon = Number(this.center?.lon);
+    const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
+
+    // Collect visible PurpleAir sensors with valid color
+    const centerW = latLonToWorld(clat, clon, z);
+    const discR = 50; // CSS pixels — overlap in dense areas, fade in sparse
+    const margin = discR + 10;
+    const sensors = [];
+    for (const f of fixed) {
+      if (!f.purpleair) continue;
+      const lat = Number(f.lat), lon = Number(f.lon);
+      if (!isFinite(lat) || !isFinite(lon)) continue;
+      const pr = primaryReadingForFixedAtTime(f, playbackTimeMs);
+      const color = safeHex(f.ci);
+      const dotColor = safeHex((pr && pr.color) || color);
+      if (!dotColor) continue;
+      // Project to screen
+      const wp = latLonToWorld(lat, lon, z);
+      const sx = wp.x - centerW.x + cssW / 2;
+      const sy = wp.y - centerW.y + cssH / 2;
+      // Skip if fully off-screen (with margin for disc radius)
+      if (sx < -margin || sy < -margin || sx > cssW + margin || sy > cssH + margin) continue;
+      sensors.push({ sx, sy, hex: darkenHex(dotColor, 0.85) });
+    }
+    if (sensors.length === 0) { this._paFieldCanvas = null; return; }
+
+    // Quantize playback time to the hour for caching
+    const hourBucket = (playbackTimeMs != null && isFinite(playbackTimeMs))
+      ? Math.floor(playbackTimeMs / 3600000)
+      : "live";
+
+    const key = `pa:${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}|h:${hourBucket}|n:${sensors.length}`;
+    if (this._paFieldCanvas && this._paFieldKey === key) return;
+    this._paFieldKey = key;
+
+    if (!this._paFieldCanvas) this._paFieldCanvas = document.createElement("canvas");
+    this._paFieldCanvas.width = Math.floor(cssW * dpr);
+    this._paFieldCanvas.height = Math.floor(cssH * dpr);
+    const ctx = this._paFieldCanvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const centerAlpha = 0.15;
+    for (const s of sensors) {
+      const grad = ctx.createRadialGradient(s.sx, s.sy, 0, s.sx, s.sy, discR);
+      grad.addColorStop(0, hexToRgba(s.hex, centerAlpha));
+      grad.addColorStop(1, hexToRgba(s.hex, 0));
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(s.sx, s.sy, discR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
   _overlayStaticKeyForState(state) {
     const w = this._cssW || 1;
     const h = this._cssH || 1;
@@ -5393,11 +5465,23 @@ class MapView {
         ctx.restore();
       };
 
+      // PurpleAir scalar field underlay (radial gradient discs behind dots)
+      if (this.showPublic !== false) {
+        this._ensurePaField(state, this.getPlaybackTimeMs());
+        if (this._paFieldCanvas) {
+          ctx.save();
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.drawImage(this._paFieldCanvas, 0, 0);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.restore();
+        }
+      }
+
       // First pass: render PurpleAir markers (drawn first, so they appear behind)
       for (const f of fixed) {
         if (f.purpleair) renderFixedMarker(f);
       }
-      
+
       // Second pass: render non-PurpleAir markers
       for (const f of fixed) {
         if (!f.purpleair) renderFixedMarker(f);
@@ -6766,6 +6850,18 @@ class MapView {
         }
         ctx.restore();
       };
+
+      // PurpleAir scalar field underlay (radial gradient discs behind dots)
+      if (this.showPublic) {
+        this._ensurePaField(state, fixedPbTimeMs);
+        if (this._paFieldCanvas) {
+          ctx.save();
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.drawImage(this._paFieldCanvas, 0, 0);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.restore();
+        }
+      }
 
       // First pass: PurpleAir (public)
       if (this.showPublic) {
