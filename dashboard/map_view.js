@@ -5293,6 +5293,19 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
+          // ── Per-sensor staleness fade matching trail duration ──
+          let staleAlpha = 1.0;
+          if (!isSel && f.last_seen) {
+            const PA_FADE_MS = 45 * 60 * 1000;
+            const PA_FADE_TAIL = 0.20;
+            const ageMs = this._dataNowMs() - f.last_seen * 1000;
+            if (ageMs >= PA_FADE_MS) { ctx.restore(); return; }
+            const fadeStart = PA_FADE_MS * (1.0 - PA_FADE_TAIL);
+            if (ageMs > fadeStart) {
+              const u = (ageMs - fadeStart) / (PA_FADE_MS - fadeStart);
+              staleAlpha = (1 - u) * (1 - u);
+            }
+          }
           const dotR = isSel ? 8 : 6;
           const dotColor = safeHex((pr && pr.color) || color);
           if (isSel) {
@@ -5305,14 +5318,14 @@ class MapView {
           // When not selected: make PurpleAir subtle but still visible
           if (!isSel) {
             const darkened = darkenHex(dotColor, 0.85);
-            ctx.fillStyle = hexToRgba(darkened, 0.45);
+            ctx.fillStyle = hexToRgba(darkened, 0.45 * staleAlpha);
           } else {
             ctx.fillStyle = dotColor;
           }
           ctx.arc(sp.x, sp.y, dotR, 0, Math.PI*2);
           ctx.fill();
           ctx.strokeStyle = isSel ? "#5bb8f5" : darkenHex(dotColor, 0.7);
-          ctx.globalAlpha = isSel ? 1 : 0.5;
+          ctx.globalAlpha = (isSel ? 1 : 0.5) * staleAlpha;
           ctx.lineWidth = isSel ? 1.8 : 1.2;
           ctx.stroke();
         } else {
@@ -6658,6 +6671,19 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
+          // ── Per-sensor staleness fade matching trail duration ──
+          let staleAlpha = 1.0;
+          if (!isSel && f.last_seen) {
+            const PA_FADE_MS = 45 * 60 * 1000;
+            const PA_FADE_TAIL = 0.20;
+            const ageMs = this._dataNowMs() - f.last_seen * 1000;
+            if (ageMs >= PA_FADE_MS) { ctx.restore(); return; }
+            const fadeStart = PA_FADE_MS * (1.0 - PA_FADE_TAIL);
+            if (ageMs > fadeStart) {
+              const u = (ageMs - fadeStart) / (PA_FADE_MS - fadeStart);
+              staleAlpha = (1 - u) * (1 - u);
+            }
+          }
           const dotR = isSel ? 8 : 6;
           const dotColor = safeHex((pr && pr.color) || color);
           if (isSel) {
@@ -6669,14 +6695,14 @@ class MapView {
           ctx.beginPath();
           if (!isSel) {
             const darkened = darkenHex(dotColor, 0.85);
-            ctx.fillStyle = hexToRgba(darkened, 0.45);
+            ctx.fillStyle = hexToRgba(darkened, 0.45 * staleAlpha);
           } else {
             ctx.fillStyle = dotColor;
           }
           ctx.arc(sp.x, sp.y, dotR, 0, Math.PI*2);
           ctx.fill();
           ctx.strokeStyle = isSel ? "#5bb8f5" : darkenHex(dotColor, 0.7);
-          ctx.globalAlpha = isSel ? 1 : 0.5;
+          ctx.globalAlpha = (isSel ? 1 : 0.5) * staleAlpha;
           ctx.lineWidth = isSel ? 1.8 : 1.2;
           ctx.stroke();
         } else {
