@@ -722,6 +722,44 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         
         if loaded_count > 0:
             _log(f"[Snapshot] Loaded {loaded_count} mobiles from today's snapshot ({today_str})")
+
+        # Seed PurpleAir sensors from snapshot when we have none yet
+        # (covers: no API key, expired key, 402, network errors, etc.)
+        if not app_state.purpleair_sensors:
+            fixed = snapshot.get("fixed", [])
+            if isinstance(fixed, list):
+                pa_seeded = 0
+                with app_state.lock:
+                    for f in fixed:
+                        if not f.get("purpleair"):
+                            continue
+                        sid_str = f.get("id", "")
+                        if not sid_str.startswith("PA_"):
+                            continue
+                        try:
+                            sensor_index = int(sid_str[3:])
+                        except (ValueError, TypeError):
+                            continue
+                        lat = f.get("lat")
+                        lon = f.get("lon")
+                        name = f.get("name", "")
+                        pm25 = None
+                        readings = f.get("readings", {})
+                        if isinstance(readings, dict):
+                            pm_r = readings.get("PM25") or readings.get("PM2.5")
+                            if isinstance(pm_r, dict):
+                                pm25 = pm_r.get("value")
+                        app_state.purpleair_sensors.append({
+                            "sensor_index": sensor_index,
+                            "name": name,
+                            "latitude": lat,
+                            "longitude": lon,
+                            "pm2.5": pm25,
+                        })
+                        pa_seeded += 1
+                if pa_seeded:
+                    _log(f"[Snapshot] Seeded {pa_seeded} PurpleAir sensors from snapshot")
+
         return loaded_count > 0
         
     except Exception as e:
@@ -2028,12 +2066,34 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
 # PurpleAir Integration
 # ─────────────────────────────────────────────────────────────────────────────
 
-PURPLEAIR_API_KEY = os.environ.get("DUSTY_PURPLEAIR_API_KEY", "").strip()
+def _load_deploy_config() -> dict[str, str]:
+    """Read key=value pairs from deploy/dustytrails/deploy.config (fallback for local dev)."""
+    cfg: dict[str, str] = {}
+    config_path = Path(__file__).resolve().parent / "deploy" / "dustytrails" / "deploy.config"
+    if not config_path.is_file():
+        return cfg
+    try:
+        for line in config_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, _, v = line.partition("=")
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return cfg
+
+_deploy_cfg = _load_deploy_config()
+
+PURPLEAIR_API_KEY = (os.environ.get("DUSTY_PURPLEAIR_API_KEY", "").strip()
+                     or _deploy_cfg.get("DUSTY_PURPLEAIR_API_KEY", ""))
 
 # Owner token: when set, write endpoints require a matching token.
 # Token is read from the `dusty_tok` HttpOnly cookie (set via POST /api/auth)
 # or from a ?tok= query param (backward compat for curl / scripts).
-OWNER_TOKEN = os.environ.get("DUSTY_OWNER_TOKEN", "").strip()
+OWNER_TOKEN = (os.environ.get("DUSTY_OWNER_TOKEN", "").strip()
+               or _deploy_cfg.get("DUSTY_OWNER_TOKEN", ""))
 _AUTH_COOKIE_NAME = "dusty_tok"
 PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
 
@@ -2364,8 +2424,8 @@ def purpleair_fetch_loop(
     except Exception as e:
         _log(f"[PurpleAir] Debug log init error: {e}")
 
-    _log("[PurpleAir] Waiting 20s for main fetch loop to start...")
-    stop_event.wait(20.0)
+    _log("[PurpleAir] Waiting 3s for main fetch loop to start...")
+    stop_event.wait(3.0)
     _log("[PurpleAir] Starting PurpleAir fetch loop (sparse sentinel strategy)")
 
     while not stop_event.is_set():
@@ -3333,7 +3393,6 @@ def list_snapshots(data_dir: Path) -> list[dict[str, Any]]:
     for f in sorted(snapshots_dir.glob("*.json"), reverse=True):
         try:
             stat = f.stat()
-            # Extract date from filename (e.g., "2025-12-31.json" -> "2025-12-31")
             date_str = f.stem
             result.append({
                 "date": date_str,
@@ -3368,7 +3427,7 @@ def save_snapshot(data_dir: Path, date_str: str, state: dict[str, Any]) -> dict[
     if not safe_date or len(safe_date) > 20:
         safe_date = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     filepath = snapshots_dir / f"{safe_date}.json"
-    filepath.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    filepath.write_text(json.dumps(state, separators=(",", ":"), allow_nan=False, default=str), encoding="utf-8")
     return {"success": True, "filename": filepath.name, "size_bytes": filepath.stat().st_size}
 
 def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
@@ -3397,7 +3456,18 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     raw_bytes = filepath.read_bytes()
     try:
         parsed = json.loads(raw_bytes)
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+    except json.JSONDecodeError:
+        # Tolerate NaN/Infinity written by older server versions
+        import re as _re
+        raw_str = raw_bytes.decode("utf-8", errors="replace")
+        raw_str = _re.sub(r'\bNaN\b', 'null', raw_str)
+        raw_str = _re.sub(r'-Infinity\b', 'null', raw_str)
+        raw_str = _re.sub(r'\bInfinity\b', 'null', raw_str)
+        try:
+            parsed = json.loads(raw_str)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise JsonValidationError(f"Corrupt snapshot: {e}")
+    except UnicodeDecodeError as e:
         raise JsonValidationError(f"Corrupt snapshot: {e}")
     if not isinstance(parsed, dict):
         raise JsonValidationError("Snapshot root must be object")
