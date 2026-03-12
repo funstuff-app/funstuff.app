@@ -508,6 +508,9 @@ class AppState:
     
     # Persistent fixed sensor history (shared with TUI)
     # Structure: { sensor_id: { pollutant: [{val, col, time, recorded_at}, ...] } }
+    # TODO: fixed_history.json is ~41 MB and growing unbounded (PurpleAir has no cap).
+    #       Merge this into the daily snapshot instead of a separate file — the snapshot
+    #       already carries today's data and gets rotated naturally.
     fixed_history: dict[str, dict[str, list[dict[str, Any]]]] = field(default_factory=dict)
     fixed_history_path: Path | None = None
     fixed_history_dirty: bool = False
