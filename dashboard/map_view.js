@@ -2230,6 +2230,7 @@ class MapView {
       this._lastTilesViewSig = viewSig;
       this.drawTiles();
     }
+    this._compositePaFieldOnTiles(state);
     this.drawOverlay(state, { cacheUnderlay: true });
   }
 
@@ -5119,7 +5120,7 @@ class MapView {
 
   /**
    * Composite the PA scalar field onto the tiles canvas (above tiles, below overlay).
-   * Re-captures the tiles snapshot so the field pans smoothly with the map.
+   * Restores tiles from snapshot first to avoid opacity accumulation on repeated calls.
    */
   _compositePaFieldOnTiles(state) {
     const pbMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
@@ -5128,12 +5129,23 @@ class MapView {
     if (!this._paFieldCanvas) return;
     const tctx = this.tctx;
     if (!tctx) return;
+    // Restore tiles-only from snapshot before compositing the field so repeated
+    // redraws (e.g. camera stopped, same viewSig) don't accumulate opacity.
+    // Skip during pinch-zoom: drawTiles() already drew a *scaled* snapshot onto
+    // tilesCanvas; restoring the unscaled original would wipe that out.
+    if (this._tilesSnapshotCanvas && !this._pinchZooming) {
+      const tw = this.tilesCanvas.width;
+      const th = this.tilesCanvas.height;
+      tctx.save();
+      tctx.setTransform(1, 0, 0, 1, 0, 0);
+      tctx.clearRect(0, 0, tw, th);
+      tctx.drawImage(this._tilesSnapshotCanvas, 0, 0);
+      tctx.restore();
+    }
     tctx.save();
     tctx.setTransform(1, 0, 0, 1, 0, 0);
     tctx.drawImage(this._paFieldCanvas, 0, 0);
     tctx.restore();
-    // Re-capture so panning includes the field
-    this._captureTilesSnapshot();
   }
 
   /**

@@ -2293,24 +2293,25 @@ def purpleair_fetch_loop(
     Metadata (name, lat, lon + full pm2.5 sweep) refreshes every 6 hours so
     the complete sensor picture stays current regardless of sentinel activity.
 
-    Budget math (2,000,000 pts/month, 242 sensors, ~1 pt/sensor/field):
-      Sentinel poll  ~50 pts/cycle (one per occupied grid cell)
-      Cluster fetch  up to ~489 pts if ALL cells trigger (worst case)
-      Metadata       ~970 pts per refresh (242 sensors × 4 fields)
+    Budget math (2,000,000 pts/month, ~392 sensors, ~1 pt/sensor/field):
+      Sentinel poll  ~81 pts/cycle (one per occupied grid cell)
+      Cluster fetch  up to ~792 pts if ALL cells trigger (worst case)
+      Metadata       ~1,568 pts per refresh (392 sensors × 4 fields)
 
-      Day  (19h, 10 min):  114 cycles × 50  =  5,700 pts  (sentinel only)
-                           114 cycles × 489 = 55,746 pts  (worst-case clusters)
-      Night (5h, 30 min):   10 cycles × 50  =    500 pts
-      Metadata (4×/day):     4         × 970 =  3,880 pts
+      Day  (19h, 3 min):   380 cycles × 81  =  30,780 pts (sentinel only)
+                           380 cycles × 792 = 300,960 pts (worst-case clusters)
+      Night (5h, 30 min):   10 cycles × 81  =    810 pts
+      Metadata (4×/day):     4       × 1568 =  6,272 pts
       ──────────────────────────────────────────────────────
-      Quiet day  (no clusters): ~10,080 pts/day →   ~307K/month
-      Worst-case day (all clusters): ~60,126 pts/day → ~1.83M/month
-      Budget: 2,000,000 pts/month ✓ even in worst case
+      Quiet day  (no clusters): ~37,862 pts/day  →  ~1.15M/month
+      Worst-case day (all clusters): ~339K pts/day → over budget
+      Typical day (~10% cluster rate): ~65K pts/day → ~1.98M/month
+      Budget: 2,000,000 pts/month ✓ for typical usage
     """
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
     META_INTERVAL       = 10800.0  # 3 hours
-    DATA_INTERVAL_DAY   = 120.0    # 2 min during day
+    DATA_INTERVAL_DAY   = 180.0    # 3 min during day
     DATA_INTERVAL_NIGHT = 1800.0   # 30 min during night (1 AM – 6 AM MST)
     NEIGHBOR_RADIUS_DEG = 0.018    # ~2 km grid cell side length
 
@@ -4481,13 +4482,13 @@ def main() -> int:
             _inject_fixed_history(app_state, app_state.state)
             app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
 
-    # Start PurpleAir fetch loop (2-min daytime / 30-min nighttime)
+    # Start PurpleAir fetch loop (3-min daytime / 30-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
         daemon=True
     ).start()
-    _log("[PurpleAir] SLC sensor integration enabled (2-min daytime / 30-min nighttime, batched requests)")
+    _log("[PurpleAir] SLC sensor integration enabled (3-min daytime / 30-min nighttime, batched requests)")
 
     # History prefetch disabled — Select Day now loads from local snapshots
     # threading.Thread(
@@ -4603,7 +4604,7 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             daemon=True
         ).start()
 
-    # PurpleAir fetch loop with batched requests (2-min daytime / 30-min nighttime)
+    # PurpleAir fetch loop with batched requests (3-min daytime / 30-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
