@@ -27,6 +27,8 @@ function _pm25ColorCat(v) {
   return 7;
 }
 
+const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
+
 class MapView {
   constructor(tilesCanvas, overlayCanvas) {
     this.tilesCanvas = tilesCanvas;
@@ -446,6 +448,8 @@ class MapView {
       this._lastTilesViewSig = viewSig;
       this.drawTiles();
     }
+    // PA scalar field: above tiles, below trails/markers. Composite onto tiles canvas.
+    this._compositePaFieldOnTiles(state);
     this.drawOverlay(state, { cacheUnderlay: true });
   }
 
@@ -2884,30 +2888,31 @@ class MapView {
     // No vignette: it reads like a “tunnel/bokeh” during zooming.
 
     // Capture snapshot for the next frame - but skip during active touch to avoid blocking input.
-    // Also avoid resizing the snapshot canvas every frame (causes GPU texture reallocation).
-    if (!this._touchActive) {
-      try {
-        const tw = this.tilesCanvas.width;
-        const th = this.tilesCanvas.height;
-        if (!this._tilesSnapshotCanvas) {
-          this._tilesSnapshotCanvas = document.createElement("canvas");
-          this._tilesSnapshotCanvas.width = tw;
-          this._tilesSnapshotCanvas.height = th;
-        } else if (this._tilesSnapshotCanvas.width !== tw || this._tilesSnapshotCanvas.height !== th) {
-          // Only resize when dimensions actually change
-          this._tilesSnapshotCanvas.width = tw;
-          this._tilesSnapshotCanvas.height = th;
-        }
-        const sctx = this._tilesSnapshotCanvas.getContext("2d");
-        if (sctx) {
-          sctx.setTransform(1, 0, 0, 1, 0, 0);
-          sctx.clearRect(0, 0, tw, th);
-          sctx.drawImage(this.tilesCanvas, 0, 0);
-          this._tilesSnapshotMeta = { zoom: this.zoom, centerLat: this.center.lat, centerLon: this.center.lon };
-        }
-      } catch {
-        // ignore snapshot capture errors
+    if (!this._touchActive) this._captureTilesSnapshot();
+  }
+
+  /** Capture the tiles canvas into a snapshot for smooth pan/zoom transitions. */
+  _captureTilesSnapshot() {
+    try {
+      const tw = this.tilesCanvas.width;
+      const th = this.tilesCanvas.height;
+      if (!this._tilesSnapshotCanvas) {
+        this._tilesSnapshotCanvas = document.createElement("canvas");
+        this._tilesSnapshotCanvas.width = tw;
+        this._tilesSnapshotCanvas.height = th;
+      } else if (this._tilesSnapshotCanvas.width !== tw || this._tilesSnapshotCanvas.height !== th) {
+        this._tilesSnapshotCanvas.width = tw;
+        this._tilesSnapshotCanvas.height = th;
       }
+      const sctx = this._tilesSnapshotCanvas.getContext("2d");
+      if (sctx) {
+        sctx.setTransform(1, 0, 0, 1, 0, 0);
+        sctx.clearRect(0, 0, tw, th);
+        sctx.drawImage(this.tilesCanvas, 0, 0);
+        this._tilesSnapshotMeta = { zoom: this.zoom, centerLat: this.center.lat, centerLon: this.center.lon };
+      }
+    } catch {
+      // ignore snapshot capture errors
     }
   }
 
@@ -5113,7 +5118,25 @@ class MapView {
   }
 
   /**
-   * Render PurpleAir scalar field underlay to _paFieldCanvas.
+   * Composite the PA scalar field onto the tiles canvas (above tiles, below overlay).
+   * Re-captures the tiles snapshot so the field pans smoothly with the map.
+   */
+  _compositePaFieldOnTiles(state) {
+    const pbMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    this._ensurePaField(state, pbMs);
+    if (pbMs != null && isFinite(pbMs)) this._preWarmPaFields(state, pbMs);
+    if (!this._paFieldCanvas) return;
+    const tctx = this.tctx;
+    if (!tctx) return;
+    tctx.save();
+    tctx.setTransform(1, 0, 0, 1, 0, 0);
+    tctx.drawImage(this._paFieldCanvas, 0, 0);
+    tctx.restore();
+    // Re-capture so panning includes the field
+    this._captureTilesSnapshot();
+  }
+
+  /**
    * Precipitation-radar style: IDW-interpolate raw PM2.5 values on a coarse
    * grid, map each to a color via _pm25ToRgb, bilinear-upscale.
    *
@@ -5211,12 +5234,51 @@ class MapView {
         if (wSum === 0) {
           px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
         } else {
-          const rgb = _pm25ToRgb(vSum / wSum);
+          const cat = _pm25ColorCat(vSum / wSum);
+          const rgb = _pm25ToRgb(_BAND_MIDS[cat]);
           px[off]   = (rgb[0] * 217) >> 8; // *0.85 via integer math
           px[off+1] = (rgb[1] * 217) >> 8;
           px[off+2] = (rgb[2] * 217) >> 8;
           px[off+3] = FIELD_ALPHA;
         }
+      }
+    }
+
+    // ── Gaussian blur (radius 2) to soften jagged band edges ──
+    const BLUR_R = 2;
+    const tmp = new Uint8ClampedArray(px.length);
+    // Horizontal pass
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < gw; x++) {
+        let rr = 0, gg = 0, bb = 0, aa = 0, ww = 0;
+        for (let dx = -BLUR_R; dx <= BLUR_R; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= gw) continue;
+          const off = (y * gw + nx) * 4;
+          if (px[off + 3] === 0) continue;
+          const g = 1.0 / (1 + dx * dx);
+          rr += px[off] * g; gg += px[off+1] * g; bb += px[off+2] * g; aa += px[off+3] * g;
+          ww += g;
+        }
+        const off = (y * gw + x) * 4;
+        if (ww > 0) { tmp[off] = rr/ww; tmp[off+1] = gg/ww; tmp[off+2] = bb/ww; tmp[off+3] = aa/ww; }
+      }
+    }
+    // Vertical pass
+    for (let x = 0; x < gw; x++) {
+      for (let y = 0; y < gh; y++) {
+        let rr = 0, gg = 0, bb = 0, aa = 0, ww = 0;
+        for (let dy = -BLUR_R; dy <= BLUR_R; dy++) {
+          const ny = y + dy;
+          if (ny < 0 || ny >= gh) continue;
+          const off = (ny * gw + x) * 4;
+          if (tmp[off + 3] === 0) continue;
+          const g = 1.0 / (1 + dy * dy);
+          rr += tmp[off] * g; gg += tmp[off+1] * g; bb += tmp[off+2] * g; aa += tmp[off+3] * g;
+          ww += g;
+        }
+        const off = (y * gw + x) * 4;
+        if (ww > 0) { px[off] = rr/ww; px[off+1] = gg/ww; px[off+2] = bb/ww; px[off+3] = aa/ww; }
       }
     }
 
@@ -5681,21 +5743,8 @@ class MapView {
         ctx.restore();
       };
 
-      // PurpleAir scalar field underlay (always visible — independent of Community dots toggle)
-      {
-        const _paPbTime = this.getPlaybackTimeMs();
-        this._ensurePaField(state, _paPbTime);
-        if (_paPbTime != null && isFinite(_paPbTime)) this._preWarmPaFields(state, _paPbTime);
-        if (this._paFieldCanvas) {
-          ctx.save();
-          ctx.setTransform(1, 0, 0, 1, 0, 0);
-          ctx.drawImage(this._paFieldCanvas, 0, 0);
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          ctx.restore();
-        }
-      }
-
       // First pass: render PurpleAir markers (drawn first, so they appear behind)
+      // (PA scalar field is rendered below, on tiles canvas — see _compositePaFieldOnTiles)
       for (const f of fixed) {
         if (f.purpleair) renderFixedMarker(f);
       }
@@ -7069,20 +7118,8 @@ class MapView {
         ctx.restore();
       };
 
-      // PurpleAir scalar field underlay (always visible — independent of Community dots toggle)
-      {
-        this._ensurePaField(state, fixedPbTimeMs);
-        if (fixedPbTimeMs != null && isFinite(fixedPbTimeMs)) this._preWarmPaFields(state, fixedPbTimeMs);
-        if (this._paFieldCanvas) {
-          ctx.save();
-          ctx.setTransform(1, 0, 0, 1, 0, 0);
-          ctx.drawImage(this._paFieldCanvas, 0, 0);
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          ctx.restore();
-        }
-      }
-
       // First pass: PurpleAir (public)
+      // (PA scalar field is rendered below, on tiles canvas — see _compositePaFieldOnTiles)
       if (this.showPublic) {
         for (const f of fixed) {
           if (f.purpleair) renderPbFixedMarker(f);
