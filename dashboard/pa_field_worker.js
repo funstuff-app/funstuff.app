@@ -31,22 +31,28 @@ function pm25ColorCat(v) {
 const BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
 
 self.onmessage = function(e) {
-  const { sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, jobId } = e.data;
+  const { sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, jobId, medianV } = e.data;
   const px = new Uint8ClampedArray(gw * gh * 4);
 
+  // Concordance-weighted IDW. sensors is stride-4: [sx, sy, value, concordance, ...]
+  // Density-adaptive background anchor: wBg = wBgBase / cnt.
+  const wBgBase = 10 / cutoffSq;
   for (let gy = 0; gy < gh; gy++) {
     const py = (gy + 0.5) * cellSize;
     for (let gx = 0; gx < gw; gx++) {
       const pxx = (gx + 0.5) * cellSize;
 
-      let wSum = 0, vSum = 0;
-      for (let i = 0; i < sensors.length; i += 3) {
+      let wSum = 0, vSum = 0, minD2 = Infinity, cnt = 0;
+      for (let i = 0; i < sensors.length; i += 4) {
         const dx = pxx - sensors[i];
         const dy = py  - sensors[i + 1];
         const d2 = dx * dx + dy * dy;
         if (d2 > cutoffSq) continue;
-        if (d2 < 1) { wSum = 1; vSum = sensors[i + 2]; break; }
-        const w = 1 / d2;
+        cnt++;
+        if (d2 < minD2) minD2 = d2;
+        const c = sensors[i + 3]; // concordance
+        if (d2 < 1) { wSum = 1e9 * c; vSum = sensors[i + 2] * 1e9 * c; minD2 = 0; break; }
+        const w = c / d2;
         wSum += w;
         vSum += w * sensors[i + 2];
       }
@@ -55,12 +61,16 @@ self.onmessage = function(e) {
       if (wSum === 0) {
         px[off] = 0; px[off + 1] = 0; px[off + 2] = 0; px[off + 3] = 0;
       } else {
-        const cat = pm25ColorCat(vSum / wSum);
+        const wBg = wBgBase / (cnt || 1);
+        const val = (vSum + wBg * medianV) / (wSum + wBg);
+        const edgeFade = 1 - Math.sqrt(minD2 / cutoffSq);
+        const alpha = Math.round(FIELD_ALPHA * Math.min(1, edgeFade * 2));
+        const cat = pm25ColorCat(val);
         const rgb = pm25ToRgb(BAND_MIDS[cat]);
         px[off]     = (rgb[0] * 217) >> 8;
         px[off + 1] = (rgb[1] * 217) >> 8;
         px[off + 2] = (rgb[2] * 217) >> 8;
-        px[off + 3] = FIELD_ALPHA;
+        px[off + 3] = alpha;
       }
     }
   }
