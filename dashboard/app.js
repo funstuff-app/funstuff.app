@@ -2703,6 +2703,7 @@ function main() {
     // RENDER
     // ─────────────────────────────────────────────────────────────────────────
     if (didAdvanceTime) {
+      map._compositePaFieldOnTiles(map.lastState);
       map.drawOverlay(map.lastState, { cacheUnderlay: true });
     }
 

@@ -1,5 +1,34 @@
 const _isLite = new URLSearchParams(window.location.search).get('lite') === '1';
 
+/**
+ * PM2.5 concentration → [r, g, b], matching Python color_for_value("pm2.5", v).
+ * Same breakpoints so scalar field colors match dot colors exactly.
+ */
+function _pm25ToRgb(v) {
+  if (v <= 2.0)  return [0x00, 0xFF, 0xFF]; // cyan
+  if (v <= 5.0)  return [0x00, 0xCC, 0xFF]; // lt-blue
+  if (v <= 9.0)  return [0x00, 0xE4, 0x00]; // green
+  if (v <= 35.4) return [0xFF, 0xFF, 0x00]; // yellow
+  if (v <= 55.4) return [0xFF, 0x7E, 0x00]; // orange
+  if (v <= 125.4) return [0xFF, 0x00, 0x00]; // red
+  if (v <= 225.4) return [0x8F, 0x3F, 0x97]; // purple
+  return [0x7E, 0x00, 0x23];                 // maroon
+}
+
+/** PM2.5 → color category index (0-7). Same breakpoints as _pm25ToRgb. */
+function _pm25ColorCat(v) {
+  if (v <= 2.0)  return 0;
+  if (v <= 5.0)  return 1;
+  if (v <= 9.0)  return 2;
+  if (v <= 35.4) return 3;
+  if (v <= 55.4) return 4;
+  if (v <= 125.4) return 5;
+  if (v <= 225.4) return 6;
+  return 7;
+}
+
+const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
+
 class MapView {
   constructor(tilesCanvas, overlayCanvas) {
     this.tilesCanvas = tilesCanvas;
@@ -60,6 +89,22 @@ class MapView {
     this._overlayStaticCanvas = null; // offscreen canvas in device pixels
     this._overlayStaticKey = "";
     this._overlayStaticDirty = true;
+
+    // PurpleAir scalar field underlay: cached offscreen canvas of radial gradient discs.
+    this._paFieldCanvas = null;
+    this._paFieldKey = "";
+    // Cross-fade: previous field canvas + transition timing
+    this._paFieldPrevCanvas = null;
+    this._paFieldFadeStart = 0;
+    this._paFieldFadeMs = 300;
+    // Worker-based pre-warming: compute upcoming color transition fields off-thread.
+    this._paWorker = null;
+    this._paWorkerJobId = 0;
+    this._paWorkerPending = false;
+    this._paWorkerFingerprint = ""; // fingerprint of the in-flight pre-warm job
+    // Pre-warmed pixel buffers keyed by color fingerprint (view-independent).
+    this._paFieldPrewarmed = new Map(); // fingerprint → { px, gw, gh }
+    this._paFieldCacheMax = 16;
 
     // Playback-mode optimization: cache trails to offscreen canvas.
     // Trails only need redrawing when view changes; time advances use incremental updates.
@@ -299,7 +344,7 @@ class MapView {
 
   _invalidateOverlayStatic() {
     this._overlayStaticDirty = true;
-    this._overlayUnderlayKey = "";
+    this._paFieldKey = "";
   }
 
   setMaxTrailLen(val) {
@@ -403,10 +448,14 @@ class MapView {
       return `${this.themeKey}|${r(z, 1e3)}|${r(lat)}|${r(lon)}|${w}x${h}|dpr:${r(dpr, 1e3)}|pinch:${this._pinchZooming ? 1 : 0}`;
     })();
 
+    let tilesRedrawn = false;
     if (this._lastTilesViewSig !== viewSig) {
       this._lastTilesViewSig = viewSig;
       this.drawTiles();
+      tilesRedrawn = true;
     }
+    // PA scalar field: above tiles, below trails/markers. Composite onto tiles canvas.
+    this._compositePaFieldOnTiles(state, tilesRedrawn);
     this.drawOverlay(state, { cacheUnderlay: true });
   }
 
@@ -647,10 +696,14 @@ class MapView {
         this._tileRedrawPending = false;
         this._scheduleTileRedraw();
       }
-      // All fingers lifted - start inertia if we were pinching
-      if (this._pinchZooming) {
+      // All fingers lifted - start inertia if we were pinching.
+      // Guard: on iOS Safari, gestureEnd fires before touchEnd for the same
+      // pinch release, so _startPinchInertia() may already be running.
+      // Starting a second chain corrupts shared state (snapshot, velocity)
+      // and causes blown-out PA field alpha.
+      if (this._pinchZooming && !this._pinchInertiaRAF) {
         this._startPinchInertia();
-      } else {
+      } else if (!this._pinchZooming) {
         // No pinch inertia - do a full redraw now
         this._requestZoomRedraw();
       }
@@ -1903,6 +1956,8 @@ class MapView {
     // Snapshot is tied to canvas size; reset on resize to avoid distortion.
     this._tilesSnapshotCanvas = null;
     this._tilesSnapshotMeta = null;
+    this._paFieldCanvas = null;
+    this._paGrid = null;
     this._invalidateOverlayStatic();
     // Invalidate trail cache on resize
     this._trailCacheCanvas = null;
@@ -2181,10 +2236,13 @@ class MapView {
       return `${this.themeKey}|${r(z, 1e3)}|${r(lat)}|${r(lon)}|${w}x${h}|dpr:${r(dpr, 1e3)}|pinch:${this._pinchZooming ? 1 : 0}`;
     })();
 
+    let tilesRedrawn = false;
     if (this._lastTilesViewSig !== viewSig) {
       this._lastTilesViewSig = viewSig;
       this.drawTiles();
+      tilesRedrawn = true;
     }
+    this._compositePaFieldOnTiles(state, tilesRedrawn);
     this.drawOverlay(state, { cacheUnderlay: true });
   }
 
@@ -2843,30 +2901,31 @@ class MapView {
     // No vignette: it reads like a “tunnel/bokeh” during zooming.
 
     // Capture snapshot for the next frame - but skip during active touch to avoid blocking input.
-    // Also avoid resizing the snapshot canvas every frame (causes GPU texture reallocation).
-    if (!this._touchActive) {
-      try {
-        const tw = this.tilesCanvas.width;
-        const th = this.tilesCanvas.height;
-        if (!this._tilesSnapshotCanvas) {
-          this._tilesSnapshotCanvas = document.createElement("canvas");
-          this._tilesSnapshotCanvas.width = tw;
-          this._tilesSnapshotCanvas.height = th;
-        } else if (this._tilesSnapshotCanvas.width !== tw || this._tilesSnapshotCanvas.height !== th) {
-          // Only resize when dimensions actually change
-          this._tilesSnapshotCanvas.width = tw;
-          this._tilesSnapshotCanvas.height = th;
-        }
-        const sctx = this._tilesSnapshotCanvas.getContext("2d");
-        if (sctx) {
-          sctx.setTransform(1, 0, 0, 1, 0, 0);
-          sctx.clearRect(0, 0, tw, th);
-          sctx.drawImage(this.tilesCanvas, 0, 0);
-          this._tilesSnapshotMeta = { zoom: this.zoom, centerLat: this.center.lat, centerLon: this.center.lon };
-        }
-      } catch {
-        // ignore snapshot capture errors
+    if (!this._touchActive) this._captureTilesSnapshot();
+  }
+
+  /** Capture the tiles canvas into a snapshot for smooth pan/zoom transitions. */
+  _captureTilesSnapshot() {
+    try {
+      const tw = this.tilesCanvas.width;
+      const th = this.tilesCanvas.height;
+      if (!this._tilesSnapshotCanvas) {
+        this._tilesSnapshotCanvas = document.createElement("canvas");
+        this._tilesSnapshotCanvas.width = tw;
+        this._tilesSnapshotCanvas.height = th;
+      } else if (this._tilesSnapshotCanvas.width !== tw || this._tilesSnapshotCanvas.height !== th) {
+        this._tilesSnapshotCanvas.width = tw;
+        this._tilesSnapshotCanvas.height = th;
       }
+      const sctx = this._tilesSnapshotCanvas.getContext("2d");
+      if (sctx) {
+        sctx.setTransform(1, 0, 0, 1, 0, 0);
+        sctx.clearRect(0, 0, tw, th);
+        sctx.drawImage(this.tilesCanvas, 0, 0);
+        this._tilesSnapshotMeta = { zoom: this.zoom, centerLat: this.center.lat, centerLon: this.center.lon };
+      }
+    } catch {
+      // ignore snapshot capture errors
     }
   }
 
@@ -5071,6 +5130,521 @@ class MapView {
     }
   }
 
+  /**
+   * Composite the PA scalar field onto the tiles canvas (above tiles, below overlay).
+   * Restores tiles from snapshot first to avoid opacity accumulation on repeated calls.
+   */
+  _compositePaFieldOnTiles(state, tilesJustRedrawn = false) {
+    // During active touch (finger-pan / pinch), the _requestPanRedraw RAF
+    // already calls drawTiles() + this method with tilesJustRedrawn=true.
+    // An interleaving caller (playbackLoop, cross-fade RAF) that passes
+    // tilesJustRedrawn=false would clear the tiles canvas and restore a
+    // stale pre-touch snapshot, overwriting the correctly-positioned tiles
+    // and causing visible flicker.  Bail out and let the pan RAF handle it.
+    if (!tilesJustRedrawn && this._touchActive) return;
+
+    // If tiles weren't just redrawn and we have no snapshot to restore
+    // clean tiles from, compositing the PA field would stack its alpha on
+    // top of whatever is already on the tiles canvas (likely tiles + a
+    // previous PA composite).  This causes blown-out opacity on iOS Safari
+    // where duplicate pinch-inertia chains can null the snapshot after the
+    // final drawTiles() captured it.  Skip — the next draw() that triggers
+    // drawTiles() will recapture the snapshot and composite correctly.
+    if (!tilesJustRedrawn && !this._tilesSnapshotCanvas) return;
+
+    const pbMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    this._ensurePaField(state, pbMs);
+    if (pbMs != null && isFinite(pbMs)) this._preWarmPaFields(state, pbMs);
+    if (!this._paFieldCanvas) return;
+    const tctx = this.tctx;
+    if (!tctx) return;
+    // Always restore tiles to a known-clean state before drawing the field.
+    // Without this, repeated composites in the same frame (e.g. draw() then
+    // _redrawViewOnly()) stack field alpha and cause opacity flashing.
+    if (!tilesJustRedrawn && this._tilesSnapshotCanvas) {
+      const dpr = this._dpr || (window.devicePixelRatio || 1);
+      const tw = this.tilesCanvas.width;
+      const th = this.tilesCanvas.height;
+      const cssW = this._cssW || 1;
+      const cssH = this._cssH || 1;
+      tctx.save();
+      tctx.setTransform(1, 0, 0, 1, 0, 0);
+      tctx.clearRect(0, 0, tw, th);
+      if (this._pinchZooming && this._tilesSnapshotMeta) {
+        // Scale snapshot to match current zoom, same as drawTiles() fast path
+        const prev = this._tilesSnapshotMeta;
+        const sZoom = Math.pow(2, this.zoom - prev.zoom);
+        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
+        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
+        const txPan = (prevC.x - currC.x) * sZoom;
+        const tyPan = (prevC.y - currC.y) * sZoom;
+        tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        tctx.translate(cssW / 2, cssH / 2);
+        tctx.scale(sZoom, sZoom);
+        tctx.translate((-cssW / 2) + (txPan / sZoom), (-cssH / 2) + (tyPan / sZoom));
+        tctx.drawImage(this._tilesSnapshotCanvas, 0, 0, cssW, cssH);
+      } else if (this._tilesSnapshotMeta) {
+        // Non-pinch: translate snapshot to match current center (same as drawTiles).
+        const prev = this._tilesSnapshotMeta;
+        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
+        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
+        const tx = (prevC.x - currC.x) * dpr;
+        const ty = (prevC.y - currC.y) * dpr;
+        tctx.drawImage(this._tilesSnapshotCanvas, tx, ty);
+      } else {
+        tctx.drawImage(this._tilesSnapshotCanvas, 0, 0);
+      }
+      tctx.restore();
+    }
+    tctx.save();
+    tctx.setTransform(1, 0, 0, 1, 0, 0);
+    // Cross-fade from previous field canvas to current one
+    const fadeT = this._paFieldPrevCanvas
+      ? Math.min(1, (performance.now() - this._paFieldFadeStart) / this._paFieldFadeMs)
+      : 1;
+    if (this._paFieldPrevCanvas && fadeT < 1) {
+      tctx.globalAlpha = 1 - fadeT;
+      tctx.drawImage(this._paFieldPrevCanvas, 0, 0);
+      tctx.globalAlpha = fadeT;
+      tctx.drawImage(this._paFieldCanvas, 0, 0);
+      tctx.globalAlpha = 1;
+      // Schedule another frame to complete the fade (no-op if playback loop is running)
+      if (!this._paFieldFadeRAF) {
+        this._paFieldFadeRAF = requestAnimationFrame(() => {
+          this._paFieldFadeRAF = null;
+          this._compositePaFieldOnTiles(this.lastState);
+          this.drawOverlay(this.lastState, { cacheUnderlay: true });
+        });
+      }
+    } else {
+      if (this._paFieldPrevCanvas) this._paFieldPrevCanvas = null;
+      tctx.drawImage(this._paFieldCanvas, 0, 0);
+    }
+    tctx.restore();
+  }
+
+  /**
+   * Precipitation-radar style: IDW-interpolate raw PM2.5 values on a coarse
+   * grid, map each to a color via _pm25ToRgb, bilinear-upscale.
+   *
+   * V(P) = Σ(w_i · v_i) / Σ(w_i),  w_i = 1/d_i²   (screen-pixel distance)
+   *
+   * Optimized for real-time scrubbing:
+   *  - Always synchronous (IDW is <2ms on a 16px grid)
+   *  - Color-fingerprint cache: only recompute IDW when a sensor changes AQI
+   *    color category, not on every minor PM2.5 fluctuation
+   *  - Web Worker pre-warms upcoming color transitions ahead of playhead
+   *  - Reuses tiny canvas + ImageData across frames
+   */
+  _ensurePaField(state, playbackTimeMs) {
+    const cssW = this._cssW || 1;
+    const cssH = this._cssH || 1;
+    if (cssW < 2 || cssH < 2) return; // not sized yet
+    const dpr = this._dpr || (window.devicePixelRatio || 1);
+    const z = Number(this.zoom);
+    const clat = Number(this.center?.lat);
+    const clon = Number(this.center?.lon);
+    const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
+
+    // ── Collect sensors, project to screen coords + build color fingerprint ──
+    const centerW = latLonToWorld(clat, clon, z);
+    const sensors = [];
+    let fingerprint = "";
+
+    // Collect PurpleAir sensor lat/lons first (for proximity filtering of non-PA sensors)
+    const paLatLons = [];
+    for (const f of fixed) {
+      if (!f.purpleair) continue;
+      const lat = Number(f.lat), lon = Number(f.lon);
+      if (isFinite(lat) && isFinite(lon)) paLatLons.push(lat, lon);
+    }
+    // Max distance (in degrees) a non-PA sensor can be from any PA sensor to be included.
+    // ~60 km ≈ 0.55° at Utah latitudes.
+    const PA_PROXIMITY_DEG = 0.55;
+
+    for (const f of fixed) {
+      const lat = Number(f.lat), lon = Number(f.lon);
+      if (!isFinite(lat) || !isFinite(lon)) continue;
+      // Non-PurpleAir sensors: only include if within ~60 km of a PurpleAir sensor
+      if (!f.purpleair) {
+        let nearPA = false;
+        for (let pi = 0; pi < paLatLons.length; pi += 2) {
+          const dlat = lat - paLatLons[pi], dlon = lon - paLatLons[pi + 1];
+          if (dlat * dlat + dlon * dlon < PA_PROXIMITY_DEG * PA_PROXIMITY_DEG) { nearPA = true; break; }
+        }
+        if (!nearPA) continue;
+      }
+      // Use PM2.5 only — not worst-pollutant (which could be ozone, NO₂, etc.)
+      const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
+      const pm = interp && (interp["PM25"] || interp["PM2.5"] || interp["pm25"] || interp["pm2.5"]);
+      const v = pm && pm.value != null ? Number(pm.value) : NaN;
+      if (!isFinite(v) || v < 0) continue;
+      const wp = latLonToWorld(lat, lon, z);
+      const sx = wp.x - centerW.x + cssW / 2;
+      const sy = wp.y - centerW.y + cssH / 2;
+      sensors.push(sx, sy, v);
+      fingerprint += _pm25ColorCat(v);
+    }
+    const nSensors = sensors.length / 3;
+    if (nSensors === 0) { this._paFieldCanvas = null; return; }
+
+    // ── LOO concordance weighting ──
+    // For each sensor, predict its value from all others via IDW. Sensors that
+    // disagree with their spatial context get downweighted. This kills outliers
+    // (broken sensors, isolated spikes) without hardcoded thresholds.
+    //
+    // Compute median as outlier-immune anchor. Use fixed AQI-scale σ (50 µg/m³)
+    // so real hotspots (28, 38, even 90) keep near-full weight while only
+    // truly broken sensors (1000+) get killed.
+    const vals = [];
+    for (let i = 0; i < sensors.length; i += 3) vals.push(sensors[i + 2]);
+    vals.sort((a, b) => a - b);
+    const medianV = vals[Math.floor(vals.length / 2)];
+    const sigmaSq = 2500; // 50² — fixed AQI-scale
+
+    // ── Cache key: view geometry + color fingerprint ──
+    const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
+    const key = `pa:${viewKey}|f:${fingerprint}`;
+    if (this._paFieldCanvas && this._paFieldKey === key) return;
+    // Only cross-fade when the color fingerprint changes (sensor crosses AQI
+    // boundary).  View-only changes (zoom/pan) recompute silently — no fade,
+    // no stacking.
+    const prevFingerprint = this._paFieldFingerprint || "";
+    const fingerprintChanged = fingerprint !== prevFingerprint;
+    if (this._paFieldCanvas && fingerprintChanged) {
+      this._paFieldPrevCanvas = this._paFieldCanvas;
+      this._paFieldCanvas = null;
+      this._paFieldFadeStart = performance.now();
+    } else {
+      // View-only change — drop the previous canvas to avoid stale fades
+      this._paFieldPrevCanvas = null;
+    }
+    this._paFieldKey = key;
+    this._paFieldFingerprint = fingerprint;
+
+    // ── Grid dimensions ──
+    const cellSize = 16;
+    const gw = Math.ceil(cssW / cellSize);
+    const gh = Math.ceil(cssH / cellSize);
+
+    // ── Cutoff in screen pixels ──
+    const refW = latLonToWorld(clat, clon + 0.15, z);
+    const cutoffPx = Math.abs(refW.x - centerW.x);
+    const cutoffSq = cutoffPx * cutoffPx;
+    const FIELD_ALPHA = 46;
+
+    // ── LOO prediction + concordance for each sensor ──
+    // Build stride-4 array: [sx, sy, v, concordance, ...]
+    const s4 = new Float64Array(nSensors * 4);
+    for (let i = 0; i < nSensors; i++) {
+      const si = i * 3;
+      const sx = sensors[si], sy = sensors[si + 1], vi = sensors[si + 2];
+      // LOO IDW: predict vi from all other sensors
+      let wSum = 0, vSum = 0;
+      for (let j = 0; j < nSensors; j++) {
+        if (j === i) continue;
+        const sj = j * 3;
+        const dx = sx - sensors[sj], dy = sy - sensors[sj + 1];
+        const d2 = dx * dx + dy * dy;
+        if (d2 > cutoffSq || d2 < 1e-6) continue;
+        const w = 1 / d2;
+        wSum += w;
+        vSum += w * sensors[sj + 2];
+      }
+      const predicted = wSum > 0 ? vSum / wSum : medianV;
+      const err = vi - predicted;
+      const concordance = 1 / (1 + (err * err) / sigmaSq);
+      const oi = i * 4;
+      s4[oi] = sx; s4[oi + 1] = sy; s4[oi + 2] = vi; s4[oi + 3] = concordance;
+    }
+
+    // ── Always synchronous — IDW is fast (<2ms on 16px grid) ──
+    this._computePaFieldSync(s4, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr, medianV);
+  }
+
+  /** Synchronous IDW computation — used as fallback and for first frame.
+   *  sensors is stride-4: [sx, sy, value, concordance, ...]  */
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr, medianV) {
+    // ── Reuse tiny canvas + ImageData if grid size unchanged ──
+    if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
+      const tc = document.createElement("canvas");
+      tc.width = gw; tc.height = gh;
+      const tctx = tc.getContext("2d");
+      this._paGrid = { tc, tctx, imgData: tctx.createImageData(gw, gh), gw, gh };
+    }
+    const { tc, tctx, imgData } = this._paGrid;
+    const px = imgData.data;
+
+    // ── Concordance-weighted IDW in screen-pixel space ──
+    // w_i = concordance_i / d_i²
+    // Density-adaptive background anchor: wBg = wBgBase / cnt.
+    // In dense clusters (many sensors), wBg is tiny — sensors dominate.
+    // Near isolated sensors (cnt=1), wBg is large — median competes,
+    // preventing one reading from monopolizing the field.
+    const wBgBase = 10 / cutoffSq;
+    for (let gy = 0; gy < gh; gy++) {
+      const py = (gy + 0.5) * cellSize;
+      for (let gx = 0; gx < gw; gx++) {
+        const pxx = (gx + 0.5) * cellSize;
+
+        let wSum = 0, vSum = 0, minD2 = Infinity, cnt = 0;
+        for (let i = 0; i < sensors.length; i += 4) {
+          const dx = pxx - sensors[i];
+          const dy = py  - sensors[i + 1];
+          const d2 = dx * dx + dy * dy;
+          if (d2 > cutoffSq) continue;
+          cnt++;
+          if (d2 < minD2) minD2 = d2;
+          const c = sensors[i + 3]; // concordance
+          if (d2 < 1) { wSum = 1e9 * c; vSum = sensors[i + 2] * 1e9 * c; minD2 = 0; break; }
+          const w = c / d2;
+          wSum += w;
+          vSum += w * sensors[i + 2];
+        }
+
+        const off = (gy * gw + gx) * 4;
+        if (wSum === 0) {
+          px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
+        } else {
+          const wBg = wBgBase / (cnt || 1);
+          const val = (vSum + wBg * medianV) / (wSum + wBg);
+          // Fade alpha near field edges
+          const edgeFade = 1 - Math.sqrt(minD2 / cutoffSq);
+          const alpha = Math.round(FIELD_ALPHA * Math.min(1, edgeFade * 2));
+          const cat = _pm25ColorCat(val);
+          const rgb = _pm25ToRgb(_BAND_MIDS[cat]);
+          px[off]   = (rgb[0] * 217) >> 8;
+          px[off+1] = (rgb[1] * 217) >> 8;
+          px[off+2] = (rgb[2] * 217) >> 8;
+          px[off+3] = alpha;
+        }
+      }
+    }
+
+    // ── Gaussian blur (radius 2) to soften jagged band edges ──
+    const BLUR_R = 2;
+    const tmp = new Uint8ClampedArray(px.length);
+    // Horizontal pass
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < gw; x++) {
+        let rr = 0, gg = 0, bb = 0, aa = 0, ww = 0;
+        for (let dx = -BLUR_R; dx <= BLUR_R; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= gw) continue;
+          const off = (y * gw + nx) * 4;
+          if (px[off + 3] === 0) continue;
+          const g = 1.0 / (1 + dx * dx);
+          rr += px[off] * g; gg += px[off+1] * g; bb += px[off+2] * g; aa += px[off+3] * g;
+          ww += g;
+        }
+        const off = (y * gw + x) * 4;
+        if (ww > 0) { tmp[off] = rr/ww; tmp[off+1] = gg/ww; tmp[off+2] = bb/ww; tmp[off+3] = aa/ww; }
+      }
+    }
+    // Vertical pass
+    for (let x = 0; x < gw; x++) {
+      for (let y = 0; y < gh; y++) {
+        let rr = 0, gg = 0, bb = 0, aa = 0, ww = 0;
+        for (let dy = -BLUR_R; dy <= BLUR_R; dy++) {
+          const ny = y + dy;
+          if (ny < 0 || ny >= gh) continue;
+          const off = (ny * gw + x) * 4;
+          if (tmp[off + 3] === 0) continue;
+          const g = 1.0 / (1 + dy * dy);
+          rr += tmp[off] * g; gg += tmp[off+1] * g; bb += tmp[off+2] * g; aa += tmp[off+3] * g;
+          ww += g;
+        }
+        const off = (y * gw + x) * 4;
+        if (ww > 0) { px[off] = rr/ww; px[off+1] = gg/ww; px[off+2] = bb/ww; px[off+3] = aa/ww; }
+      }
+    }
+
+    tctx.putImageData(imgData, 0, 0);
+    this._upscalePaField(tc, cssW, cssH, dpr);
+  }
+
+  /** Upscale the coarse IDW grid to viewport size with bilinear smoothing. */
+  _upscalePaField(tc, cssW, cssH, dpr) {
+    if (!this._paFieldCanvas) this._paFieldCanvas = document.createElement("canvas");
+    const pw = Math.floor(cssW * dpr), ph = Math.floor(cssH * dpr);
+    if (this._paFieldCanvas.width !== pw || this._paFieldCanvas.height !== ph) {
+      this._paFieldCanvas.width = pw;
+      this._paFieldCanvas.height = ph;
+    }
+    const ctx = this._paFieldCanvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(tc, 0, 0, cssW, cssH);
+  }
+
+  /** Handle worker result — cache pre-warmed pixel data for future scrub hits. */
+  _onPaWorkerResult(data) {
+    const { px, gw, gh, jobId } = data;
+    if (jobId !== this._paWorkerJobId) return;
+    this._paWorkerPending = false;
+
+    const fp = this._paWorkerFingerprint;
+    if (!fp) return;
+
+    // Store the raw pixel data keyed by fingerprint only (view-independent).
+    // _ensurePaField will project + upscale synchronously when the fingerprint matches.
+    this._paFieldPrewarmed.set(fp, { px: new Uint8ClampedArray(px), gw, gh });
+    // Evict oldest if over limit
+    if (this._paFieldPrewarmed.size > this._paFieldCacheMax) {
+      const first = this._paFieldPrewarmed.keys().next().value;
+      this._paFieldPrewarmed.delete(first);
+    }
+  }
+
+  /**
+   * Pre-warm scalar fields for upcoming color transitions.
+   * Scans PurpleAir sensor history to find the next times ANY sensor crosses
+   * a color category boundary, then dispatches worker jobs to pre-compute
+   * those fields. Called periodically from the playback render loop.
+   */
+  _preWarmPaFields(state, playbackTimeMs) {
+    // Initialize worker on first use
+    if (!this._paWorker) {
+      try {
+        this._paWorker = new Worker("pa_field_worker.js");
+        this._paWorker.onmessage = (e) => this._onPaWorkerResult(e.data);
+      } catch (_) {
+        this._paWorker = false;
+      }
+    }
+    if (!this._paWorker || this._paWorkerPending) return;
+    const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
+    const cssW = this._cssW || 1;
+    const cssH = this._cssH || 1;
+    if (cssW < 2 || cssH < 2) return;
+    const z = Number(this.zoom);
+    const clat = Number(this.center?.lat);
+    const clon = Number(this.center?.lon);
+
+    // Find sensor color transition times ahead of the playhead (up to 30 min).
+    const lookAheadMs = 30 * 60 * 1000;
+    const maxTime = playbackTimeMs + lookAheadMs;
+
+    // Collect unique transition fingerprints and their sensor arrays
+    // Walk forward in time through each sensor's history and find points
+    // where the color category changes.
+    const transitionTimes = new Set();
+    for (const f of fixed) {
+      const readings = f && f.readings;
+      if (!readings) continue;
+      for (const key of Object.keys(readings)) {
+        const r = readings[key];
+        if (!r || !r._parsedTimeline) continue;
+        const { timesMs, valuesF } = r._parsedTimeline;
+        if (!timesMs || timesMs.length < 2) continue;
+        // Find the current index
+        let idx = 0;
+        for (let i = 0; i < timesMs.length; i++) {
+          if (timesMs[i] <= playbackTimeMs) idx = i; else break;
+        }
+        const curCat = _pm25ColorCat(valuesF[idx]);
+        // Walk forward to find next color change
+        for (let i = idx + 1; i < timesMs.length; i++) {
+          if (timesMs[i] > maxTime) break;
+          if (_pm25ColorCat(valuesF[i]) !== curCat) {
+            transitionTimes.add(timesMs[i]);
+            break;
+          }
+        }
+      }
+    }
+
+    // Pick the nearest transition time not already cached
+    const sorted = Array.from(transitionTimes).sort((a, b) => a - b);
+    for (const tMs of sorted) {
+      // Build sensor array and fingerprint at this time
+      const centerW = latLonToWorld(clat, clon, z);
+      const sensors = [];
+      let fp = "";
+      // Collect PA lat/lons for proximity filtering
+      const _paLL = [];
+      for (const f of fixed) {
+        if (!f.purpleair) continue;
+        const lat = Number(f.lat), lon = Number(f.lon);
+        if (isFinite(lat) && isFinite(lon)) _paLL.push(lat, lon);
+      }
+      const _PA_DEG = 0.55;
+      for (const f of fixed) {
+        const lat = Number(f.lat), lon = Number(f.lon);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+        if (!f.purpleair) {
+          let nearPA = false;
+          for (let pi = 0; pi < _paLL.length; pi += 2) {
+            const dlat = lat - _paLL[pi], dlon = lon - _paLL[pi + 1];
+            if (dlat * dlat + dlon * dlon < _PA_DEG * _PA_DEG) { nearPA = true; break; }
+          }
+          if (!nearPA) continue;
+        }
+        const interp = interpolateFixedReadingsAtTime(f, tMs);
+        const pm = interp && (interp["PM25"] || interp["PM2.5"] || interp["pm25"] || interp["pm2.5"]);
+        const v = pm && pm.value != null ? Number(pm.value) : NaN;
+        if (!isFinite(v) || v < 0) continue;
+        const wp = latLonToWorld(lat, lon, z);
+        sensors.push(wp.x - centerW.x + cssW / 2, wp.y - centerW.y + cssH / 2, v);
+        fp += _pm25ColorCat(v);
+      }
+      if (sensors.length === 0) continue;
+      if (this._paFieldPrewarmed.has(fp)) continue;
+
+      // ── LOO concordance for pre-warm sensors ──
+      const nPw = sensors.length / 3;
+      const pwVals = [];
+      for (let i = 0; i < sensors.length; i += 3) pwVals.push(sensors[i + 2]);
+      pwVals.sort((a, b) => a - b);
+      const pwMedian = pwVals[Math.floor(pwVals.length / 2)];
+      const pwSigmaSq = 2500; // 50² — fixed AQI-scale
+
+      // Dispatch this one to the worker
+      const cellSize = 16;
+      const gw = Math.ceil(cssW / cellSize);
+      const gh = Math.ceil(cssH / cellSize);
+      const refW = latLonToWorld(clat, clon + 0.15, z);
+      const cutoffPx = Math.abs(refW.x - centerW.x);
+      const cutoffSq = cutoffPx * cutoffPx;
+      const FIELD_ALPHA = 46;
+
+      // Build stride-4 array with concordance
+      const s4pw = new Float64Array(nPw * 4);
+      for (let i = 0; i < nPw; i++) {
+        const si = i * 3;
+        const sx = sensors[si], sy = sensors[si + 1], vi = sensors[si + 2];
+        let wSum = 0, vSum = 0;
+        for (let j = 0; j < nPw; j++) {
+          if (j === i) continue;
+          const sj = j * 3;
+          const dx = sx - sensors[sj], dy = sy - sensors[sj + 1];
+          const d2 = dx * dx + dy * dy;
+          if (d2 > cutoffSq || d2 < 1e-6) continue;
+          const w = 1 / d2;
+          wSum += w;
+          vSum += w * sensors[sj + 2];
+        }
+        const predicted = wSum > 0 ? vSum / wSum : pwMedian;
+        const err = vi - predicted;
+        const concordance = 1 / (1 + (err * err) / pwSigmaSq);
+        const oi = i * 4;
+        s4pw[oi] = sx; s4pw[oi + 1] = sy; s4pw[oi + 2] = vi; s4pw[oi + 3] = concordance;
+      }
+
+      const jobId = ++this._paWorkerJobId;
+      this._paWorkerPending = true;
+      this._paWorkerFingerprint = fp;
+      this._paWorker.postMessage({
+        sensors: s4pw,
+        gw, gh, cellSize, cutoffSq, FIELD_ALPHA, jobId, medianV: pwMedian
+      });
+      return; // one at a time
+    }
+  }
+
   _overlayStaticKeyForState(state) {
     const w = this._cssW || 1;
     const h = this._cssH || 1;
@@ -5394,10 +5968,11 @@ class MapView {
       };
 
       // First pass: render PurpleAir markers (drawn first, so they appear behind)
+      // (PA scalar field is rendered below, on tiles canvas — see _compositePaFieldOnTiles)
       for (const f of fixed) {
         if (f.purpleair) renderFixedMarker(f);
       }
-      
+
       // Second pass: render non-PurpleAir markers
       for (const f of fixed) {
         if (!f.purpleair) renderFixedMarker(f);
@@ -6768,6 +7343,7 @@ class MapView {
       };
 
       // First pass: PurpleAir (public)
+      // (PA scalar field is rendered below, on tiles canvas — see _compositePaFieldOnTiles)
       if (this.showPublic) {
         for (const f of fixed) {
           if (f.purpleair) renderPbFixedMarker(f);
