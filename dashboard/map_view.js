@@ -696,10 +696,14 @@ class MapView {
         this._tileRedrawPending = false;
         this._scheduleTileRedraw();
       }
-      // All fingers lifted - start inertia if we were pinching
-      if (this._pinchZooming) {
+      // All fingers lifted - start inertia if we were pinching.
+      // Guard: on iOS Safari, gestureEnd fires before touchEnd for the same
+      // pinch release, so _startPinchInertia() may already be running.
+      // Starting a second chain corrupts shared state (snapshot, velocity)
+      // and causes blown-out PA field alpha.
+      if (this._pinchZooming && !this._pinchInertiaRAF) {
         this._startPinchInertia();
-      } else {
+      } else if (!this._pinchZooming) {
         // No pinch inertia - do a full redraw now
         this._requestZoomRedraw();
       }
@@ -5131,6 +5135,23 @@ class MapView {
    * Restores tiles from snapshot first to avoid opacity accumulation on repeated calls.
    */
   _compositePaFieldOnTiles(state, tilesJustRedrawn = false) {
+    // During active touch (finger-pan / pinch), the _requestPanRedraw RAF
+    // already calls drawTiles() + this method with tilesJustRedrawn=true.
+    // An interleaving caller (playbackLoop, cross-fade RAF) that passes
+    // tilesJustRedrawn=false would clear the tiles canvas and restore a
+    // stale pre-touch snapshot, overwriting the correctly-positioned tiles
+    // and causing visible flicker.  Bail out and let the pan RAF handle it.
+    if (!tilesJustRedrawn && this._touchActive) return;
+
+    // If tiles weren't just redrawn and we have no snapshot to restore
+    // clean tiles from, compositing the PA field would stack its alpha on
+    // top of whatever is already on the tiles canvas (likely tiles + a
+    // previous PA composite).  This causes blown-out opacity on iOS Safari
+    // where duplicate pinch-inertia chains can null the snapshot after the
+    // final drawTiles() captured it.  Skip — the next draw() that triggers
+    // drawTiles() will recapture the snapshot and composite correctly.
+    if (!tilesJustRedrawn && !this._tilesSnapshotCanvas) return;
+
     const pbMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
     this._ensurePaField(state, pbMs);
     if (pbMs != null && isFinite(pbMs)) this._preWarmPaFields(state, pbMs);
@@ -5162,6 +5183,14 @@ class MapView {
         tctx.scale(sZoom, sZoom);
         tctx.translate((-cssW / 2) + (txPan / sZoom), (-cssH / 2) + (tyPan / sZoom));
         tctx.drawImage(this._tilesSnapshotCanvas, 0, 0, cssW, cssH);
+      } else if (this._tilesSnapshotMeta) {
+        // Non-pinch: translate snapshot to match current center (same as drawTiles).
+        const prev = this._tilesSnapshotMeta;
+        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
+        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
+        const tx = (prevC.x - currC.x) * dpr;
+        const ty = (prevC.y - currC.y) * dpr;
+        tctx.drawImage(this._tilesSnapshotCanvas, tx, ty);
       } else {
         tctx.drawImage(this._tilesSnapshotCanvas, 0, 0);
       }
