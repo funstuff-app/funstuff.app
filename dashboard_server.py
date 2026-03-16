@@ -365,13 +365,15 @@ def default_data_dir() -> Path:
 # Geo-IP visitor logging
 # Logs city/region/country to ~/.mobileair/visitors.log on each unique page load.
 # The raw IP address is NEVER written to disk — only the resolved location.
+# Re-logs if the resolved location changes (e.g. client toggled a VPN).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# In-memory de-duplicate cache: maps sha256(ip) → last-logged epoch (seconds).
-# Prevents re-logging the same visitor within GEO_IP_CACHE_TTL_S seconds.
-_geo_ip_cache: dict[str, float] = {}
+# Cache: sha256(ip) → (last_check_monotonic, last_logged_location)
+# last_logged_location is "" when the IP has never been successfully logged.
+_geo_ip_cache: dict[str, tuple[float, str]] = {}
 _geo_ip_cache_lock = threading.Lock()
-GEO_IP_CACHE_TTL_S = 3600  # 1 hour
+# Minimum seconds between geo lookups for the same IP (keeps ip-api.com happy).
+GEO_IP_RECHECK_S = 300  # 5 minutes
 
 
 def _resolve_client_ip(headers, client_address: tuple) -> str:
@@ -382,27 +384,40 @@ def _resolve_client_ip(headers, client_address: tuple) -> str:
     return client_address[0]
 
 
-def _log_visitor_geo(ip: str, data_dir: Path) -> None:
-    """Background worker: geo-resolve *ip* and append location to visitors.log.
-    The IP address is used only for the API call and is never persisted."""
+def _log_visitor_geo(ip: str, ip_hash: str, prev_location: str, data_dir: Path) -> None:
+    """Background worker: geo-resolve *ip* and append to visitors.log if location changed.
+
+    *ip* is used only for the API call and is never persisted.
+    *prev_location* is the last location we logged for this IP hash so we can
+    detect changes (e.g. Apple iCloud Private Relay / VPN toggle).
+    """
     try:
         import urllib.request
-        import urllib.error
         # Resolve geo location — city/region/country only, no ISP or ASN.
         url = f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,timezone"
         with urllib.request.urlopen(url, timeout=5) as resp:
             data = json.loads(resp.read().decode())
         if data.get("status") != "success":
             return
-        country  = data.get("country", "Unknown")
-        region   = data.get("regionName", "")
-        city     = data.get("city", "")
-        tz       = data.get("timezone", "")
-        # Build a readable location string, omitting empty parts.
-        parts = [p for p in [city, region, country] if p]
+        country = data.get("country", "Unknown")
+        region  = data.get("regionName", "")
+        city    = data.get("city", "")
+        tz      = data.get("timezone", "")
+        parts    = [p for p in [city, region, country] if p]
         location = ", ".join(parts) if parts else "Unknown"
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        line = f"{ts}  |  {location}  |  tz:{tz}\n"
+
+        # Always update the cached location so future checks compare correctly.
+        now = time.monotonic()
+        with _geo_ip_cache_lock:
+            _geo_ip_cache[ip_hash] = (now, location)
+
+        # Only write to log if location differs from the last logged value.
+        if location == prev_location:
+            return
+
+        note = f"  [was: {prev_location}]" if prev_location else ""
+        ts   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        line = f"{ts}  |  {location}  |  tz:{tz}{note}\n"
         log_path = data_dir / "visitors.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as fh:
@@ -414,27 +429,41 @@ def _log_visitor_geo(ip: str, data_dir: Path) -> None:
 def maybe_log_visitor(headers, client_address: tuple, data_dir: Path) -> None:
     """Fire-and-forget geo-IP log for a page-load request.
 
-    De-duplicates by IP within GEO_IP_CACHE_TTL_S so one person refreshing
-    the page doesn't spam the log or the upstream API.
+    Rate-limits geo lookups to GEO_IP_RECHECK_S per IP, but always re-logs
+    when the resolved location changes (catches VPN/relay toggles).
     """
     ip = _resolve_client_ip(headers, client_address)
     # Skip loopback / private network hits — those are local/dev.
     if ip in ("127.0.0.1", "::1") or ip.startswith("192.168.") or ip.startswith("10."):
         return
-    # Use a hash so the IP never lives in a data structure that could be logged.
+    # Use a hash so the raw IP never lives in any persistent data structure.
     ip_hash = hashlib.sha256(ip.encode()).hexdigest()
     now = time.monotonic()
     with _geo_ip_cache_lock:
-        last = _geo_ip_cache.get(ip_hash, 0.0)
-        if now - last < GEO_IP_CACHE_TTL_S:
+        last_check, prev_location = _geo_ip_cache.get(ip_hash, (0.0, ""))
+        if now - last_check < GEO_IP_RECHECK_S:
             return
-        _geo_ip_cache[ip_hash] = now
+        # Stamp the check time immediately so parallel requests don't pile up.
+        _geo_ip_cache[ip_hash] = (now, prev_location)
     # Do the network call off the request thread.
     threading.Thread(
         target=_log_visitor_geo,
-        args=(ip, data_dir),
+        args=(ip, ip_hash, prev_location, data_dir),
         daemon=True,
     ).start()
+
+
+def _current_day_window_5am() -> tuple[float, float]:
+    """Return (start_ts, end_ts) for the current 5am–5am day window (local time)."""
+    import datetime
+    now = datetime.datetime.now()
+    if now.hour < 5:
+        # Before 5am: window started yesterday at 5am
+        start = now.replace(hour=5, minute=0, second=0, microsecond=0) - datetime.timedelta(days=1)
+    else:
+        start = now.replace(hour=5, minute=0, second=0, microsecond=0)
+    end = start + datetime.timedelta(days=1)
+    return start.timestamp(), end.timestamp()
 
 
 def load_json_file(path: Path, default):
@@ -479,6 +508,9 @@ class AppState:
     
     # Persistent fixed sensor history (shared with TUI)
     # Structure: { sensor_id: { pollutant: [{val, col, time, recorded_at}, ...] } }
+    # TODO: fixed_history.json is ~41 MB and growing unbounded (PurpleAir has no cap).
+    #       Merge this into the daily snapshot instead of a separate file — the snapshot
+    #       already carries today's data and gets rotated naturally.
     fixed_history: dict[str, dict[str, list[dict[str, Any]]]] = field(default_factory=dict)
     fixed_history_path: Path | None = None
     fixed_history_dirty: bool = False
@@ -693,6 +725,44 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         
         if loaded_count > 0:
             _log(f"[Snapshot] Loaded {loaded_count} mobiles from today's snapshot ({today_str})")
+
+        # Seed PurpleAir sensors from snapshot when we have none yet
+        # (covers: no API key, expired key, 402, network errors, etc.)
+        if not app_state.purpleair_sensors:
+            fixed = snapshot.get("fixed", [])
+            if isinstance(fixed, list):
+                pa_seeded = 0
+                with app_state.lock:
+                    for f in fixed:
+                        if not f.get("purpleair"):
+                            continue
+                        sid_str = f.get("id", "")
+                        if not sid_str.startswith("PA_"):
+                            continue
+                        try:
+                            sensor_index = int(sid_str[3:])
+                        except (ValueError, TypeError):
+                            continue
+                        lat = f.get("lat")
+                        lon = f.get("lon")
+                        name = f.get("name", "")
+                        pm25 = None
+                        readings = f.get("readings", {})
+                        if isinstance(readings, dict):
+                            pm_r = readings.get("PM25") or readings.get("PM2.5")
+                            if isinstance(pm_r, dict):
+                                pm25 = pm_r.get("value")
+                        app_state.purpleair_sensors.append({
+                            "sensor_index": sensor_index,
+                            "name": name,
+                            "latitude": lat,
+                            "longitude": lon,
+                            "pm2.5": pm25,
+                        })
+                        pa_seeded += 1
+                if pa_seeded:
+                    _log(f"[Snapshot] Seeded {pa_seeded} PurpleAir sensors from snapshot")
+
         return loaded_count > 0
         
     except Exception as e:
@@ -1999,12 +2069,34 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
 # PurpleAir Integration
 # ─────────────────────────────────────────────────────────────────────────────
 
-PURPLEAIR_API_KEY = os.environ.get("DUSTY_PURPLEAIR_API_KEY", "").strip()
+def _load_deploy_config() -> dict[str, str]:
+    """Read key=value pairs from deploy/dustytrails/deploy.config (fallback for local dev)."""
+    cfg: dict[str, str] = {}
+    config_path = Path(__file__).resolve().parent / "deploy" / "dustytrails" / "deploy.config"
+    if not config_path.is_file():
+        return cfg
+    try:
+        for line in config_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, _, v = line.partition("=")
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return cfg
+
+_deploy_cfg = _load_deploy_config()
+
+PURPLEAIR_API_KEY = (os.environ.get("DUSTY_PURPLEAIR_API_KEY", "").strip()
+                     or _deploy_cfg.get("DUSTY_PURPLEAIR_API_KEY", ""))
 
 # Owner token: when set, write endpoints require a matching token.
 # Token is read from the `dusty_tok` HttpOnly cookie (set via POST /api/auth)
 # or from a ?tok= query param (backward compat for curl / scripts).
-OWNER_TOKEN = os.environ.get("DUSTY_OWNER_TOKEN", "").strip()
+OWNER_TOKEN = (os.environ.get("DUSTY_OWNER_TOKEN", "").strip()
+               or _deploy_cfg.get("DUSTY_OWNER_TOKEN", ""))
 _AUTH_COOKIE_NAME = "dusty_tok"
 PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
 
@@ -2201,24 +2293,25 @@ def purpleair_fetch_loop(
     Metadata (name, lat, lon + full pm2.5 sweep) refreshes every 6 hours so
     the complete sensor picture stays current regardless of sentinel activity.
 
-    Budget math (2,000,000 pts/month, 242 sensors, ~1 pt/sensor/field):
-      Sentinel poll  ~50 pts/cycle (one per occupied grid cell)
-      Cluster fetch  up to ~489 pts if ALL cells trigger (worst case)
-      Metadata       ~970 pts per refresh (242 sensors × 4 fields)
+    Budget math (2,000,000 pts/month, ~392 sensors, ~1 pt/sensor/field):
+      Sentinel poll  ~81 pts/cycle (one per occupied grid cell)
+      Cluster fetch  up to ~792 pts if ALL cells trigger (worst case)
+      Metadata       ~1,568 pts per refresh (392 sensors × 4 fields)
 
-      Day  (19h, 10 min):  114 cycles × 50  =  5,700 pts  (sentinel only)
-                           114 cycles × 489 = 55,746 pts  (worst-case clusters)
-      Night (5h, 30 min):   10 cycles × 50  =    500 pts
-      Metadata (4×/day):     4         × 970 =  3,880 pts
+      Day  (19h, 3 min):   380 cycles × 81  =  30,780 pts (sentinel only)
+                           380 cycles × 792 = 300,960 pts (worst-case clusters)
+      Night (5h, 30 min):   10 cycles × 81  =    810 pts
+      Metadata (4×/day):     4       × 1568 =  6,272 pts
       ──────────────────────────────────────────────────────
-      Quiet day  (no clusters): ~10,080 pts/day →   ~307K/month
-      Worst-case day (all clusters): ~60,126 pts/day → ~1.83M/month
-      Budget: 2,000,000 pts/month ✓ even in worst case
+      Quiet day  (no clusters): ~37,862 pts/day  →  ~1.15M/month
+      Worst-case day (all clusters): ~339K pts/day → over budget
+      Typical day (~10% cluster rate): ~65K pts/day → ~1.98M/month
+      Budget: 2,000,000 pts/month ✓ for typical usage
     """
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
     META_INTERVAL       = 10800.0  # 3 hours
-    DATA_INTERVAL_DAY   = 300.0    # 5 min during day
+    DATA_INTERVAL_DAY   = 180.0    # 3 min during day
     DATA_INTERVAL_NIGHT = 1800.0   # 30 min during night (1 AM – 6 AM MST)
     NEIGHBOR_RADIUS_DEG = 0.018    # ~2 km grid cell side length
 
@@ -2335,8 +2428,8 @@ def purpleair_fetch_loop(
     except Exception as e:
         _log(f"[PurpleAir] Debug log init error: {e}")
 
-    _log("[PurpleAir] Waiting 20s for main fetch loop to start...")
-    stop_event.wait(20.0)
+    _log("[PurpleAir] Waiting 3s for main fetch loop to start...")
+    stop_event.wait(3.0)
     _log("[PurpleAir] Starting PurpleAir fetch loop (sparse sentinel strategy)")
 
     while not stop_event.is_set():
@@ -3304,7 +3397,6 @@ def list_snapshots(data_dir: Path) -> list[dict[str, Any]]:
     for f in sorted(snapshots_dir.glob("*.json"), reverse=True):
         try:
             stat = f.stat()
-            # Extract date from filename (e.g., "2025-12-31.json" -> "2025-12-31")
             date_str = f.stem
             result.append({
                 "date": date_str,
@@ -3339,7 +3431,7 @@ def save_snapshot(data_dir: Path, date_str: str, state: dict[str, Any]) -> dict[
     if not safe_date or len(safe_date) > 20:
         safe_date = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     filepath = snapshots_dir / f"{safe_date}.json"
-    filepath.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    filepath.write_text(json.dumps(state, separators=(",", ":"), allow_nan=False, default=str), encoding="utf-8")
     return {"success": True, "filename": filepath.name, "size_bytes": filepath.stat().st_size}
 
 def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
@@ -3368,7 +3460,18 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     raw_bytes = filepath.read_bytes()
     try:
         parsed = json.loads(raw_bytes)
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+    except json.JSONDecodeError:
+        # Tolerate NaN/Infinity written by older server versions
+        import re as _re
+        raw_str = raw_bytes.decode("utf-8", errors="replace")
+        raw_str = _re.sub(r'\bNaN\b', 'null', raw_str)
+        raw_str = _re.sub(r'-Infinity\b', 'null', raw_str)
+        raw_str = _re.sub(r'\bInfinity\b', 'null', raw_str)
+        try:
+            parsed = json.loads(raw_str)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise JsonValidationError(f"Corrupt snapshot: {e}")
+    except UnicodeDecodeError as e:
         raise JsonValidationError(f"Corrupt snapshot: {e}")
     if not isinstance(parsed, dict):
         raise JsonValidationError("Snapshot root must be object")
@@ -3548,7 +3651,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             
             # Static HTML - short cache, may change frequently during development
             if path_no_query in ("/", "/index.html"):
-                maybe_log_visitor(self.headers, self.client_address, data_dir)
+                if not self._is_owner():
+                    maybe_log_visitor(self.headers, self.client_address, data_dir)
                 return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="public, max-age=300")
             # JavaScript assets - serve any .js file from dashboard dir
             # Cache for 1 day (use cache-busting query params like ?v=20260205 for updates)
@@ -3697,6 +3801,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._handle_load_snapshot()
             if self.path.startswith("/api/prefs/log"):
                 return self._handle_prefs_log()
+            if self.path.startswith("/api/view/clients"):
+                return self._handle_view_clients()
+            if self.path.startswith("/api/view/log"):
+                return self._handle_view_log()
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
@@ -3704,6 +3812,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._handle_auth()
             if self.path.startswith("/api/prefs/sync"):
                 return self._handle_prefs_sync()
+            if self.path.startswith("/api/view/sync"):
+                return self._handle_view_sync()
             if self.path.startswith("/api/snapshot/save"):
                 return self._handle_save_snapshot()
             return self._send(404, b"not found", "text/plain")
@@ -3771,6 +3881,97 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         except json.JSONDecodeError:
                             pass
             body = json.dumps(entries).encode("utf-8")
+            return self._send(200, body, "application/json")
+
+        def _handle_view_sync(self):
+            """Append a camera-position entry to view_log.ndjson (visitors only).
+
+            Body: {"client_id": "abc123", "lat": 40.76, "lon": -111.89, "zoom": 12.5}
+            Owner requests are silently dropped — only non-owner visitors are logged.
+            """
+            content_length = int(self.headers.get("Content-Length", 0))
+            if not (0 < content_length <= 2048):
+                return self._send(400, b'{"error": "bad length"}', "application/json")
+            # Silently discard owner's own view — we only want visitor data
+            if self._is_owner():
+                return self._send(200, b'{"ok": true}', "application/json")
+            try:
+                raw = self.rfile.read(content_length)
+                incoming = json.loads(raw)
+                cid = str(incoming.get("client_id", ""))[:24]
+                lat = float(incoming["lat"])
+                lon = float(incoming["lon"])
+                zoom = float(incoming["zoom"])
+                if not cid or not all(map(math.isfinite, (lat, lon, zoom))):
+                    raise ValueError("invalid fields")
+                entry = {"ts": time.time(), "client_id": cid, "lat": round(lat, 6), "lon": round(lon, 6), "zoom": round(zoom, 3)}
+                log_path = Path(data_dir) / "view_log.ndjson"
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+                return self._send(200, b'{"ok": true}', "application/json")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode()
+                return self._send(400, body, "application/json")
+
+        def _handle_view_clients(self):
+            """Return distinct client IDs active in the current 5am–5am day window."""
+            window_start, window_end = _current_day_window_5am()
+            log_path = Path(data_dir) / "view_log.ndjson"
+            counts: dict[str, int] = {}
+            if log_path.exists():
+                for line in log_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        ts = float(entry.get("ts", 0))
+                        if not (window_start <= ts < window_end):
+                            continue
+                        cid = entry.get("client_id", "")
+                        if cid:
+                            counts[cid] = counts.get(cid, 0) + 1
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            result = [{"client_id": cid, "count": cnt} for cid, cnt in sorted(counts.items(), key=lambda x: -x[1])]
+            body = json.dumps(result).encode("utf-8")
+            return self._send(200, body, "application/json")
+
+        def _handle_view_log(self):
+            """Return view entries for a specific client within the current 5am–5am day window.
+
+            Query params:
+              client=<str>  — required client ID
+              n=<int>       — max entries (default 500, max 5000)
+            """
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            client_id = (qs.get("client") or [""])[0].strip()
+            if not client_id:
+                return self._send(400, b'{"error": "missing client param"}', "application/json")
+            try:
+                n = min(int((qs.get("n") or ["500"])[0]), 5000)
+            except (ValueError, TypeError):
+                n = 500
+            window_start, window_end = _current_day_window_5am()
+            log_path = Path(data_dir) / "view_log.ndjson"
+            entries = []
+            if log_path.exists():
+                for line in log_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("client_id") != client_id:
+                            continue
+                        ts = float(entry.get("ts", 0))
+                        if not (window_start <= ts < window_end):
+                            continue
+                        entries.append(entry)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            body = json.dumps(entries[-n:]).encode("utf-8")
             return self._send(200, body, "application/json")
 
         def _handle_tui_state(self):
@@ -4274,13 +4475,20 @@ def main() -> int:
     except Exception as e:
         _log(f"[PurpleAir] Initial fetch error (will retry in background): {e}")
 
-    # Start PurpleAir fetch loop (10-min daytime / 30-min nighttime)
+    # Ensure snapshot-seeded PurpleAir sensors are merged into state even if API failed
+    if app_state.purpleair_sensors and isinstance(app_state.state, dict):
+        with app_state.lock:
+            _merge_purpleair_into_fixed(app_state.state, app_state)
+            _inject_fixed_history(app_state, app_state.state)
+            app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
+
+    # Start PurpleAir fetch loop (3-min daytime / 30-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
         daemon=True
     ).start()
-    _log("[PurpleAir] SLC sensor integration enabled (10-min daytime / 30-min nighttime, batched requests)")
+    _log("[PurpleAir] SLC sensor integration enabled (3-min daytime / 30-min nighttime, batched requests)")
 
     # History prefetch disabled — Select Day now loads from local snapshots
     # threading.Thread(
@@ -4396,7 +4604,7 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             daemon=True
         ).start()
 
-    # PurpleAir fetch loop with batched requests (10-min daytime / 30-min nighttime)
+    # PurpleAir fetch loop with batched requests (3-min daytime / 30-min nighttime)
     threading.Thread(
         target=purpleair_fetch_loop,
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),

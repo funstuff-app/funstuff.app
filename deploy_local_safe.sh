@@ -62,10 +62,25 @@ install_wrapper() {
   mkdir -p "$wrapperDir"
   local wrapperPath="$wrapperDir/mobileair"
 
+  # Load secrets from deploy.config so the local binary gets the same env vars
+  # that the Pi systemd service injects.
+  local pa_key="" an_key="" owner_token=""
+  local config_file="$REPO_ROOT/deploy/dustytrails/deploy.config"
+  if [[ -f "$config_file" ]]; then
+    # shellcheck source=/dev/null
+    source "$config_file"
+    pa_key="${DUSTY_PURPLEAIR_API_KEY:-}"
+    an_key="${AIRNOW_API_KEY:-}"
+    owner_token="${DUSTY_OWNER_TOKEN:-}"
+  fi
+
   # IMPORTANT: do NOT symlink the binary into PATH; PyInstaller one-folder builds
   # expect _internal next to the executable. Use a wrapper that execs the real binary.
   cat > "$wrapperPath" <<EOF
 #!/usr/bin/env bash
+export DUSTY_PURPLEAIR_API_KEY="${pa_key}"
+export AIRNOW_API_KEY="${an_key}"
+export DUSTY_OWNER_TOKEN="${owner_token}"
 exec "${TARGET}/mobileair" "\$@"
 EOF
   chmod +x "$wrapperPath"
@@ -143,17 +158,6 @@ sudo_if_needed mv "$STAGING" "$TARGET"
 # The '-' identity means ad-hoc (no Apple Developer ID required).
 if command -v codesign &>/dev/null; then
   codesign --force --deep --sign - "$TARGET/mobileair" 2>/dev/null || true
-fi
-
-# Add to macOS firewall allowlist to prevent "accept incoming connections" prompts.
-# This requires sudo but only needs to be done once per path.
-FIREWALL_CMD="/usr/libexec/ApplicationFirewall/socketfilterfw"
-if [[ -x "$FIREWALL_CMD" ]]; then
-  echo "Adding to macOS firewall allowlist (may require sudo password)..."
-  # Remove any stale rule first, then add fresh
-  sudo "$FIREWALL_CMD" --remove "$TARGET/mobileair" >/dev/null 2>&1 || true
-  sudo "$FIREWALL_CMD" --add "$TARGET/mobileair"
-  sudo "$FIREWALL_CMD" --unblockapp "$TARGET/mobileair"
 fi
 
 install_wrapper

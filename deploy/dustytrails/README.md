@@ -91,16 +91,16 @@ location /dustytrails/ {
 
 ```bash
 # View logs
-ssh -t pi@raspi.local 'sudo journalctl -u dustytrails -f'
+ssh pi@raspi.local 'journalctl -u dustytrails -f'
 
 # Check status
-ssh -t pi@raspi.local 'sudo systemctl status dustytrails'
+ssh pi@raspi.local 'sudo systemctl status dustytrails'
 
 # Restart
-ssh -t pi@raspi.local 'sudo systemctl restart dustytrails'
+ssh pi@raspi.local 'sudo systemctl restart dustytrails'
 
 # Stop
-ssh -t pi@raspi.local 'sudo systemctl stop dustytrails'
+ssh pi@raspi.local 'sudo systemctl stop dustytrails'
 ```
 
 ## Files Deployed
@@ -165,7 +165,7 @@ ssh pi@raspi.local 'echo ok'
 ### Service won't start
 ```bash
 # Check logs
-ssh pi@raspi.local 'sudo journalctl -u dustytrails -n 50'
+ssh pi@raspi.local 'journalctl -u dustytrails -n 50'
 
 # Common issues:
 # - Python dependencies failed to install

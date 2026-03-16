@@ -46,23 +46,23 @@
     var target = _snapshotDate(idx);
     var dateStr = _formatDate(target);
     iframe.src = baseSrc + "?" + _snapshotParamStr(dateStr) + "&lite=1&fresh=1";
-    _widgetSnapshotParams = { date: dateStr, start: 14, duration: 2, basePlayhead: 60, speed: 20 };
+    _widgetSnapshotParams = { date: dateStr, start: 14, duration: 8, basePlayhead: 30, speed: 10 };
     _widgetLoadTime = Date.now();
     _snapshotIdx = idx;
     _updateIndicator(target);
   }
 
-  function _cycleSnapshot(idx) {
-    var iframe = document.getElementById("map-iframe");
-    if (!iframe || !iframe.contentWindow) return;
-    var target = _snapshotDate(idx);
-    var dateStr = _formatDate(target);
-    try { iframe.contentWindow.location.hash = _snapshotParamStr(dateStr); } catch(e) { _loadSnapshot(idx); return; }
-    _widgetSnapshotParams = { date: dateStr, start: 10, duration: 2, basePlayhead: 60, speed: 20 };
-    _widgetLoadTime = Date.now();
-    _snapshotIdx = idx;
-    _updateIndicator(target);
-  }
+  // function _cycleSnapshot(idx) {
+  //   var iframe = document.getElementById("map-iframe");
+  //   if (!iframe || !iframe.contentWindow) return;
+  //   var target = _snapshotDate(idx);
+  //   var dateStr = _formatDate(target);
+  //   try { iframe.contentWindow.location.hash = _snapshotParamStr(dateStr); } catch(e) { _loadSnapshot(idx); return; }
+  //   _widgetSnapshotParams = { date: dateStr, start: 14, duration: 8, basePlayhead: 30, speed: 10 };
+  //   _widgetLoadTime = Date.now();
+  //   _snapshotIdx = idx;
+  //   _updateIndicator(target);
+  // }
 
   function _updateIndicator(target) {
     var indicator = document.getElementById("snapshot-indicator");

@@ -61,6 +61,41 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", _syncPrefsToServer);
 
+// ── View sync (all visitors) ────────────────────────────────────────────
+// Every visitor gets a stable random client ID and syncs their map position
+// to /api/view/sync on page hide. No auth required.
+const _clientId = (() => {
+  const KEY = "dusty_cid";
+  let cid = localStorage.getItem(KEY);
+  if (!cid) {
+    cid = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6);
+    localStorage.setItem(KEY, cid);
+  }
+  return cid;
+})();
+
+function _syncViewToServer() {
+  if (_ownerTok) return; // owner's view is not logged
+  const raw = localStorage.getItem("mobileair.mapView");
+  if (!raw) return;
+  let v;
+  try { v = JSON.parse(raw); } catch { return; }
+  const lat = Number(v.lat), lon = Number(v.lon), zoom = Number(v.zoom);
+  if (!isFinite(lat) || !isFinite(lon) || !isFinite(zoom)) return;
+  const payload = JSON.stringify({ client_id: _clientId, lat, lon, zoom });
+  fetch("/api/view/sync", {
+    method: "POST",
+    body: payload,
+    headers: { "Content-Type": "application/json" },
+    keepalive: true,
+  }).catch(() => {});
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") _syncViewToServer();
+});
+window.addEventListener("pagehide", _syncViewToServer);
+
 // ETag for conditional polling — avoids re-downloading unchanged payloads.
 let _stateEtag = null;
 let _stateCached = null;
@@ -727,6 +762,129 @@ function main() {
     });
   }
 
+  // ── Camera history replay (visitors only, not owner) ───────────────────────
+  // Fetches /api/view/clients, shows a picker of client IDs, and
+  // replays the selected client's camera positions on the map.
+  const camReplayBtn = document.getElementById("camReplayBtn");
+  const camClientPicker = document.getElementById("camClientPicker");
+  if (camReplayBtn && !_ownerTok) {
+    camReplayBtn.classList.add("visible");
+    let _camReplaying = false;
+    let _camReplayStopped = false;
+    let _pickerOpen = false;
+
+    function _closePicker() {
+      _pickerOpen = false;
+      if (camClientPicker) camClientPicker.classList.add("hidden");
+    }
+
+    function _stopCamReplay() {
+      _camReplayStopped = true;
+      _camReplaying = false;
+      camReplayBtn.classList.remove("replaying");
+      camReplayBtn.title = "Replay visitor camera history";
+      camReplayBtn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>`;
+    }
+
+    async function _runCamReplay(clientId) {
+      _closePicker();
+      let entries;
+      try {
+        const resp = await fetch(`/api/view/log?client=${encodeURIComponent(clientId)}&n=500`);
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        entries = await resp.json();
+      } catch (e) {
+        console.warn("[CamReplay] Failed to load view log:", e);
+        _stopCamReplay();
+        return;
+      }
+
+      // Deduplicate near-identical positions
+      const snapshots = [];
+      let prevLat = null, prevLon = null, prevZoom = null;
+      for (const entry of entries) {
+        const lat = Number(entry.lat), lon = Number(entry.lon), zoom = Number(entry.zoom);
+        if (!isFinite(lat) || !isFinite(lon) || !isFinite(zoom)) continue;
+        if (prevLat !== null &&
+            Math.abs(lat - prevLat) < 0.002 &&
+            Math.abs(lon - prevLon) < 0.002 &&
+            Math.abs(zoom - prevZoom) < 0.3) continue;
+        snapshots.push({ lat, lon, zoom });
+        prevLat = lat; prevLon = lon; prevZoom = zoom;
+      }
+
+      if (snapshots.length === 0) {
+        console.warn("[CamReplay] No snapshots for client", clientId);
+        _stopCamReplay();
+        return;
+      }
+
+      for (let i = 0; i < snapshots.length; i++) {
+        if (_camReplayStopped) break;
+        const snap = snapshots[i];
+        camReplayBtn.innerHTML = `<span>${i + 1}/${snapshots.length}</span>`;
+        map._animateTo(
+          { centerLat: snap.lat, centerLon: snap.lon, zoom: snap.zoom },
+          { durationMs: 1200 }
+        );
+        await new Promise(r => setTimeout(r, 1800));
+      }
+      _stopCamReplay();
+    }
+
+    async function _showPicker() {
+      if (!camClientPicker) return;
+      camClientPicker.innerHTML = `<div class="camClientItem" style="opacity:0.5">Loading…</div>`;
+      camClientPicker.classList.remove("hidden");
+      _pickerOpen = true;
+      try {
+        const resp = await fetch("/api/view/clients");
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const clients = await resp.json();
+        if (!clients.length) {
+          camClientPicker.innerHTML = `<div class="camClientItem" style="opacity:0.5">No visitors yet</div>`;
+          return;
+        }
+        camClientPicker.innerHTML = "";
+        for (const c of clients) {
+          const item = document.createElement("div");
+          item.className = "camClientItem";
+          const label = c.client_id === _clientId ? `${c.client_id} (you)` : c.client_id;
+          item.innerHTML = `<span>${label}</span><span class="count">${c.count}</span>`;
+          item.addEventListener("click", () => {
+            _camReplaying = true;
+            _camReplayStopped = false;
+            camReplayBtn.classList.add("replaying");
+            camReplayBtn.title = "Stop replay";
+            camReplayBtn.innerHTML = `<span>■ …</span>`;
+            _runCamReplay(c.client_id);
+          });
+          camClientPicker.appendChild(item);
+        }
+      } catch (e) {
+        console.warn("[CamReplay] Failed to load clients:", e);
+        camClientPicker.innerHTML = `<div class="camClientItem" style="color:#d06060">Error loading</div>`;
+      }
+    }
+
+    // Click outside picker closes it
+    document.addEventListener("click", (e) => {
+      if (_pickerOpen && camClientPicker && !camClientPicker.contains(e.target) && e.target !== camReplayBtn) {
+        _closePicker();
+      }
+    });
+
+    camReplayBtn.addEventListener("click", () => {
+      if (_camReplaying) {
+        _stopCamReplay();
+      } else if (_pickerOpen) {
+        _closePicker();
+      } else {
+        _showPicker();
+      }
+    });
+  }
+
   // Tab click behavior:
   // - Click inactive tab: switch to that list, make markers visible if hidden
   // - Click active tab: toggle marker visibility on/off
@@ -1209,6 +1367,131 @@ function main() {
   const pbPagePrevEl = document.getElementById("pbPagePrev");
   const pbPageNextEl = document.getElementById("pbPageNext");
 
+  // ── A/B Barrel Jog Wheel ────────────────────────────────────────────────
+  const pbJogWheelEl    = document.getElementById("pbJogWheel");
+  const pbJogBarrelEl   = document.getElementById("pbJogBarrel");
+  const pbBarrelClipEl  = document.getElementById("pbBarrelClip");
+  const pbBarrelCanvas  = document.getElementById("pbBarrelCanvas");
+  const pbBarrelToggle  = document.getElementById("pbBarrelToggle");
+  let _jogWheel = null;          // JogWheel instance (created on first enable)
+  let _barrelMode = false;       // current A/B state
+  const _BARREL_STORAGE_KEY = "mobileair.barrelJogWheel";
+
+  function _setBarrelMode(on) {
+    return; // SHUNT: barrel feature bypassed — restore by removing this line
+    _barrelMode = on;
+    if (pbJogWheelEl) pbJogWheelEl.classList.toggle("hidden", on);
+    if (pbJogBarrelEl) pbJogBarrelEl.classList.toggle("hidden", !on);
+    if (pbBarrelToggle) pbBarrelToggle.checked = on;
+    try { localStorage.setItem(_BARREL_STORAGE_KEY, on ? "1" : "0"); } catch {}
+
+    if (on && !_jogWheel && pbJogBarrelEl && pbBarrelClipEl && pbBarrelCanvas && typeof JogWheel !== "undefined") {
+      _jogWheel = JogWheel.create({
+        wrapEl: pbJogBarrelEl,
+        clipEl: pbBarrelClipEl,
+        canvasEl: pbBarrelCanvas,
+        onWheel(delta) {
+          // Same physics as classic wheel handler on pbScrubEl
+          _pbAtEndSincePerf = null;
+          _pbArrivedAtEndViaPlayback = false;
+          _pbIsRewinding = false;
+          _pbPageAutoFollow = true;
+          map.setPlaybackPlaying(false);
+          map._playbackLiveFollow = false;
+          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
+          _pbIsWheelCoasting = true;
+          _pbCommitLoopStartOnCoastEnd = true;
+          if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+            const pr = _pbGetPageRange();
+            _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+          }
+          const b = map.getPlaybackBounds();
+          const durMs = (b.maxMs - b.minMs) || 1;
+          const nudge = (delta / 1000) * (durMs / 480);
+          const prevDir = Math.sign(_pbVelocity);
+          _pbVelocity -= nudge;
+          if (prevDir !== 0 && Math.sign(_pbVelocity) !== 0 && Math.sign(_pbVelocity) !== prevDir) {
+            _pbSnapWindowToPlayhead();
+            updatePlaybackUi();
+          }
+          if (!_pbRAF) {
+            _pbLastPerf = performance.now();
+            _pbRAF = requestAnimationFrame(playbackLoop);
+          }
+        },
+        onDragStart() {
+          // Same cancel-all-physics as classic pointerdown
+          _pbVelocity = 0;
+          _pbWheelAccum = 0;
+          _pbAtEndSincePerf = null;
+          _pbArrivedAtEndViaPlayback = false;
+          _pbIsRewinding = false;
+          _pbEaseStartPerf = null;
+          _pbIsWheelCoasting = false;
+          _pbScrubbing = true;
+          map._scrubbing = true;
+          _pbDidDrag = false;
+          map.setPlaybackPlaying(false);
+          map._playbackLiveFollow = false;
+          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
+          _resetLiveTracking();
+          if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+            const pr = _pbGetPageRange();
+            _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+          }
+          updatePlaybackUi();
+        },
+        onPositionChange(deltaFrac) {
+          // deltaFrac is already gear-reduced (dx / (width*8))
+          // Map to timeline ms and apply
+          _pbDidDrag = true;
+          const b = map.getPlaybackBounds();
+          const pr = _pbPagingActive() ? _pbGetPageRange() : b;
+          const durMs = (pr.maxMs - pr.minMs) || 1;
+          const tMs = map.getPlaybackTimeMs() || pr.minMs;
+          const newT = clamp(tMs + deltaFrac * durMs, pr.minMs, pr.maxMs);
+          map.setPlaybackTimeMs(newT);
+          map.setPlaybackPlaying(false);
+          // Coalesce render
+          if (!_scrubRAF) {
+            _scrubRAF = requestAnimationFrame(() => {
+              _scrubRAF = 0;
+              map.drawOverlay(map.lastState);
+              updatePlaybackUi();
+            });
+          }
+        },
+        onDragEnd(vel) {
+          _pbSnapWindowToPlayhead();
+          _pbScrubbing = false;
+          map._scrubbing = false;
+          // Convert barrel velocity to timeline velocity for inertial coasting
+          const b = map.getPlaybackBounds();
+          const pr = _pbPagingActive() ? _pbGetPageRange() : b;
+          const durMs = (pr.maxMs - pr.minMs) || 1;
+          _pbVelocity = (vel * durMs) / 16;
+          _pbIsWheelCoasting = false;
+          _pbPageAutoFollow = true;
+          map.setPlaybackPlaying(true);
+          _pbLastPerf = performance.now();
+          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        }
+      });
+    }
+  }
+
+  // Restore saved preference
+  {
+    const saved = localStorage.getItem(_BARREL_STORAGE_KEY);
+    if (saved === "1") _setBarrelMode(true);
+  }
+
+  if (pbBarrelToggle) {
+    pbBarrelToggle.addEventListener("change", () => {
+      _setBarrelMode(pbBarrelToggle.checked);
+    });
+  }
+
   let _pbRAF = null;
   let _pbLastPerf = 0;
   let _pbLastUiPerf = 0;
@@ -1290,6 +1573,136 @@ function main() {
   const _HIGH_ALERT_COOLDOWN_MS = 1200;  // 1.2s override cooldown
   const _SLC_BOUNDS = { minLat: 40.4, maxLat: 41.0, minLon: -112.2, maxLon: -111.7 };
 
+  // Whether the auto-center camera follow is enabled. Toggled by #autoCameraBtn.
+  let _autoCameraEnabled = true;
+
+  // Perform a live camera fit: compute bounds from current vehicle/sensor state
+  // and animate the camera to frame them. When force=true, bypasses _canRunAutoCamera
+  // and signature-dedup guards (used for explicit user action).
+  // In playback mode, uses the time-clipped trail data so the camera frames
+  // where vehicles are at the current scrub time, not the latest data.
+  function _performCameraFit({ force = false } = {}) {
+    const state = map.lastState;
+    const mobiles = state && Array.isArray(state.mobile) ? state.mobile : [];
+    const fixed = state && Array.isArray(state.fixed) ? state.fixed : [];
+    const logic = (typeof window !== "undefined") ? window.CameraFitLogic : null;
+    let bb = null;
+
+    // In playback mode, resolve each vehicle's position at the current playback time
+    // using _playbackPtsById (the same time-sorted data the renderer uses).
+    const pbTimeMs = map.playbackMode ? map.getPlaybackTimeMs() : null;
+    const usePbTime = pbTimeMs != null && isFinite(pbTimeMs) && map._playbackPtsById;
+
+    if (logic && typeof logic.collectRobustLiveBounds === "function") {
+      const vehicleEntries = [];
+      for (const m of mobiles) {
+        if (!m || m.ghosted) continue;
+        const id = m.id != null ? String(m.id) : "";
+
+        let headLat = NaN, headLon = NaN;
+        let trail = Array.isArray(m.trail) ? m.trail : [];
+
+        if (usePbTime && id) {
+          // Use playback points clipped to current scrub time
+          const pts = map._playbackPtsById.get(id);
+          if (pts && pts.length > 0) {
+            // Binary search for last point <= pbTimeMs
+            let lo = 0, hi = pts.length - 1;
+            while (lo < hi) {
+              const mid = (lo + hi + 1) >> 1;
+              if (pts[mid].tMs <= pbTimeMs) lo = mid; else hi = mid - 1;
+            }
+            if (pts[lo].tMs <= pbTimeMs) {
+              headLat = pts[lo].lat;
+              headLon = pts[lo].lon;
+              // Build a clipped trail for bounds calculation
+              trail = pts.slice(0, lo + 1).map(p => ({ lat: p.lat, lon: p.lon, t: p.t }));
+            }
+          }
+        }
+
+        // Fallback: walk raw trail backwards (live mode / no playback data)
+        if (!isFinite(headLat) || !isFinite(headLon)) {
+          if (trail.length === 0) continue;
+          for (let i = trail.length - 1; i >= 0; i--) {
+            const p = trail[i];
+            if (!p) continue;
+            const lat = Number(p.lat);
+            const lon = Number(p.lon);
+            if (isFinite(lat) && isFinite(lon)) { headLat = lat; headLon = lon; break; }
+          }
+        }
+        if (!isFinite(headLat) || !isFinite(headLon)) continue;
+        vehicleEntries.push({ id: m.id, lat: headLat, lon: headLon, trail });
+      }
+
+      const mustIncludePoints = [];
+      const _inSlc = (lat, lon) => lat >= _SLC_BOUNDS.minLat && lat <= _SLC_BOUNDS.maxLat
+        && lon >= _SLC_BOUNDS.minLon && lon <= _SLC_BOUNDS.maxLon;
+      for (const f of fixed) {
+        if (!f || f.purpleair) continue;
+        const flat = Number(f.lat), flon = Number(f.lon);
+        if (!isFinite(flat) || !isFinite(flon) || !_inSlc(flat, flon)) continue;
+        const w = (typeof pickWorstReadingKey === "function") ? pickWorstReadingKey(f.readings) : null;
+        if (w && typeof w.aqi === "number" && w.aqi >= _HIGH_ALERT_AQI_THRESHOLD) {
+          mustIncludePoints.push({ lat: flat, lon: flon });
+        }
+      }
+      for (const m of mobiles) {
+        if (!m || m.ghosted) continue;
+        const mlat = Number(m.lat), mlon = Number(m.lon);
+        if (!isFinite(mlat) || !isFinite(mlon) || !_inSlc(mlat, mlon)) continue;
+        const w = (typeof pickWorstReadingKey === "function") ? pickWorstReadingKey(m.readings) : null;
+        if (w && typeof w.aqi === "number" && w.aqi >= _HIGH_ALERT_AQI_THRESHOLD) {
+          mustIncludePoints.push({ lat: mlat, lon: mlon });
+        }
+      }
+
+      if (mustIncludePoints.length > 0 && map && typeof map._overrideCooldownForAlert === "function") {
+        map._overrideCooldownForAlert(_HIGH_ALERT_COOLDOWN_MS);
+      }
+
+      bb = logic.collectRobustLiveBounds(vehicleEntries, {
+        fixedSensors: fixed,
+        includeDebugPath: !!map._pbDebugPath,
+        maxSegmentLengthM: MapView.MAX_CAMERA_FIT_SEGMENT_LENGTH_M,
+        mustIncludePoints: mustIncludePoints.length > 0 ? mustIncludePoints : null,
+      });
+    } else {
+      bb = _collectHeadPositionBounds(mobiles);
+    }
+
+    if (bb && bb.visibleVehicleCount >= 2 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
+      _animateFitBoundsLatLon(bb, { durationMs: _pbLiveFollowDurationMs, force });
+    } else {
+      _animateToStoredView(_pbLiveFollowDurationMs);
+    }
+  }
+
+  // Returns true if the user is zoomed in enough that SLC extends beyond the
+  // viewport — i.e. they're looking at vehicle-level detail, not the whole metro.
+  // If SLC fits entirely on screen, the user is zoomed out and auto-camera should not fire.
+  function _slcInView() {
+    if (!map || !map.tilesCanvas) return true; // fail open
+    const rect = map.tilesCanvas.getBoundingClientRect();
+    const w = rect.width, h = rect.height;
+    if (w <= 0 || h <= 0) return true;
+    const z = map.zoom;
+    const centerW = latLonToWorld(map.center.lat, map.center.lon, z);
+    const toScreen = (lat, lon) => {
+      const wpt = latLonToWorld(lat, lon, z);
+      return { x: wpt.x - centerW.x + w / 2, y: wpt.y - centerW.y + h / 2 };
+    };
+    const tl = toScreen(_SLC_BOUNDS.maxLat, _SLC_BOUNDS.minLon);
+    const br = toScreen(_SLC_BOUNDS.minLat, _SLC_BOUNDS.maxLon);
+    // Must overlap viewport at all
+    if (br.x <= 0 || tl.x >= w || br.y <= 0 || tl.y >= h) return false;
+    // SLC must be larger than the viewport in at least one axis (zoomed in)
+    const slcW = br.x - tl.x;
+    const slcH = br.y - tl.y;
+    return slcW > w || slcH > h;
+  }
+
   // Smoothly animate back to the user's stored view (from localStorage) when no
   // meaningful vehicle movement is detected. Acts as a screensaver-like idle return.
   function _animateToStoredView(durationMs) {
@@ -1323,12 +1736,13 @@ function main() {
     }
   }
 
-  function _animateFitBoundsLatLon({ minLat, minLon, maxLat, maxLon }, { durationMs = _pbLiveFollowDurationMs } = {}) {
+  function _animateFitBoundsLatLon({ minLat, minLon, maxLat, maxLon }, { durationMs = _pbLiveFollowDurationMs, force = false } = {}) {
     if (!isFinite(minLat) || !isFinite(maxLat) || !isFinite(minLon) || !isFinite(maxLon)) return;
 
     // User interaction always wins: do not start/continue auto camera fits while the user
     // is actively panning/zooming, or during the post-interaction cooldown.
-    if (map && typeof map._canRunAutoCamera === "function" && !map._canRunAutoCamera()) {
+    // Exception: force=true (explicit user button click) overrides the cooldown.
+    if (!force && map && typeof map._canRunAutoCamera === "function" && !map._canRunAutoCamera()) {
       // Defer: replay this fit once the user stops interacting.
       _deferredCameraFit = { type: "bounds", bb: { minLat, minLon, maxLat, maxLon }, durationMs };
       return;
@@ -1365,6 +1779,17 @@ function main() {
     const w = rect.width;
     const h = rect.height;
     const pad = map._getOverlayPaddingPx ? map._getOverlayPaddingPx() : { left: 0, right: 0, top: 0, bottom: 0 };
+
+    // Account for the playback bar at the bottom so the camera centers in the visible map area.
+    const pbBarEl = document.getElementById("playbackBar");
+    if (pbBarEl) {
+      const pbRect = pbBarEl.getBoundingClientRect();
+      if (pbRect.height > 0) {
+        const overlap = Math.max(0, rect.bottom - pbRect.top);
+        if (overlap > 0) pad.bottom = Math.max(pad.bottom, overlap + 10);
+      }
+    }
+
     const availW = Math.max(40, w - pad.left - pad.right);
     const availH = Math.max(40, h - pad.top - pad.bottom);
 
@@ -1394,8 +1819,8 @@ function main() {
       const currentSig = `${qLatLon(Number(curr.lat))}|${qLatLon(Number(curr.lon))}|${qZoom(Number(map?.zoom))}`;
       const targetSig = `${qLatLon(Number(finalCenter.lat))}|${qLatLon(Number(finalCenter.lon))}|${qZoom(Number(targetZoom))}`;
 
-      if (currentSig === targetSig) return;
-      if (map && map._centerAnimRAF && map._autoFitInFlightSig === targetSig) return;
+      if (!force && currentSig === targetSig) return;
+      if (!force && map && map._centerAnimRAF && map._autoFitInFlightSig === targetSig) return;
       if (map) {
         map._autoFitInFlightSig = targetSig;
         map._lastAutoFitSig = targetSig;
@@ -2043,78 +2468,8 @@ function main() {
     // a distant long-route vehicle doesn't drag the camera to city scale.
     // ─────────────────────────────────────────────────────────────────────────
     {
-      if ((newDataArrived || forceCameraFit) && map._playbackLiveFollow) {
-        const state = map.lastState;
-        const mobiles = state && Array.isArray(state.mobile) ? state.mobile : [];
-        const fixed = state && Array.isArray(state.fixed) ? state.fixed : [];
-        const logic = (typeof window !== "undefined") ? window.CameraFitLogic : null;
-        let bb = null;
-
-        if (logic && typeof logic.collectRobustLiveBounds === "function") {
-          // Build per-vehicle entries: head position + trail reference
-          const vehicleEntries = [];
-          for (const m of mobiles) {
-            if (!m || m.ghosted) continue;
-            const trail = Array.isArray(m.trail) ? m.trail : [];
-            if (trail.length === 0) continue;
-            let headLat = NaN, headLon = NaN;
-            for (let i = trail.length - 1; i >= 0; i--) {
-              const p = trail[i];
-              if (!p) continue;
-              const lat = Number(p.lat);
-              const lon = Number(p.lon);
-              if (isFinite(lat) && isFinite(lon)) { headLat = lat; headLon = lon; break; }
-            }
-            if (!isFinite(headLat) || !isFinite(headLon)) continue;
-            vehicleEntries.push({ id: m.id, lat: headLat, lon: headLon, trail });
-          }
-
-          // High-AQI alert: force-include sensors with harmful readings within SLC metro.
-          // These bypass cluster-radius gating so the camera pulls toward the event.
-          const mustIncludePoints = [];
-          const _inSlc = (lat, lon) => lat >= _SLC_BOUNDS.minLat && lat <= _SLC_BOUNDS.maxLat
-            && lon >= _SLC_BOUNDS.minLon && lon <= _SLC_BOUNDS.maxLon;
-          for (const f of fixed) {
-            if (!f || f.purpleair) continue;
-            const flat = Number(f.lat), flon = Number(f.lon);
-            if (!isFinite(flat) || !isFinite(flon) || !_inSlc(flat, flon)) continue;
-            const w = (typeof pickWorstReadingKey === "function") ? pickWorstReadingKey(f.readings) : null;
-            if (w && typeof w.aqi === "number" && w.aqi >= _HIGH_ALERT_AQI_THRESHOLD) {
-              mustIncludePoints.push({ lat: flat, lon: flon });
-            }
-          }
-          for (const m of mobiles) {
-            if (!m || m.ghosted) continue;
-            const mlat = Number(m.lat), mlon = Number(m.lon);
-            if (!isFinite(mlat) || !isFinite(mlon) || !_inSlc(mlat, mlon)) continue;
-            const w = (typeof pickWorstReadingKey === "function") ? pickWorstReadingKey(m.readings) : null;
-            if (w && typeof w.aqi === "number" && w.aqi >= _HIGH_ALERT_AQI_THRESHOLD) {
-              mustIncludePoints.push({ lat: mlat, lon: mlon });
-            }
-          }
-
-          // Override cooldown if any high-AQI sensors detected
-          if (mustIncludePoints.length > 0 && map && typeof map._overrideCooldownForAlert === "function") {
-            map._overrideCooldownForAlert(_HIGH_ALERT_COOLDOWN_MS);
-          }
-
-          bb = logic.collectRobustLiveBounds(vehicleEntries, {
-            fixedSensors: fixed,
-            includeDebugPath: !!map._pbDebugPath,
-            maxSegmentLengthM: MapView.MAX_CAMERA_FIT_SEGMENT_LENGTH_M,
-            mustIncludePoints: mustIncludePoints.length > 0 ? mustIncludePoints : null,
-          });
-        } else {
-          bb = _collectHeadPositionBounds(mobiles);
-        }
-
-        if (bb && bb.visibleVehicleCount >= 2 && isFinite(bb.minLat) && isFinite(bb.maxLat)) {
-          _animateFitBoundsLatLon(bb, { durationMs: _pbLiveFollowDurationMs });
-        } else {
-          // Not enough active vehicles/sensors to form a meaningful view —
-          // return to the user's stored camera position.
-          _animateToStoredView(_pbLiveFollowDurationMs);
-        }
+      if (_autoCameraEnabled && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && _slcInView()) {
+        _performCameraFit();
       }
     }
 
@@ -2348,6 +2703,7 @@ function main() {
     // RENDER
     // ─────────────────────────────────────────────────────────────────────────
     if (didAdvanceTime) {
+      map._compositePaFieldOnTiles(map.lastState);
       map.drawOverlay(map.lastState, { cacheUnderlay: true });
     }
 
@@ -2394,6 +2750,17 @@ function main() {
 
     // Sync legend tab to selected marker's displayed pollutant (changes during scrub)
     syncLegendToMapSelection();
+
+    // ── Barrel jog wheel: sync position & render ──
+    if (_barrelMode && _jogWheel) {
+      const b2 = map.getPlaybackBounds();
+      const t2 = map.getPlaybackTimeMs();
+      if (isFinite(b2.minMs) && isFinite(b2.maxMs) && b2.maxMs > b2.minMs && isFinite(t2)) {
+        const frac = (t2 - b2.minMs) / (b2.maxMs - b2.minMs);
+        if (!_jogWheel.isScrubbing()) _jogWheel.setPosition(frac);
+      }
+      _jogWheel.render();
+    }
 
     // Keep loop running if there's any motion or pending state
     const markerInertiaActive = (typeof map._hasPbMarkerInertia === "function") ? !!map._hasPbMarkerInertia() : false;
@@ -3112,6 +3479,24 @@ function main() {
   const pbMenu = document.getElementById("pbMenu");
   const pbDaysSubmenu = document.getElementById("pbDaysSubmenu");
   const shareBtn = document.getElementById("shareBtn");
+  const autoCameraBtn = document.getElementById("autoCameraBtn");
+
+  function _updateAutoCameraBtn() {
+    if (!autoCameraBtn) return;
+    autoCameraBtn.classList.toggle("active", _autoCameraEnabled);
+    autoCameraBtn.title = `Auto-center camera: ${_autoCameraEnabled ? "on" : "off"}`;
+    autoCameraBtn.setAttribute("aria-label", `Toggle auto-center camera (currently ${_autoCameraEnabled ? "on" : "off"})`);
+  }
+  _updateAutoCameraBtn();
+
+  if (autoCameraBtn) {
+    autoCameraBtn.addEventListener("click", () => {
+      _autoCameraEnabled = !_autoCameraEnabled;
+      _updateAutoCameraBtn();
+      // Immediately fly camera to vehicles when toggling on.
+      if (_autoCameraEnabled) _performCameraFit({ force: true });
+    });
+  }
   
   // Menu close delay for better UX
   let _menuHideTimer = null;

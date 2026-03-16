@@ -46,12 +46,12 @@ SLC_LAT = 40.7608
 SLC_LON = -111.8910
 SLC_ZIP = "84101"
 
-# SLC metro bounding box
+# SLC metro bounding box (extended to cover Provo ↔ Ogden corridor)
 SLC_BOUNDS = {
-    "lat_min": 40.4,
-    "lat_max": 41.0,
-    "lon_min": -112.2,
-    "lon_max": -111.7,
+    "lat_min": 40.1,
+    "lat_max": 41.3,
+    "lon_min": -112.45,
+    "lon_max": -111.45,
 }
 
 # AQI color/category mapping
