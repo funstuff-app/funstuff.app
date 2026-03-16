@@ -1378,7 +1378,6 @@ function main() {
   const _BARREL_STORAGE_KEY = "mobileair.barrelJogWheel";
 
   function _setBarrelMode(on) {
-    return; // SHUNT: barrel feature bypassed — restore by removing this line
     _barrelMode = on;
     if (pbJogWheelEl) pbJogWheelEl.classList.toggle("hidden", on);
     if (pbJogBarrelEl) pbJogBarrelEl.classList.toggle("hidden", !on);
@@ -1480,7 +1479,7 @@ function main() {
     }
   }
 
-  // Restore saved preference
+  // Restore saved preference (default: classic jog wheel)
   {
     const saved = localStorage.getItem(_BARREL_STORAGE_KEY);
     if (saved === "1") _setBarrelMode(true);
@@ -2760,6 +2759,21 @@ function main() {
         if (!_jogWheel.isScrubbing()) _jogWheel.setPosition(frac);
       }
       _jogWheel.render();
+    }
+
+    // ── Classic jog wheel: sync ridge position ──
+    if (!_barrelMode && pbJogWheelEl && !_pbScrubbing) {
+      const _jwRidges = pbJogWheelEl.querySelector('.jogRidges');
+      if (_jwRidges) {
+        _jwRidges.style.animation = 'none';
+        const b2 = map.getPlaybackBounds();
+        const t2 = map.getPlaybackTimeMs();
+        if (isFinite(b2.minMs) && isFinite(b2.maxMs) && b2.maxMs > b2.minMs && isFinite(t2)) {
+          const frac = (t2 - b2.minMs) / (b2.maxMs - b2.minMs);
+          const travel = pbJogWheelEl.offsetWidth * 4;
+          _jwRidges.style.backgroundPosition = (frac * travel) + 'px 0';
+        }
+      }
     }
 
     // Keep loop running if there's any motion or pending state
@@ -4255,6 +4269,230 @@ function main() {
       _pbLastPerf = performance.now();
       if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
       applyScrub();
+    });
+  }
+
+  // ── Classic Jog Wheel interaction ──────────────────────────────────────────
+  // Mirrors the dev slider (pbScrubEl) and barrel (JogWheel) physics so the
+  // CSS jog wheel is a fully interactable scrubbing surface.
+  if (pbJogWheelEl) {
+    const _jogRidgesEl = pbJogWheelEl.querySelector('.jogRidges');
+    const _jogSheenEl = pbJogWheelEl.querySelector('.jogSheen');
+    const JOG_GEAR = 8;
+    let _jogPtrX = 0;
+    let _jogPtrTime = 0;
+    let _jogDragVel = 0;
+    let _jogHintKilled = false;
+
+    // Single source of truth: read playback time, position ridges.
+    function _syncJogRidges() {
+      if (!_jogRidgesEl) return;
+      if (!_jogHintKilled) { _jogHintKilled = true; _jogRidgesEl.style.animation = 'none'; }
+      const b = map.getPlaybackBounds();
+      const t = map.getPlaybackTimeMs();
+      if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs) || !isFinite(t)) return;
+      const frac = (t - b.minMs) / (b.maxMs - b.minMs);
+      const travel = pbJogWheelEl.offsetWidth * 4;
+      _jogRidgesEl.style.backgroundPosition = (frac * travel) + 'px 0';
+    }
+
+    // ── Pointer drag ──
+    pbJogWheelEl.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      _pbVelocity = 0;
+      _pbWheelAccum = 0;
+      _pbAtEndSincePerf = null;
+      _pbArrivedAtEndViaPlayback = false;
+      _pbIsRewinding = false;
+      _pbEaseStartPerf = null;
+      _pbIsWheelCoasting = false;
+      _pbScrubbing = true;
+      map._scrubbing = true;
+      _pbDidDrag = false;
+      _jogPtrX = e.clientX;
+      _jogPtrTime = performance.now();
+      _jogDragVel = 0;
+      pbJogWheelEl.setPointerCapture(e.pointerId);
+      map.setPlaybackPlaying(false);
+      map._playbackLiveFollow = false;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, '0'); } catch {}
+      _resetLiveTracking();
+      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+        const pr = _pbGetPageRange();
+        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+      }
+      updatePlaybackUi();
+    });
+
+    pbJogWheelEl.addEventListener('pointermove', (e) => {
+      if (!_pbScrubbing) return;
+      const dx = e.clientX - _jogPtrX;
+      const now = performance.now();
+      const dt = Math.max(1, now - _jogPtrTime);
+      _jogDragVel = (dx / dt) * 16; // px per 16ms frame
+      _jogPtrX = e.clientX;
+      _jogPtrTime = now;
+      _pbDidDrag = true;
+
+      const deltaFrac = dx / (pbJogWheelEl.offsetWidth * JOG_GEAR);
+      const b = map.getPlaybackBounds();
+      const pr = _pbPagingActive() ? _pbGetPageRange() : b;
+      const durMs = (pr.maxMs - pr.minMs) || 1;
+      const tMs = map.getPlaybackTimeMs() || pr.minMs;
+      const newT = clamp(tMs + deltaFrac * durMs, pr.minMs, pr.maxMs);
+      map.setPlaybackTimeMs(newT);
+      map.setPlaybackPlaying(false);
+
+      if (!_scrubRAF) {
+        _scrubRAF = requestAnimationFrame(() => {
+          _scrubRAF = 0;
+          _syncJogRidges();
+          map.drawOverlay(map.lastState);
+          updatePlaybackUi();
+        });
+      }
+    });
+
+    pbJogWheelEl.addEventListener('pointerup', () => {
+      if (!_pbScrubbing) return;
+      _pbSnapWindowToPlayhead();
+      _pbScrubbing = false;
+      map._scrubbing = false;
+      // Decay velocity if pointer was idle before release
+      const idleMs = performance.now() - _jogPtrTime;
+      const dragVel = idleMs > 80 ? 0 : _jogDragVel;
+      const vel = dragVel / (pbJogWheelEl.offsetWidth * JOG_GEAR);
+      const b = map.getPlaybackBounds();
+      const pr = _pbPagingActive() ? _pbGetPageRange() : b;
+      const durMs = (pr.maxMs - pr.minMs) || 1;
+      _pbVelocity = (vel * durMs) / 16;
+      _pbIsWheelCoasting = Math.abs(_pbVelocity) > 0.01;
+      _pbCommitLoopStartOnCoastEnd = _pbIsWheelCoasting;
+      _pbPageAutoFollow = true;
+      // Don't set playbackPlaying — let the coasting friction branch handle inertia
+      if (!_pbIsWheelCoasting) map.setPlaybackPlaying(true);
+      _pbLastPerf = performance.now();
+      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+    });
+
+    // ── Wheel / trackpad ──
+    pbJogWheelEl.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      _pbAtEndSincePerf = null;
+      _pbArrivedAtEndViaPlayback = false;
+      _pbIsRewinding = false;
+      _pbPageAutoFollow = true;
+      map.setPlaybackPlaying(false);
+      map._playbackLiveFollow = false;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, '0'); } catch {}
+      _pbIsWheelCoasting = true;
+      _pbCommitLoopStartOnCoastEnd = true;
+      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+        const pr = _pbGetPageRange();
+        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+      }
+      const b = map.getPlaybackBounds();
+      const durMs = (b.maxMs - b.minMs) || 1;
+      const isH = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
+      const isMouse = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
+      const delta = isH ? e.deltaX : (isMouse ? e.deltaY : -e.deltaY) * 0.15;
+      const nudge = (delta / 1000) * (durMs / 480);
+      const prevDir = Math.sign(_pbVelocity);
+      _pbVelocity -= nudge;
+      if (prevDir !== 0 && Math.sign(_pbVelocity) !== 0 && Math.sign(_pbVelocity) !== prevDir) {
+        _pbSnapWindowToPlayhead();
+        updatePlaybackUi();
+      }
+      if (!_pbRAF) {
+        _pbLastPerf = performance.now();
+        _pbRAF = requestAnimationFrame(playbackLoop);
+      }
+    }, { passive: false });
+
+    // ── Touch drag (reduced sensitivity, matching dev slider) ──
+    let _jogTouchStartX = null;
+    let _jogTouchLastX = null;
+    let _jogTouchLastTime = 0;
+    let _jogTouchDragVel = 0;
+    const JOG_TOUCH_SENS = 0.3;
+
+    pbJogWheelEl.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      const t = e.touches[0];
+      _jogTouchStartX = t.clientX;
+      _jogTouchLastX = t.clientX;
+      _jogTouchLastTime = performance.now();
+      _jogTouchDragVel = 0;
+      _pbVelocity = 0;
+      _pbWheelAccum = 0;
+      _pbAtEndSincePerf = null;
+      _pbArrivedAtEndViaPlayback = false;
+      _pbIsRewinding = false;
+      _pbEaseStartPerf = null;
+      _pbIsWheelCoasting = false;
+      _pbScrubbing = true;
+      map._scrubbing = true;
+      _pbDidDrag = false;
+      map.setPlaybackPlaying(false);
+      map._playbackLiveFollow = false;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, '0'); } catch {}
+      _resetLiveTracking();
+      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+        const pr = _pbGetPageRange();
+        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+      }
+      updatePlaybackUi();
+    }, { passive: false });
+
+    pbJogWheelEl.addEventListener('touchmove', (e) => {
+      if (_jogTouchStartX == null) return;
+      e.preventDefault();
+      const t = e.touches[0];
+      const dx = (t.clientX - _jogTouchLastX) * JOG_TOUCH_SENS;
+      const now = performance.now();
+      const dt = Math.max(1, now - _jogTouchLastTime);
+      _jogTouchDragVel = (dx / dt) * 16;
+      _jogTouchLastX = t.clientX;
+      _jogTouchLastTime = now;
+      _pbDidDrag = true;
+
+      const deltaFrac = dx / (pbJogWheelEl.offsetWidth * JOG_GEAR);
+      const b = map.getPlaybackBounds();
+      const pr = _pbPagingActive() ? _pbGetPageRange() : b;
+      const durMs = (pr.maxMs - pr.minMs) || 1;
+      const tMs = map.getPlaybackTimeMs() || pr.minMs;
+      const newT = clamp(tMs + deltaFrac * durMs, pr.minMs, pr.maxMs);
+      map.setPlaybackTimeMs(newT);
+      map.setPlaybackPlaying(false);
+
+      if (!_scrubRAF) {
+        _scrubRAF = requestAnimationFrame(() => {
+          _scrubRAF = 0;
+          _syncJogRidges();
+          map.drawOverlay(map.lastState);
+          updatePlaybackUi();
+        });
+      }
+    }, { passive: false });
+
+    pbJogWheelEl.addEventListener('touchend', () => {
+      _jogTouchStartX = null;
+      _pbSnapWindowToPlayhead();
+      _pbScrubbing = false;
+      map._scrubbing = false;
+      const idleMs = performance.now() - _jogTouchLastTime;
+      const dragVel = idleMs > 80 ? 0 : _jogTouchDragVel;
+      const vel = dragVel / (pbJogWheelEl.offsetWidth * JOG_GEAR);
+      const b = map.getPlaybackBounds();
+      const pr = _pbPagingActive() ? _pbGetPageRange() : b;
+      const durMs = (pr.maxMs - pr.minMs) || 1;
+      _pbVelocity = (vel * durMs) / 16;
+      _pbIsWheelCoasting = Math.abs(_pbVelocity) > 0.01;
+      _pbCommitLoopStartOnCoastEnd = _pbIsWheelCoasting;
+      _pbPageAutoFollow = true;
+      if (!_pbIsWheelCoasting) map.setPlaybackPlaying(true);
+      _pbLastPerf = performance.now();
+      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
     });
   }
 

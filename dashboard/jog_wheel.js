@@ -81,7 +81,7 @@
     const lLen = Math.sqrt(lx * lx + ly * ly + lz * lz);
     const Lx = lx / lLen, Ly = ly / lLen, Lz = lz / lLen;
 
-    const barrelHalfH = H * 0.5;
+    const barrelHalfH = H * 1.0;
     const cy = H * 0.5;
     const centerR = MAJOR_R + MINOR_R;
 
@@ -102,8 +102,8 @@
       const hRadius = MAJOR_R + MINOR_R * cosPhi;
 
       const yClip = y / (H - 1);
-      const topOcc = yClip < 0.10 ? (1 - yClip / 0.10) * 0.65 : 0;
-      const botOcc = yClip > 0.85 ? ((yClip - 0.85) / 0.15) * 0.50 : 0;
+      const topOcc = yClip < 0.15 ? (1 - yClip / 0.15) * 0.55 : 0;
+      const botOcc = yClip > 0.80 ? ((yClip - 0.80) / 0.20) * 0.45 : 0;
       const occlusion = 1 - topOcc - botOcc;
 
       for (let x = 0; x < W; x++) {

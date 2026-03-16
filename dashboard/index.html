@@ -157,15 +157,15 @@
         <div id="playbackBar" class="playbackBar" role="group" aria-label="Playback controls">
           <div class="pbRow1">
             <button id="pbPlay" type="button" title="Play/Pause">Live</button>
-            <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" />
-            <!-- Classic CSS jog wheel (A) — SHUNTED: barrel feature bypass -->
-            <div class="jogWheel" id="pbJogWheel" style="display:none">
+            <input id="pbScrub" type="range" min="0" max="1" value="0" step="1" aria-label="Scrub time" style="display:none" />
+            <!-- Classic CSS jog wheel (A) -->
+            <div class="jogWheel" id="pbJogWheel">
               <div class="jogRidges"></div>
               <div class="jogSheen"></div>
               <div class="jogPlayhead"></div>
             </div>
-            <!-- Canvas barrel jog wheel (B) — SHUNTED -->
-            <div class="jogBarrel hidden" id="pbJogBarrel" style="display:none">
+            <!-- Canvas barrel jog wheel (B) -->
+            <div class="jogBarrel hidden" id="pbJogBarrel">
               <svg width="0" height="0" style="position:absolute">
                 <defs>
                   <clipPath id="barrelClip" clipPathUnits="objectBoundingBox">
@@ -199,9 +199,9 @@
               </select>
             </label>
           </div>
-          <!-- A/B toggle for jog wheel style — SHUNTED -->
-          <div class="pbRow0" id="pbRow0" style="display:none">
-            <label class="iosToggle" title="Switch between classic and barrel jog wheel">
+          <!-- A/B toggle for jog wheel style -->
+          <div class="pbRow0" id="pbRow0">
+            <label class="iosToggle" style="display: none !important" title="Switch between classic and barrel jog wheel">
               <input type="checkbox" id="pbBarrelToggle" />
               <span class="iosToggleTrack"><span class="iosToggleThumb"></span></span>
             </label>
