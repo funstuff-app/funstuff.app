@@ -250,7 +250,7 @@ class MapView {
     this._tilesSnapshotMeta = null; // { zoom, centerLat, centerLon }
 
     // Theme
-    this.themeKey = "carto_voyager";
+    this.themeKey = "carto_dark_all";
     const t = TILE_THEMES[this.themeKey];
     this.tileTemplate = t.template;
     this.tileSubdomains = t.subdomains;
@@ -288,25 +288,35 @@ class MapView {
     });
     this._ro.observe(this.tilesCanvas.parentElement);
 
-    // Fullscreen change can briefly detach/reattach the parent; re-observe and
-    // force a resize after the browser has committed the new layout.
-    this._onFullscreenChange = () => {
-      const parent = this.tilesCanvas.parentElement;
-      if (parent) this._ro.observe(parent);
-      // Clear cached dimensions so the guard never skips the post-fullscreen resize.
+    // Any viewport change: fullscreen, window resize, display switch.
+    // Bust the guard so the next resize applies the correct size.
+    this._forceResize = () => {
       this._cssW = 0;
       this._cssH = 0;
-      // visualViewport gives the true visible area; fall back to innerWidth/Height.
-      const vv = window.visualViewport;
-      requestAnimationFrame(() => {
-        const w = vv ? vv.width : window.innerWidth;
-        const h = vv ? vv.height : window.innerHeight;
-        this.resize(w, h);
-      });
+      const parent = this.tilesCanvas.parentElement;
+      if (parent) {
+        this._ro.observe(parent);
+        const w = parent.clientWidth;
+        const h = parent.clientHeight;
+        if (w > 0 && h > 0) this.resize(w, h);
+      }
     };
-    document.addEventListener("fullscreenchange", this._onFullscreenChange);
-    document.addEventListener("webkitfullscreenchange", this._onFullscreenChange);
-    
+    window.addEventListener("resize", () => this._forceResize());
+    document.addEventListener("fullscreenchange", () => this._forceResize());
+    document.addEventListener("webkitfullscreenchange", () => this._forceResize());
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", () => this._forceResize());
+    }
+    // DPR change watcher (display switches).
+    this._watchDpr = () => {
+      const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      mq.addEventListener("change", () => {
+        this._forceResize();
+        this._watchDpr();
+      }, { once: true });
+    };
+    this._watchDpr();
+
     this.overlayCanvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
     // Safari (macOS) provides native trackpad pinch as gesture events.
     this.overlayCanvas.addEventListener("gesturestart", (e) => this.onGestureStart(e), { passive: false });
@@ -762,8 +772,8 @@ class MapView {
 
   setTheme(themeKey) {
     const k = String(themeKey || "");
-    const t = TILE_THEMES[k] || TILE_THEMES["carto_voyager"];
-    this.themeKey = TILE_THEMES[k] ? k : "carto_voyager";
+    const t = TILE_THEMES[k] || TILE_THEMES["carto_dark_all"];
+    this.themeKey = TILE_THEMES[k] ? k : "carto_dark_all";
     this.tileTemplate = t.template;
     this.tileSubdomains = t.subdomains;
     this._tileEpoch++;

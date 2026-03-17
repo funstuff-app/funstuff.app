@@ -10,14 +10,14 @@ var TILE_SIZE = 256;
 
 // Basemap is fixed to CARTO Voyager.
 var TILE_THEMES = {
-  carto_voyager: {
-    label: "CARTO Voyager",
-    template: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
-    subdomains: ["a", "b", "c", "d"],
-    filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
-    defaultDim: 25,
-    bgColor: "#c4c0b8",
-  },
+  // carto_voyager: {
+  //   label: "CARTO Voyager",
+  //   template: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+  //   subdomains: ["a", "b", "c", "d"],
+  //   filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
+  //   defaultDim: 25,
+  //   bgColor: "#c4c0b8",
+  // },
   carto_dark_all: {
     label: "CARTO Dark (all)",
     template: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
@@ -36,30 +36,30 @@ var TILE_THEMES = {
     defaultSat: 118,
     bgColor: "#282828",
   },
-  carto_positron_all: {
-    label: "CARTO Positron (all)",
-    template: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-    subdomains: ["a", "b", "c", "d"],
-    filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
-    defaultDim: 25,
-    bgColor: "#a8a8a6",
-  },
-  carto_positron_nolabels: {
-    label: "CARTO Positron (no labels)",
-    template: "https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png",
-    subdomains: ["a", "b", "c", "d"],
-    filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
-    defaultDim: 25,
-    bgColor: "#a8a8a6",
-  },
-  osm: {
-    label: "OSM Standard",
-    template: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-    subdomains: [""],
-    filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
-    defaultDim: 25,
-    bgColor: "#b5b2ab",
-  },
+  // carto_positron_all: {
+  //   label: "CARTO Positron (all)",
+  //   template: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+  //   subdomains: ["a", "b", "c", "d"],
+  //   filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
+  //   defaultDim: 25,
+  //   bgColor: "#a8a8a6",
+  // },
+  // carto_positron_nolabels: {
+  //   label: "CARTO Positron (no labels)",
+  //   template: "https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png",
+  //   subdomains: ["a", "b", "c", "d"],
+  //   filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
+  //   defaultDim: 25,
+  //   bgColor: "#a8a8a6",
+  // },
+  // osm: {
+  //   label: "OSM Standard",
+  //   template: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  //   subdomains: [""],
+  //   filter: { saturate: 0.55, brightness: 0.72, contrast: 1.12 },
+  //   defaultDim: 25,
+  //   bgColor: "#b5b2ab",
+  // },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1109,7 +1109,9 @@ function main() {
   }
   
   function getDefaultThemeForMode() {
-    return isSystemDarkMode() ? "carto_dark_all" : "carto_voyager";
+    // Light themes disabled — always default to dark
+    return "carto_dark_all";
+    // return isSystemDarkMode() ? "carto_dark_all" : "carto_voyager";
   }
   
   function getSavedThemeForCurrentMode() {
@@ -1182,32 +1184,32 @@ function main() {
     applyThemeAndFilters(fallbackTheme, fallbackT.defaultDim ?? 70, Math.round(100 * (fallbackT.filter?.saturate ?? 1.30)));
   }
   
-  // Listen for system theme changes
-  if (window.matchMedia) {
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-      const newTheme = getSavedThemeForCurrentMode();
-      applyTheme(newTheme);
-    });
-  }
+  // System theme auto-switching disabled (light themes disabled)
+  // if (window.matchMedia) {
+  //   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  //     const newTheme = getSavedThemeForCurrentMode();
+  //     applyTheme(newTheme);
+  //   });
+  // }
 
-  // Re-check system theme when app returns to foreground (PWA / tab switch).
-  // The matchMedia 'change' event may not fire while the app is backgrounded,
-  // so the theme can get out of sync until the user interacts.
-  {
-    let _lastKnownSystemDark = isSystemDarkMode();
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState !== "visible") return;
-      const nowDark = isSystemDarkMode();
-      if (nowDark !== _lastKnownSystemDark) {
-        _lastKnownSystemDark = nowDark;
-        const newTheme = getSavedThemeForCurrentMode();
-        // Only switch if the current theme's dark/light doesn't match system
-        if (isThemeDark(_currentThemeKey) !== nowDark) {
-          applyTheme(newTheme);
-        }
-      }
-    });
-  }
+  // // Re-check system theme when app returns to foreground (PWA / tab switch).
+  // // The matchMedia 'change' event may not fire while the app is backgrounded,
+  // // so the theme can get out of sync until the user interacts.
+  // {
+  //   let _lastKnownSystemDark = isSystemDarkMode();
+  //   document.addEventListener("visibilitychange", () => {
+  //     if (document.visibilityState !== "visible") return;
+  //     const nowDark = isSystemDarkMode();
+  //     if (nowDark !== _lastKnownSystemDark) {
+  //       _lastKnownSystemDark = nowDark;
+  //       const newTheme = getSavedThemeForCurrentMode();
+  //       // Only switch if the current theme's dark/light doesn't match system
+  //       if (isThemeDark(_currentThemeKey) !== nowDark) {
+  //         applyTheme(newTheme);
+  //       }
+  //     }
+  //   });
+  // }
 
   // Restore view after map is initialized (theme/filter doesn't affect center/zoom).
   restoreViewIfAny();
