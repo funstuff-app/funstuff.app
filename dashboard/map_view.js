@@ -29,6 +29,34 @@ function _pm25ColorCat(v) {
 
 const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
 
+/** PM2.5 → [r,g,b] with continuous linear interpolation between AQI color stops. */
+function _pm25ToRgbSmooth(v) {
+  const stops = [
+    [0,    0x00,0xFF,0xFF],
+    [2.0,  0x00,0xFF,0xFF],
+    [5.0,  0x00,0xCC,0xFF],
+    [9.0,  0x00,0xE4,0x00],
+    [35.4, 0xFF,0xFF,0x00],
+    [55.4, 0xFF,0x7E,0x00],
+    [125.4,0xFF,0x00,0x00],
+    [225.4,0x8F,0x3F,0x97],
+    [500,  0x7E,0x00,0x23]
+  ];
+  if (v <= stops[0][0]) return [stops[0][1], stops[0][2], stops[0][3]];
+  for (let i = 1; i < stops.length; i++) {
+    if (v <= stops[i][0]) {
+      const t = (v - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+      return [
+        Math.round(stops[i-1][1] + t * (stops[i][1] - stops[i-1][1])),
+        Math.round(stops[i-1][2] + t * (stops[i][2] - stops[i-1][2])),
+        Math.round(stops[i-1][3] + t * (stops[i][3] - stops[i-1][3]))
+      ];
+    }
+  }
+  const last = stops[stops.length - 1];
+  return [last[1], last[2], last[3]];
+}
+
 class MapView {
   constructor(tilesCanvas, overlayCanvas) {
     this.tilesCanvas = tilesCanvas;
@@ -5288,20 +5316,6 @@ class MapView {
     const nSensors = sensors.length / 3;
     if (nSensors === 0) { this._paFieldCanvas = null; return; }
 
-    // ── LOO concordance weighting ──
-    // For each sensor, predict its value from all others via IDW. Sensors that
-    // disagree with their spatial context get downweighted. This kills outliers
-    // (broken sensors, isolated spikes) without hardcoded thresholds.
-    //
-    // Compute median as outlier-immune anchor. Use fixed AQI-scale σ (50 µg/m³)
-    // so real hotspots (28, 38, even 90) keep near-full weight while only
-    // truly broken sensors (1000+) get killed.
-    const vals = [];
-    for (let i = 0; i < sensors.length; i += 3) vals.push(sensors[i + 2]);
-    vals.sort((a, b) => a - b);
-    const medianV = vals[Math.floor(vals.length / 2)];
-    const sigmaSq = 2500; // 50² — fixed AQI-scale
-
     // ── Cache key: view geometry + color fingerprint ──
     const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
     const key = `pa:${viewKey}|f:${fingerprint}`;
@@ -5332,39 +5346,28 @@ class MapView {
     const cutoffPx = Math.abs(refW.x - centerW.x);
     const cutoffSq = cutoffPx * cutoffPx;
     const FIELD_ALPHA = 46;
+    // Gaussian kernel: σ = cutoff/6 (~2.5km effective radius per sensor).
+    const sigma = cutoffPx / 6;
+    const twoSigmaSq = 2 * sigma * sigma;
 
-    // ── LOO prediction + concordance for each sensor ──
-    // Build stride-4 array: [sx, sy, v, concordance, ...]
-    const s4 = new Float64Array(nSensors * 4);
+    // ── Build stride-3 sensor array: [sx, sy, v, ...] ──
+    const s3 = new Float64Array(nSensors * 3);
     for (let i = 0; i < nSensors; i++) {
       const si = i * 3;
-      const sx = sensors[si], sy = sensors[si + 1], vi = sensors[si + 2];
-      // LOO IDW: predict vi from all other sensors
-      let wSum = 0, vSum = 0;
-      for (let j = 0; j < nSensors; j++) {
-        if (j === i) continue;
-        const sj = j * 3;
-        const dx = sx - sensors[sj], dy = sy - sensors[sj + 1];
-        const d2 = dx * dx + dy * dy;
-        if (d2 > cutoffSq || d2 < 1e-6) continue;
-        const w = 1 / d2;
-        wSum += w;
-        vSum += w * sensors[sj + 2];
-      }
-      const predicted = wSum > 0 ? vSum / wSum : medianV;
-      const err = vi - predicted;
-      const concordance = 1 / (1 + (err * err) / sigmaSq);
-      const oi = i * 4;
-      s4[oi] = sx; s4[oi + 1] = sy; s4[oi + 2] = vi; s4[oi + 3] = concordance;
+      s3[si] = sensors[si];
+      s3[si + 1] = sensors[si + 1];
+      s3[si + 2] = Math.min(sensors[si + 2], 75);
     }
 
     // ── Always synchronous — IDW is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s4, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr, medianV);
+    this._computePaFieldSync(s3, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr);
   }
 
-  /** Synchronous IDW computation — used as fallback and for first frame.
-   *  sensors is stride-4: [sx, sy, value, concordance, ...]  */
-  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr, medianV) {
+  /** Synchronous IDW computation.
+   *  sensors: stride-3 [sx, sy, value, ...]
+   *  cutoffSq: max range² for early-out
+   *  twoSigmaSq: 2σ² for Gaussian kernel */
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr) {
     // ── Reuse tiny canvas + ImageData if grid size unchanged ──
     if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
       const tc = document.createElement("canvas");
@@ -5375,55 +5378,48 @@ class MapView {
     const { tc, tctx, imgData } = this._paGrid;
     const px = imgData.data;
 
-    // ── Concordance-weighted IDW in screen-pixel space ──
-    // w_i = concordance_i / d_i²
-    // Density-adaptive background anchor: wBg = wBgBase / cnt.
-    // In dense clusters (many sensors), wBg is tiny — sensors dominate.
-    // Near isolated sensors (cnt=1), wBg is large — median competes,
-    // preventing one reading from monopolizing the field.
-    const wBgBase = 10 / cutoffSq;
+    // ── Gaussian-kernel IDW with weight-sum fading ──
     for (let gy = 0; gy < gh; gy++) {
       const py = (gy + 0.5) * cellSize;
       for (let gx = 0; gx < gw; gx++) {
         const pxx = (gx + 0.5) * cellSize;
 
-        let wSum = 0, vSum = 0, minD2 = Infinity, cnt = 0;
-        for (let i = 0; i < sensors.length; i += 4) {
+        let wSum = 0, vSum = 0;
+        for (let i = 0; i < sensors.length; i += 3) {
           const dx = pxx - sensors[i];
           const dy = py  - sensors[i + 1];
           const d2 = dx * dx + dy * dy;
           if (d2 > cutoffSq) continue;
-          cnt++;
-          if (d2 < minD2) minD2 = d2;
-          const c = sensors[i + 3]; // concordance
-          if (d2 < 1) { wSum = 1e9 * c; vSum = sensors[i + 2] * 1e9 * c; minD2 = 0; break; }
-          const w = c / d2;
+          const w = Math.exp(-d2 / twoSigmaSq);
           wSum += w;
           vSum += w * sensors[i + 2];
         }
 
         const off = (gy * gw + gx) * 4;
-        if (wSum === 0) {
+        if (wSum < 0.001) {
           px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
         } else {
-          const wBg = wBgBase / (cnt || 1);
-          const val = (vSum + wBg * medianV) / (wSum + wBg);
-          // Fade alpha near field edges
-          const edgeFade = 1 - Math.sqrt(minD2 / cutoffSq);
-          const alpha = Math.round(FIELD_ALPHA * Math.min(1, edgeFade * 2));
-          const cat = _pm25ColorCat(val);
-          const rgb = _pm25ToRgb(_BAND_MIDS[cat]);
-          px[off]   = (rgb[0] * 217) >> 8;
-          px[off+1] = (rgb[1] * 217) >> 8;
-          px[off+2] = (rgb[2] * 217) >> 8;
+          const fade = Math.min(1, wSum * 2);
+          const alpha = Math.round(FIELD_ALPHA * fade);
+          const val = vSum / wSum;
+          const rgb = _pm25ToRgbSmooth(val);
+          px[off]   = rgb[0];
+          px[off+1] = rgb[1];
+          px[off+2] = rgb[2];
           px[off+3] = alpha;
         }
       }
     }
 
-    // ── Gaussian blur (radius 2) to soften jagged band edges ──
+    // ── Gaussian blur (radius 2) to soften edges ──
     const BLUR_R = 2;
-    const tmp = new Uint8ClampedArray(px.length);
+    // Reuse blur buffer across frames when grid dimensions match
+    const bufLen = px.length;
+    if (!this._paGrid.blurBuf || this._paGrid.blurBuf.length !== bufLen) {
+      this._paGrid.blurBuf = new Uint8ClampedArray(bufLen);
+    }
+    const tmp = this._paGrid.blurBuf;
+    tmp.fill(0);
     // Horizontal pass
     for (let y = 0; y < gh; y++) {
       for (let x = 0; x < gw; x++) {
@@ -5594,14 +5590,6 @@ class MapView {
       if (sensors.length === 0) continue;
       if (this._paFieldPrewarmed.has(fp)) continue;
 
-      // ── LOO concordance for pre-warm sensors ──
-      const nPw = sensors.length / 3;
-      const pwVals = [];
-      for (let i = 0; i < sensors.length; i += 3) pwVals.push(sensors[i + 2]);
-      pwVals.sort((a, b) => a - b);
-      const pwMedian = pwVals[Math.floor(pwVals.length / 2)];
-      const pwSigmaSq = 2500; // 50² — fixed AQI-scale
-
       // Dispatch this one to the worker
       const cellSize = 16;
       const gw = Math.ceil(cssW / cellSize);
@@ -5609,37 +5597,26 @@ class MapView {
       const refW = latLonToWorld(clat, clon + 0.15, z);
       const cutoffPx = Math.abs(refW.x - centerW.x);
       const cutoffSq = cutoffPx * cutoffPx;
+      const sigma = cutoffPx / 6;
+      const twoSigmaSq = 2 * sigma * sigma;
       const FIELD_ALPHA = 46;
 
-      // Build stride-4 array with concordance
-      const s4pw = new Float64Array(nPw * 4);
+      // Build stride-3 array: [sx, sy, value, ...]
+      const nPw = sensors.length / 3;
+      const s3pw = new Float64Array(nPw * 3);
       for (let i = 0; i < nPw; i++) {
         const si = i * 3;
-        const sx = sensors[si], sy = sensors[si + 1], vi = sensors[si + 2];
-        let wSum = 0, vSum = 0;
-        for (let j = 0; j < nPw; j++) {
-          if (j === i) continue;
-          const sj = j * 3;
-          const dx = sx - sensors[sj], dy = sy - sensors[sj + 1];
-          const d2 = dx * dx + dy * dy;
-          if (d2 > cutoffSq || d2 < 1e-6) continue;
-          const w = 1 / d2;
-          wSum += w;
-          vSum += w * sensors[sj + 2];
-        }
-        const predicted = wSum > 0 ? vSum / wSum : pwMedian;
-        const err = vi - predicted;
-        const concordance = 1 / (1 + (err * err) / pwSigmaSq);
-        const oi = i * 4;
-        s4pw[oi] = sx; s4pw[oi + 1] = sy; s4pw[oi + 2] = vi; s4pw[oi + 3] = concordance;
+        s3pw[si] = sensors[si];
+        s3pw[si + 1] = sensors[si + 1];
+        s3pw[si + 2] = Math.min(sensors[si + 2], 75);
       }
 
       const jobId = ++this._paWorkerJobId;
       this._paWorkerPending = true;
       this._paWorkerFingerprint = fp;
       this._paWorker.postMessage({
-        sensors: s4pw,
-        gw, gh, cellSize, cutoffSq, FIELD_ALPHA, jobId, medianV: pwMedian
+        sensors: s3pw,
+        gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, jobId
       });
       return; // one at a time
     }

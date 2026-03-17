@@ -4,72 +4,66 @@
  * so scrubbing never blocks the UX.
  */
 
-// PM2.5 → [r,g,b] — must match main-thread _pm25ToRgb exactly
-function pm25ToRgb(v) {
-  if (v <= 2.0)  return [0x00, 0xFF, 0xFF];
-  if (v <= 5.0)  return [0x00, 0xCC, 0xFF];
-  if (v <= 9.0)  return [0x00, 0xE4, 0x00];
-  if (v <= 35.4) return [0xFF, 0xFF, 0x00];
-  if (v <= 55.4) return [0xFF, 0x7E, 0x00];
-  if (v <= 125.4) return [0xFF, 0x00, 0x00];
-  if (v <= 225.4) return [0x8F, 0x3F, 0x97];
-  return [0x7E, 0x00, 0x23];
+// PM2.5 → [r,g,b] with continuous interpolation — must match main-thread _pm25ToRgbSmooth
+function pm25ToRgbSmooth(v) {
+  const stops = [
+    [0,    0x00,0xFF,0xFF],
+    [2.0,  0x00,0xFF,0xFF],
+    [5.0,  0x00,0xCC,0xFF],
+    [9.0,  0x00,0xE4,0x00],
+    [35.4, 0xFF,0xFF,0x00],
+    [55.4, 0xFF,0x7E,0x00],
+    [125.4,0xFF,0x00,0x00],
+    [225.4,0x8F,0x3F,0x97],
+    [500,  0x7E,0x00,0x23]
+  ];
+  if (v <= stops[0][0]) return [stops[0][1], stops[0][2], stops[0][3]];
+  for (let i = 1; i < stops.length; i++) {
+    if (v <= stops[i][0]) {
+      const t = (v - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+      return [
+        Math.round(stops[i-1][1] + t * (stops[i][1] - stops[i-1][1])),
+        Math.round(stops[i-1][2] + t * (stops[i][2] - stops[i-1][2])),
+        Math.round(stops[i-1][3] + t * (stops[i][3] - stops[i-1][3]))
+      ];
+    }
+  }
+  const last = stops[stops.length - 1];
+  return [last[1], last[2], last[3]];
 }
-
-// PM2.5 → color category index (0-7) — must match main-thread _pm25ColorCat
-function pm25ColorCat(v) {
-  if (v <= 2.0)  return 0;
-  if (v <= 5.0)  return 1;
-  if (v <= 9.0)  return 2;
-  if (v <= 35.4) return 3;
-  if (v <= 55.4) return 4;
-  if (v <= 125.4) return 5;
-  if (v <= 225.4) return 6;
-  return 7;
-}
-
-const BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
 
 self.onmessage = function(e) {
-  const { sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, jobId, medianV } = e.data;
+  const { sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, jobId } = e.data;
   const px = new Uint8ClampedArray(gw * gh * 4);
 
-  // Concordance-weighted IDW. sensors is stride-4: [sx, sy, value, concordance, ...]
-  // Density-adaptive background anchor: wBg = wBgBase / cnt.
-  const wBgBase = 10 / cutoffSq;
+  // Gaussian-kernel IDW with weight-sum fading.
   for (let gy = 0; gy < gh; gy++) {
     const py = (gy + 0.5) * cellSize;
     for (let gx = 0; gx < gw; gx++) {
       const pxx = (gx + 0.5) * cellSize;
 
-      let wSum = 0, vSum = 0, minD2 = Infinity, cnt = 0;
-      for (let i = 0; i < sensors.length; i += 4) {
+      let wSum = 0, vSum = 0;
+      for (let i = 0; i < sensors.length; i += 3) {
         const dx = pxx - sensors[i];
         const dy = py  - sensors[i + 1];
         const d2 = dx * dx + dy * dy;
         if (d2 > cutoffSq) continue;
-        cnt++;
-        if (d2 < minD2) minD2 = d2;
-        const c = sensors[i + 3]; // concordance
-        if (d2 < 1) { wSum = 1e9 * c; vSum = sensors[i + 2] * 1e9 * c; minD2 = 0; break; }
-        const w = c / d2;
+        const w = Math.exp(-d2 / twoSigmaSq);
         wSum += w;
         vSum += w * sensors[i + 2];
       }
 
       const off = (gy * gw + gx) * 4;
-      if (wSum === 0) {
+      if (wSum < 0.001) {
         px[off] = 0; px[off + 1] = 0; px[off + 2] = 0; px[off + 3] = 0;
       } else {
-        const wBg = wBgBase / (cnt || 1);
-        const val = (vSum + wBg * medianV) / (wSum + wBg);
-        const edgeFade = 1 - Math.sqrt(minD2 / cutoffSq);
-        const alpha = Math.round(FIELD_ALPHA * Math.min(1, edgeFade * 2));
-        const cat = pm25ColorCat(val);
-        const rgb = pm25ToRgb(BAND_MIDS[cat]);
-        px[off]     = (rgb[0] * 217) >> 8;
-        px[off + 1] = (rgb[1] * 217) >> 8;
-        px[off + 2] = (rgb[2] * 217) >> 8;
+        const fade = Math.min(1, wSum * 2);
+        const alpha = Math.round(FIELD_ALPHA * fade);
+        const val = vSum / wSum;
+        const rgb = pm25ToRgbSmooth(val);
+        px[off]     = rgb[0];
+        px[off + 1] = rgb[1];
+        px[off + 2] = rgb[2];
         px[off + 3] = alpha;
       }
     }
