@@ -232,8 +232,9 @@ function newestReadingMsFromState(st) {
 
 function main() {
   const tiles = document.getElementById("tilesCanvas");
+  const paField = document.getElementById("paFieldCanvas");
   const overlay = document.getElementById("overlayCanvas");
-  const map = new MapView(tiles, overlay);
+  const map = new MapView(tiles, paField, overlay);
   window.__map = map;  // Expose for updateSidebarPlaybackValues
 
   // Lite mode: hide all chrome (sidebar, controls, legend, menu button)

@@ -58,12 +58,14 @@ function _pm25ToRgbSmooth(v) {
 }
 
 class MapView {
-  constructor(tilesCanvas, overlayCanvas) {
+  constructor(tilesCanvas, paFieldCanvas, overlayCanvas) {
     this.tilesCanvas = tilesCanvas;
+    this.paFieldCanvasEl = paFieldCanvas;
     this.overlayCanvas = overlayCanvas;
     // Use willReadFrequently: false (default) to hint GPU-accelerated rendering.
     // This is especially important for iPad/iOS performance.
     this.tctx = tilesCanvas.getContext("2d", { willReadFrequently: false });
+    this.pfctx = paFieldCanvas.getContext("2d", { willReadFrequently: false });
     this.octx = overlayCanvas.getContext("2d", { willReadFrequently: false });
 
     // fractional zoom for smooth pinch / button zooming
@@ -1968,6 +1970,8 @@ class MapView {
     // Set internal canvas dimensions
     this.tilesCanvas.width = Math.floor(w * dpr);
     this.tilesCanvas.height = Math.floor(h * dpr);
+    this.paFieldCanvasEl.width = Math.floor(w * dpr);
+    this.paFieldCanvasEl.height = Math.floor(h * dpr);
     this.overlayCanvas.width = Math.floor(w * dpr);
     this.overlayCanvas.height = Math.floor(h * dpr);
 
@@ -1975,10 +1979,13 @@ class MapView {
     // where percentage-based sizing can be calculated incorrectly
     this.tilesCanvas.style.width = w + 'px';
     this.tilesCanvas.style.height = h + 'px';
+    this.paFieldCanvasEl.style.width = w + 'px';
+    this.paFieldCanvasEl.style.height = h + 'px';
     this.overlayCanvas.style.width = w + 'px';
     this.overlayCanvas.style.height = h + 'px';
 
     this.tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.pfctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.octx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Snapshot is tied to canvas size; reset on resize to avoid distortion.
@@ -5163,79 +5170,28 @@ class MapView {
    * Restores tiles from snapshot first to avoid opacity accumulation on repeated calls.
    */
   _compositePaFieldOnTiles(state, tilesJustRedrawn = false) {
-    // During active touch (finger-pan / pinch), the _requestPanRedraw RAF
-    // already calls drawTiles() + this method with tilesJustRedrawn=true.
-    // An interleaving caller (playbackLoop, cross-fade RAF) that passes
-    // tilesJustRedrawn=false would clear the tiles canvas and restore a
-    // stale pre-touch snapshot, overwriting the correctly-positioned tiles
-    // and causing visible flicker.  Bail out and let the pan RAF handle it.
-    if (!tilesJustRedrawn && this._touchActive) return;
-
-    // If tiles weren't just redrawn and we have no snapshot to restore
-    // clean tiles from, compositing the PA field would stack its alpha on
-    // top of whatever is already on the tiles canvas (likely tiles + a
-    // previous PA composite).  This causes blown-out opacity on iOS Safari
-    // where duplicate pinch-inertia chains can null the snapshot after the
-    // final drawTiles() captured it.  Skip — the next draw() that triggers
-    // drawTiles() will recapture the snapshot and composite correctly.
-    if (!tilesJustRedrawn && !this._tilesSnapshotCanvas) return;
-
     const pbMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
     this._ensurePaField(state, pbMs);
     if (pbMs != null && isFinite(pbMs)) this._preWarmPaFields(state, pbMs);
-    if (!this._paFieldCanvas) return;
-    const tctx = this.tctx;
-    if (!tctx) return;
-    // Always restore tiles to a known-clean state before drawing the field.
-    // Without this, repeated composites in the same frame (e.g. draw() then
-    // _redrawViewOnly()) stack field alpha and cause opacity flashing.
-    if (!tilesJustRedrawn && this._tilesSnapshotCanvas) {
-      const dpr = this._dpr || (window.devicePixelRatio || 1);
-      const tw = this.tilesCanvas.width;
-      const th = this.tilesCanvas.height;
-      const cssW = this._cssW || 1;
-      const cssH = this._cssH || 1;
-      tctx.save();
-      tctx.setTransform(1, 0, 0, 1, 0, 0);
-      tctx.clearRect(0, 0, tw, th);
-      if (this._pinchZooming && this._tilesSnapshotMeta) {
-        // Scale snapshot to match current zoom, same as drawTiles() fast path
-        const prev = this._tilesSnapshotMeta;
-        const sZoom = Math.pow(2, this.zoom - prev.zoom);
-        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
-        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
-        const txPan = (prevC.x - currC.x) * sZoom;
-        const tyPan = (prevC.y - currC.y) * sZoom;
-        tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        tctx.translate(cssW / 2, cssH / 2);
-        tctx.scale(sZoom, sZoom);
-        tctx.translate((-cssW / 2) + (txPan / sZoom), (-cssH / 2) + (tyPan / sZoom));
-        tctx.drawImage(this._tilesSnapshotCanvas, 0, 0, cssW, cssH);
-      } else if (this._tilesSnapshotMeta) {
-        // Non-pinch: translate snapshot to match current center (same as drawTiles).
-        const prev = this._tilesSnapshotMeta;
-        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
-        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
-        const tx = (prevC.x - currC.x) * dpr;
-        const ty = (prevC.y - currC.y) * dpr;
-        tctx.drawImage(this._tilesSnapshotCanvas, tx, ty);
-      } else {
-        tctx.drawImage(this._tilesSnapshotCanvas, 0, 0);
-      }
-      tctx.restore();
-    }
-    tctx.save();
-    tctx.setTransform(1, 0, 0, 1, 0, 0);
+    const ctx = this.pfctx;
+    if (!ctx) return;
+    const pw = this.paFieldCanvasEl.width;
+    const ph = this.paFieldCanvasEl.height;
+    // Clear the dedicated PA field canvas every frame (no snapshot restore needed)
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, pw, ph);
+    if (!this._paFieldCanvas) { ctx.restore(); return; }
     // Cross-fade from previous field canvas to current one
     const fadeT = this._paFieldPrevCanvas
       ? Math.min(1, (performance.now() - this._paFieldFadeStart) / this._paFieldFadeMs)
       : 1;
     if (this._paFieldPrevCanvas && fadeT < 1) {
-      tctx.globalAlpha = 1 - fadeT;
-      tctx.drawImage(this._paFieldPrevCanvas, 0, 0);
-      tctx.globalAlpha = fadeT;
-      tctx.drawImage(this._paFieldCanvas, 0, 0);
-      tctx.globalAlpha = 1;
+      ctx.globalAlpha = 1 - fadeT;
+      ctx.drawImage(this._paFieldPrevCanvas, 0, 0);
+      ctx.globalAlpha = fadeT;
+      ctx.drawImage(this._paFieldCanvas, 0, 0);
+      ctx.globalAlpha = 1;
       // Schedule another frame to complete the fade (no-op if playback loop is running)
       if (!this._paFieldFadeRAF) {
         this._paFieldFadeRAF = requestAnimationFrame(() => {
@@ -5246,9 +5202,9 @@ class MapView {
       }
     } else {
       if (this._paFieldPrevCanvas) this._paFieldPrevCanvas = null;
-      tctx.drawImage(this._paFieldCanvas, 0, 0);
+      ctx.drawImage(this._paFieldCanvas, 0, 0);
     }
-    tctx.restore();
+    ctx.restore();
   }
 
   /**
@@ -5945,7 +5901,7 @@ class MapView {
       };
 
       // First pass: render PurpleAir markers (drawn first, so they appear behind)
-      // (PA scalar field is rendered below, on tiles canvas — see _compositePaFieldOnTiles)
+      // (PA scalar field is rendered below, on PA field canvas — see _compositePaFieldOnTiles)
       for (const f of fixed) {
         if (f.purpleair) renderFixedMarker(f);
       }
@@ -7320,7 +7276,7 @@ class MapView {
       };
 
       // First pass: PurpleAir (public)
-      // (PA scalar field is rendered below, on tiles canvas — see _compositePaFieldOnTiles)
+      // (PA scalar field is rendered below, on PA field canvas — see _compositePaFieldOnTiles)
       if (this.showPublic) {
         for (const f of fixed) {
           if (f.purpleair) renderPbFixedMarker(f);

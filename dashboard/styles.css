@@ -300,12 +300,21 @@ aside, section { min-height: 0; }
   opacity: var(--map-shadow-lift);
   mix-blend-mode: screen; /* lifts dark areas much more than light labels/roads */
 }
-#overlayCanvas {
+#paFieldCanvas {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   z-index: 2;
+  pointer-events: none;
+  will-change: transform;
+}
+#overlayCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 3;
   /* Prevent browser default touch gestures - this canvas receives touch events */
   touch-action: none;
   /* GPU layer compositing hint for smoother panning/zooming */
