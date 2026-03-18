@@ -281,7 +281,7 @@ function main() {
   const _isMobileWidth = window.innerWidth <= 768;
   let sidebarOpen = _isMobileWidth
     ? false
-    : localStorage.getItem(SIDEBAR_OPEN_KEY) !== "false"; // Default open on desktop
+    : localStorage.getItem(SIDEBAR_OPEN_KEY) === "true"; // Default closed
   
   // Restore visibility states
   map.showMobile = localStorage.getItem(SHOW_MOBILE_KEY) !== "false";
@@ -365,7 +365,7 @@ function main() {
   const LEGEND_TAB_KEY = "dusty_legend_tab";
   let legendOpen = _isMobileWidth
     ? false
-    : localStorage.getItem(LEGEND_OPEN_KEY) !== "false";
+    : localStorage.getItem(LEGEND_OPEN_KEY) === "true";
   let legendTab = localStorage.getItem(LEGEND_TAB_KEY) || "pm25";
   let userLegendTab = legendTab; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected

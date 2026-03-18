@@ -2007,6 +2007,8 @@ class MapView {
     // Invalidate trail cache on resize
     this._trailCacheCanvas = null;
     this._trailCacheViewKey = "";
+    // Force drawTiles() in draw() even if viewSig matches (canvas was cleared above).
+    this._lastTilesViewSig = null;
 
     this.draw(this.lastState);
   }
@@ -3054,7 +3056,34 @@ class MapView {
       }
     }
 
-    // No parent available — only draw placeholder if there's no snapshot backdrop.
+    // No parent available — try child tiles (higher zoom) scaled down.
+    // When zooming out, child tiles from the previous zoom level are likely cached.
+    for (let cz = z + 1; cz <= Math.min(z + 2, this._zoomMax); cz++) {
+      const diff = cz - z;
+      const childrenPerAxis = 1 << diff; // 2 for diff=1, 4 for diff=2
+      const baseChildX = x << diff;
+      const baseChildY = y << diff;
+      let anyHit = false;
+      for (let dy = 0; dy < childrenPerAxis; dy++) {
+        for (let dx = 0; dx < childrenPerAxis; dx++) {
+          const childKey = `${this.themeKey}:${cz}/${baseChildX + dx}/${baseChildY + dy}`;
+          const childCached = this._tileCacheGet(childKey);
+          if (childCached && childCached.ok) {
+            const sz = TILE_SIZE * scale;
+            const dstSize = sz / childrenPerAxis;
+            ctx.filter = "none";
+            ctx.drawImage(childCached.img,
+              0, 0, TILE_SIZE, TILE_SIZE,
+              Math.floor(px + dx * dstSize), Math.floor(py + dy * dstSize),
+              Math.ceil(dstSize), Math.ceil(dstSize));
+            anyHit = true;
+          }
+        }
+      }
+      if (anyHit) return;
+    }
+
+    // No parent or child available — only draw placeholder if there's no snapshot backdrop.
     if (!hasSnapshot) {
       const sz = TILE_SIZE * scale;
       ctx.fillStyle = "rgba(255,255,255,0.03)";
