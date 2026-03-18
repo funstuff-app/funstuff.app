@@ -7366,7 +7366,11 @@ class MapView {
         if (this._historicalMode) {
           pr = prHist;
         } else {
-          const followingLive = !!this._playbackLiveFollow || this.isPlaybackAtEnd(200);
+          // Only blend with live readings when the playhead is actually at the trail end.
+          // _playbackLiveFollow means "will eventually reach the end", not "is there now";
+          // using it here caused the marker to show the current live value (e.g. PM10 394)
+          // when the playhead was still minutes behind the end on initial load.
+          const followingLive = this.isPlaybackAtEnd(200);
           if (followingLive) {
             const aNow = (pr && pr.aqi != null) ? Number(pr.aqi) : valueToAqi(pr?.key, pr?.value);
             const aHist = (prHist && prHist.aqi != null) ? Number(prHist.aqi) : valueToAqi(prHist?.key, prHist?.value);
