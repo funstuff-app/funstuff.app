@@ -3632,11 +3632,21 @@ class MapView {
     const maxLon = Math.max(tl.lon, br.lon);
     
     // Don't refetch if viewport hasn't changed much (use coarse key to avoid excessive fetches)
-    const key = `${minLat.toFixed(2)},${maxLat.toFixed(2)},${minLon.toFixed(2)},${maxLon.toFixed(2)}`;
+    // Use .toFixed(1) (~11 km granularity) so smooth zoom/pan doesn't trigger a fetch every frame.
+    const key = `${minLat.toFixed(1)},${maxLat.toFixed(1)},${minLon.toFixed(1)},${maxLon.toFixed(1)}`;
     if (this._tramEdgesLastKey === key) return;
-    
+
+    // Debounce: wait 300ms after last viewport change before fetching.
+    if (this._tramEdgesDebounce) clearTimeout(this._tramEdgesDebounce);
+    this._tramEdgesDebounce = setTimeout(() => {
+      this._tramEdgesDebounce = null;
+      this._doFetchTramLineEdges(minLat, maxLat, minLon, maxLon, key);
+    }, 300);
+  }
+
+  async _doFetchTramLineEdges(minLat, maxLat, minLon, maxLon, key) {
+    if (this._tramEdgesFetching) return;
     this._tramEdgesFetching = true;
-    
     try {
       const url = `${appConfig.apiBaseUrl}/tram_line_edges?minLat=${minLat}&maxLat=${maxLat}&minLon=${minLon}&maxLon=${maxLon}&limit=8000`;
       const resp = await fetch(url);

@@ -4305,11 +4305,54 @@ function main() {
   }
 
   const POLL_MS = 120000;  // 2-min fallback poll interval (PurpleAir updates ~every 2 min)
+  const POLL_MS_SSE = 600000; // 10-min safety-net poll when SSE is connected
   let _tickTimeout = null; // dynamic poll scheduler handle
   let _tickInFlight = false;
   let _tickInFlightSince = 0;  // perf timestamp when _tickInFlight was set
   let _tickLastForceRefreshSeq = null;
   let _tickConsecutiveFailures = 0; // for exponential backoff on errors
+
+  // ── SSE (Server-Sent Events) — push-based state change notifications ──
+  let _sseConnected = false;
+  let _sseLastSeq = null;
+  let _sseSource = null;
+
+  function connectSSE() {
+    if (_sseSource) { try { _sseSource.close(); } catch {} }
+    var url = (appConfig.apiBaseUrl || "/api") + "/events";
+    _sseSource = new EventSource(url);
+
+    _sseSource.onopen = function () {
+      _sseConnected = true;
+      // Shorten the next scheduled poll now that SSE is live.
+      if (_tickTimeout) {
+        clearTimeout(_tickTimeout);
+        _tickTimeout = setTimeout(tick, POLL_MS_SSE);
+      }
+    };
+
+    _sseSource.onmessage = function (ev) {
+      try {
+        var msg = JSON.parse(ev.data);
+        var seq = msg.seq;
+        if (seq != null && seq !== _sseLastSeq) {
+          _sseLastSeq = seq;
+          // New data available — fetch immediately.
+          if (_tickTimeout) clearTimeout(_tickTimeout);
+          tick();
+        }
+      } catch {}
+    };
+
+    _sseSource.onerror = function () {
+      _sseConnected = false;
+      // EventSource auto-reconnects; revert to normal polling in the meantime.
+      if (_tickTimeout) {
+        clearTimeout(_tickTimeout);
+        _tickTimeout = setTimeout(tick, POLL_MS);
+      }
+    };
+  }
 
   async function tick() {
     // Safety valve: if _tickInFlight has been true for over 60 seconds, force-reset it.
@@ -4516,8 +4559,11 @@ function main() {
     } finally {
       _tickInFlight = false;
       // Always reschedule. Use server-provided timing if available, else fallback.
+      // When SSE is connected, use a long safety-net interval (SSE drives timely updates).
+      var basePollMs = _sseConnected ? POLL_MS_SSE : POLL_MS;
       const clientPollS = Number(window.__lastState?.meta?.client_poll_in_s);
-      const nextMs = (isFinite(clientPollS) && clientPollS > 0) ? clientPollS * 1000 : POLL_MS;
+      const nextMs = _sseConnected ? basePollMs
+        : (isFinite(clientPollS) && clientPollS > 0) ? clientPollS * 1000 : basePollMs;
       if (_tickTimeout) clearTimeout(_tickTimeout);
       _tickTimeout = setTimeout(tick, nextMs);
     }
@@ -4616,6 +4662,7 @@ function main() {
     }
 
     tick(); // finally block inside tick() schedules all subsequent polls
+    connectSSE(); // open SSE stream for push-based updates
   });
 }
 
