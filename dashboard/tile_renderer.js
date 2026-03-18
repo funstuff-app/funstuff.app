@@ -83,6 +83,7 @@
      * @param {number} zoomMax
      */
     render({ center, zoom, cssW, cssH, dpr, pinchZooming, touchActive, zoomMin, zoomMax }) {
+      this._zoomMax = zoomMax;
       const ctx = this.ctx;
       if (!ctx) return;
       const w = cssW || 1;
@@ -276,7 +277,35 @@
         }
       }
 
-      // No parent available — only draw placeholder if there's no snapshot backdrop.
+      // No parent available — try child tiles (higher zoom) scaled down.
+      // When zooming out, child tiles from the previous zoom level are likely cached.
+      const czMax = Math.min(z + 2, this._zoomMax || 19);
+      for (let cz = z + 1; cz <= czMax; cz++) {
+        const diff = cz - z;
+        const childrenPerAxis = 1 << diff;
+        const baseChildX = x << diff;
+        const baseChildY = y << diff;
+        let anyHit = false;
+        for (let dy = 0; dy < childrenPerAxis; dy++) {
+          for (let dx = 0; dx < childrenPerAxis; dx++) {
+            const childKey = `${this.themeKey}:${cz}/${baseChildX + dx}/${baseChildY + dy}`;
+            const childCached = this._cacheGet(childKey);
+            if (childCached && childCached.ok) {
+              const sz = TILE_SIZE * scale;
+              const dstSize = sz / childrenPerAxis;
+              ctx.filter = "none";
+              ctx.drawImage(childCached.img,
+                0, 0, TILE_SIZE, TILE_SIZE,
+                Math.floor(px + dx * dstSize), Math.floor(py + dy * dstSize),
+                Math.ceil(dstSize), Math.ceil(dstSize));
+              anyHit = true;
+            }
+          }
+        }
+        if (anyHit) return;
+      }
+
+      // No parent or child available — only draw placeholder if there's no snapshot backdrop.
       if (!hasSnapshot) {
         const sz = TILE_SIZE * scale;
         ctx.fillStyle = "rgba(255,255,255,0.03)";
