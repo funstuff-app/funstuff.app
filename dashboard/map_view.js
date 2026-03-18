@@ -72,16 +72,7 @@ class MapView {
     this.zoom = 12.58; // 50% more zoomed in than the original 12 (log2 scale: +log2(1.5))
     this._zoomMin = 3;
     this._zoomMax = 18;
-    this._pinchAnchor = null; // { lat, lon, sx, sy, lastTs }
-    // Prefer native macOS Safari pinch gesture events when available.
-    this._gesture = null; // { startZoom, startScale, anchorLat, anchorLon, sx, sy }
-    // Mouse drag pan (optional). Does not affect trackpad controls.
-    this._mouseDragging = false;
-    this._mouseDragStart = null; // {x,y}
-    this._mouseDragCenterStart = null; // {x,y,ws}
-    this._mouseDragMoved = false;
     this.center = { lat: 40.7608, lon: -111.8910 };
-    // macOS trackpad UX: two-finger pan + pinch zoom (avoid mouse-drag schema)
     this._centerAnimRAF = null;
 
     // Auto-camera follow must never override user interaction.
@@ -108,12 +99,6 @@ class MapView {
     this._dpr = window.devicePixelRatio || 1;
     this._cssW = 1;
     this._cssH = 1;
-
-    // OS detection for platform-specific input handling
-    // macOS: scroll = pan, pinch (ctrlKey) = zoom, mouse wheel (deltaMode≠0) = zoom
-    // Windows/Linux: smooth-scroll mice also zoom (primary pointing device)
-    this._isWindows = /Win/.test(navigator.platform || navigator.userAgent);
-    this._isMac = /Mac/.test(navigator.platform || navigator.userAgent);
 
     // Trace-mode optimization: cache static overlay (trails + fixed markers).
     this._overlayStaticCanvas = null; // offscreen canvas in device pixels
@@ -233,46 +218,20 @@ class MapView {
     this._persistedTrailRev = 0;
     this.maxTrailLen = 1000;
 
-    // Basemap tile cache (LRU bounded). Without eviction this grows unbounded as you pan/zoom.
-    // Lower limit on mobile/tablet for memory constraints; detect via coarse heuristic.
-    this.tileCache = new Map(); // key -> {img, ok}
+    // Tile rendering delegated to TileRenderer (tile_renderer.js).
     const isMobileDevice = /iPad|iPhone|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1);
-    this._tileCacheMax = isMobileDevice ? 180 : 420;
+    this._tileRenderer = new TileRenderer({
+      canvas: tilesCanvas,
+      initialTheme: "carto_dark_all",
+      cacheSize: isMobileDevice ? 180 : 420,
+      onRedrawNeeded: () => this.drawTiles(),
+    });
+    // Expose theme key for view signature and external reads.
+    this.themeKey = this._tileRenderer.themeKey;
 
-    // Touch pan/pinch state (iPad, iOS, Android)
-    this._touchState = null; // null or { startTouches, startCenter, startZoom, startCenterLatLon, lastPinchDist, lastMidpoint }
-    this._touchActive = false; // true while any touch is in progress (for skipping expensive ops)
-
-    // Debounce tile-load redraws to avoid cascading redraws when multiple tiles load at once
-    this._tileLoadRedrawTimer = null;
-    // Snapshot of the last rendered basemap frame to avoid flicker while tiles load.
-    this._tilesSnapshotCanvas = null; // offscreen canvas
-    this._tilesSnapshotMeta = null; // { zoom, centerLat, centerLon }
-
-    // Theme
-    this.themeKey = "carto_dark_all";
-    const t = TILE_THEMES[this.themeKey];
-    this.tileTemplate = t.template;
-    this.tileSubdomains = t.subdomains;
-    this._tileEpoch = 1; // increments on theme swap; used to ignore late tile loads
-
-    // Coalesce pinch-zoom redraws to rAF for smoother feel (no extra easing math).
-    this._zoomDrawRAF = null;
-
-    // Coalesce pan redraws to rAF (Safari trackpad wheel-pan can be very high frequency).
-    this._panDrawRAF = null;
-
-    // Minimal pinch-zoom inertia (only for trackpad pinch streams; does not affect pan).
-    this._pinchInertiaRAF = null;
-    this._pinchVz = 0; // zoom units per ms
-    this._pinchVelTs = 0;
-    this._pinchAnchorSX = null;
-    this._pinchAnchorSY = null;
-    this._wheelPinchEndTimer = null;
-    this._pinchZooming = false;
-    this._lastWheelPanTime = 0; // debounce pan→zoom from trackpad finger-lift artifacts
-    this._wheelPanning = false; // true during trackpad/keyboard-trackpad wheel-pan streams
-    this._wheelPanEndTimer = null; // debounce timer to exit wheel-pan mode
+    // Input handling delegated to InputDispatcher (input_dispatcher.js).
+    // Provides: touchActive, pinchZooming, mouseDragging, mouseDragMoved getters.
+    this._input = new InputDispatcher(overlayCanvas, this);
 
     // ResizeObserver fires after layout settles — catches window resize, devtools
     // show/hide, and fullscreen toggle more reliably than window "resize".
@@ -317,21 +276,6 @@ class MapView {
     };
     this._watchDpr();
 
-    this.overlayCanvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
-    // Safari (macOS) provides native trackpad pinch as gesture events.
-    this.overlayCanvas.addEventListener("gesturestart", (e) => this.onGestureStart(e), { passive: false });
-    this.overlayCanvas.addEventListener("gesturechange", (e) => this.onGestureChange(e), { passive: false });
-    this.overlayCanvas.addEventListener("gestureend", (e) => this.onGestureEnd(e), { passive: false });
-    this.overlayCanvas.addEventListener("click", (e) => this.onClick(e));
-    this.overlayCanvas.addEventListener("mousedown", (e) => this.onMouseDown(e));
-    window.addEventListener("mousemove", (e) => this.onMouseMove(e));
-    window.addEventListener("mouseup", () => this.onMouseUp());
-    // Touch events for iPad/iOS/Android pan and pinch-zoom
-    this.overlayCanvas.addEventListener("touchstart", (e) => this.onTouchStart(e), { passive: false });
-    this.overlayCanvas.addEventListener("touchmove", (e) => this.onTouchMove(e), { passive: false });
-    this.overlayCanvas.addEventListener("touchend", (e) => this.onTouchEnd(e), { passive: false });
-    this.overlayCanvas.addEventListener("touchcancel", (e) => this.onTouchEnd(e), { passive: false });
-
     this.resize();
   }
 
@@ -369,7 +313,7 @@ class MapView {
 
   _canRunAutoCamera() {
     const now = performance.now();
-    if (this._touchActive || this._mouseDragging || this._pinchZooming) return false;
+    if (this._input.touchActive || this._input.mouseDragging || this._input.pinchZooming) return false;
     return now >= (this._autoCameraSuppressedUntilPerfMs || 0);
   }
 
@@ -407,69 +351,6 @@ class MapView {
     }
   }
 
-  _stopPinchInertia() {
-    if (this._pinchInertiaRAF) cancelAnimationFrame(this._pinchInertiaRAF);
-    this._pinchInertiaRAF = null;
-    this._wheelPinchEndTimer = null;
-    this._pinchVz = 0;
-    this._pinchVelTs = 0;
-  }
-
-  _notePinchVelocity(dz, now) {
-    const t = (typeof now === "number" && isFinite(now)) ? now : performance.now();
-    const dt = (this._pinchVelTs > 0) ? (t - this._pinchVelTs) : 0;
-    if (dt > 4 && dt < 120) {
-      // Simple EMA-ish blend; keep it tiny and stable.
-      const v = dz / dt;
-      this._pinchVz = (this._pinchVz * 0.65) + (v * 0.35);
-    }
-    this._pinchVelTs = t;
-  }
-
-  _startPinchInertia() {
-    // Only continue if we have meaningful velocity and an anchor.
-    if (!isFinite(this._pinchVz) || Math.abs(this._pinchVz) < 0.00005 || !isFinite(this._pinchAnchorSX) || !isFinite(this._pinchAnchorSY)) {
-      // No coast; end pinch mode and force a "real tiles" redraw.
-      this._pinchZooming = false;
-      this._requestZoomRedraw();
-      return;
-    }
-
-    let last = performance.now();
-    const step = () => {
-      const now = performance.now();
-      const dt = now - last;
-      last = now;
-
-      // Apply velocity, then decay it quickly (feels like native trackpad momentum).
-      const z2 = clamp(this.zoom + this._pinchVz * dt, this._zoomMin, this._zoomMax);
-      this._setZoomAroundScreenPoint(z2, this._pinchAnchorSX, this._pinchAnchorSY);
-      this._tilesSnapshotCanvas = null;
-      this._tilesSnapshotMeta = null;
-      this._requestZoomRedraw();
-      this._notifyViewChanged();
-
-      this._pinchVz *= 0.90; // fast decay; keep minimal math
-      if (Math.abs(this._pinchVz) < 0.00005 || z2 === this._zoomMin || z2 === this._zoomMax) {
-        this._pinchInertiaRAF = null;
-        this._pinchZooming = false;
-        this._requestZoomRedraw(); // redraw with real tiles at final zoom
-        return;
-      }
-      this._pinchInertiaRAF = requestAnimationFrame(step);
-    };
-    // Kick the first step immediately to avoid a perceptible "stutter" before inertia begins.
-    last = performance.now() - 16;
-    step();
-  }
-
-  _requestZoomRedraw() {
-    if (this._zoomDrawRAF) return;
-    this._zoomDrawRAF = requestAnimationFrame(() => {
-      this._zoomDrawRAF = null;
-      this.draw(this.lastState);
-    });
-  }
 
   _redrawViewOnly() {
     // Redraw basemap + overlay for view changes (center/zoom/theme/size) without
@@ -485,7 +366,7 @@ class MapView {
       const h = Number(this._cssH);
       const dpr = Number(this._dpr || (window.devicePixelRatio || 1));
       const r = (x, p = 1e6) => (isFinite(x) ? (Math.round(x * p) / p) : x);
-      return `${this.themeKey}|${r(z, 1e3)}|${r(lat)}|${r(lon)}|${w}x${h}|dpr:${r(dpr, 1e3)}|pinch:${this._pinchZooming ? 1 : 0}`;
+      return `${this.themeKey}|${r(z, 1e3)}|${r(lat)}|${r(lon)}|${w}x${h}|dpr:${r(dpr, 1e3)}|pinch:${this._input.pinchZooming ? 1 : 0}`;
     })();
 
     let tilesRedrawn = false;
@@ -499,15 +380,6 @@ class MapView {
     this.drawOverlay(state, { cacheUnderlay: true });
   }
 
-  _requestPanRedraw() {
-    if (this._panDrawRAF) return;
-    this._panDrawRAF = requestAnimationFrame(() => {
-      this._panDrawRAF = null;
-      this._redrawViewOnly();
-      this._notifyViewChanged();
-    });
-  }
-
   _notifyViewChanged() {
     try {
       if (typeof window.__onMapViewChanged === "function") window.__onMapViewChanged();
@@ -516,419 +388,6 @@ class MapView {
     }
   }
 
-  _eventToLocalXY(e) {
-    const rect = this.overlayCanvas.getBoundingClientRect();
-    const cx = (typeof e.clientX === "number") ? e.clientX : (rect.left + rect.width / 2);
-    const cy = (typeof e.clientY === "number") ? e.clientY : (rect.top + rect.height / 2);
-    return { sx: cx - rect.left, sy: cy - rect.top };
-  }
-
-  onGestureStart(e) {
-    // Safari-only; prevent page zoom and handle pinch natively.
-    e.preventDefault();
-    e.stopPropagation();
-    this._noteUserInteraction();
-    this._stopPinchInertia();
-    this._pinchZooming = true;
-    const { sx, sy } = this._eventToLocalXY(e);
-    const ll = this._screenPointToLatLon(sx, sy);
-    this._gesture = {
-      startZoom: this.zoom,
-      startScale: (typeof e.scale === "number" && isFinite(e.scale) && e.scale > 0) ? e.scale : 1,
-      anchorLat: ll.lat,
-      anchorLon: ll.lon,
-      sx,
-      sy,
-    };
-    this._pinchAnchorSX = sx;
-    this._pinchAnchorSY = sy;
-  }
-
-  onGestureChange(e) {
-    if (!this._gesture) return;
-    e.preventDefault();
-    e.stopPropagation();
-    this._noteUserInteraction();
-    this._pinchZooming = true;
-    const { sx, sy } = this._eventToLocalXY(e);
-    // Update anchor screen point as the gesture midpoint moves.
-    this._gesture.sx = sx;
-    this._gesture.sy = sy;
-
-    const scale = (typeof e.scale === "number" && isFinite(e.scale) && e.scale > 0) ? e.scale : 1;
-    const ratio = Math.max(0.2, Math.min(5, scale / (this._gesture.startScale || 1)));
-    const dz = Math.log2(ratio);
-    const z2 = clamp(this._gesture.startZoom + dz, this._zoomMin, this._zoomMax);
-    const prevZ = this.zoom;
-    this._setZoomAroundScreenPoint(z2, sx, sy);
-    this._requestZoomRedraw();
-    this._notifyViewChanged();
-    this._pinchAnchorSX = sx;
-    this._pinchAnchorSY = sy;
-    this._notePinchVelocity(z2 - prevZ, performance.now());
-  }
-
-  onGestureEnd(e) {
-    if (!this._gesture) return;
-    e.preventDefault();
-    e.stopPropagation();
-    this._gesture = null;
-    this._startPinchInertia();
-  }
-
-  // Touch event handlers for iPad/iOS/Android pan and pinch-zoom
-  onTouchStart(e) {
-    // Prevent browser's default behavior (page scroll, zoom)
-    e.preventDefault();
-    
-    // Mark touch as active to skip expensive operations during interaction
-    this._touchActive = true;
-
-    this._noteUserInteraction();
-    
-    // Cancel any in-progress pinch inertia
-    this._stopPinchInertia();
-    
-    const touches = e.touches;
-    if (touches.length === 0) return;
-
-    const rect = this.overlayCanvas.getBoundingClientRect();
-    
-    // Compute touch midpoint in canvas-local coordinates
-    let sumX = 0, sumY = 0;
-    for (let i = 0; i < touches.length; i++) {
-      sumX += touches[i].clientX - rect.left;
-      sumY += touches[i].clientY - rect.top;
-    }
-    const midX = sumX / touches.length;
-    const midY = sumY / touches.length;
-
-    // Dead zone: ignore pinch-zoom attempts where any finger starts in the
-    // bottom 130px of the canvas (playback bar area).  Single-finger pans are
-    // still allowed so the user can swipe-to-jog on the edge of the bar.
-    if (touches.length >= 2) {
-      const canvasH = rect.height;
-      const deadZonePx = 130;
-      for (let i = 0; i < touches.length; i++) {
-        const ty = touches[i].clientY - rect.top;
-        if (ty > canvasH - deadZonePx) {
-          // Finger is in the dead zone — abort pinch-zoom entirely
-          this._touchActive = false;
-          return;
-        }
-      }
-    }
-
-    // For pinch: compute initial distance
-    let pinchDist = 0;
-    if (touches.length >= 2) {
-      const dx = touches[0].clientX - touches[1].clientX;
-      const dy = touches[0].clientY - touches[1].clientY;
-      pinchDist = Math.sqrt(dx * dx + dy * dy);
-      this._pinchZooming = true;
-    }
-
-    // Store initial touch state
-    const cw = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
-    this._touchState = {
-      startTouches: touches.length,
-      startMidpoint: { x: midX, y: midY },
-      startCenterWorld: { x: cw.x, y: cw.y, ws: cw.ws },
-      startZoom: this.zoom,
-      lastPinchDist: pinchDist,
-      lastMidpoint: { x: midX, y: midY },
-      // Track for tap detection (single touch, minimal movement)
-      tapCandidate: touches.length === 1,
-      tapStartTime: performance.now(),
-      tapStartPos: { x: midX, y: midY },
-    };
-    
-    // Store anchor for inertia
-    this._pinchAnchorSX = midX;
-    this._pinchAnchorSY = midY;
-    
-  }
-
-  onTouchMove(e) {
-    if (!this._touchState) return;
-    e.preventDefault();
-
-    this._noteUserInteraction();
-
-    const touches = e.touches;
-    if (touches.length === 0) return;
-
-    const rect = this.overlayCanvas.getBoundingClientRect();
-
-    // Compute current touch midpoint
-    let sumX = 0, sumY = 0;
-    for (let i = 0; i < touches.length; i++) {
-      sumX += touches[i].clientX - rect.left;
-      sumY += touches[i].clientY - rect.top;
-    }
-    const midX = sumX / touches.length;
-    const midY = sumY / touches.length;
-
-    // Pinch-zoom if 2+ fingers
-    if (touches.length >= 2) {
-      this._pinchZooming = true;
-      const dx = touches[0].clientX - touches[1].clientX;
-      const dy = touches[0].clientY - touches[1].clientY;
-      const pinchDist = Math.sqrt(dx * dx + dy * dy);
-
-      if (this._touchState.lastPinchDist > 0 && pinchDist > 0) {
-        const scale = pinchDist / this._touchState.lastPinchDist;
-        const dz = Math.log2(scale);
-        const prevZ = this.zoom;
-        const z2 = clamp(this.zoom + dz, this._zoomMin, this._zoomMax);
-        this._setZoomAroundScreenPoint(z2, midX, midY);
-        this._notePinchVelocity(z2 - prevZ, performance.now());
-      }
-      this._touchState.lastPinchDist = pinchDist;
-    }
-
-    // Pan: translate based on midpoint delta from last frame
-    const dmx = midX - this._touchState.lastMidpoint.x;
-    const dmy = midY - this._touchState.lastMidpoint.y;
-
-    if (Math.abs(dmx) > 0.5 || Math.abs(dmy) > 0.5) {
-      const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
-      const nx = c.x - dmx;
-      const ny = clamp(c.y - dmy, 0, c.ws - 1);
-      const ll = worldToLatLon(nx, ny, this.zoom);
-      this.center = { lat: ll.lat, lon: ll.lon };
-    }
-
-    // Invalidate tap if moved too far from start (use 25px threshold for iOS finger drift)
-    if (this._touchState.tapCandidate && this._touchState.tapStartPos) {
-      const tdx = midX - this._touchState.tapStartPos.x;
-      const tdy = midY - this._touchState.tapStartPos.y;
-      if (Math.abs(tdx) > 25 || Math.abs(tdy) > 25) {
-        this._touchState.tapCandidate = false;
-      }
-    }
-
-    this._touchState.lastMidpoint = { x: midX, y: midY };
-    this._pinchAnchorSX = midX;
-    this._pinchAnchorSY = midY;
-
-    // Use lightweight redraw during touch - just reposition existing content
-    this._requestPanRedraw();
-  }
-
-  onTouchEnd(e) {
-    if (!this._touchState) return;
-    e.preventDefault();
-
-    const remaining = e.touches.length;
-
-    if (remaining === 0) {
-      // Check for tap gesture before clearing state
-      const wasTap = this._touchState.tapCandidate &&
-        this._touchState.startTouches === 1 &&
-        (performance.now() - this._touchState.tapStartTime) < 300;
-      const tapPos = this._touchState.tapStartPos;
-
-      // Mark touch as ended
-      this._touchActive = false;
-      // Flush any tile redraws that were deferred during touch
-      if (this._tileRedrawPending) {
-        this._tileRedrawPending = false;
-        this._scheduleTileRedraw();
-      }
-      // All fingers lifted - start inertia if we were pinching.
-      // Guard: on iOS Safari, gestureEnd fires before touchEnd for the same
-      // pinch release, so _startPinchInertia() may already be running.
-      // Starting a second chain corrupts shared state (snapshot, velocity)
-      // and causes blown-out PA field alpha.
-      if (this._pinchZooming && !this._pinchInertiaRAF) {
-        this._startPinchInertia();
-      } else if (!this._pinchZooming) {
-        // No pinch inertia - do a full redraw now
-        this._requestZoomRedraw();
-      }
-
-      // Handle tap for marker selection
-      if (wasTap && tapPos) {
-        this._handleTapSelection(tapPos.x, tapPos.y);
-      }
-
-      this._touchState = null;
-    } else if (remaining === 1 && this._touchState.startTouches >= 2) {
-      // Went from 2+ fingers to 1 - reset pan origin to avoid jump
-      const rect = this.overlayCanvas.getBoundingClientRect();
-      const t = e.touches[0];
-      const mx = t.clientX - rect.left;
-      const my = t.clientY - rect.top;
-      this._touchState.lastMidpoint = { x: mx, y: my };
-      this._touchState.lastPinchDist = 0;
-      this._touchState.startTouches = 1;
-      this._pinchZooming = false;
-      // End zoom inertia; continue panning only
-      this._stopPinchInertia();
-      this._requestZoomRedraw();
-    }
-  }
-
-  setTheme(themeKey) {
-    const k = String(themeKey || "");
-    const t = TILE_THEMES[k] || TILE_THEMES["carto_dark_all"];
-    this.themeKey = TILE_THEMES[k] ? k : "carto_dark_all";
-    this.tileTemplate = t.template;
-    this.tileSubdomains = t.subdomains;
-    this._tileEpoch++;
-    this.tileCache.clear();
-    // snapshot invalid across theme swaps
-    this._tilesSnapshotCanvas = null;
-    this._tilesSnapshotMeta = null;
-    // Force drawTiles() inside draw(): cache/epoch were invalidated, so even if
-    // center/zoom/theme-key haven't changed the old tiles are gone and we must
-    // start new requests at the current epoch.
-    this._lastTilesViewSig = null;
-    this.draw(this.lastState);
-  }
-
-  onMouseDown(e) {
-    // Click-drag pan (mouse). Trackpad two-finger pan is still wheel-based.
-    if (e.button !== 0) return;
-
-    // DVR: drag a marker to scrub playback time along its path.
-    // NOTE: Click-to-drag marker scrubbing is temporarily disabled.
-    /*
-    if (this.playbackMode) {
-      const nowMs = performance.now();
-      const hit = this._hitTestMobileAtClientXY(e.clientX, e.clientY, nowMs);
-      if (hit && hit.id != null) {
-        try { e.preventDefault(); e.stopPropagation(); } catch {}
-        const id = String(hit.id);
-        const wasPlaying = this.getPlaybackPlaying();
-        // Stop playback while manipulating (like a DVR scrub).
-        this.setPlaybackPlaying(false);
-
-        // Cancel any existing inertia glide when a new interaction begins.
-        this._pbInertia2d = null;
-
-        // Bring the interacted marker to the top of the draw stack immediately.
-        // (Do not call __selectSensor here; that may trigger camera orchestration.)
-        try {
-          const k = keyFor("mobile", id);
-          if (this.selectedId !== k) this.selectedId = k;
-        } catch {}
-
-        this._pbDrag = {
-          id,
-          startedAtMs: nowMs,
-          lastClient: { x: e.clientX, y: e.clientY },
-          cursorClient: { x: e.clientX, y: e.clientY },
-          lastMoveMs: nowMs,
-          vel: { x: 0, y: 0 },
-          wasPlaying,
-        };
-
-        // Immediately scrub to the closest point under the cursor.
-        try { this._scrubPlaybackTimeForMobileAtClientXY(hit, e.clientX, e.clientY); } catch {}
-
-        // Treat as a drag so onClick does not toggle selection.
-        this._mouseDragMoved = false;
-        this.drawOverlay(this.lastState);
-        return;
-      }
-    }
-    */
-
-    this._noteUserInteraction();
-    this._stopPinchInertia();
-    this._pinchZooming = false;
-    this._mouseDragging = true;
-    this._mouseDragMoved = false;
-    this._mouseDragStart = { x: e.clientX, y: e.clientY };
-    const cw = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
-    this._mouseDragCenterStart = { x: cw.x, y: cw.y, ws: cw.ws };
-  }
-
-  onMouseMove(e) {
-    if (this._pbDrag && this.playbackMode) {
-      const nowMs = performance.now();
-      const dx = e.clientX - (this._pbDrag.lastClient?.x ?? e.clientX);
-      const dy = e.clientY - (this._pbDrag.lastClient?.y ?? e.clientY);
-      if (Math.abs(dx) + Math.abs(dy) > 2) this._mouseDragMoved = true;
-
-      // Track drag velocity for inertial glide on release.
-      const lastMoveMs = (this._pbDrag.lastMoveMs != null && isFinite(this._pbDrag.lastMoveMs)) ? this._pbDrag.lastMoveMs : nowMs;
-      const dtMs = Math.max(1, nowMs - lastMoveMs);
-      const vx = dx / dtMs;
-      const vy = dy / dtMs;
-      const prevV = this._pbDrag.vel || { x: 0, y: 0 };
-      // Low-pass filter: stable velocity estimate without jitter.
-      const a = 0.25;
-      this._pbDrag.vel = {
-        x: prevV.x * (1 - a) + vx * a,
-        y: prevV.y * (1 - a) + vy * a,
-      };
-      this._pbDrag.lastMoveMs = nowMs;
-
-      this._pbDrag.lastClient = { x: e.clientX, y: e.clientY };
-      this._pbDrag.cursorClient = { x: e.clientX, y: e.clientY };
-      const st = this.lastState;
-      const mobiles = st && Array.isArray(st.mobile) ? st.mobile : [];
-      const m = mobiles.find(mm => (mm && mm.id != null && String(mm.id) === String(this._pbDrag.id))) || null;
-      if (m) {
-        // Always scrub time to the closest point on the path (no distance gating).
-        const closest = this._closestPlaybackPathPointForMobileAtClientXY(m, e.clientX, e.clientY);
-        if (closest && isFinite(closest.tMs)) {
-          const bounds = this.getPlaybackBounds();
-          const tMs = closest.tMs;
-          if (isFinite(bounds.minMs) && isFinite(bounds.maxMs)) {
-            const clamped = clamp(tMs, bounds.minMs, bounds.maxMs);
-            this.setPlaybackTimeMs(clamped);
-            // User interaction exits LIVE mode (they're manually controlling)
-            this._playbackLiveFollow = false;
-            if (typeof this._resetLiveTracking === "function") this._resetLiveTracking();
-          } else {
-            this.setPlaybackTimeMs(tMs);
-            this._playbackLiveFollow = false;
-            if (typeof this._resetLiveTracking === "function") this._resetLiveTracking();
-          }
-        }
-        this.drawOverlay(this.lastState);
-      }
-      return;
-    }
-    if (!this._mouseDragging || !this._mouseDragStart || !this._mouseDragCenterStart) return;
-    this._noteUserInteraction();
-    const dx = e.clientX - this._mouseDragStart.x;
-    const dy = e.clientY - this._mouseDragStart.y;
-    if (Math.abs(dx) + Math.abs(dy) > 3) this._mouseDragMoved = true;
-
-    const centerX = this._mouseDragCenterStart.x - dx;
-    const centerY = clamp(this._mouseDragCenterStart.y - dy, 0, this._mouseDragCenterStart.ws - 1);
-    const ll = worldToLatLon(centerX, centerY, this.zoom);
-    this.center = { lat: ll.lat, lon: ll.lon };
-    // If zoom inertia is running, its RAF already calls draw() which reads this.center —
-    // no separate pan redraw needed (avoids two full draws fighting per frame).
-    if (!this._pinchInertiaRAF) this._requestPanRedraw();
-  }
-
-  onMouseUp() {
-    if (this._pbDrag) {
-      const drag = this._pbDrag;
-      this._pbDrag = null;
-
-      // Start a short inertial glide for the interacted marker.
-      // This continues scrubbing the global time for *all* markers.
-      try { this._startPbMarkerInertiaFromDrag(drag); } catch {}
-
-      // User request: always resume playback for all after interacting.
-      this.setPlaybackPlaying(true);
-      if (typeof window.__ensurePlaybackLoop === "function") window.__ensurePlaybackLoop();
-      return;
-    }
-    this._mouseDragging = false;
-    this._mouseDragStart = null;
-    this._mouseDragCenterStart = null;
-    this._redrawViewOnly();
-    // click behavior is handled in onClick; we just stop dragging here.
-  }
 
   _getOverlayPaddingPx() {
     // Side-specific padding based on overlay panels that obscure the map.
@@ -1954,8 +1413,7 @@ class MapView {
     const target = clamp(Math.round(this.zoom) + delta, this._zoomMin, this._zoomMax);
     this.zoom = target;
     // Invalidate snapshot when zoom jumps (prevents “tunnel” feel).
-    this._tilesSnapshotCanvas = null;
-    this._tilesSnapshotMeta = null;
+    this._tileRenderer.invalidateSnapshot();
     this.draw(this.lastState);
     this._notifyViewChanged();
   }
@@ -1999,8 +1457,7 @@ class MapView {
     this.octx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     // Snapshot is tied to canvas size; reset on resize to avoid distortion.
-    this._tilesSnapshotCanvas = null;
-    this._tilesSnapshotMeta = null;
+    this._tileRenderer.invalidateSnapshot();
     this._paFieldCanvas = null;
     this._paGrid = null;
     this._invalidateOverlayStatic();
@@ -2014,99 +1471,6 @@ class MapView {
   }
 
 
-  onWheel(e) {
-    // Platform-aware wheel handling:
-    // - Windows: scroll wheel = zoom (no Ctrl needed), trackpad pan = pan
-    // - macOS: trackpad pinch (ctrlKey) = zoom, trackpad pan = pan, mouse wheel = zoom
-    e.preventDefault();
-    this._noteUserInteraction();
-
-    // deltaMode !== 0 means mouse wheel (line or page scrolling mode)
-    const isMouseWheel = e.deltaMode !== 0;
-
-    // Smooth-scroll mice (Windows/Linux only): vertical-only with significant delta.
-    // Catches mice that report deltaMode=0 (Logitech, Razer, etc).
-    // NOT applied on macOS — two-finger vertical trackpad pan is indistinguishable,
-    // and macOS convention is scroll=pan, pinch=zoom (like Apple Maps).
-    const isSmoothScrollZoom = !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
-
-    // Determine if this should be a zoom event:
-    // 1. True mouse wheel (deltaMode !== 0) → zoom
-    // 2. Ctrl+wheel (trackpad pinch gesture) → zoom
-    // 3. Windows/Linux: vertical smooth-scroll (smooth-scroll mice) → zoom
-    let shouldZoom = isMouseWheel || e.ctrlKey || isSmoothScrollZoom;
-
-    // Debounce pan→zoom transitions: when lifting one finger during a two-finger
-    // trackpad pan, macOS briefly interprets the finger separation as a pinch gesture,
-    // firing ctrlKey=true wheel events. Ignore these artifacts if we were panning
-    // within the last 100ms (a real intentional pinch starts well after pan ends).
-    if (shouldZoom && !isMouseWheel && this._lastWheelPanTime
-        && (performance.now() - this._lastWheelPanTime) < 100) {
-      shouldZoom = false;
-    }
-
-    if (shouldZoom) {
-      if (this._gesture) return;
-      if (this._mouseDragging) return; // Don't zoom while user is panning
-
-      if (this._wheelPinchEndTimer) window.clearTimeout(this._wheelPinchEndTimer);
-      this._pinchZooming = true;
-
-      const rect = this.overlayCanvas.getBoundingClientRect();
-      const sx = e.clientX - rect.left;
-      const sy = e.clientY - rect.top;
-      this._pinchAnchorSX = sx;
-      this._pinchAnchorSY = sy;
-
-      const rawDy = clamp(e.deltaY, -300, 300);
-      // Mouse wheel natural direction is inverted vs trackpad pinch
-      const dy = (isMouseWheel || isSmoothScrollZoom) ? -rawDy : rawDy;
-      const dir = dy < 0 ? 1 : -1;
-      // Adjust zoom sensitivity per input type.
-      // Chrome trackpad pinch reports ~3-5x smaller deltaY than Safari for same gesture.
-      const isChromePinch = e.ctrlKey && !isMouseWheel && /Chrome/.test(navigator.userAgent || "");
-      const strength = (isMouseWheel || isSmoothScrollZoom) ? 0.018 : isChromePinch ? 0.055 : 0.020;
-      const dz = dir * Math.log1p(Math.abs(dy)) * strength;
-      const prevZ = this.zoom;
-      const z2 = clamp(this.zoom + dz, this._zoomMin, this._zoomMax);
-      this._setZoomAroundScreenPoint(z2, sx, sy);
-      this._requestZoomRedraw();
-      this._notifyViewChanged();
-      this._notePinchVelocity(z2 - prevZ, performance.now());
-
-      // Trackpad pinch needs inertia; mouse wheel doesn't
-      if (!isMouseWheel && !isSmoothScrollZoom) {
-        this._wheelPinchEndTimer = window.setTimeout(() => this._startPinchInertia(), 28);
-      } else {
-        this._wheelPinchEndTimer = window.setTimeout(() => {
-          this._pinchZooming = false;
-          this._requestZoomRedraw(); // Final redraw with crisp tiles at settled zoom
-        }, 150);
-      }
-      return;
-    }
-
-    // Trackpad two-finger pan (deltaMode = 0, no ctrlKey, has horizontal component on macOS)
-    // Also covers iPad keyboard trackpad which fires wheel events, not touch events.
-    this._lastWheelPanTime = performance.now();
-    if (!this._wheelPanning) {
-      this._wheelPanning = true;
-    }
-    if (this._wheelPanEndTimer) window.clearTimeout(this._wheelPanEndTimer);
-    this._wheelPanEndTimer = window.setTimeout(() => {
-      this._wheelPanning = false;
-      this._wheelPanEndTimer = null;
-      this._redrawViewOnly();
-    }, 120);
-    const scale = 0.65;
-    const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
-    const nx = c.x + e.deltaX * scale;
-    const ny = clamp(c.y + e.deltaY * scale, 0, c.ws - 1);
-    const ll = worldToLatLon(nx, ny, this.zoom);
-    this.center = { lat: ll.lat, lon: ll.lon };
-    if (!this._pinchInertiaRAF) this._requestPanRedraw();
-  }
-
   onClick(e) {
     // Click empty map to deselect
     const st = this.lastState;
@@ -2117,8 +1481,8 @@ class MapView {
     const sy = e.clientY - rect.top;
 
     // Ignore click if it was part of a drag gesture.
-    if (this._mouseDragMoved) {
-      this._mouseDragMoved = false;
+    if (this._input.mouseDragMoved) {
+      this._input.mouseDragMoved = false;
       return;
     }
 
@@ -2280,7 +1644,7 @@ class MapView {
       const dpr = Number(this._dpr || (window.devicePixelRatio || 1));
       // Round to reduce float churn without affecting visual correctness.
       const r = (x, p = 1e6) => (isFinite(x) ? (Math.round(x * p) / p) : x);
-      return `${this.themeKey}|${r(z, 1e3)}|${r(lat)}|${r(lon)}|${w}x${h}|dpr:${r(dpr, 1e3)}|pinch:${this._pinchZooming ? 1 : 0}`;
+      return `${this.themeKey}|${r(z, 1e3)}|${r(lat)}|${r(lon)}|${w}x${h}|dpr:${r(dpr, 1e3)}|pinch:${this._input.pinchZooming ? 1 : 0}`;
     })();
 
     let tilesRedrawn = false;
@@ -2856,229 +2220,17 @@ class MapView {
   }
 
   drawTiles() {
-    const ctx = this.tctx;
-    if (!ctx) return;
-    // Avoid per-frame layout reads during panning.
-    const w = this._cssW || 1;
-    const h = this._cssH || 1;
-    const dpr = this._dpr || (window.devicePixelRatio || 1);
-
-    // Reset transform to canonical dpr-scaled state to prevent scaling bugs
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
-    const ws = c.ws;
-
-    // Backdrop: reuse previous frame so *panning* doesn't flicker while tiles stream in.
-    // During active pinch/inertia we also reuse+scale the snapshot (fast path) so zooming
-    // is closer to the OS-native feel and doesn't spend time drawing N tiles every event.
-    const hasSnapshot = !!(this._tilesSnapshotCanvas && this._tilesSnapshotMeta);
-    ctx.clearRect(0, 0, w, h);
-    if (hasSnapshot) {
-      try {
-        const prev = this._tilesSnapshotMeta;
-        ctx.save();
-        if (this._pinchZooming) {
-          // Scale around the screen center; also translate for center changes.
-          const sZoom = Math.pow(2, this.zoom - prev.zoom);
-          const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
-          const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
-          const txPan = (prevC.x - currC.x) * sZoom;
-          const tyPan = (prevC.y - currC.y) * sZoom;
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          ctx.translate(w / 2, h / 2);
-          ctx.scale(sZoom, sZoom);
-          ctx.translate((-w / 2) + (txPan / sZoom), (-h / 2) + (tyPan / sZoom));
-          ctx.drawImage(this._tilesSnapshotCanvas, 0, 0, w, h);
-          ctx.restore();
-          // Fast path: don't draw individual tiles while pinch-zooming. We'll do a full tiles
-          // render once the gesture/inertia completes.
-          return;
-        }
-
-        // Non-pinch: translate-only (same integer zoom snapshots).
-        if (Math.floor(prev.zoom) !== Math.floor(this.zoom)) throw new Error("zoom changed");
-        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
-        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
-        const tx = (prevC.x - currC.x);
-        const ty = (prevC.y - currC.y);
-        ctx.setTransform(dpr, 0, 0, dpr, dpr * tx, dpr * ty);
-        ctx.drawImage(this._tilesSnapshotCanvas, 0, 0, w, h);
-        ctx.restore();
-      } catch {
-        // ignore snapshot issues
-      }
-    }
-
-    const topLeftX = c.x - w / 2;
-    const topLeftY = c.y - h / 2;
-
-    // Use integer tile zoom for fetching, scaled to fractional zoom.
-    const tileZ = clamp(Math.floor(this.zoom), this._zoomMin, this._zoomMax);
-    const s = Math.pow(2, this.zoom - tileZ); // scale factor from tileZ world to zoom world
-
-    const topLeftX_Z = topLeftX / s;
-    const topLeftY_Z = topLeftY / s;
-    const w_Z = w / s;
-    const h_Z = h / s;
-
-    const minTileX = Math.floor(topLeftX_Z / TILE_SIZE);
-    const minTileY = Math.floor(topLeftY_Z / TILE_SIZE);
-    const maxTileX = Math.floor((topLeftX_Z + w_Z) / TILE_SIZE);
-    const maxTileY = Math.floor((topLeftY_Z + h_Z) / TILE_SIZE);
-
-    const tilesPerAxis = Math.pow(2, tileZ);
-    for (let ty = minTileY; ty <= maxTileY; ty++) {
-      if (ty < 0 || ty >= tilesPerAxis) continue;
-      for (let tx = minTileX; tx <= maxTileX; tx++) {
-        // wrap X
-        let wrappedX = tx;
-        while (wrappedX < 0) wrappedX += tilesPerAxis;
-        while (wrappedX >= tilesPerAxis) wrappedX -= tilesPerAxis;
-
-        // IMPORTANT: key includes theme to prevent "checkerboard" mixing when switching themes.
-        const key = `${this.themeKey}:${tileZ}/${wrappedX}/${ty}`;
-        const px = (tx * TILE_SIZE * s) - topLeftX;
-        const py = (ty * TILE_SIZE * s) - topLeftY;
-
-        this.drawTile(ctx, key, tileZ, wrappedX, ty, px, py, s, hasSnapshot);
-      }
-    }
-
-    // No vignette: it reads like a “tunnel/bokeh” during zooming.
-
-    // Capture snapshot for the next frame - but skip during active touch to avoid blocking input.
-    if (!this._touchActive) this._captureTilesSnapshot();
-  }
-
-  /** Capture the tiles canvas into a snapshot for smooth pan/zoom transitions. */
-  _captureTilesSnapshot() {
-    try {
-      const tw = this.tilesCanvas.width;
-      const th = this.tilesCanvas.height;
-      if (!this._tilesSnapshotCanvas) {
-        this._tilesSnapshotCanvas = document.createElement("canvas");
-        this._tilesSnapshotCanvas.width = tw;
-        this._tilesSnapshotCanvas.height = th;
-      } else if (this._tilesSnapshotCanvas.width !== tw || this._tilesSnapshotCanvas.height !== th) {
-        this._tilesSnapshotCanvas.width = tw;
-        this._tilesSnapshotCanvas.height = th;
-      }
-      const sctx = this._tilesSnapshotCanvas.getContext("2d");
-      if (sctx) {
-        sctx.setTransform(1, 0, 0, 1, 0, 0);
-        sctx.clearRect(0, 0, tw, th);
-        sctx.drawImage(this.tilesCanvas, 0, 0);
-        this._tilesSnapshotMeta = { zoom: this.zoom, centerLat: this.center.lat, centerLon: this.center.lon };
-      }
-    } catch {
-      // ignore snapshot capture errors
-    }
-  }
-
-  _tileCacheGet(key) {
-    if (!this.tileCache || !key) return null;
-    const v = this.tileCache.get(key) || null;
-    if (!v) return null;
-    // LRU: refresh insertion order.
-    this.tileCache.delete(key);
-    this.tileCache.set(key, v);
-    return v;
-  }
-
-  _tileCacheSet(key, value) {
-    if (!this.tileCache || !key) return;
-    if (this.tileCache.has(key)) this.tileCache.delete(key);
-    this.tileCache.set(key, value);
-    const max = (typeof this._tileCacheMax === "number" && isFinite(this._tileCacheMax) && this._tileCacheMax > 0)
-      ? Math.floor(this._tileCacheMax)
-      : 420;
-    while (this.tileCache.size > max) {
-      const oldestKey = this.tileCache.keys().next().value;
-      if (oldestKey == null) break;
-      this.tileCache.delete(oldestKey);
-    }
-  }
-
-  drawTile(ctx, key, z, x, y, px, py, scale, hasSnapshot) {
-    const cached = this._tileCacheGet(key);
-    if (cached && cached.ok) {
-      const sz = TILE_SIZE * scale;
-      ctx.filter = "none";
-      ctx.drawImage(cached.img, Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
-      return;
-    }
-
-    if (!cached) {
-      const img = new Image();
-      const epoch = this._tileEpoch;
-      img.crossOrigin = "anonymous";
-      img.onload = () => {
-        if (epoch !== this._tileEpoch) return;
-        this._tileCacheSet(key, { img, ok: true });
-        this._scheduleTileRedraw();
-      };
-      img.onerror = () => {
-        if (epoch !== this._tileEpoch) return;
-        this._tileCacheSet(key, { img, ok: false });
-      };
-      const subs = this.tileSubdomains || [""];
-      const sub = subs[(x + y) % subs.length] || "";
-      img.src = this.tileTemplate
-        .replace("{s}", sub)
-        .replace("{z}", z)
-        .replace("{x}", x)
-        .replace("{y}", y);
-      if (epoch === this._tileEpoch) this._tileCacheSet(key, { img, ok: false });
-    }
-
-    // Tile not ready yet — try to draw a parent tile (lower zoom) scaled up as fallback.
-    // Walk up zoom levels to find a cached ancestor tile covering this area.
-    for (let pz = z - 1; pz >= Math.max(z - 4, this._zoomMin); pz--) {
-      const diff = z - pz;
-      const parentX = x >> diff;
-      const parentY = y >> diff;
-      const parentKey = `${this.themeKey}:${pz}/${parentX}/${parentY}`;
-      const parentCached = this._tileCacheGet(parentKey);
-      if (parentCached && parentCached.ok) {
-        // Draw the sub-region of the parent tile that corresponds to this tile.
-        const subScale = 1 << diff;
-        const subX = x - (parentX << diff);
-        const subY = y - (parentY << diff);
-        const srcSize = TILE_SIZE / subScale;
-        const srcX = subX * srcSize;
-        const srcY = subY * srcSize;
-        const sz = TILE_SIZE * scale;
-        ctx.filter = "none";
-        ctx.drawImage(parentCached.img, srcX, srcY, srcSize, srcSize,
-          Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
-        return;
-      }
-    }
-
-    // No parent available — only draw placeholder if there's no snapshot backdrop.
-    if (!hasSnapshot) {
-      const sz = TILE_SIZE * scale;
-      ctx.fillStyle = "rgba(255,255,255,0.03)";
-      ctx.fillRect(Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
-      ctx.strokeStyle = "rgba(255,255,255,0.04)";
-      ctx.strokeRect(Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
-    }
-  }
-
-  _scheduleTileRedraw() {
-    // Debounce tile-load redraws: wait a short time for more tiles to finish loading
-    // before redrawing, to avoid N separate redraws when N tiles load in quick succession.
-    if (this._touchActive) {
-      // Mark pending so tiles redraw when touch ends
-      this._tileRedrawPending = true;
-      return;
-    }
-    if (this._tileLoadRedrawTimer) return; // already scheduled
-    this._tileLoadRedrawTimer = setTimeout(() => {
-      this._tileLoadRedrawTimer = null;
-      this.drawTiles();
-    }, 50);
+    this._tileRenderer.render({
+      center: this.center,
+      zoom: this.zoom,
+      cssW: this._cssW || 1,
+      cssH: this._cssH || 1,
+      dpr: this._dpr || (window.devicePixelRatio || 1),
+      pinchZooming: this._input.pinchZooming,
+      touchActive: this._input.touchActive,
+      zoomMin: this._zoomMin,
+      zoomMax: this._zoomMax,
+    });
   }
 
   _tracePointsKeyForState(state) {
