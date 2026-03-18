@@ -4523,6 +4523,40 @@ function main() {
     }
   }
 
+  // ── Playback-bar auto-hide (20 s idle → slide down + fade out) ──
+  {
+    const PB_HIDE_MS = 20000;
+    const bar = document.getElementById("playbackBar");
+    if (bar) {
+      let _hideTimer = setTimeout(() => bar.classList.add("pb-hidden"), PB_HIDE_MS);
+
+      const resetHide = () => {
+        bar.classList.remove("pb-hidden");
+        clearTimeout(_hideTimer);
+        _hideTimer = setTimeout(() => bar.classList.add("pb-hidden"), PB_HIDE_MS);
+      };
+
+      // Any interaction with the bar itself resets the timer
+      bar.addEventListener("pointerdown", resetHide);
+      bar.addEventListener("input", resetHide);
+
+      // Mouse entering the lower third of the viewport re-shows it
+      document.addEventListener("mousemove", (e) => {
+        if (e.clientY > window.innerHeight * (2 / 3)) {
+          resetHide();
+        }
+      });
+
+      // Touch in the lower third also re-shows
+      document.addEventListener("touchstart", (e) => {
+        const t = e.touches[0];
+        if (t && t.clientY > window.innerHeight * (2 / 3)) {
+          resetHide();
+        }
+      }, { passive: true });
+    }
+  }
+
   // Load server config before starting data polling
   // This allows the server to control CDN/caching behavior
   loadConfig().then(async () => {
