@@ -36,24 +36,45 @@ self.onmessage = function(e) {
   const { sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, blurRadius, jobId } = e.data;
   const px = new Uint8ClampedArray(gw * gh * 4);
 
-  // IDW interpolation with Gaussian alpha.
+  // KNN-IDW interpolation with Gaussian alpha.
+  const K = 8;
   const eps2 = 1;
+  const kD2  = new Float64Array(K);
+  const kIdx = new Int32Array(K);
   for (let gy = 0; gy < gh; gy++) {
     const py = (gy + 0.5) * cellSize;
     for (let gx = 0; gx < gw; gx++) {
       const pxx = (gx + 0.5) * cellSize;
 
-      let wSum = 0, vSum = 0, gSum = 0;
+      let kCount = 0;
       for (let i = 0; i < sensors.length; i += 3) {
         const dx = pxx - sensors[i];
         const dy = py  - sensors[i + 1];
         const d2 = dx * dx + dy * dy;
         if (d2 > cutoffSq) continue;
+        if (kCount < K) {
+          kD2[kCount] = d2;
+          kIdx[kCount] = i;
+          kCount++;
+        } else {
+          let maxJ = 0;
+          for (let j = 1; j < K; j++) { if (kD2[j] > kD2[maxJ]) maxJ = j; }
+          if (d2 < kD2[maxJ]) {
+            kD2[maxJ] = d2;
+            kIdx[maxJ] = i;
+          }
+        }
+      }
+
+      let wSum = 0, vSum = 0, gSum = 0;
+      for (let j = 0; j < kCount; j++) {
+        const d2 = kD2[j];
+        const si = kIdx[j];
         const t = d2 / cutoffSq;
         const envelope = (1 - t) * (1 - t);
         const w = envelope / (d2 + eps2);
         wSum += w;
-        vSum += w * sensors[i + 2];
+        vSum += w * sensors[si + 2];
         gSum += Math.exp(-d2 / twoSigmaSq);
       }
 

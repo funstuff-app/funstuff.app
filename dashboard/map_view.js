@@ -5360,28 +5360,53 @@ class MapView {
     const { tc, tctx, imgData } = this._paGrid;
     const px = imgData.data;
 
-    // ── IDW interpolation with Gaussian alpha ──
-    // VALUE: IDW 1/(d²+ε) so each sensor dominates its own location.
-    // ALPHA: Gaussian accumulator (zoom-independent) for smooth edge fading.
-    const eps2 = 1;  // tiny regularisation — sensor owns its grid cell
+    // ── KNN-IDW interpolation with Gaussian alpha ──
+    // VALUE: K-nearest-neighbor IDW. Only the K closest sensors contribute
+    //   to each grid cell, so clean sensor clusters form connected regions
+    //   and a single high reading can't bleed across distant clean sensors.
+    // ALPHA: Gaussian accumulator for smooth edge fading.
+    const K = 8;  // number of nearest neighbors
+    const eps2 = 1;
+    // Scratch arrays reused across grid cells (avoids alloc per cell)
+    const kD2  = new Float64Array(K);  // squared distances of K nearest
+    const kIdx = new Int32Array(K);    // sensor indices (stride-3 offset)
     for (let gy = 0; gy < gh; gy++) {
       const py = (gy + 0.5) * cellSize;
       for (let gx = 0; gx < gw; gx++) {
         const pxx = (gx + 0.5) * cellSize;
 
-        let wSum = 0, vSum = 0, gSum = 0;
+        // Find K nearest sensors within cutoff
+        let kCount = 0;
         for (let i = 0; i < sensors.length; i += 3) {
           const dx = pxx - sensors[i];
           const dy = py  - sensors[i + 1];
           const d2 = dx * dx + dy * dy;
           if (d2 > cutoffSq) continue;
+          if (kCount < K) {
+            // Fill first K slots
+            kD2[kCount] = d2;
+            kIdx[kCount] = i;
+            kCount++;
+          } else {
+            // Find the farthest of the current K and replace if closer
+            let maxJ = 0;
+            for (let j = 1; j < K; j++) { if (kD2[j] > kD2[maxJ]) maxJ = j; }
+            if (d2 < kD2[maxJ]) {
+              kD2[maxJ] = d2;
+              kIdx[maxJ] = i;
+            }
+          }
+        }
+
+        let wSum = 0, vSum = 0, gSum = 0;
+        for (let j = 0; j < kCount; j++) {
+          const d2 = kD2[j];
+          const si = kIdx[j];
           const t = d2 / cutoffSq;
           const envelope = (1 - t) * (1 - t);
-          // IDW weight for value interpolation
           const w = envelope / (d2 + eps2);
           wSum += w;
-          vSum += w * sensors[i + 2];
-          // Gaussian weight for alpha (coverage density)
+          vSum += w * sensors[si + 2];
           gSum += Math.exp(-d2 / twoSigmaSq);
         }
 
@@ -5581,7 +5606,7 @@ class MapView {
       if (this._paFieldPrewarmed.has(fp)) continue;
 
       // Dispatch this one to the worker
-      const cellSize = 16;
+      const cellSize = 8;
       const gw = Math.ceil(cssW / cellSize);
       const gh = Math.ceil(cssH / cellSize);
       const _fdw = window._fieldDebug;
