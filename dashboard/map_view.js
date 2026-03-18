@@ -2945,8 +2945,6 @@ class MapView {
       }
     }
 
-    // No vignette: it reads like a “tunnel/bokeh” during zooming.
-
     // Capture snapshot for the next frame - but skip during active touch to avoid blocking input.
     if (!this._touchActive) this._captureTilesSnapshot();
   }
