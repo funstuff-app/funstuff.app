@@ -2007,6 +2007,8 @@ class MapView {
     // Invalidate trail cache on resize
     this._trailCacheCanvas = null;
     this._trailCacheViewKey = "";
+    // Force drawTiles() in draw() even if viewSig matches (canvas was cleared above).
+    this._lastTilesViewSig = null;
 
     this.draw(this.lastState);
   }
