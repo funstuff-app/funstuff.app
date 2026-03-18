@@ -4570,34 +4570,46 @@ function main() {
   }
 
   // ── Playback-bar auto-hide (10 s idle → slide down + fade out) ──
+  // Only hides when the pointer is in the top 2/3 of the viewport.
+  // A 15 px buffer keeps the boundary from overlapping the bar.
   {
     const PB_HIDE_MS = 10000;
     const bar = document.getElementById("playbackBar");
     if (bar) {
-      let _hideTimer = setTimeout(() => bar.classList.add("pb-hidden"), PB_HIDE_MS);
+      let _lastMouseY = 0;
+      let _hideTimer = null;
+
+      const inBottomZone = () =>
+        _lastMouseY > window.innerHeight * (2 / 3) - 15;
+
+      const tryHide = () => {
+        if (!inBottomZone()) bar.classList.add("pb-hidden");
+      };
 
       const resetHide = () => {
         bar.classList.remove("pb-hidden");
         clearTimeout(_hideTimer);
-        _hideTimer = setTimeout(() => bar.classList.add("pb-hidden"), PB_HIDE_MS);
+        _hideTimer = setTimeout(tryHide, PB_HIDE_MS);
       };
+
+      _hideTimer = setTimeout(tryHide, PB_HIDE_MS);
 
       // Any interaction with the bar itself resets the timer
       bar.addEventListener("pointerdown", resetHide);
       bar.addEventListener("input", resetHide);
 
-      // Mouse entering the lower third of the viewport re-shows it
+      // Track pointer position & re-show when entering bottom third
       document.addEventListener("mousemove", (e) => {
-        if (e.clientY > window.innerHeight * (2 / 3)) {
-          resetHide();
-        }
+        _lastMouseY = e.clientY;
+        if (inBottomZone()) resetHide();
       });
 
       // Touch in the lower third also re-shows
       document.addEventListener("touchstart", (e) => {
         const t = e.touches[0];
-        if (t && t.clientY > window.innerHeight * (2 / 3)) {
-          resetHide();
+        if (t) {
+          _lastMouseY = t.clientY;
+          if (inBottomZone()) resetHide();
         }
       }, { passive: true });
     }
