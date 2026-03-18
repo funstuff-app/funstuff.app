@@ -2254,8 +2254,8 @@ class MapView {
         this._dataNowBasePerfMs = performance.now();
       }
       this._hasTrxVehicles = hasTrx;
-      // Fetch tram track edges for curve rendering when TRX vehicles present
-      if (hasTrx) this._fetchTramLineEdgesForViewport();
+      // Only fetch tram track edges when debug path overlay is active (debug-only visualizer)
+      if (hasTrx && this._pbDebugPath) this._fetchTramLineEdgesForViewport();
     } catch {
       // ignore
     }
