@@ -4523,9 +4523,9 @@ function main() {
     }
   }
 
-  // ── Playback-bar auto-hide (20 s idle → slide down + fade out) ──
+  // ── Playback-bar auto-hide (10 s idle → slide down + fade out) ──
   {
-    const PB_HIDE_MS = 20000;
+    const PB_HIDE_MS = 10000;
     const bar = document.getElementById("playbackBar");
     if (bar) {
       let _hideTimer = setTimeout(() => bar.classList.add("pb-hidden"), PB_HIDE_MS);
