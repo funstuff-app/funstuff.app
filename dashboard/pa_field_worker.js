@@ -33,31 +33,35 @@ function pm25ToRgbSmooth(v) {
 }
 
 self.onmessage = function(e) {
-  const { sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, jobId } = e.data;
+  const { sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, blurRadius, jobId } = e.data;
   const px = new Uint8ClampedArray(gw * gh * 4);
 
-  // Gaussian-kernel IDW with weight-sum fading.
+  // IDW interpolation with Gaussian alpha.
+  const eps2 = 1;
   for (let gy = 0; gy < gh; gy++) {
     const py = (gy + 0.5) * cellSize;
     for (let gx = 0; gx < gw; gx++) {
       const pxx = (gx + 0.5) * cellSize;
 
-      let wSum = 0, vSum = 0;
+      let wSum = 0, vSum = 0, gSum = 0;
       for (let i = 0; i < sensors.length; i += 3) {
         const dx = pxx - sensors[i];
         const dy = py  - sensors[i + 1];
         const d2 = dx * dx + dy * dy;
         if (d2 > cutoffSq) continue;
-        const w = Math.exp(-d2 / twoSigmaSq);
+        const t = d2 / cutoffSq;
+        const envelope = (1 - t) * (1 - t);
+        const w = envelope / (d2 + eps2);
         wSum += w;
         vSum += w * sensors[i + 2];
+        gSum += Math.exp(-d2 / twoSigmaSq);
       }
 
       const off = (gy * gw + gx) * 4;
-      if (wSum < 0.001) {
+      if (wSum < 1e-12) {
         px[off] = 0; px[off + 1] = 0; px[off + 2] = 0; px[off + 3] = 0;
       } else {
-        const fade = Math.min(1, wSum * 2);
+        const fade = Math.min(1, gSum * 2);
         const alpha = Math.round(FIELD_ALPHA * fade);
         const val = vSum / wSum;
         const rgb = pm25ToRgbSmooth(val);
@@ -69,8 +73,8 @@ self.onmessage = function(e) {
     }
   }
 
-  // ── Gaussian blur (radius 2) to soften jagged band edges ──
-  const BLUR_R = 2;
+  // ── Gaussian blur to soften jagged band edges ──
+  const BLUR_R = blurRadius != null ? blurRadius : 2;
   const tmp = new Uint8ClampedArray(px.length);
   // Horizontal pass
   for (let y = 0; y < gh; y++) {

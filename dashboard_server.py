@@ -528,6 +528,14 @@ class AppState:
     # next /api/state poll as a "new data" event even if timestamps/trails are unchanged.
     force_refresh_seq: int = 0
 
+    # --demo-pa mode flag
+    demo_pa: bool = False
+    # The identifier used for the demo snapshot in the API ("demo")
+    demo_pa_date: str = ""
+    # Separate demo history dict — never merged into fixed_history
+    demo_pa_history: dict = field(default_factory=dict)
+    demo_pa_bounds_ms: tuple = (0.0, 0.0)  # (min_ms, max_ms)
+
     # Monotonic counter bumped on EVERY state mutation (fetch loop, PurpleAir,
     # Home sensor, force-refresh).  Used as the ETag so clients skip unchanged
     # payloads via 304 regardless of which subsystem triggered the change.
@@ -2186,6 +2194,54 @@ def _fetch_purpleair_sensors(fields: str = "pm2.5,last_seen",
         return []
 
 
+def detect_pa_outliers(
+    sensor_values: list[tuple[float, float, float]],
+    *,
+    neighbor_radius_km: float = 5.0,
+    min_neighbors: int = 3,
+    ratio_threshold: float = 5.0,
+    abs_diff_threshold: float = 30.0,
+    agreement_count: int = 2,
+    agreement_floor: float = 15.0,
+) -> set[int]:
+    """Detect spatial outliers in a list of (lat, lon, pm25) tuples.
+
+    Returns a set of indices into *sensor_values* that are outliers.
+    A sensor is an outlier if it is dramatically higher than its local
+    neighborhood median AND fewer than *agreement_count* neighbors are
+    also elevated (ruling out correlated real events like fires).
+    """
+    cos_lat = math.cos(math.radians(40.7))
+    km_per_deg_lat = 110.57
+    km_per_deg_lon = 111.32 * cos_lat
+    r_sq = neighbor_radius_km * neighbor_radius_km
+
+    outliers: set[int] = set()
+    for i, (lat_i, lon_i, val_i) in enumerate(sensor_values):
+        neighbor_vals: list[float] = []
+        for j, (lat_j, lon_j, val_j) in enumerate(sensor_values):
+            if i == j:
+                continue
+            dlat_km = (lat_j - lat_i) * km_per_deg_lat
+            dlon_km = (lon_j - lon_i) * km_per_deg_lon
+            if dlat_km * dlat_km + dlon_km * dlon_km <= r_sq:
+                neighbor_vals.append(val_j)
+
+        if len(neighbor_vals) < min_neighbors:
+            continue
+
+        neighbor_vals.sort()
+        median = neighbor_vals[len(neighbor_vals) // 2]
+        diff = val_i - median
+
+        if diff >= abs_diff_threshold and (median < 1.0 or val_i >= ratio_threshold * median):
+            elevated = sum(1 for nv in neighbor_vals if nv >= agreement_floor)
+            if elevated < agreement_count:
+                outliers.add(i)
+
+    return outliers
+
+
 def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
     """Merge PurpleAir sensors into fixed list as dot markers."""
     sensors = app_state.purpleair_sensors
@@ -2199,9 +2255,9 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
     # Remove any existing PurpleAir sensors to avoid duplicates on re-merge
     fixed_list = [f for f in fixed_list if not f.get("purpleair")]
 
-    # ── Outlier detection: compare each sensor against peers ─────────
-    # Collect all valid PM2.5 values in-bounds
-    valid_values: list[float] = []
+    # ── Local spatial outlier detection ──────────────────────────────
+    # Pre-filter to valid in-bounds sensors with lat/lon/pm2.5
+    valid_sensors: list[dict[str, Any]] = []
     for s in sensors:
         lat = s.get("latitude")
         lon = s.get("longitude")
@@ -2210,39 +2266,6 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
         if not (SLC_BOUNDS["lat_min"] <= lat <= SLC_BOUNDS["lat_max"] and
                 SLC_BOUNDS["lon_min"] <= lon <= SLC_BOUNDS["lon_max"]):
             continue
-        pm25 = s.get("pm2.5")
-        if pm25 is None:
-            continue
-        try:
-            valid_values.append(float(pm25))
-        except (TypeError, ValueError):
-            pass
-
-    # Compute outlier threshold from peer readings using IQR method
-    # Only filters truly broken hardware (e.g., 3000+ when median is 2).
-    # Must NOT filter legitimate hotspots near highways, construction,
-    # or during dust storms/inversions (200+ is realistic).
-    outlier_threshold = float("inf")
-    if len(valid_values) >= 3:
-        sv = sorted(valid_values)
-        n = len(sv)
-        q1 = sv[n // 4]
-        q3 = sv[(3 * n) // 4]
-        iqr = q3 - q1
-        # Floor of 500 µg/m³: never filter readings below 500.
-        # Above 500, must exceed Q3 + 10× IQR to be considered broken.
-        outlier_threshold = max(500.0, q3 + iqr * 10.0)
-    # ─────────────────────────────────────────────────────────────────
-
-    for s in sensors:
-        lat = s.get("latitude")
-        lon = s.get("longitude")
-        if lat is None or lon is None:
-            continue
-        if not (SLC_BOUNDS["lat_min"] <= lat <= SLC_BOUNDS["lat_max"] and
-                SLC_BOUNDS["lon_min"] <= lon <= SLC_BOUNDS["lon_max"]):
-            continue
-
         pm25 = s.get("pm2.5")
         if pm25 is None:
             continue
@@ -2250,19 +2273,38 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
             pm25_val = float(pm25)
         except (TypeError, ValueError):
             continue
-
-        # Skip outlier sensors (broken hardware reporting wildly wrong values)
-        if pm25_val < 0 or pm25_val > outlier_threshold:
+        if pm25_val < 0:
             continue
+        valid_sensors.append({**s, "_pm25": pm25_val, "_lat": lat, "_lon": lon})
+
+    # Build outlier set using local spatial comparison
+    sensor_tuples = [(vs["_lat"], vs["_lon"], vs["_pm25"]) for vs in valid_sensors]
+    outlier_indices = detect_pa_outliers(sensor_tuples)
+    # ─────────────────────────────────────────────────────────────────
+
+    for i, s in enumerate(valid_sensors):
+        pm25_val = s["_pm25"]
+        lat = s["_lat"]
+        lon = s["_lon"]
+        is_outlier = i in outlier_indices
 
         sid = f"PA_{s.get('sensor_index', '')}"
         name = s.get("name", sid)
         # Strip branding from name
         name = re.sub(r'(?:\s*-\s*|\s+)power(?:ed)?\s+by\s+uto[pi]{2}a(?:\s+fiber)?', '', name, flags=re.IGNORECASE).strip()
-        color = _get_aqi_color("PM25", pm25_val)
+
+        if is_outlier:
+            # Outlier: show in sidebar/map but with null value and grey color.
+            # Does NOT contribute to the PA field interpolation.
+            display_val = None
+            color = "#cccccc"
+        else:
+            display_val = round(pm25_val, 1)
+            color = _get_aqi_color("PM25", pm25_val)
+
         readings = {
             "PM25": {
-                "value": round(pm25_val, 1),
+                "value": display_val,
                 "ci": color_to_idx(color),
                 "key": "PM2.5",
             }
@@ -2279,9 +2321,10 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
             "ci": color_to_idx(color),
             "purpleair": True,
             "primary_key": "PM25",
-            "primary_value": round(pm25_val, 1),
+            "primary_value": display_val,
             "pci": color_to_idx(color),
             "primary_aqi": None,
+            "outlier": is_outlier,
         })
 
     # ── Spatial thinning: keep one PurpleAir sensor per ~500 m grid cell ──
@@ -4063,6 +4106,15 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             """List all saved snapshots."""
             try:
                 snapshots = list_snapshots(data_dir)
+                # In demo-pa mode, inject a synthetic "demo" day at the top
+                if app_state.demo_pa_date:
+                    snapshots.insert(0, {
+                        "date": app_state.demo_pa_date,
+                        "filename": "demo-pa.json",
+                        "size_bytes": 0,
+                        "modified": datetime.now(timezone.utc).isoformat() + "Z",
+                        "demo": True,
+                    })
                 body = json.dumps({"snapshots": snapshots}).encode("utf-8")
                 return self._send(200, body, "application/json")
             except Exception as e:
@@ -4116,6 +4168,60 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
         # Avoids re-parsing the full snapshot JSON on every widget load.
         _snapshot_window_cache: dict[tuple, bytes] = {}
 
+        def _serve_demo_pa_snapshot(self, date_str: str):
+            """Build and serve a synthetic snapshot from demo PA history."""
+            min_ms, max_ms = app_state.demo_pa_bounds_ms
+
+            meta: dict[str, Any] = {"demo_pa": True}
+            if min_ms < max_ms:
+                meta["trail_update_start_ms"] = min_ms
+                meta["trail_update_end_ms"] = max_ms
+
+            demo_state: dict[str, Any] = {
+                "ts": time.time(),
+                "mobile": [],
+                "fixed": [],
+                "meta": meta,
+            }
+
+            # Build fixed sensor list from PA metadata
+            with app_state.lock:
+                _merge_purpleair_into_fixed(demo_state, app_state)
+
+            # Inject ONLY demo history (not live-accumulated fixed_history)
+            demo_hist = app_state.demo_pa_history
+            for sensor in demo_state.get("fixed", []):
+                sid = sensor.get("id")
+                if not sid or sid not in demo_hist:
+                    continue
+                readings = sensor.get("readings", {})
+                for pollutant, reading in readings.items():
+                    if not isinstance(reading, dict):
+                        continue
+                    entries = demo_hist[sid].get(pollutant, [])
+                    if not entries:
+                        continue
+                    history_values = []
+                    hci = []
+                    history_times = []
+                    for entry in entries:
+                        val = entry.get("val")
+                        try:
+                            fval = float(val) if val is not None else None
+                            if fval is not None and fval == int(fval):
+                                fval = int(fval)
+                        except (ValueError, TypeError):
+                            fval = None
+                        history_values.append(fval)
+                        hci.append(entry.get("ci", 0))
+                        history_times.append(entry.get("time", ""))
+                    reading["history"] = history_values
+                    reading["hci"] = hci
+                    reading["history_times"] = history_times
+
+            body = json.dumps(demo_state).encode("utf-8")
+            return self._send(200, body, "application/json")
+
         def _handle_load_snapshot(self):
             """Load a saved snapshot by date.
 
@@ -4129,6 +4235,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
 
             if not date_str:
                 return self._send(400, b'{"error": "date parameter required"}', "application/json")
+
+            # ── Demo PA snapshot: build synthetic state from demo history ──
+            if app_state.demo_pa_date and date_str == app_state.demo_pa_date:
+                return self._serve_demo_pa_snapshot(date_str)
 
             # Check window cache first (widget requests the same window all day)
             start_hour_raw = query.get("start", [None])[0]
@@ -4452,6 +4562,11 @@ def main() -> int:
         default="proxy",
         help="Data mode: 'proxy' = clients fetch via server API (default), 'direct' = clients fetch from .edu/.gov directly"
     )
+    parser.add_argument(
+        "--demo-pa",
+        action="store_true",
+        help="Demo mode: fetch real PA sensor coordinates once, then generate synthetic PM2.5 time-series with choreographed effects for field testing"
+    )
     args = parser.parse_args()
     
     # Build server config for /api/config endpoint
@@ -4479,6 +4594,7 @@ def main() -> int:
         state={"ts": time.time(), "mobile": [], "fixed": [], "meta": {"server_start_ts": time.time()}},
         persistent_mobile={},
     )
+    app_state.demo_pa = getattr(args, "demo_pa", False)
     
     # Load persistent fixed sensor history
     load_fixed_history(app_state, data_dir)
@@ -4533,6 +4649,35 @@ def main() -> int:
                         app_state.purpleair_sensors.append(s)
                 app_state.purpleair_meta_last_fetch = time.time()
             _log(f"[PurpleAir] Metadata loaded ({len(meta_sensors)} sensors)")
+
+        if getattr(args, "demo_pa", False):
+            # ── Demo PA mode: generate synthetic time-series for playback ──
+            from demo_pa_effects import generate_demo_day, get_demo_day_label
+            _log("[DemoPA] Generating synthetic PA time-series for playback...")
+            demo_history = generate_demo_day(app_state.purpleair_sensors, seed=42)
+            n_entries = sum(len(v["PM25"]) for v in demo_history.values())
+            _log(f"[DemoPA] Generated {len(demo_history)} sensor time-series ({n_entries} total entries)")
+
+            # Compute tight time bounds from demo data only
+            min_t = float('inf')
+            max_t = float('-inf')
+            for pollutants in demo_history.values():
+                for entries in pollutants.values():
+                    for e in entries:
+                        ra = e.get("recorded_at")
+                        if ra is not None:
+                            t = float(ra) * 1000
+                            if t < min_t: min_t = t
+                            if t > max_t: max_t = t
+
+            app_state.demo_pa_history = demo_history
+            app_state.demo_pa_bounds_ms = (min_t, max_t)
+            app_state.demo_pa_date = "demo"
+            _log(f"[DemoPA] Demo day ready (label: {get_demo_day_label()})")
+            _log(f"[DemoPA] Time range: {min_t:.0f} – {max_t:.0f} ms")
+
+        # Always fetch live PA data and start the live loop
+        # (demo day is served from fixed_history via the snapshot endpoint)
         data_sensors = _fetch_purpleair_sensors(fields="pm2.5")
         if data_sensors:
             data_by_id = {s["sensor_index"]: s for s in data_sensors if s.get("sensor_index")}
@@ -4542,7 +4687,6 @@ def main() -> int:
                     if sid and sid in data_by_id:
                         s["pm2.5"] = data_by_id[sid].get("pm2.5")
                 app_state.purpleair_last_fetch = time.time()
-                # Re-bake state with PurpleAir included
                 if isinstance(app_state.state, dict):
                     _merge_purpleair_into_fixed(app_state.state, app_state)
                     _inject_fixed_history(app_state, app_state.state)
@@ -4558,13 +4702,14 @@ def main() -> int:
             _inject_fixed_history(app_state, app_state.state)
             app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
 
-    # Start PurpleAir fetch loop (3-min daytime / 30-min nighttime)
-    threading.Thread(
-        target=purpleair_fetch_loop,
-        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
-        daemon=True
-    ).start()
-    _log("[PurpleAir] SLC sensor integration enabled (3-min daytime / 30-min nighttime, batched requests)")
+    if not getattr(args, "demo_pa", False):
+        # Start PurpleAir fetch loop (3-min daytime / 30-min nighttime)
+        threading.Thread(
+            target=purpleair_fetch_loop,
+            kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+            daemon=True
+        ).start()
+        _log("[PurpleAir] SLC sensor integration enabled (3-min daytime / 30-min nighttime, batched requests)")
 
     # History prefetch disabled — Select Day now loads from local snapshots
     # threading.Thread(
@@ -4631,7 +4776,7 @@ def main() -> int:
     return 0
 
 
-def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: float = 60.0) -> tuple[threading.Event, ThreadingHTTPServer]:
+def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: float = 60.0, demo_pa: bool = False) -> tuple[threading.Event, ThreadingHTTPServer]:
     """Start the dashboard server in a background thread.
     
     Returns (stop_event, httpd) so the caller can stop it later.
@@ -4649,6 +4794,7 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
         state={"ts": time.time(), "mobile": [], "fixed": [], "meta": {"server_start_ts": time.time()}},
         persistent_mobile={},
     )
+    app_state.demo_pa = demo_pa
     
     load_fixed_history(app_state, data_dir)
     
@@ -4680,12 +4826,50 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             daemon=True
         ).start()
 
-    # PurpleAir fetch loop with batched requests (3-min daytime / 30-min nighttime)
-    threading.Thread(
-        target=purpleair_fetch_loop,
-        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
-        daemon=True
-    ).start()
+    # PurpleAir: fetch metadata, then either inject demo data or start live loop
+    try:
+        meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude")
+        if meta_sensors:
+            with app_state.lock:
+                for s in meta_sensors:
+                    if s.get("sensor_index"):
+                        app_state.purpleair_sensors.append(s)
+                app_state.purpleair_meta_last_fetch = time.time()
+    except Exception:
+        pass
+
+    if demo_pa:
+        from demo_pa_effects import generate_demo_day, get_demo_day_label
+        _log("[DemoPA] Generating synthetic PA time-series for playback...")
+        demo_history = generate_demo_day(app_state.purpleair_sensors, seed=42)
+
+        min_t = float('inf')
+        max_t = float('-inf')
+        for pollutants in demo_history.values():
+            for entries in pollutants.values():
+                for e in entries:
+                    ra = e.get("recorded_at")
+                    if ra is not None:
+                        t = float(ra) * 1000
+                        if t < min_t: min_t = t
+                        if t > max_t: max_t = t
+
+        app_state.demo_pa_history = demo_history
+        app_state.demo_pa_bounds_ms = (min_t, max_t)
+        app_state.demo_pa_date = "demo"
+        _log(f"[DemoPA] Demo day ready")
+        # Still start the normal PA fetch loop for live view
+        threading.Thread(
+            target=purpleair_fetch_loop,
+            kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+            daemon=True
+        ).start()
+    else:
+        threading.Thread(
+            target=purpleair_fetch_loop,
+            kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+            daemon=True
+        ).start()
 
     # History prefetch disabled — Select Day now loads from local snapshots
     # threading.Thread(

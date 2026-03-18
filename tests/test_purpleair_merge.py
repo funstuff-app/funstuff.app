@@ -229,8 +229,8 @@ class TestPurpleAirMerge(unittest.TestCase):
 
     # ── outlier detection ────────────────────────────────────────────
 
-    def test_broken_sensor_filtered_out(self):
-        """A sensor reading 3000+ when peers read 1-5 should be filtered."""
+    def test_broken_sensor_flagged_as_outlier(self):
+        """A sensor reading 3000+ when peers read 1-5 should be flagged as outlier."""
         sensors = [
             self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=1.0),
             self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=2.0),
@@ -242,16 +242,19 @@ class TestPurpleAirMerge(unittest.TestCase):
         st = {"fixed": [], "mobile": []}
         _merge_purpleair_into_fixed(st, app)
         ids = {f["id"] for f in st["fixed"]}
-        self.assertNotIn("PA_99", ids)
-        self.assertEqual(len(st["fixed"]), 4)
+        # Outlier stays in list but flagged
+        self.assertIn("PA_99", ids)
+        outlier_entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
+        self.assertTrue(outlier_entry.get("outlier"))
+        self.assertIsNone(outlier_entry["primary_value"])
 
     def test_negative_pm25_filtered(self):
         """Negative PM2.5 values should be filtered."""
         sensors = [
-            self._make_sensor(sensor_index=1, pm25=2.0),
-            self._make_sensor(sensor_index=2, pm25=3.0),
-            self._make_sensor(sensor_index=3, pm25=1.5),
-            self._make_sensor(sensor_index=4, pm25=-5.0),
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=2.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=3.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=1.5),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=-5.0),
         ]
         app = self._make_app_state(sensors)
         st = {"fixed": [], "mobile": []}
@@ -272,20 +275,21 @@ class TestPurpleAirMerge(unittest.TestCase):
         _merge_purpleair_into_fixed(st, app)
         self.assertEqual(len(st["fixed"]), 4)
 
-    def test_hotspot_near_highway_not_filtered(self):
-        """A single sensor reading 200 near highways when others read 1-5 is legitimate."""
+    def test_hotspot_lone_sensor_flagged_as_outlier(self):
+        """A single sensor at 201 when all neighbors are 1-3 IS an outlier."""
         sensors = [
-            self._make_sensor(sensor_index=1, pm25=1.0),
-            self._make_sensor(sensor_index=2, pm25=2.0),
-            self._make_sensor(sensor_index=3, pm25=1.5),
-            self._make_sensor(sensor_index=4, pm25=3.0),
-            self._make_sensor(sensor_index=5, name="Near Freeway", pm25=201.0),
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=1.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=2.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=1.5),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=3.0),
+            self._make_sensor(sensor_index=5, lat=40.780, lon=-111.870, name="Near Freeway", pm25=201.0),
         ]
         app = self._make_app_state(sensors)
         st = {"fixed": [], "mobile": []}
         _merge_purpleair_into_fixed(st, app)
-        ids = {f["id"] for f in st["fixed"]}
-        self.assertIn("PA_5", ids, "201 µg/m³ near highway should NOT be filtered")
+        outlier_entry = next(f for f in st["fixed"] if f["id"] == "PA_5")
+        self.assertTrue(outlier_entry.get("outlier"),
+                        "201 µg/m³ lone sensor among clean air should be outlier")
 
     def test_dust_storm_readings_not_filtered(self):
         """During dust storms, readings of 400+ are real and should be kept."""

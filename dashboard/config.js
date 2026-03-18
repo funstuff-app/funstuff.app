@@ -117,6 +117,7 @@ var SAT_STORAGE_PREFIX = "mobileair.mapSat."; // per theme (0..150 => saturate f
 var VIEW_STORAGE_KEY = "mobileair.mapView"; // {lat, lon, zoom}
 var TRACE_STORAGE_KEY = "mobileair.traceMode"; // "1" or "0"
 var LIVE_MODE_STORAGE_KEY = "mobileair.liveFollow"; // "1" = LIVE follow mode
+var PA_ALPHA_STORAGE_KEY = "mobileair.paFieldAlpha"; // 0..100 (percent)
 var MAX_TRAIL_LEN = 1000;
 
 function applyMapFilterVars({ saturate, brightness, contrast, shadowLift }) {

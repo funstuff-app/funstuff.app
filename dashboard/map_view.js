@@ -5318,32 +5318,38 @@ class MapView {
     const gh = Math.ceil(cssH / cellSize);
 
     // ── Cutoff in screen pixels ──
-    const refW = latLonToWorld(clat, clon + 0.15, z);
+    const _fd = window._fieldDebug;
+    const cutoffDeg = _fd ? _fd.cutoffDeg : 0.15;
+    const refW = latLonToWorld(clat, clon + cutoffDeg, z);
     const cutoffPx = Math.abs(refW.x - centerW.x);
     const cutoffSq = cutoffPx * cutoffPx;
-    const FIELD_ALPHA = 46;
-    // Gaussian kernel: σ = cutoff/6 (~2.5km effective radius per sensor).
-    const sigma = cutoffPx / 6;
+    const FIELD_ALPHA = _fd && _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
+    // Gaussian kernel: σ = cutoff/sigmaDivisor (~2.5km effective radius per sensor).
+    const sigmaDivisor = _fd ? _fd.sigmaDivisor : 6;
+    const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
+    const blurRadius = _fd ? _fd.blur : 2;
 
     // ── Build stride-3 sensor array: [sx, sy, v, ...] ──
+    // Values are NOT clamped — outlier sensors are already nulled by the
+    // backend so they never reach this point.
     const s3 = new Float64Array(nSensors * 3);
     for (let i = 0; i < nSensors; i++) {
       const si = i * 3;
       s3[si] = sensors[si];
       s3[si + 1] = sensors[si + 1];
-      s3[si + 2] = Math.min(sensors[si + 2], 75);
+      s3[si + 2] = sensors[si + 2];
     }
 
     // ── Always synchronous — IDW is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s3, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr);
+    this._computePaFieldSync(s3, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr, blurRadius);
   }
 
   /** Synchronous IDW computation.
    *  sensors: stride-3 [sx, sy, value, ...]
    *  cutoffSq: max range² for early-out
    *  twoSigmaSq: 2σ² for Gaussian kernel */
-  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr) {
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr, blurRadius) {
     // ── Reuse tiny canvas + ImageData if grid size unchanged ──
     if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
       const tc = document.createElement("canvas");
@@ -5354,28 +5360,36 @@ class MapView {
     const { tc, tctx, imgData } = this._paGrid;
     const px = imgData.data;
 
-    // ── Gaussian-kernel IDW with weight-sum fading ──
+    // ── IDW interpolation with Gaussian alpha ──
+    // VALUE: IDW 1/(d²+ε) so each sensor dominates its own location.
+    // ALPHA: Gaussian accumulator (zoom-independent) for smooth edge fading.
+    const eps2 = 1;  // tiny regularisation — sensor owns its grid cell
     for (let gy = 0; gy < gh; gy++) {
       const py = (gy + 0.5) * cellSize;
       for (let gx = 0; gx < gw; gx++) {
         const pxx = (gx + 0.5) * cellSize;
 
-        let wSum = 0, vSum = 0;
+        let wSum = 0, vSum = 0, gSum = 0;
         for (let i = 0; i < sensors.length; i += 3) {
           const dx = pxx - sensors[i];
           const dy = py  - sensors[i + 1];
           const d2 = dx * dx + dy * dy;
           if (d2 > cutoffSq) continue;
-          const w = Math.exp(-d2 / twoSigmaSq);
+          const t = d2 / cutoffSq;
+          const envelope = (1 - t) * (1 - t);
+          // IDW weight for value interpolation
+          const w = envelope / (d2 + eps2);
           wSum += w;
           vSum += w * sensors[i + 2];
+          // Gaussian weight for alpha (coverage density)
+          gSum += Math.exp(-d2 / twoSigmaSq);
         }
 
         const off = (gy * gw + gx) * 4;
-        if (wSum < 0.001) {
+        if (wSum < 1e-12) {
           px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
         } else {
-          const fade = Math.min(1, wSum * 2);
+          const fade = Math.min(1, gSum * 2);
           const alpha = Math.round(FIELD_ALPHA * fade);
           const val = vSum / wSum;
           const rgb = _pm25ToRgbSmooth(val);
@@ -5387,8 +5401,8 @@ class MapView {
       }
     }
 
-    // ── Gaussian blur (radius 2) to soften edges ──
-    const BLUR_R = 2;
+    // ── Gaussian blur to soften edges ──
+    const BLUR_R = blurRadius != null ? blurRadius : 2;
     // Reuse blur buffer across frames when grid dimensions match
     const bufLen = px.length;
     if (!this._paGrid.blurBuf || this._paGrid.blurBuf.length !== bufLen) {
@@ -5570,12 +5584,16 @@ class MapView {
       const cellSize = 16;
       const gw = Math.ceil(cssW / cellSize);
       const gh = Math.ceil(cssH / cellSize);
-      const refW = latLonToWorld(clat, clon + 0.15, z);
+      const _fdw = window._fieldDebug;
+      const cutoffDegW = _fdw ? _fdw.cutoffDeg : 0.15;
+      const refW = latLonToWorld(clat, clon + cutoffDegW, z);
       const cutoffPx = Math.abs(refW.x - centerW.x);
       const cutoffSq = cutoffPx * cutoffPx;
-      const sigma = cutoffPx / 6;
+      const sigmaDivisorW = _fdw ? _fdw.sigmaDivisor : 6;
+      const sigma = cutoffPx / sigmaDivisorW;
       const twoSigmaSq = 2 * sigma * sigma;
-      const FIELD_ALPHA = 46;
+      const FIELD_ALPHA = _fdw && _fdw.alpha != null ? _fdw.alpha : (window._paFieldAlpha ?? 46);
+      const blurRadiusW = _fdw ? _fdw.blur : 2;
 
       // Build stride-3 array: [sx, sy, value, ...]
       const nPw = sensors.length / 3;
@@ -5584,7 +5602,7 @@ class MapView {
         const si = i * 3;
         s3pw[si] = sensors[si];
         s3pw[si + 1] = sensors[si + 1];
-        s3pw[si + 2] = Math.min(sensors[si + 2], 75);
+        s3pw[si + 2] = sensors[si + 2];
       }
 
       const jobId = ++this._paWorkerJobId;
@@ -5592,7 +5610,7 @@ class MapView {
       this._paWorkerFingerprint = fp;
       this._paWorker.postMessage({
         sensors: s3pw,
-        gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, jobId
+        gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, blurRadius: blurRadiusW, jobId
       });
       return; // one at a time
     }

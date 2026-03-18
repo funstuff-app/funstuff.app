@@ -106,22 +106,25 @@ function reconcileList(container, items, type, selectedId, order) {
 var _sidebarElCache = null;
 
 function _buildSidebarCache() {
-  const listMobileEl = document.getElementById("sensorListMobile");
-  if (!listMobileEl) return null;
   const cache = new Map();
-  for (const itemEl of listMobileEl.querySelectorAll("[data-id]")) {
-    const id = itemEl.getAttribute("data-id");
-    const row2 = itemEl.querySelector(".row2");
-    if (!row2) continue;
-    const readings = [];
-    for (const rEl of row2.querySelectorAll(".reading")) {
-      const kEl = rEl.querySelector(".k");
-      const vEl = rEl.querySelector(".v");
-      if (kEl && vEl) readings.push({ k: kEl.textContent, vEl });
+  // Index both mobile and community (public) sensor lists
+  for (const listId of ["sensorListMobile", "sensorListPublic"]) {
+    const listEl = document.getElementById(listId);
+    if (!listEl) continue;
+    for (const itemEl of listEl.querySelectorAll("[data-id]")) {
+      const id = itemEl.getAttribute("data-id");
+      const row2 = itemEl.querySelector(".row2");
+      if (!row2) continue;
+      const readings = [];
+      for (const rEl of row2.querySelectorAll(".reading")) {
+        const kEl = rEl.querySelector(".k");
+        const vEl = rEl.querySelector(".v");
+        if (kEl && vEl) readings.push({ k: kEl.textContent, vEl });
+      }
+      cache.set(id, { itemEl, readings });
     }
-    cache.set(id, { itemEl, readings });
   }
-  return cache;
+  return cache.size > 0 ? cache : null;
 }
 
 function updateSidebarPlaybackValues() {
@@ -185,6 +188,34 @@ function updateSidebarPlaybackValues() {
           vEl.textContent = newVal;
         }
         const newColor = safeHex(r.ci);
+        if (vEl.style.color !== newColor) {
+          vEl.style.color = newColor;
+        }
+      }
+    }
+  }
+
+  // ── Update community (PurpleAir / fixed) sensor readings ──
+  const fixedArr = Array.isArray(state.fixed) ? state.fixed : [];
+  for (const f of fixedArr) {
+    if (!f || !f.id) continue;
+    const cached = _sidebarElCache.get(String(f.id));
+    if (!cached) continue;
+
+    // Use the same interpolation the field uses
+    const interp = typeof interpolateFixedReadingsAtTime === "function"
+      ? interpolateFixedReadingsAtTime(f, t)
+      : null;
+    if (!interp) continue;
+
+    for (const { k, vEl } of cached.readings) {
+      const r = interp[k];
+      if (r && r.value != null) {
+        const newVal = String(r.value);
+        if (vEl.textContent !== newVal) {
+          vEl.textContent = newVal;
+        }
+        const newColor = safeHex(r.color != null ? r.color : r.ci);
         if (vEl.style.color !== newColor) {
           vEl.style.color = newColor;
         }

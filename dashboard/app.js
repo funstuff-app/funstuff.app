@@ -3194,9 +3194,18 @@ function main() {
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
         // Set playhead to 5AM local on the loaded day
-        const [_y, _mo, _d] = dateStr.split("-").map(Number);
-        const fiveAM = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
-        const initMs = clamp(fiveAM, b.minMs, b.maxMs);
+        let initMs;
+        if (dateStr === "demo") {
+          // Demo snapshot: start at 5AM using bounds
+          const startDate = new Date(b.minMs);
+          const fiveAM = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate(), 5, 0, 0, 0).getTime();
+          initMs = clamp(fiveAM, b.minMs, b.maxMs);
+        } else {
+          const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
+          const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
+          const fiveAM = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
+          initMs = clamp(fiveAM, b.minMs, b.maxMs);
+        }
         map.setPlaybackTimeMs(initMs);
       }
       
@@ -3621,13 +3630,13 @@ function main() {
     pbDaysSubmenu.innerHTML = "";
 
     // Fetch available snapshots to know which days have data
-    const snapshotDates = new Map(); // dateStr -> size_bytes
+    const snapshotDates = new Map(); // dateStr -> {size_bytes, demo}
     try {
       const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`);
       if (resp.ok) {
         const data = await resp.json();
         for (const snap of (data.snapshots || [])) {
-          snapshotDates.set(snap.date, snap.size_bytes);
+          snapshotDates.set(snap.date, { size_bytes: snap.size_bytes, demo: !!snap.demo });
         }
       }
     } catch (e) {
@@ -3646,6 +3655,22 @@ function main() {
     });
     pbDaysSubmenu.appendChild(liveItem);
 
+    // Show demo entries from the snapshot list (if any)
+    for (const [snap, info] of snapshotDates.entries()) {
+      if (!info.demo) continue;
+      const item = document.createElement("div");
+      item.className = "pbSubmenuItem";
+      if (_selectedDayValue === snap) item.classList.add("active");
+      item.textContent = `🧪 ${snap} (demo)`;
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        _selectedDayValue = snap;
+        loadHistoricalDay(snap);
+        closePlaybackMenu();
+      });
+      pbDaysSubmenu.appendChild(item);
+    }
+
     // Show the past 7 days, every day, snapshot or not
     const now = new Date();
     for (let i = 1; i <= 7; i++) {
@@ -3657,12 +3682,13 @@ function main() {
       const dateStr = `${yyyy}-${mm}-${dd}`;
       const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
       const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-      const hasSnapshot = snapshotDates.has(dateStr);
+      const snapInfo = snapshotDates.get(dateStr);
+      const hasSnapshot = snapInfo && !snapInfo.demo;
 
       const item = document.createElement("div");
       item.className = "pbSubmenuItem";
       if (hasSnapshot) {
-        const sizeMB = (snapshotDates.get(dateStr) / (1024 * 1024)).toFixed(1);
+        const sizeMB = (snapInfo.size_bytes / (1024 * 1024)).toFixed(1);
         item.textContent = `${dayName} ${monthDay} (${sizeMB} MB)`;
         if (_selectedDayValue === dateStr) item.classList.add("active");
         item.addEventListener("click", (e) => {
@@ -3846,13 +3872,28 @@ function main() {
   const pbDisplaySubmenu = document.getElementById("pbDisplaySubmenu");
   const menuDimEl = document.getElementById("menuDim");
   const menuSatEl = document.getElementById("menuSat");
-  
+  const menuAlphaEl = document.getElementById("menuAlpha");
+
+  // PA field alpha: restore from localStorage (0-100%)
+  {
+    const raw = localStorage.getItem(PA_ALPHA_STORAGE_KEY);
+    const v = raw != null ? Number(raw) : 18;
+    const pct = Math.max(0, Math.min(100, isFinite(v) ? v : 18));
+    window._paFieldAlpha = Math.round(pct * 2.55);
+    if (menuAlphaEl) menuAlphaEl.value = pct;
+  }
+
   // Wire up Display submenu hover (uses centralized debounce)
   const pbDisplaySubEl = document.querySelector(".pbMenuSub[data-submenu='display']");
   if (pbDisplaySubEl && pbDisplaySubmenu) {
     function syncDisplaySliders() {
       if (menuDimEl && dimEl) menuDimEl.value = dimEl.value;
       if (menuSatEl && satEl) menuSatEl.value = satEl.value;
+      if (menuAlphaEl) {
+        const raw = localStorage.getItem(PA_ALPHA_STORAGE_KEY);
+        const v = raw != null ? Number(raw) : 18;
+        menuAlphaEl.value = Math.max(0, Math.min(100, isFinite(v) ? v : 18));
+      }
     }
     
     pbDisplaySubEl.addEventListener("mouseenter", () => showSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, syncDisplaySliders));
@@ -3875,6 +3916,14 @@ function main() {
           satEl.value = menuSatEl.value;
           satEl.dispatchEvent(new Event("input"));
         }
+      });
+    }
+    if (menuAlphaEl) {
+      menuAlphaEl.addEventListener("input", () => {
+        const pct = Math.max(0, Math.min(100, Number(menuAlphaEl.value) || 0));
+        window._paFieldAlpha = Math.round(pct * 2.55);
+        localStorage.setItem(PA_ALPHA_STORAGE_KEY, String(pct));
+        if (map) { map._paFieldKey = null; map._redrawViewOnly(); }
       });
     }
   }
