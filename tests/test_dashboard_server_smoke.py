@@ -118,6 +118,73 @@ class TestDashboardServerSmoke(unittest.TestCase):
                 httpd.shutdown()
                 th.join(timeout=2)
 
+    def test_sse_events_endpoint(self):
+        """SSE /api/events returns text/event-stream and sends initial seq."""
+        with TemporaryDirectory() as td:
+            data_dir = Path(td) / "data"
+            static_dir = Path(td) / "dashboard"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            static_dir.mkdir(parents=True, exist_ok=True)
+            (static_dir / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+
+            app_state = srv.AppState(
+                lock=threading.Lock(),
+                state={"ts": time.time(), "mobile": [], "fixed": [], "meta": {}},
+                persistent_mobile={},
+            )
+
+            handler = srv.make_handler(app_state=app_state, static_dir=static_dir, data_dir=static_dir)
+            port = _free_port()
+            httpd = srv.ThreadingHTTPServer(("127.0.0.1", port), handler)
+            th = threading.Thread(target=httpd.serve_forever, daemon=True)
+            th.start()
+            try:
+                import socket as _sock
+                s = _sock.create_connection(("127.0.0.1", port), timeout=3)
+                s.sendall(b"GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                # Read enough to get headers + first SSE event
+                chunks = []
+                s.settimeout(3)
+                while True:
+                    try:
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        # Stop once we've received the first data line
+                        if b"\ndata:" in b"".join(chunks):
+                            break
+                    except _sock.timeout:
+                        break
+                raw = b"".join(chunks).decode("utf-8", errors="replace")
+                self.assertIn("text/event-stream", raw)
+                self.assertIn("data:", raw)
+                # Verify initial seq is present (seq == 0 for fresh state)
+                self.assertIn('"seq":', raw)
+
+                # Now bump state_seq and verify a notification arrives
+                with app_state.lock:
+                    app_state.state_seq += 1
+                    srv._sse_broadcast(app_state)
+                s.settimeout(3)
+                chunks2 = []
+                while True:
+                    try:
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        chunks2.append(chunk)
+                        if b"data:" in b"".join(chunks2):
+                            break
+                    except _sock.timeout:
+                        break
+                raw2 = b"".join(chunks2).decode("utf-8", errors="replace")
+                self.assertIn('"seq":1', raw2.replace(" ", "").replace("\\", ""))
+                s.close()
+            finally:
+                httpd.shutdown()
+                th.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()

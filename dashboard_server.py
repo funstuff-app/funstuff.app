@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
 import ssl
 import socket
@@ -538,6 +539,11 @@ class AppState:
     trail_update_start_ms: int | None = None
     trail_update_end_ms: int | None = None
 
+    # SSE (Server-Sent Events) subscriber queues.
+    # Each connected client gets a Queue; broadcast puts a lightweight
+    # notification dict into every queue when state_seq bumps.
+    sse_clients: list[queue.Queue] = field(default_factory=list)
+
     def __post_init__(self) -> None:
         try:
             self.cached_json_bytes = json.dumps(self.state).encode("utf-8")
@@ -559,6 +565,15 @@ def bump_force_refresh_seq(app_state: AppState) -> int:
     try:
         app_state.force_refresh_seq = int(getattr(app_state, "force_refresh_seq", 0) or 0) + 1
         app_state.state_seq = int(getattr(app_state, "state_seq", 0) or 0) + 1
+        # Best-effort broadcast — may be called from a signal handler without
+        # the lock, so iterate a snapshot of the client list.
+        seq = app_state.state_seq
+        msg = {"seq": seq, "ts": time.time()}
+        for q in list(app_state.sse_clients):
+            try:
+                q.put_nowait(msg)
+            except Exception:
+                pass
     except Exception:
         try:
             app_state.force_refresh_seq = 1
@@ -600,6 +615,27 @@ def _ensure_force_refresh_seq_cached(app_state: AppState) -> None:
         try:
             app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
         except Exception:
+            pass
+
+
+def _sse_broadcast(app_state: AppState) -> None:
+    """Push a lightweight notification to all SSE subscribers.
+
+    Must be called **after** state_seq is bumped.  Runs under app_state.lock
+    (already held by the caller).  Dead queues are pruned lazily.
+    """
+    seq = app_state.state_seq
+    msg = {"seq": seq, "ts": time.time()}
+    dead: list[queue.Queue] = []
+    for q in app_state.sse_clients:
+        try:
+            q.put_nowait(msg)
+        except queue.Full:
+            dead.append(q)
+    for q in dead:
+        try:
+            app_state.sse_clients.remove(q)
+        except ValueError:
             pass
 
 
@@ -1950,6 +1986,7 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
         app_state.state = st
         app_state.state_seq += 1
         app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
+        _sse_broadcast(app_state)
 
 
 def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
@@ -2414,6 +2451,7 @@ def purpleair_fetch_loop(
             app_state.state.setdefault("meta", {})["state_seq"] = app_state.state_seq
             app_state.cached_json_bytes = json.dumps(app_state.state).encode("utf-8")
             app_state.state_seq += 1
+            _sse_broadcast(app_state)
 
     # Write initial debug file
     try:
@@ -2972,6 +3010,7 @@ def _update_home_sensor_in_state(app_state: AppState) -> None:
                     st["fixed"][i] = home_entry
                     app_state.state_seq += 1
                     app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
+                    _sse_broadcast(app_state)
                     break
     except Exception as e:
         _log(f"[HomeSensor] Update error: {e}")
@@ -3708,6 +3747,43 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                            '  </url>\n'
                            '</urlset>\n')
                 return self._send(200, sitemap.encode("utf-8"), "application/xml", cache_control="public, max-age=86400")
+            if self.path.startswith("/api/events"):
+                # SSE (Server-Sent Events) endpoint — push state-change
+                # notifications so clients don't have to poll.
+                q: queue.Queue = queue.Queue(maxsize=64)
+                with app_state.lock:
+                    app_state.sse_clients.append(q)
+                    init_seq = app_state.state_seq
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("X-Accel-Buffering", "no")  # nginx/Cloudflare
+                    self.end_headers()
+                    # Send current seq so client knows the baseline.
+                    self.wfile.write(f"id: {init_seq}\ndata: {{\"seq\":{init_seq}}}\n\n".encode())
+                    self.wfile.flush()
+                    while True:
+                        try:
+                            msg = q.get(timeout=25)
+                            seq = msg.get("seq", 0)
+                            self.wfile.write(f"id: {seq}\ndata: {json.dumps(msg)}\n\n".encode())
+                            self.wfile.flush()
+                        except queue.Empty:
+                            # Keepalive comment to prevent proxy/browser timeout
+                            self.wfile.write(b":keepalive\n\n")
+                            self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    pass
+                finally:
+                    with app_state.lock:
+                        try:
+                            app_state.sse_clients.remove(q)
+                        except ValueError:
+                            pass
+                return
             if self.path.startswith("/api/config"):
                 # Return server configuration for client scaling/caching decisions
                 # Cache for 5 minutes - config changes rarely
