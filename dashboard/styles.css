@@ -27,6 +27,7 @@ html, body {
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 
 #app {
+  position: relative;
   height: 100%;
   /* Match body's PWA fix */
   height: 100dvh;
@@ -41,8 +42,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
   left: 0;
   right: 0;
   padding: 4px 14px;
-  background: var(--bg);
-  border-top: 1px solid rgba(255,255,255,0.04);
+  background: rgba(12, 18, 28, 0.86);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-top: 1px solid rgba(255,255,255,0.10);
   z-index: 100;
   font-size: 11px;
   color: rgba(147,164,186,0.45);
@@ -70,6 +73,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
 }
 
 #topbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
   height: 52px;
   padding-top: 10px;
   display: flex;
@@ -78,8 +86,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helve
   padding-left: 14px;
   padding-right: 14px;
   padding-bottom: 10px;
-  border-bottom: 1px solid var(--border);
-  background: linear-gradient(180deg, rgba(17,24,38,0.9), rgba(15,22,35,0.9));
+  border-bottom: 1px solid rgba(255,255,255,0.10);
+  background: rgba(12, 18, 28, 0.86);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   /* Prevent iOS swipe-to-go-back on topbar */
   touch-action: manipulation;
   overscroll-behavior: contain;
@@ -1250,7 +1260,7 @@ button#pbPlay.isLive {
 /* Legend panel (top-right overlay) */
 .legendPanel {
   position: absolute;
-  top: 12px;
+  top: 64px;
   right: 12px;
   z-index: 20;
   width: 280px;
@@ -1486,7 +1496,7 @@ button#pbPlay.isLive {
 }
 .legendToggleBtn {
   position: absolute;
-  top: 14px;
+  top: 66px;
   right: 14px;
   z-index: 19;
   width: 32px;
@@ -1516,7 +1526,7 @@ button#pbPlay.isLive {
 /* Camera history replay button (owner-only, top-right below legend toggle) */
 #camReplayBtn {
   position: absolute;
-  top: 54px; /* 14px offset + 32px button + 8px gap */
+  top: 106px; /* 52px topbar + 14px offset + 32px button + 8px gap */
   right: 14px;
   z-index: 19;
   width: 32px;
@@ -1555,7 +1565,7 @@ button#pbPlay.isLive {
 /* Client picker dropdown for cam replay */
 .camClientPicker {
   position: absolute;
-  top: 54px;
+  top: 106px;
   right: 50px;
   z-index: 20;
   background: rgba(12, 18, 28, 0.92);
@@ -1593,12 +1603,12 @@ button#pbPlay.isLive {
 /* Sidebar panel (integrated, overlays full-bleed map) */
 .sidebarPanel {
   position: absolute;
-  top: 12px;
+  top: 64px;
   left: 12px;
   bottom: 12px;
   z-index: 20;
   width: 300px;
-  max-height: calc(100% - 24px);
+  max-height: calc(100% - 76px);
   background: rgba(12, 18, 28, 0.92);
   border: 1px solid rgba(255,255,255,0.10);
   border-radius: 12px;
@@ -1670,7 +1680,7 @@ button#pbPlay.isLive {
 /* Overlay panel (for other floating panels) */
 .overlayPanel {
   position: absolute;
-  top: 14px;
+  top: 66px;
   bottom: 14px;
   z-index: 10;
   background: rgba(12, 18, 28, 0.88);
