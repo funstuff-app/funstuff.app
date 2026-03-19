@@ -246,6 +246,7 @@ build_staging() {
     cp "$REPO_ROOT/dashboard/tui.css" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/tui.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/manifest.json" "$STAGING_DIR/dashboard/"
+    cp "$REPO_ROOT/dashboard/pa_field_worker.js" "$STAGING_DIR/dashboard/"
     
     # Patch dashboard files for subpath deployment
     # The reverse proxy uses handle_path which strips /dustytrails prefix,

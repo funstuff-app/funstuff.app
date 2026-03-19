@@ -86,7 +86,7 @@ def _is_bundled() -> bool:
     return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
 
 
-def _start_dashboard_server_process() -> subprocess.Popen | tuple | None:
+def _start_dashboard_server_process(demo_pa: bool = False) -> subprocess.Popen | tuple | None:
     """Start the browser dashboard server in the background.
 
     When running normally, this starts a subprocess.
@@ -114,7 +114,7 @@ def _start_dashboard_server_process() -> subprocess.Popen | tuple | None:
     if _is_bundled():
         try:
             from dashboard_server import start_server_in_thread
-            return start_server_in_thread(host=host, port=port)
+            return start_server_in_thread(host=host, port=port, demo_pa=demo_pa)
         except Exception:
             return None
 
@@ -129,6 +129,8 @@ def _start_dashboard_server_process() -> subprocess.Popen | tuple | None:
         log_fh = subprocess.DEVNULL
 
     cmd = [sys.executable, str(Path(__file__).resolve().parent / "dashboard_server.py"), "--host", host, "--port", str(port)]
+    if demo_pa:
+        cmd.append("--demo-pa")
     try:
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=log_fh)
     except Exception:
@@ -2083,13 +2085,15 @@ class AirQualityApp(App):
                     self.update_list(self.current_data)
                 self.notify(f"Sensor {s_name} {state}")
 
-def _run_headless_server(host: str, port: int):
+def _run_headless_server(host: str, port: int, demo_pa: bool = False):
     """Run the dashboard server in headless mode (no TUI, stdout/stderr visible)."""
     from dashboard_server import main as dashboard_main
     print("[Headless] Starting MobileAir dashboard server (no TUI)...")
     print("[Headless] Press Ctrl+C to stop.")
     # Replace sys.argv so dashboard_server.main() sees the right args
     sys.argv = [sys.argv[0], "--host", host, "--port", str(port)]
+    if demo_pa:
+        sys.argv.append("--demo-pa")
     try:
         sys.exit(dashboard_main())
     except KeyboardInterrupt:
@@ -2111,6 +2115,8 @@ if __name__ == "__main__":
                         help="Dashboard server host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("MOBILEAIR_DASHBOARD_PORT", "8766")),
                         help="Dashboard server port (default: 8766)")
+    parser.add_argument("--demo-pa", action="store_true",
+                        help="Demo mode: synthetic PA effects from real sensor coordinates")
     args = parser.parse_args()
 
     if args.remote:
@@ -2119,9 +2125,9 @@ if __name__ == "__main__":
         app = AirQualityApp(dashboard_handle=None)
         app.run()
     elif args.headless:
-        _run_headless_server(args.host, args.port)
+        _run_headless_server(args.host, args.port, demo_pa=args.demo_pa)
     else:
-        dashboard_handle = _start_dashboard_server_process()
+        dashboard_handle = _start_dashboard_server_process(demo_pa=args.demo_pa)
         try:
             app = AirQualityApp(dashboard_handle=dashboard_handle)
             app.run()

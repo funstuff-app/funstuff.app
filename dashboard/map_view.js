@@ -29,18 +29,21 @@ function _pm25ColorCat(v) {
 
 const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
 
-/** PM2.5 → [r,g,b] with continuous linear interpolation between AQI color stops. */
+/** PM2.5 → [r,g,b] with continuous linear interpolation between AQI color stops.
+ *  Stops placed at band midpoints (_BAND_MIDS) so colors match dot palette at
+ *  typical readings; transitions occur near band boundaries. */
 function _pm25ToRgbSmooth(v) {
   const stops = [
-    [0,    0x00,0xFF,0xFF],
-    [2.0,  0x00,0xFF,0xFF],
-    [5.0,  0x00,0xCC,0xFF],
-    [9.0,  0x00,0xE4,0x00],
-    [35.4, 0xFF,0xFF,0x00],
-    [55.4, 0xFF,0x7E,0x00],
-    [125.4,0xFF,0x00,0x00],
-    [225.4,0x8F,0x3F,0x97],
-    [500,  0x7E,0x00,0x23]
+    [0,     0x00,0xFF,0xFF],
+    [1.0,   0x00,0xFF,0xFF],  // cyan   – mid of 0–2
+    [3.5,   0x00,0xCC,0xFF],  // lt-blue– mid of 2–5
+    [7.0,   0x00,0xE4,0x00],  // green  – mid of 5–9
+    [22.2,  0xFF,0xFF,0x00],  // yellow – mid of 9–35.4
+    [45.4,  0xFF,0x7E,0x00],  // orange – mid of 35.4–55.4
+    [90.4,  0xFF,0x00,0x00],  // red    – mid of 55.4–125.4
+    [175.4, 0x8F,0x3F,0x97],  // purple – mid of 125.4–225.4
+    [250.0, 0x7E,0x00,0x23],  // maroon – mid of 225.4+
+    [500,   0x7E,0x00,0x23]
   ];
   if (v <= stops[0][0]) return [stops[0][1], stops[0][2], stops[0][3]];
   for (let i = 1; i < stops.length; i++) {
@@ -5318,32 +5321,61 @@ class MapView {
     const gh = Math.ceil(cssH / cellSize);
 
     // ── Cutoff in screen pixels ──
-    const refW = latLonToWorld(clat, clon + 0.15, z);
+    const _fd = window._fieldDebug;
+    const cutoffDeg = _fd ? _fd.cutoffDeg : 0.15;
+    const refW = latLonToWorld(clat, clon + cutoffDeg, z);
     const cutoffPx = Math.abs(refW.x - centerW.x);
     const cutoffSq = cutoffPx * cutoffPx;
-    const FIELD_ALPHA = 46;
-    // Gaussian kernel: σ = cutoff/6 (~2.5km effective radius per sensor).
-    const sigma = cutoffPx / 6;
+    const FIELD_ALPHA = _fd && _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
+    // Gaussian kernel: σ = cutoff/sigmaDivisor (~2.5km effective radius per sensor).
+    const sigmaDivisor = _fd ? _fd.sigmaDivisor : 6;
+    const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
 
-    // ── Build stride-3 sensor array: [sx, sy, v, ...] ──
-    const s3 = new Float64Array(nSensors * 3);
+    // ── Build stride-4 sensor array: [sx, sy, v, twoSigSq, ...] ──
+    // Per-sensor σ ratio (cached on fingerprint) controls Gaussian reach.
+    // Sensors where no neighbor agrees (within 2×) get tighter σ so their
+    // field hotspot stays local.  Baked into stride-4 to avoid extra array
+    // lookups or divisions in the hot IDW loop.
+    let sigRatios = this._paSigRatioCache;
+    if (!sigRatios || this._paSigRatioFP !== fingerprint) {
+      sigRatios = new Float64Array(nSensors);
+      for (let i = 0; i < nSensors; i++) {
+        const vi = sensors[i * 3 + 2];
+        let hasAgree = false;
+        for (let j = 0; j < nSensors; j++) {
+          if (j === i) continue;
+          const vj = sensors[j * 3 + 2];
+          const hi = vi > vj ? vi : vj, lo = vi > vj ? vj : vi;
+          if (hi < 20 || hi <= lo * 2) { hasAgree = true; break; }
+        }
+        sigRatios[i] = hasAgree ? 1.0 : 0.25;
+      }
+      this._paSigRatioCache = sigRatios;
+      this._paSigRatioFP = fingerprint;
+    }
+
+    const s4 = new Float64Array(nSensors * 4);
     for (let i = 0; i < nSensors; i++) {
-      const si = i * 3;
-      s3[si] = sensors[si];
-      s3[si + 1] = sensors[si + 1];
-      s3[si + 2] = Math.min(sensors[si + 2], 75);
+      const si3 = i * 3, si4 = i * 4;
+      s4[si4]     = sensors[si3];
+      s4[si4 + 1] = sensors[si3 + 1];
+      // Log-space interpolation: geometric weighted mean prevents extreme
+      // values from dominating at distance.  ln(3328)/ln(6) ≈ 4.5× instead
+      // of 3327/5 = 665×.  Reconstructed with expm1 at output.
+      s4[si4 + 2] = Math.log1p(sensors[si3 + 2]);
+      const r = sigRatios[i];
+      s4[si4 + 3] = twoSigmaSq * r * r;
     }
 
     // ── Always synchronous — IDW is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s3, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr);
+    this._computePaFieldSync(s4, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr);
   }
 
   /** Synchronous IDW computation.
-   *  sensors: stride-3 [sx, sy, value, ...]
-   *  cutoffSq: max range² for early-out
-   *  twoSigmaSq: 2σ² for Gaussian kernel */
-  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr) {
+   *  sensors: stride-4 Float64Array [sx, sy, value, twoSigSq, ...]
+   *  cutoffSq: max range² for early-out */
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr) {
     // ── Reuse tiny canvas + ImageData if grid size unchanged ──
     if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
       const tc = document.createElement("canvas");
@@ -5361,12 +5393,12 @@ class MapView {
         const pxx = (gx + 0.5) * cellSize;
 
         let wSum = 0, vSum = 0;
-        for (let i = 0; i < sensors.length; i += 3) {
+        for (let i = 0; i < sensors.length; i += 4) {
           const dx = pxx - sensors[i];
           const dy = py  - sensors[i + 1];
           const d2 = dx * dx + dy * dy;
           if (d2 > cutoffSq) continue;
-          const w = Math.exp(-d2 / twoSigmaSq);
+          const w = Math.exp(-d2 / sensors[i + 3]);
           wSum += w;
           vSum += w * sensors[i + 2];
         }
@@ -5377,7 +5409,7 @@ class MapView {
         } else {
           const fade = Math.min(1, wSum * 2);
           const alpha = Math.round(FIELD_ALPHA * fade);
-          const val = vSum / wSum;
+          const val = Math.expm1(vSum / wSum);
           const rgb = _pm25ToRgbSmooth(val);
           px[off]   = rgb[0];
           px[off+1] = rgb[1];
@@ -5387,8 +5419,9 @@ class MapView {
       }
     }
 
-    // ── Gaussian blur (radius 2) to soften edges ──
-    const BLUR_R = 2;
+    // ── Gaussian blur to soften edges ──
+    const _fd = window._fieldDebug;
+    const BLUR_R = _fd ? _fd.blur : 2;
     // Reuse blur buffer across frames when grid dimensions match
     const bufLen = px.length;
     if (!this._paGrid.blurBuf || this._paGrid.blurBuf.length !== bufLen) {
@@ -6101,13 +6134,26 @@ class MapView {
       return (tMs == null || !isFinite(tMs)) ? Number.NEGATIVE_INFINITY : Number(tMs);
     };
 
-    const alphaOther = selectedId ? 0.35 : 1.0;
-    const nonSelected = mobiles
-      .filter(m => !(selectedId && m.id === selectedId))
-      .slice()
-      .sort((a, b) => trailLastMs(a) - trailLastMs(b));
+    // Pre-filter: skip mobiles whose trail is entirely expired (>45 min old).
+    // During evening playback, most morning/afternoon vehicles are expired —
+    // this avoids _collectTrailData + array allocs + projection for each.
+    const TRAIL_EXPIRE_MS = 45 * 60 * 1000;
+    const refTimeMs = this.getPlaybackTimeMs();
+    const hasRefTime = refTimeMs != null && isFinite(refTimeMs);
 
-    for (const m of nonSelected) {
+    const alphaOther = selectedId ? 0.35 : 1.0;
+    const candidates = [];
+    for (const m of mobiles) {
+      if (selectedId && m.id === selectedId) continue;
+      const lastMs = trailLastMs(m);
+      m._cachedTrailLastMs = lastMs;
+      // Skip if trail ended >45 min before playback time
+      if (hasRefTime && isFinite(lastMs) && refTimeMs - lastMs > TRAIL_EXPIRE_MS) continue;
+      candidates.push(m);
+    }
+    candidates.sort((a, b) => a._cachedTrailLastMs - b._cachedTrailLastMs);
+
+    for (const m of candidates) {
       drawTrailFor(m, alphaOther, worldToScreenFast);
     }
 
@@ -6609,15 +6655,24 @@ class MapView {
             return true;
           };
 
-          const alphaOther = selectedId ? 0.35 : 1.0;
-          const nonSelected = mobiles
-            .filter(m => !(selectedId && m.id === selectedId))
-            .slice()
-            .sort((a, b) => trailLastMs(a) - trailLastMs(b));
+          // Pre-filter expired trails (>45 min old) to avoid array
+          // allocations and projection work for vehicles no longer visible.
+          const TRAIL_EXPIRE_MS = 45 * 60 * 1000;
+          const hasRefTime = pbTimeMs != null && isFinite(pbTimeMs);
 
-          // Incremental mode disabled - always do full redraw for proper fading
+          const alphaOther = selectedId ? 0.35 : 1.0;
+          const candidates = [];
+          for (const m of mobiles) {
+            if (selectedId && m.id === selectedId) continue;
+            const lastMs = trailLastMs(m);
+            m._cachedTrailLastMs = lastMs;
+            if (hasRefTime && isFinite(lastMs) && pbTimeMs - lastMs > TRAIL_EXPIRE_MS) continue;
+            candidates.push(m);
+          }
+          candidates.sort((a, b) => a._cachedTrailLastMs - b._cachedTrailLastMs);
+
           const timeFilter = null;
-          for (const m of nonSelected) {
+          for (const m of candidates) {
             drawTrailForCached(m, alphaOther, worldToScreenFast, timeFilter);
           }
 
