@@ -1403,7 +1403,15 @@ class MapView {
   }
 
   getPlaybackBounds() {
-    return { minMs: this._playbackMinMs, maxMs: this._playbackMaxMs };
+    let maxMs = this._playbackMaxMs;
+    // In non-historical mode, extend the edge to wall-clock now so the
+    // playhead and scrub bar aren't stuck at the last data-point timestamp.
+    // This applies regardless of _playbackLiveFollow — LIVE follow controls
+    // auto-advance, not the visible time range.
+    if (!this._historicalMode && maxMs != null) {
+      maxMs = Math.max(maxMs, Date.now());
+    }
+    return { minMs: this._playbackMinMs, maxMs };
   }
 
   getPlaybackTimeMs() {

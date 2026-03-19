@@ -2770,9 +2770,12 @@ function main() {
     const hasMotion = Math.abs(_pbVelocity) > _pbVelocityThreshold;
     const hasWheelMomentum = Math.abs(_pbWheelAccum) > 0.1;
     const waitingToRewind = _pbAtEndSincePerf != null;
-    const inLiveMode = map._playbackLiveFollow;  // LIVE mode always keeps loop running
+    // In LIVE mode, only keep the loop running while the playhead has
+    // catching-up to do.  Once at the wall-clock edge, let the loop
+    // sleep — tick() (via SSE push) will restart it when new data arrives.
+    const liveNeedsLoop = map._playbackLiveFollow && !map.isPlaybackAtEnd(500);
     
-    if (map.getPlaybackPlaying() || markerInertiaActive || hasMotion || hasWheelMomentum || waitingToRewind || inLiveMode) {
+    if (map.getPlaybackPlaying() || markerInertiaActive || hasMotion || hasWheelMomentum || waitingToRewind || liveNeedsLoop) {
       _pbRAF = requestAnimationFrame(playbackLoop);
     } else {
       _pbLastPerf = 0;
@@ -4576,6 +4579,12 @@ function main() {
         }
       } catch {}
 
+      // In LIVE mode, snap playhead to wall-clock now so the render
+      // reflects real-time sensor data (not the last trail timestamp).
+      if (map._playbackLiveFollow && !map._historicalMode && map._playbackInitialized) {
+        map.setPlaybackTimeMs(Date.now());
+      }
+
       // Avoid forcing an extra overlay redraw every poll.
       // Selection is applied before draw() so the single drawOverlay pass uses the right styling.
       if (map.selectedId !== selectedId) {
@@ -4583,6 +4592,13 @@ function main() {
         map._invalidateOverlayStatic();
       }
       map.draw(st);
+
+      // Kick the playback loop so it processes new-data detection (camera
+      // follow, buffer recalc, etc.) even if the rAF was idle at the edge.
+      if (map._playbackLiveFollow && !_pbRAF) {
+        _pbLastPerf = 0;
+        _pbRAF = requestAnimationFrame(playbackLoop);
+      }
 
       renderLists(st, selectedId);
       renderDetails(st, selectedId);
