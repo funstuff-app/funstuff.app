@@ -5329,21 +5329,11 @@ class MapView {
     const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
 
-    // ── Build stride-3 sensor array: [sx, sy, v, ...] ──
-    const s3 = new Float64Array(nSensors * 3);
-    for (let i = 0; i < nSensors; i++) {
-      const si = i * 3;
-      s3[si] = sensors[si];
-      s3[si + 1] = sensors[si + 1];
-      s3[si + 2] = sensors[si + 2];
-    }
-
-    // ── Per-sensor σ ratio based on neighbor agreement ────────────
-    // Cached on fingerprint — only recomputed when sensor values cross
-    // an AQI color boundary, not on pan/zoom.
-    // Sensors where no neighbor agrees (within 2×) get a tighter σ so
-    // their field hotspot stays local. Sensors in real events (fire)
-    // where neighbors agree keep σ ratio = 1.
+    // ── Build stride-4 sensor array: [sx, sy, v, twoSigSq, ...] ──
+    // Per-sensor σ ratio (cached on fingerprint) controls Gaussian reach.
+    // Sensors where no neighbor agrees (within 2×) get tighter σ so their
+    // field hotspot stays local.  Baked into stride-4 to avoid extra array
+    // lookups or divisions in the hot IDW loop.
     let sigRatios = this._paSigRatioCache;
     if (!sigRatios || this._paSigRatioFP !== fingerprint) {
       sigRatios = new Float64Array(nSensors);
@@ -5362,24 +5352,24 @@ class MapView {
       this._paSigRatioFP = fingerprint;
     }
 
-    // Build per-sensor 2σ² from ratio × global twoSigmaSq
-    const sensorTwoSigSq = new Float64Array(nSensors);
+    const s4 = new Float64Array(nSensors * 4);
     for (let i = 0; i < nSensors; i++) {
+      const si3 = i * 3, si4 = i * 4;
+      s4[si4]     = sensors[si3];
+      s4[si4 + 1] = sensors[si3 + 1];
+      s4[si4 + 2] = sensors[si3 + 2];
       const r = sigRatios[i];
-      sensorTwoSigSq[i] = twoSigmaSq * r * r;
+      s4[si4 + 3] = twoSigmaSq * r * r;
     }
-    // ────────────────────────────────────────────────────────────────
 
     // ── Always synchronous — IDW is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s3, sensorTwoSigSq, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr);
+    this._computePaFieldSync(s4, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr);
   }
 
   /** Synchronous IDW computation.
-   *  sensors: stride-3 [sx, sy, value, ...]
-   *  sensorTwoSigSq: Float64Array — per-sensor 2σ² for Gaussian reach
-   *  cutoffSq: max range² for early-out
-   *  twoSigmaSq: 2σ² for global Gaussian alpha fading */
-  _computePaFieldSync(sensors, sensorTwoSigSq, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, cssW, cssH, dpr) {
+   *  sensors: stride-4 Float64Array [sx, sy, value, twoSigSq, ...]
+   *  cutoffSq: max range² for early-out */
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr) {
     // ── Reuse tiny canvas + ImageData if grid size unchanged ──
     if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
       const tc = document.createElement("canvas");
@@ -5397,12 +5387,12 @@ class MapView {
         const pxx = (gx + 0.5) * cellSize;
 
         let wSum = 0, vSum = 0;
-        for (let i = 0; i < sensors.length; i += 3) {
+        for (let i = 0; i < sensors.length; i += 4) {
           const dx = pxx - sensors[i];
           const dy = py  - sensors[i + 1];
           const d2 = dx * dx + dy * dy;
           if (d2 > cutoffSq) continue;
-          const w = Math.exp(-d2 / sensorTwoSigSq[i / 3]);
+          const w = Math.exp(-d2 / sensors[i + 3]);
           wSum += w;
           vSum += w * sensors[i + 2];
         }
