@@ -125,13 +125,28 @@
     return rs != null && tMs >= rs && tMs < de - 500;
   };
 
+  /** True when in "Live glow" state: playhead at wall clock. */
+  PlaybackState.prototype.inLiveGlow = function () {
+    return !this.map._historicalMode && this.atWallEdge();
+  };
+
+  /**
+   * Whether the click handler should enter runway catch-up mode.
+   * True when: past data edge, not already in liveFollow, not historical.
+   */
+  PlaybackState.prototype.shouldEnterLive = function () {
+    var m = this.map;
+    return !m._playbackLiveFollow
+      && !m._historicalMode
+      && this.pastDataEdge();
+  };
+
   /**
    * Determine the text and glow state for the play/pause/live button.
    *
-   *   "Live"  + glow  → playhead at wall edge, liveFollow on
+   *   "Live"  + glow  → playhead at wall clock (atWallEdge)
    *   "Pause"         → playing (including runway catch-up)
    *   "Play"          → paused
-   *   "Live"  no glow → paused near wall edge (user can tap to enter LIVE)
    */
   PlaybackState.prototype.buttonState = function () {
     var m = this.map;
@@ -140,19 +155,20 @@
         ? { text: "Pause", glow: false }
         : { text: "Play",  glow: false };
     }
-    // Live glow: liveFollow + at wall edge
-    if (m._playbackLiveFollow && this.atWallEdge()) {
-      return { text: "Live", glow: true };
+    var result;
+    // Live glow: playhead is at wall clock time. Not liveFollow (that's runway).
+    if (this.atWallEdge()) {
+      result = { text: "Live", glow: true };
+    } else if (m.getPlaybackPlaying()) {
+      result = { text: "Pause", glow: false };
+    } else {
+      result = { text: "Play", glow: false };
     }
-    // Playing (including runway catch-up with liveFollow on)
-    if (m.getPlaybackPlaying()) {
-      return { text: "Pause", glow: false };
+    if (this._lastBtnText !== result.text) {
+      console.log('[PS] buttonState %s → %s (liveFollow=%s atWall=%s playing=%s)', this._lastBtnText || '(init)', result.text, m._playbackLiveFollow, this.atWallEdge(), m.getPlaybackPlaying());
+      this._lastBtnText = result.text;
     }
-    // Paused near the wall edge — show tappable "Live" (no glow)
-    if (this.pastDataEdge()) {
-      return { text: "Live", glow: false };
-    }
-    return { text: "Play", glow: false };
+    return result;
   };
 
   // ── LIVE buffer helpers ─────────────────────────────────────────────────

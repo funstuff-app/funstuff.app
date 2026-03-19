@@ -1534,6 +1534,10 @@ function main() {
   // Server can bump this to force LIVE camera follow even if data timestamps are unchanged.
   let _pbLastForceRefreshSeq = null;
 
+  // Camera follow only fires when we were ALREADY in live glow on the previous frame.
+  // Prevents camera snap on the frame we first enter live glow.
+  let _pbWasInLiveGlow = false;
+
   // ─────────────────────────────────────────────────────────────────────────────
   // PlaybackState module: single source of truth for runway, live-window, and
   // button-state calculations.  Replaces the duplicated _pbLiveStart*, _pbLiveTarget*,
@@ -2289,6 +2293,11 @@ function main() {
 
     if (pbPlayEl) {
       const bs = _PS ? _PS.buttonState() : { text: "Play", glow: false };
+      if (pbPlayEl.textContent !== bs.text || pbPlayEl.classList.contains("isLive") !== bs.glow) {
+        console.log('[UI] btn: %s glow=%s  liveFollow=%s playing=%s pastDE=%s tMs=%s dataEdge=%s',
+          bs.text, bs.glow, map._playbackLiveFollow, map.getPlaybackPlaying(),
+          _PS ? _PS.pastDataEdge() : '?', map.getPlaybackTimeMs(), _PS ? _PS.dataEdgeMs() : '?');
+      }
       pbPlayEl.textContent = bs.text;
       if (bs.glow) pbPlayEl.classList.add("isLive");
       else pbPlayEl.classList.remove("isLive");
@@ -2404,18 +2413,19 @@ function main() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // LIVE CAMERA FOLLOW
+    // LIVE CAMERA FOLLOW — only when already in Live glow AND new data arrived
     // ─────────────────────────────────────────────────────────────────────────
     {
-      if (_autoCameraEnabled && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && _slcInView()) {
+      const inGlow = _PS && _PS.inLiveGlow();
+      if (_autoCameraEnabled && (newDataArrived || forceCameraFit) && inGlow && _pbWasInLiveGlow && _slcInView()) {
         _performCameraFit();
       }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // DEFERRED CAMERA FIT
+    // DEFERRED CAMERA FIT — drain when already in Live glow AND new data arrived
     // ─────────────────────────────────────────────────────────────────────────
-    if (_PS && map._playbackLiveFollow
+    if (_PS && _PS.inLiveGlow() && _pbWasInLiveGlow && (newDataArrived || forceCameraFit)
         && typeof map._canRunAutoCamera === "function" && map._canRunAutoCamera()) {
       const d = _PS.consumeDeferredCameraFit();
       if (d) {
@@ -2646,8 +2656,7 @@ function main() {
       map.drawOverlay(map.lastState, { cacheUnderlay: true });
     }
 
-    // When playback crosses past the data edge, stop and show the Live button.
-    // Uses the module's data-edge query instead of duplicating runway math.
+    // When playback crosses past the data edge, enter LIVE mode automatically.
     {
       const dataEdge = _PS ? _PS.dataEdgeMs() : b.maxMs;
       const pastDE = _PS ? _PS.pastDataEdge() : false;
@@ -2656,13 +2665,24 @@ function main() {
     if (!_pbIsRewinding &&
         map.getPlaybackPlaying() &&
         !map._playbackLiveFollow &&
+        !map._historicalMode &&
         !_pbIsWheelCoasting &&
         didAdvanceTime && _pbVelocity >= 0 &&
         _crossedPastDataEdge) {
+      // Auto-enter LIVE: camera follow when new data arrives
+      console.log('[CROSSING] Auto-entering Live! tMsBefore=%s tMs=%s dataEdge=%s pastDE=%s liveFollow=%s',
+        tMsBefore, tMs, _PS ? _PS.dataEdgeMs() : '?', _PS ? _PS.pastDataEdge() : '?', map._playbackLiveFollow);
+      map._playbackLiveFollow = true;
+      _pbPageAutoFollow = true;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+      updatePlaybackUi();
+    }
+
+    // Runway catch-up reached wall clock → exit liveFollow, we're now LIVE.
+    if (map._playbackLiveFollow && _PS && _PS.atWallEdge()) {
+      console.log('[WALL] Runway reached wall clock, exiting liveFollow. tMs=%s', tMs);
+      map._playbackLiveFollow = false;
       _pbVelocity = 0;
-      _pbAtEndSincePerf = null;
-      _pbIsRewinding = false;
-      map.setPlaybackPlaying(false);
       updatePlaybackUi();
     }
 
@@ -2699,6 +2719,10 @@ function main() {
     // sleep — tick() (via SSE push) will restart it when new data arrives.
     const liveNeedsLoop = map._playbackLiveFollow && !map.isPlaybackAtEnd(500);
     
+    // Update live glow tracking for next frame (camera follow only fires
+    // when we were ALREADY in live glow, not on the transition frame).
+    _pbWasInLiveGlow = !!(_PS && _PS.inLiveGlow());
+
     if (map.getPlaybackPlaying() || markerInertiaActive || hasMotion || hasWheelMomentum || waitingToRewind || liveNeedsLoop) {
       _pbRAF = requestAnimationFrame(playbackLoop);
     } else {
@@ -2788,85 +2812,58 @@ function main() {
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
       const _spd = map.getPlaybackSpeed() || 1.0;
-      // Use PlaybackState module for all live-state queries
-      const pastDE = _PS ? _PS.pastDataEdge() : false;
-      
-      // If in LIVE mode (glow or runway), clicking turns OFF live camera follow
-      // but keeps playback running.
-      if (map._playbackLiveFollow) {
-        map._playbackLiveFollow = false;
-        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-        if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
-        // Set loop start to current position so rewind doesn't go to beginning of time
-        const curMs = map.getPlaybackTimeMs();
-        if (curMs != null && isFinite(curMs)) {
-          _pbLoopStartMs = curMs;
-        }
-        // Keep playback running (or start it if paused)
-        if (!map.getPlaybackPlaying()) {
-          _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-          map.setPlaybackPlaying(true);
-          _pbLastPerf = 0;
-          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        }
-        updatePlaybackUi();
-        return;
-      }
+      const bs = _PS ? _PS.buttonState() : { text: map.getPlaybackPlaying() ? "Pause" : "Play", glow: false };
+      console.log('[CLICK] btn text=%s glow=%s  atWall=%s liveFollow=%s playing=%s pastDE=%s tMs=%s dataEdge=%s',
+        bs.text, bs.glow, _PS && _PS.atWallEdge(), map._playbackLiveFollow, map.getPlaybackPlaying(),
+        _PS && _PS.pastDataEdge(), map.getPlaybackTimeMs(), _PS ? _PS.dataEdgeMs() : '?');
 
-      // If past data edge, enable LIVE mode (not available for historical replays)
-      if (pastDE && !map._playbackLiveFollow && !map._historicalMode) {
+      if (bs.text === "Live") {
+        // Clicking Live glow → snap to runway, enter catch-up playback
+        console.log('[CLICK] → Live: snap to runway');
         map._playbackLiveFollow = true;
         _pbPageAutoFollow = true;
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-        // Snap playhead to runway start (before data edge)
         if (_PS) _PS.snapToRunway(_spd);
         _pbVelocity = _pbPlaybackSpeed * _spd;
+        map.setPlaybackPlaying(true);
         _pbAtEndSincePerf = null;
         _pbIsRewinding = false;
-        map.setPlaybackPlaying(true);
         _pbLastPerf = 0;
         if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
         updatePlaybackUi();
         return;
       }
 
-      // >5x at end: snap to runway position and play (no Live glow at high speeds)
-      if (pastDE && _spd > 5 && _PS) {
-        _PS.snapToRunway(_spd);
-        _pbVelocity = _pbPlaybackSpeed * _spd;
-        _pbAtEndSincePerf = null;
-        _pbIsRewinding = false;
-        map.setPlaybackPlaying(true);
-        _pbLastPerf = 0;
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
-        return;
-      }
-
-      // If currently playing (not LIVE mode), pause
-      if (map.getPlaybackPlaying()) {
+      if (bs.text === "Pause") {
+        // Clicking Pause → pause playback, clear liveFollow if in runway
+        console.log('[CLICK] → Pause');
         map.setPlaybackPlaying(false);
         _pbVelocity = 0;
         _pbWheelAccum = 0;
         _pbAtEndSincePerf = null;
         _pbIsRewinding = false;
+        if (map._playbackLiveFollow) {
+          map._playbackLiveFollow = false;
+          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
+          if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
+        }
         updatePlaybackUi();
         return;
       }
 
-      // Paused - just play from current position
+      // bs.text === "Play"
+      // Clicking Play → resume from current position
+      console.log('[CLICK] → Play');
       _pbAtEndSincePerf = null;
       _pbWheelAccum = 0;
       _pbIsRewinding = false;
-      // Capture replay point A if it hasn't been set via scrubbing.
       if (_pbLoopStartMs == null || !isFinite(Number(_pbLoopStartMs))) {
         const cur = map.getPlaybackTimeMs();
         _pbLoopStartMs = (cur != null && isFinite(Number(cur))) ? Number(cur) : b.minMs;
       }
-      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      _pbVelocity = _pbPlaybackSpeed * _spd;
       map.setPlaybackPlaying(true);
       _pbLastPerf = 0;
-      // Always restart the loop
       if (_pbRAF) cancelAnimationFrame(_pbRAF);
       _pbRAF = requestAnimationFrame(playbackLoop);
       updatePlaybackUi();
