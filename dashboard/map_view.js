@@ -5345,22 +5345,32 @@ class MapView {
 
     // ── Build stride-4 sensor array: [sx, sy, v, twoSigSq, ...] ──
     // Per-sensor σ ratio (cached on fingerprint) controls Gaussian reach.
-    // Sensors where no neighbor agrees (within 2×) get tighter σ so their
-    // field hotspot stays local.  Baked into stride-4 to avoid extra array
-    // lookups or divisions in the hot IDW loop.
+    // Outlier sensors get a tighter σ so their hotspot stays local.
+    // Graduated: ratio ramps from 1.0 (≤2× nearest neighbor) down to 0.25
+    // (≥5× nearest neighbor) to avoid a visual cliff at the 2× boundary.
     let sigRatios = this._paSigRatioCache;
     if (!sigRatios || this._paSigRatioFP !== fingerprint) {
       sigRatios = new Float64Array(nSensors);
       for (let i = 0; i < nSensors; i++) {
         const vi = sensors[i * 3 + 2];
-        let hasAgree = false;
+        // Find the best (lowest) ratio between this sensor and any neighbor.
+        let bestRatio = Infinity;
         for (let j = 0; j < nSensors; j++) {
           if (j === i) continue;
           const vj = sensors[j * 3 + 2];
           const hi = vi > vj ? vi : vj, lo = vi > vj ? vj : vi;
-          if (hi < 20 || hi <= lo * 2) { hasAgree = true; break; }
+          if (hi < 20) { bestRatio = 1; break; }
+          const r = lo > 0 ? hi / lo : Infinity;
+          if (r < bestRatio) bestRatio = r;
         }
-        sigRatios[i] = hasAgree ? 1.0 : 0.25;
+        // Graduated ramp: 1.0 at ratio ≤2, 0.25 at ratio ≥5, linear between.
+        if (bestRatio <= 2) {
+          sigRatios[i] = 1.0;
+        } else if (bestRatio >= 5) {
+          sigRatios[i] = 0.25;
+        } else {
+          sigRatios[i] = 1.0 - 0.75 * (bestRatio - 2) / 3;
+        }
       }
       this._paSigRatioCache = sigRatios;
       this._paSigRatioFP = fingerprint;
