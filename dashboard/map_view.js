@@ -29,18 +29,21 @@ function _pm25ColorCat(v) {
 
 const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
 
-/** PM2.5 → [r,g,b] with continuous linear interpolation between AQI color stops. */
+/** PM2.5 → [r,g,b] with continuous linear interpolation between AQI color stops.
+ *  Stops placed at band midpoints (_BAND_MIDS) so colors match dot palette at
+ *  typical readings; transitions occur near band boundaries. */
 function _pm25ToRgbSmooth(v) {
   const stops = [
-    [0,    0x00,0xFF,0xFF],
-    [2.0,  0x00,0xFF,0xFF],
-    [5.0,  0x00,0xCC,0xFF],
-    [9.0,  0x00,0xE4,0x00],
-    [35.4, 0xFF,0xFF,0x00],
-    [55.4, 0xFF,0x7E,0x00],
-    [125.4,0xFF,0x00,0x00],
-    [225.4,0x8F,0x3F,0x97],
-    [500,  0x7E,0x00,0x23]
+    [0,     0x00,0xFF,0xFF],
+    [1.0,   0x00,0xFF,0xFF],  // cyan   – mid of 0–2
+    [3.5,   0x00,0xCC,0xFF],  // lt-blue– mid of 2–5
+    [7.0,   0x00,0xE4,0x00],  // green  – mid of 5–9
+    [22.2,  0xFF,0xFF,0x00],  // yellow – mid of 9–35.4
+    [45.4,  0xFF,0x7E,0x00],  // orange – mid of 35.4–55.4
+    [90.4,  0xFF,0x00,0x00],  // red    – mid of 55.4–125.4
+    [175.4, 0x8F,0x3F,0x97],  // purple – mid of 125.4–225.4
+    [250.0, 0x7E,0x00,0x23],  // maroon – mid of 225.4+
+    [500,   0x7E,0x00,0x23]
   ];
   if (v <= stops[0][0]) return [stops[0][1], stops[0][2], stops[0][3]];
   for (let i = 1; i < stops.length; i++) {
