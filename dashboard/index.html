@@ -287,7 +287,7 @@
   <script src="aqi.js?v=20260224a"></script>
   <script src="format_utils.js?v=20260224a"></script>
   <script src="data_utils.js?v=20260224a"></script>
-  <script src="map_view.js?v=20260318i"></script>
+  <script src="map_view.js?v=20260318k"></script>
   <script src="sidebar_ui.js?v=20260224a"></script>
   <script src="jog_wheel.js?v=20260227a"></script>
   <script src="app.js?v=20260318b"></script>
@@ -298,7 +298,7 @@
     font:10px/1.4 monospace; color:#aaa; width:210px; pointer-events:auto;">
     <div style="font-weight:bold; margin-bottom:4px; color:#fff; font-size:10px;">Field Debug</div>
     <div style="display:grid; grid-template-columns:42px 30px 1fr; gap:2px 4px; align-items:center;">
-      <span>sigma÷</span><span id="fdSigmaVal" style="text-align:right">6</span><input id="fdSigma" type="range" min="1" max="20" step="0.5" value="6" style="height:14px;width:100%;">
+      <span>sigma÷</span><span id="fdSigmaVal" style="text-align:right">12</span><input id="fdSigma" type="range" min="1" max="20" step="0.5" value="12" style="height:14px;width:100%;">
       <span>cut°</span><span id="fdCutoffVal" style="text-align:right">0.15</span><input id="fdCutoff" type="range" min="0.02" max="0.5" step="0.01" value="0.15" style="height:14px;width:100%;">
       <span>blur</span><span id="fdBlurVal" style="text-align:right">2</span><input id="fdBlur" type="range" min="0" max="6" step="1" value="2" style="height:14px;width:100%;">
     </div>
@@ -308,7 +308,7 @@
     if(new URLSearchParams(location.search).get('fieldDebug')!=='1') return;
     document.getElementById('fieldDebugPanel').style.display='block';
     var ids=['fdSigma','fdCutoff','fdBlur'];
-    window._fieldDebug={sigmaDivisor:6,cutoffDeg:0.15,blur:2};
+    window._fieldDebug={sigmaDivisor:12,cutoffDeg:0.15,blur:2};
 
     // ── Wheel-scroll physics (replicated from playback scrub bar) ──────────
     var _fdVel = {};       // per-slider velocity

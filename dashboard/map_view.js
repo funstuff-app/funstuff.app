@@ -204,8 +204,6 @@ class MapView {
     // Vehicle actual path buffer: records the dynamically computed positions (phys.lat/lon)
     // This is the ACTUAL path the vehicle takes, which differs based on speed/steering
     this._vehicleActualPathById = new Map(); // id -> [{lat, lon, d}]
-    // Raw GPS storage: original GPS coordinates before road snapping
-    this._rawGpsById = new Map(); // id -> [{lat, lon, t, ...}]
     // Road graph edges cache (for debug visualization)
     this._roadGraphEdges = null; // [{lat1, lon1, lat2, lon2}, ...] or null
     // Tram line graph edges cache (for debug visualization)
@@ -2328,6 +2326,19 @@ class MapView {
     removedAny = pruneMap(this._traceInitialRunDoneById) || removedAny;
     removedAny = pruneMap(this._traceAngleById) || removedAny;
     removedAny = pruneMap(this._traceAngleLastMsById) || removedAny;
+    // Playback physics / path caches (added later, were previously missed)
+    removedAny = pruneMap(this._vehiclePathById) || removedAny;
+    removedAny = pruneMap(this._smoothPathCache) || removedAny;
+    removedAny = pruneMap(this._pathDistCache) || removedAny;
+    removedAny = pruneMap(this._vehiclePhysicsCache) || removedAny;
+    removedAny = pruneMap(this._curveLookaheadCache) || removedAny;
+    removedAny = pruneMap(this._screenHeadingCache) || removedAny;
+    removedAny = pruneMap(this._vehicleRevealDist) || removedAny;
+    removedAny = pruneMap(this._roadMatchedRangesById) || removedAny;
+    removedAny = pruneMap(this._scrubCooldownById) || removedAny;
+    removedAny = pruneMap(this._physicsStateById) || removedAny;
+    removedAny = pruneMap(this._vehicleActualPathById) || removedAny;
+    removedAny = pruneMap(this._traceSelectionWarpById) || removedAny;
 
     if (removedAny) {
       this._persistedTrailRev++;
@@ -5328,7 +5339,7 @@ class MapView {
     const cutoffSq = cutoffPx * cutoffPx;
     const FIELD_ALPHA = _fd && _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
     // Gaussian kernel: σ = cutoff/sigmaDivisor (~2.5km effective radius per sensor).
-    const sigmaDivisor = _fd ? _fd.sigmaDivisor : 6;
+    const sigmaDivisor = _fd ? _fd.sigmaDivisor : 12;
     const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
 
@@ -5606,7 +5617,7 @@ class MapView {
       const refW = latLonToWorld(clat, clon + 0.15, z);
       const cutoffPx = Math.abs(refW.x - centerW.x);
       const cutoffSq = cutoffPx * cutoffPx;
-      const sigma = cutoffPx / 6;
+      const sigma = cutoffPx / 12;
       const twoSigmaSq = 2 * sigma * sigma;
       const FIELD_ALPHA = 46;
 
@@ -6218,6 +6229,12 @@ class MapView {
       ec.textBaseline = "middle";
       ec.fillText(emoji, px / 2, px / 2);
       this._emojiCanvasCache.set(key, c);
+      // Evict oldest entries if cache grows too large
+      while (this._emojiCanvasCache.size > 200) {
+        const oldest = this._emojiCanvasCache.keys().next().value;
+        if (oldest == null) break;
+        this._emojiCanvasCache.delete(oldest);
+      }
       return c;
     };
 
@@ -6231,6 +6248,12 @@ class MapView {
       width = ctx.measureText(text).width;
       if (!(width > 0)) width = text.length * 7; // iOS fallback
       this._textWidthCache.set(key, width);
+      // Evict oldest entries if cache grows too large
+      while (this._textWidthCache.size > 2000) {
+        const oldest = this._textWidthCache.keys().next().value;
+        if (oldest == null) break;
+        this._textWidthCache.delete(oldest);
+      }
       return width;
     };
 
@@ -6703,7 +6726,7 @@ class MapView {
     if (this._pbDebugPath && this._pbDebugRawGps && this.playbackMode) {
       const selId = _frameSelectedId;
       if (selId) {
-        const rawGps = this._rawGpsById.get(String(selId));
+        const rawGps = this._playbackPtsById?.get(String(selId));
         if (rawGps && rawGps.length >= 2) {
           const ws = worldSizeForZoom(this.zoom);
           const pbTimeMs = _framePbTimeMs;
