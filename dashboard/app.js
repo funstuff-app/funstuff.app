@@ -2438,6 +2438,30 @@ function main() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // LIVE GLOW IDLE: When at wall edge with no velocity, throttle to ~1fps
+    // for trail fading. Skip physics, UI polling, legend sync, jog wheel.
+    // Data-change detection + camera follow above still run every frame.
+    // ─────────────────────────────────────────────────────────────────────────
+    {
+      const _inLiveIdle = !newDataArrived && !forceCameraFit
+        && _PS && _PS.inLiveGlow()
+        && Math.abs(_pbVelocity) <= _pbVelocityThreshold
+        && Math.abs(_pbWheelAccum) < 0.1
+        && !_pbScrubbing;
+
+      if (_inLiveIdle) {
+        // Redraw overlay at ~1fps so trails keep fading
+        if (now - _pbLastUiPerf >= 1000) {
+          map.drawOverlay(map.lastState, { cacheUnderlay: true });
+          _pbLastUiPerf = now;
+        }
+        _pbWasInLiveGlow = true;
+        _pbRAF = requestAnimationFrame(playbackLoop);
+        return; // skip physics, rendering, UI sync, jog wheel, legend sync
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // PHYSICS SIMULATION
     // ─────────────────────────────────────────────────────────────────────────
     let didAdvanceTime = false;
