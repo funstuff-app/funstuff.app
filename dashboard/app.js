@@ -1531,30 +1531,18 @@ function main() {
   let _pbLastKnownMinMs = null;
   let _pbLastKnownMaxMs = null;
 
-  // Wall-clock ms (Date.now) when last server response arrived
-  let _pbLastServerResponseMs = Date.now();
-
   // Server can bump this to force LIVE camera follow even if data timestamps are unchanged.
   let _pbLastForceRefreshSeq = null;
-  
+
   // ─────────────────────────────────────────────────────────────────────────────
-  // LIVE BUFFER: Track wall-clock time since app started to know how much data we have.
-  // Buffer = time since first data arrival. Playback replays this accumulated buffer.
+  // PlaybackState module: single source of truth for runway, live-window, and
+  // button-state calculations.  Replaces the duplicated _pbLiveStart*, _pbLiveTarget*,
+  // _pbLastServerResponseMs, and _resetLiveTracking scattered across this file.
   // ─────────────────────────────────────────────────────────────────────────────
-  let _pbLiveStartWallMs = null;        // wall-clock time (perf.now) when LIVE mode started
-  let _pbLiveStartDataMs = null;        // data time (maxMs) when LIVE mode started
-  const _pbLiveStallThreshold = 3;      // stalls before auto-rewind in LIVE mode
-  let _pbLiveTargetMs = null;           // where playback should aim in LIVE mode
-  let _pbLiveStallCount = 0;            // how many times we've hit end waiting for data
-  
-  // Helper to reset LIVE tracking (call when exiting LIVE mode)
-  // Exposed on map object so class methods can call it
-  function _resetLiveTracking() {
-    _pbLiveStartWallMs = null;
-    _pbLiveStartDataMs = null;
-    _pbLiveStallCount = 0;
-    _deferredCameraFit = null;
-  }
+  const _PS = (typeof PlaybackState === "function") ? new PlaybackState(map) : null;
+  // Back-compat shim so existing code referencing the old local keeps working
+  // during the incremental migration (alias for reads only).
+  function _resetLiveTracking() { if (_PS) _PS.resetLiveTracking(); }
   map._resetLiveTracking = _resetLiveTracking;
   
   // LIVE camera follow: smooth pan/zoom to fit moving vehicles
@@ -1564,7 +1552,7 @@ function main() {
   // Deferred camera fit: when new data arrives while the user is panning/zooming
   // (or during post-interaction easing), we stash the intended camera fit here.
   // The playback loop drains it once _canRunAutoCamera() returns true.
-  let _deferredCameraFit = null; // { type: "bounds", bb, durationMs } | { type: "storedView", durationMs }
+  let _deferredCameraFit = null; // legacy; redirected to _PS when available
 
   // Minimum geographic extent (in degrees) for bounds to be considered "meaningful" movement.
   // ~0.002° lat ≈ 220m. Below this the vehicles are just jittering in place (depot, parking lot).
@@ -1713,7 +1701,8 @@ function main() {
     if (!map || typeof map._canRunAutoCamera !== "function") return;
     if (!map._canRunAutoCamera()) {
       // User is interacting — defer until interaction + easing finishes.
-      _deferredCameraFit = { type: "storedView", durationMs: durationMs || _pbLiveFollowDurationMs };
+      if (_PS) _PS.deferCameraFit({ type: "storedView", durationMs: durationMs || _pbLiveFollowDurationMs });
+      else _deferredCameraFit = { type: "storedView", durationMs: durationMs || _pbLiveFollowDurationMs };
       return;
     }
     try {
@@ -1747,7 +1736,8 @@ function main() {
     // Exception: force=true (explicit user button click) overrides the cooldown.
     if (!force && map && typeof map._canRunAutoCamera === "function" && !map._canRunAutoCamera()) {
       // Defer: replay this fit once the user stops interacting.
-      _deferredCameraFit = { type: "bounds", bb: { minLat, minLon, maxLat, maxLon }, durationMs };
+      if (_PS) _PS.deferCameraFit({ type: "bounds", bb: { minLat, minLon, maxLat, maxLon }, durationMs });
+      else _deferredCameraFit = { type: "bounds", bb: { minLat, minLon, maxLat, maxLon }, durationMs };
       return;
     }
 
@@ -2296,39 +2286,12 @@ function main() {
     }
 
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
-    const atEnd = !hasBounds || map.isPlaybackAtEnd(200);
-    // Live window: playhead is close enough to maxMs that continuing playback
-    // would naturally reach the end before the next server update.
-    // Only applies at 1x and 5x; higher speeds don't get the buffer.
-    const _speed = map.getPlaybackSpeed() || 1.0;
-    const _nextInS = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-    const _wallElapsed2 = (Date.now() - _pbLastServerResponseMs) / 1000;
-    const _remS2 = Math.max(0, _nextInS - _wallElapsed2);
-    const _liveWindowMs = (_speed <= 5) ? _remS2 * 1000 * _speed : 0;
-    const inLiveWindow = !hasBounds || atEnd || (
-      _liveWindowMs > 0 && tMs != null && isFinite(tMs) && tMs >= b.maxMs - _liveWindowMs
-    );
-    // LIVE mode is based on the flag, not position - we're replaying the buffer
-    const followingLive = map._playbackLiveFollow;
 
     if (pbPlayEl) {
-      if (followingLive && !map._historicalMode) {
-        // LIVE mode enabled: show Live button highlighted
-        pbPlayEl.textContent = "Live";
-        pbPlayEl.classList.add("isLive");
-      } else if (inLiveWindow && !map._historicalMode) {
-        // In live buffer window but LIVE not enabled: show Live button (not highlighted)
-        pbPlayEl.textContent = "Live";
-        pbPlayEl.classList.remove("isLive");
-      } else if (map.getPlaybackPlaying()) {
-        // Playing but not at end: show Pause
-        pbPlayEl.textContent = "Pause";
-        pbPlayEl.classList.remove("isLive");
-      } else {
-        // Paused: show Play
-        pbPlayEl.textContent = "Play";
-        pbPlayEl.classList.remove("isLive");
-      }
+      const bs = _PS ? _PS.buttonState() : { text: "Play", glow: false };
+      pbPlayEl.textContent = bs.text;
+      if (bs.glow) pbPlayEl.classList.add("isLive");
+      else pbPlayEl.classList.remove("isLive");
     }
     if (pbSpeedEl) pbSpeedEl.value = String(map.getPlaybackSpeed() || 1.0);
   };
@@ -2367,7 +2330,7 @@ function main() {
           _pbLastDataUpdateWindowEndMs = b.maxMs;
         }
         // Reset stall counter when fresh data arrives
-        _pbLiveStallCount = 0;
+        if (_PS) _PS._liveStallCount = 0;
       }
       _pbLastKnownMinMs = b.minMs;
       _pbLastKnownMaxMs = b.maxMs;
@@ -2402,12 +2365,12 @@ function main() {
           if (seq > 0) {
             newDataArrived = true;
             forceCameraFit = true;
-            _pbLiveStallCount = 0;
+            if (_PS) _PS._liveStallCount = 0;
           }
         } else if (seq !== _pbLastForceRefreshSeq) {
           newDataArrived = true;
           forceCameraFit = true;
-          _pbLiveStallCount = 0;
+          if (_PS) _PS._liveStallCount = 0;
         }
         _pbLastForceRefreshSeq = seq;
       }
@@ -2427,48 +2390,21 @@ function main() {
     }
     
     // ─────────────────────────────────────────────────────────────────────────
-    // LIVE BUFFER CALCULATION
-    // Buffer = wall-clock time since LIVE started (how much data we've accumulated).
-    // Playback consumes this buffer at playbackSpeed rate.
+    // LIVE BUFFER CALCULATION (delegated to PlaybackState module)
     // ─────────────────────────────────────────────────────────────────────────
     let liveBufferMs = 0;
     
-    if (hasBounds && map._playbackLiveFollow) {
-      // Initialize playhead if not set (handled above, but keep for safety)
+    if (hasBounds && map._playbackLiveFollow && _PS) {
       if (tMs == null || !isFinite(tMs)) {
-        const meta = map.lastState?.meta;
-        const nextInS = Number(meta?.polling_next_update_in_s) ?? Number(meta?.polling_predicted_interval_s) ?? 600;
-        const speed = map.getPlaybackSpeed() || 1.0;
-        const offsetMs = nextInS * 1000 * speed;
-        tMs = Math.max(b.minMs, b.maxMs - offsetMs);
-        map.setPlaybackTimeMs(tMs);
+        _PS.snapToRunway();
+        tMs = map.getPlaybackTimeMs();
       }
-      
-      // Initialize LIVE tracking on first entry
-      if (_pbLiveStartWallMs == null) {
-        _pbLiveStartWallMs = now;
-        _pbLiveStartDataMs = b.maxMs;
-      }
-      
-      // Buffer = wall-clock time since we started LIVE mode
-      // This is how much new data has accumulated since we began
-      const wallElapsed = now - _pbLiveStartWallMs;
-      liveBufferMs = wallElapsed;
-      
-      // Target = newest data minus the buffer (stay behind the live edge)
-      // The buffer grows in real-time, so we always have runway
-      _pbLiveTargetMs = b.maxMs - liveBufferMs;
-      
-      // Clamp: if rewind outpaces buffer accumulation, just use minMs
-      if (_pbLiveTargetMs < b.minMs) {
-        _pbLiveTargetMs = b.minMs;
-      }
+      const liveInfo = _PS.updateLiveBuffer(now);
+      liveBufferMs = liveInfo.liveBufferMs;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // LIVE CAMERA FOLLOW: Frame where vehicles currently are, their visible
-    // trails, and nearby fixed sensors. Uses median-based outlier trimming so
-    // a distant long-route vehicle doesn't drag the camera to city scale.
+    // LIVE CAMERA FOLLOW
     // ─────────────────────────────────────────────────────────────────────────
     {
       if (_autoCameraEnabled && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && _slcInView()) {
@@ -2477,17 +2413,17 @@ function main() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // DEFERRED CAMERA FIT: If a live camera fit was blocked by user interaction,
-    // replay it now that the interaction + easing has settled.
+    // DEFERRED CAMERA FIT
     // ─────────────────────────────────────────────────────────────────────────
-    if (_deferredCameraFit && map._playbackLiveFollow
+    if (_PS && map._playbackLiveFollow
         && typeof map._canRunAutoCamera === "function" && map._canRunAutoCamera()) {
-      const d = _deferredCameraFit;
-      _deferredCameraFit = null;
-      if (d.type === "bounds" && d.bb) {
-        _animateFitBoundsLatLon(d.bb, { durationMs: d.durationMs || _pbLiveFollowDurationMs });
-      } else if (d.type === "storedView") {
-        _animateToStoredView(d.durationMs || _pbLiveFollowDurationMs);
+      const d = _PS.consumeDeferredCameraFit();
+      if (d) {
+        if (d.type === "bounds" && d.bb) {
+          _animateFitBoundsLatLon(d.bb, { durationMs: d.durationMs || _pbLiveFollowDurationMs });
+        } else if (d.type === "storedView") {
+          _animateToStoredView(d.durationMs || _pbLiveFollowDurationMs);
+        }
       }
     }
 
@@ -2710,31 +2646,19 @@ function main() {
       map.drawOverlay(map.lastState, { cacheUnderlay: true });
     }
 
-    // When playback enters the live buffer window, stop and show Live button.
-    // Buffer window = predictedInterval * speed, but only for 1x and 5x.
+    // When playback crosses past the data edge, stop and show the Live button.
+    // Uses the module's data-edge query instead of duplicating runway math.
     {
-      const _spd2 = map.getPlaybackSpeed() || 1.0;
-      const _nextInS2 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-      const _wallElapsed3 = (Date.now() - _pbLastServerResponseMs) / 1000;
-      const _remS3 = Math.max(0, _nextInS2 - _wallElapsed3);
-      const _lwMs2 = (_spd2 <= 5) ? _remS3 * 1000 * _spd2 : 0;
-      const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
-      var _inLiveWindow2 = hasBounds && tMs != null && isFinite(tMs) && tMs >= bufferEdge;
-      // Only trigger if we CROSSED into the window this frame (were below, now at/above).
-      // If the user scrubbed into the window, let playback continue to maxMs.
-      var _crossedIntoLiveWindow = _inLiveWindow2 && isFinite(tMsBefore) && tMsBefore < bufferEdge;
+      const dataEdge = _PS ? _PS.dataEdgeMs() : b.maxMs;
+      const pastDE = _PS ? _PS.pastDataEdge() : false;
+      var _crossedPastDataEdge = pastDE && isFinite(tMsBefore) && tMsBefore < (dataEdge - 500);
     }
     if (!_pbIsRewinding &&
         map.getPlaybackPlaying() &&
         !map._playbackLiveFollow &&
         !_pbIsWheelCoasting &&
         didAdvanceTime && _pbVelocity >= 0 &&
-        _crossedIntoLiveWindow) {
-      // Don't auto-activate Live mode — just stop playback at the buffer edge.
-      // The button will show "Live" (not highlighted) so the user can opt in.
-      // map._playbackLiveFollow = true;
-      // _pbPageAutoFollow = true;
-      // try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+        _crossedPastDataEdge) {
       _pbVelocity = 0;
       _pbAtEndSincePerf = null;
       _pbIsRewinding = false;
@@ -2863,22 +2787,12 @@ function main() {
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
-      const atEnd = map.isPlaybackAtEnd(100);
-      // Buffer snap target: always calculated regardless of speed.
-      // Live window (button shows "Live"): only for 1x and 5x.
       const _spd = map.getPlaybackSpeed() || 1.0;
-      const _nextInS3 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-      const _wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
-      const _remS = Math.max(0, _nextInS3 - _wallElapsed);
-      const _snapMs = _remS * 1000 * _spd;
-      const _lwMs = (_spd <= 5) ? _snapMs : 0;
-      const curMs = map.getPlaybackTimeMs();
-      const inLiveWindow = atEnd || (
-        _lwMs > 0 && curMs != null && isFinite(curMs) && curMs >= b.maxMs - _lwMs
-      );
+      // Use PlaybackState module for all live-state queries
+      const pastDE = _PS ? _PS.pastDataEdge() : false;
       
-      // If in LIVE mode, clicking turns OFF live camera follow (but keeps playback running).
-      // This allows the user to stay at the end receiving new data, but without the camera auto-following.
+      // If in LIVE mode (glow or runway), clicking turns OFF live camera follow
+      // but keeps playback running.
       if (map._playbackLiveFollow) {
         map._playbackLiveFollow = false;
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
@@ -2899,17 +2813,14 @@ function main() {
         return;
       }
 
-      // If in live window (1x/5x), enable LIVE mode (not available for historical replays)
-      if (inLiveWindow && _spd <= 5 && !map._playbackLiveFollow && !map._historicalMode) {
+      // If past data edge, enable LIVE mode (not available for historical replays)
+      if (pastDE && !map._playbackLiveFollow && !map._historicalMode) {
         map._playbackLiveFollow = true;
-        _pbPageAutoFollow = true; // resume page tracking in LIVE mode
+        _pbPageAutoFollow = true;
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-        // Snap playhead to leading edge of buffer
-        if (_snapMs > 0) {
-          const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
-          map.setPlaybackTimeMs(bufferStart);
-        }
-        _pbVelocity = 0;
+        // Snap playhead to runway start (before data edge)
+        if (_PS) _PS.snapToRunway(_spd);
+        _pbVelocity = _pbPlaybackSpeed * _spd;
         _pbAtEndSincePerf = null;
         _pbIsRewinding = false;
         map.setPlaybackPlaying(true);
@@ -2919,10 +2830,9 @@ function main() {
         return;
       }
 
-      // >5x at end: snap to buffer position and play (no Live mode)
-      if (atEnd && _spd > 5 && _snapMs > 0) {
-        const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
-        map.setPlaybackTimeMs(bufferStart);
+      // >5x at end: snap to runway position and play (no Live glow at high speeds)
+      if (pastDE && _spd > 5 && _PS) {
+        _PS.snapToRunway(_spd);
         _pbVelocity = _pbPlaybackSpeed * _spd;
         _pbAtEndSincePerf = null;
         _pbIsRewinding = false;
@@ -2981,39 +2891,13 @@ function main() {
 
       // If in LIVE mode, recalculate buffer position when speed changes.
       if (map._playbackLiveFollow) {
-        // Speeds >5x don't support Live mode
+        // Speeds >5x don't support Live glow
         if (newSpeed > 5) {
           map._playbackLiveFollow = false;
           try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
           _resetLiveTracking();
-        } else {
-          // Recalculate buffer start for the new speed.
-          // Larger speed = larger buffer window = playhead must move back.
-          // Smaller speed = smaller buffer window = playhead should move forward
-          //   (otherwise it's behind the new buffer start and Live button state
-          //   becomes inconsistent — the user expects to be "caught up").
-          const b = map.getPlaybackBounds();
-          if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
-            const meta = map.lastState?.meta || {};
-            const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
-            const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
-            const remS = Math.max(0, nextInS - wallElapsed);
-            const snapMs = remS * 1000 * newSpeed;
-            if (snapMs > 0) {
-              const bufferStart = Math.max(b.minMs, b.maxMs - snapMs);
-              const curMs = map.getPlaybackTimeMs();
-              if (curMs != null && isFinite(curMs)) {
-                // Speed increased: snap back if ahead of new (larger) buffer start
-                // Speed decreased: snap forward if behind new (smaller) buffer start
-                if (curMs > bufferStart || curMs < bufferStart) {
-                  map.setPlaybackTimeMs(bufferStart);
-                  // Reset LIVE tracking so buffer accumulation restarts from here
-                  _pbLiveStartWallMs = performance.now();
-                  _pbLiveStartDataMs = b.maxMs;
-                }
-              }
-            }
-          }
+        } else if (_PS) {
+          _PS.snapToRunway(newSpeed);
         }
       }
 
@@ -3028,25 +2912,12 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
-    if (!map._playbackLiveFollow) return; // only applies in LIVE mode
+    if (!map._playbackLiveFollow || !_PS) return;
     const b = map.getPlaybackBounds();
     if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;
-    const speed = map.getPlaybackSpeed() || 1.0;
-    const meta = map.lastState?.meta || {};
-    const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
-    const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
-    const remS = Math.max(0, nextInS - wallElapsed);
-    const bufferMs = remS * 1000 * speed;
-    if (bufferMs > 0) {
-      const bufferStart = Math.max(b.minMs, b.maxMs - bufferMs);
-      map.setPlaybackTimeMs(bufferStart);
-      // Restart LIVE tracking from current position
-      _pbLiveStartWallMs = performance.now();
-      _pbLiveStartDataMs = b.maxMs;
-      // Reset the frame timer so dt doesn't include backgrounded time
-      _pbLastPerf = 0;
-      updatePlaybackUi();
-    }
+    _PS.snapToRunway();
+    _pbLastPerf = 0;
+    updatePlaybackUi();
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -4386,6 +4257,8 @@ function main() {
     _sseSource.onmessage = function (ev) {
       try {
         var msg = JSON.parse(ev.data);
+        // Forward prediction timing to PlaybackState module
+        if (_PS) _PS.onSSEMessage(msg);
         var seq = msg.seq;
         if (seq != null && seq !== _sseLastSeq) {
           _sseLastSeq = seq;
@@ -4460,7 +4333,7 @@ function main() {
     if (!Array.isArray(st.fixed)) st.fixed = [];
 
     window.__lastState = st;
-    _pbLastServerResponseMs = Date.now();
+    if (_PS) _PS.onServerResponse();
     _tickConsecutiveFailures = 0; // reset backoff on success
 
     // Update save button now that we have data
@@ -4518,20 +4391,18 @@ function main() {
       if (!map._playbackInitialized && Array.isArray(st.mobile) && st.mobile.length > 0) {
         const b = map.getPlaybackBounds();
         if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
-          const meta = st?.meta || {};
-          const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
           const speed = map.getPlaybackSpeed() || 1.0;
-          const offsetMs = nextInS * 1000 * speed;
           
           // Only activate Live mode for speeds 1-5x
           if (speed > 5) {
             map._playbackLiveFollow = false;
           }
           
-          const initMs = map._playbackLiveFollow 
-            ? Math.max(b.minMs, b.maxMs - offsetMs)
-            : b.maxMs;
-          map.setPlaybackTimeMs(initMs);
+          if (map._playbackLiveFollow && _PS) {
+            _PS.snapToRunway(speed);
+          } else {
+            map.setPlaybackTimeMs(b.maxMs);
+          }
           map._playbackInitialized = true;
         }
       }
@@ -4579,10 +4450,10 @@ function main() {
         }
       } catch {}
 
-      // In LIVE mode, snap playhead to wall-clock now so the render
-      // reflects real-time sensor data (not the last trail timestamp).
-      if (map._playbackLiveFollow && !map._historicalMode && map._playbackInitialized) {
-        map.setPlaybackTimeMs(Date.now());
+      // In LIVE mode at the wall edge, keep playhead at Date.now().
+      // In runway (catching up), don't move — let playback velocity do it.
+      if (map._playbackLiveFollow && !map._historicalMode && map._playbackInitialized && _PS && _PS.atWallEdge()) {
+        _PS.snapToWallEdge();
       }
 
       // Avoid forcing an extra overlay redraw every poll.

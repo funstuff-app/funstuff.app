@@ -440,6 +440,7 @@ button#pbPlay {
   -webkit-user-select: none;
   -webkit-tap-highlight-color: rgba(0,0,0,0);
   touch-action: manipulation;
+  z-index: 1; /* Elevate above range input whose oversized thumb hit-area overlaps the button center */
 }
 button#pbPlay * {
   pointer-events: none !important;

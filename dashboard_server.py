@@ -633,7 +633,17 @@ def _sse_broadcast(app_state: AppState) -> None:
     (already held by the caller).  Dead queues are pruned lazily.
     """
     seq = app_state.state_seq
-    msg = {"seq": seq, "ts": time.time()}
+    msg: dict[str, Any] = {"seq": seq, "ts": time.time()}
+    # Include polling prediction so the client can compute an accurate runway
+    # without waiting for the next /state fetch.
+    try:
+        meta = (app_state.state or {}).get("meta", {})
+        pred = meta.get("polling_predicted_interval_s")
+        tsc = meta.get("polling_time_since_change_s")
+        if pred is not None and tsc is not None:
+            msg["predicted_next_update_ts"] = time.time() + max(0.0, float(pred) - float(tsc))
+    except Exception:
+        pass
     dead: list[queue.Queue] = []
     for q in app_state.sse_clients:
         try:
