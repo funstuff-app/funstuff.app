@@ -5307,12 +5307,43 @@ class MapView {
       sensors.push(sx, sy, v, credWeight);
       fingerprint += _pm25ColorCat(v);
     }
+
+    // ── Inject trail breadcrumbs as continuous field readings ──
+    // Every TRAIL_STRIDE-th point is added with low credibility so fixed
+    // sensors dominate where both exist, but trails fill spatial gaps.
+    const TRAIL_STRIDE = 4;
+    const trailCredWeight = 0.5;
+    for (const [, entry] of this._persistedTrailById) {
+      if (!entry || entry.ghosted) continue;
+      const trail = entry.trail;
+      if (!Array.isArray(trail) || trail.length < 2) continue;
+      for (let ti = 0; ti < trail.length; ti += TRAIL_STRIDE) {
+        const p = trail[ti];
+        if (!p) continue;
+        const lat = Number(p.lat), lon = Number(p.lon);
+        if (!isFinite(lat) || !isFinite(lon)) continue;
+        if (playbackTimeMs != null && isFinite(playbackTimeMs) && typeof p.t === "string") {
+          const pMs = parseUtcMs(p.t);
+          if (pMs != null && pMs > playbackTimeMs) continue;
+        }
+        const r = p.readings;
+        const pm = r && (r["PM25"] || r["PM2.5"] || r["pm25"] || r["pm2.5"]);
+        const v = pm && pm.value != null ? Number(pm.value) : NaN;
+        if (!isFinite(v) || v < 0) continue;
+        const wp = latLonToWorld(lat, lon, z);
+        const sx = wp.x - centerW.x + cssW / 2;
+        const sy = wp.y - centerW.y + cssH / 2;
+        sensors.push(sx, sy, v, trailCredWeight);
+        fingerprint += _pm25ColorCat(v);
+      }
+    }
+
     const nSensors = sensors.length / 4;
     if (nSensors === 0) { this._paFieldCanvas = null; return; }
 
     // ── Cache key: view geometry + color fingerprint ──
     const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
-    const key = `pa:${viewKey}|f:${fingerprint}`;
+    const key = `pa:${viewKey}|f:${fingerprint}|tr:${this._persistedTrailRev}`;
     if (this._paFieldCanvas && this._paFieldKey === key) return;
     // Only cross-fade when the color fingerprint changes (sensor crosses AQI
     // boundary).  View-only changes (zoom/pan) recompute silently — no fade,
@@ -5606,6 +5637,29 @@ class MapView {
         const credW = f.purpleair ? 1.0 : 8.0;
         sensors.push(wp.x - centerW.x + cssW / 2, wp.y - centerW.y + cssH / 2, v, credW);
         fp += _pm25ColorCat(v);
+      }
+      // Include trail breadcrumbs in prewarmed fields
+      for (const [, entry] of this._persistedTrailById) {
+        if (!entry || entry.ghosted) continue;
+        const trail = entry.trail;
+        if (!Array.isArray(trail) || trail.length < 2) continue;
+        for (let ti = 0; ti < trail.length; ti += 4) {
+          const p = trail[ti];
+          if (!p) continue;
+          const lat = Number(p.lat), lon = Number(p.lon);
+          if (!isFinite(lat) || !isFinite(lon)) continue;
+          if (typeof p.t === "string") {
+            const pMs = parseUtcMs(p.t);
+            if (pMs != null && pMs > tMs) continue;
+          }
+          const r = p.readings;
+          const pm = r && (r["PM25"] || r["PM2.5"] || r["pm25"] || r["pm2.5"]);
+          const v = pm && pm.value != null ? Number(pm.value) : NaN;
+          if (!isFinite(v) || v < 0) continue;
+          const wp = latLonToWorld(lat, lon, z);
+          sensors.push(wp.x - centerW.x + cssW / 2, wp.y - centerW.y + cssH / 2, v, 0.5);
+          fp += _pm25ColorCat(v);
+        }
       }
       if (sensors.length === 0) continue;
       if (this._paFieldPrewarmed.has(fp)) continue;
