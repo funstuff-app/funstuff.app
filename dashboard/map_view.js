@@ -5357,7 +5357,10 @@ class MapView {
       const si3 = i * 3, si4 = i * 4;
       s4[si4]     = sensors[si3];
       s4[si4 + 1] = sensors[si3 + 1];
-      s4[si4 + 2] = sensors[si3 + 2];
+      // Log-space interpolation: geometric weighted mean prevents extreme
+      // values from dominating at distance.  ln(3328)/ln(6) ≈ 4.5× instead
+      // of 3327/5 = 665×.  Reconstructed with expm1 at output.
+      s4[si4 + 2] = Math.log1p(sensors[si3 + 2]);
       const r = sigRatios[i];
       s4[si4 + 3] = twoSigmaSq * r * r;
     }
@@ -5403,7 +5406,7 @@ class MapView {
         } else {
           const fade = Math.min(1, wSum * 2);
           const alpha = Math.round(FIELD_ALPHA * fade);
-          const val = vSum / wSum;
+          const val = Math.expm1(vSum / wSum);
           const rgb = _pm25ToRgbSmooth(val);
           px[off]   = rgb[0];
           px[off+1] = rgb[1];
@@ -6128,13 +6131,26 @@ class MapView {
       return (tMs == null || !isFinite(tMs)) ? Number.NEGATIVE_INFINITY : Number(tMs);
     };
 
-    const alphaOther = selectedId ? 0.35 : 1.0;
-    const nonSelected = mobiles
-      .filter(m => !(selectedId && m.id === selectedId))
-      .slice()
-      .sort((a, b) => trailLastMs(a) - trailLastMs(b));
+    // Pre-filter: skip mobiles whose trail is entirely expired (>45 min old).
+    // During evening playback, most morning/afternoon vehicles are expired —
+    // this avoids _collectTrailData + array allocs + projection for each.
+    const TRAIL_EXPIRE_MS = 45 * 60 * 1000;
+    const refTimeMs = this.getPlaybackTimeMs();
+    const hasRefTime = refTimeMs != null && isFinite(refTimeMs);
 
-    for (const m of nonSelected) {
+    const alphaOther = selectedId ? 0.35 : 1.0;
+    const candidates = [];
+    for (const m of mobiles) {
+      if (selectedId && m.id === selectedId) continue;
+      const lastMs = trailLastMs(m);
+      m._cachedTrailLastMs = lastMs;
+      // Skip if trail ended >45 min before playback time
+      if (hasRefTime && isFinite(lastMs) && refTimeMs - lastMs > TRAIL_EXPIRE_MS) continue;
+      candidates.push(m);
+    }
+    candidates.sort((a, b) => a._cachedTrailLastMs - b._cachedTrailLastMs);
+
+    for (const m of candidates) {
       drawTrailFor(m, alphaOther, worldToScreenFast);
     }
 
@@ -6636,15 +6652,24 @@ class MapView {
             return true;
           };
 
-          const alphaOther = selectedId ? 0.35 : 1.0;
-          const nonSelected = mobiles
-            .filter(m => !(selectedId && m.id === selectedId))
-            .slice()
-            .sort((a, b) => trailLastMs(a) - trailLastMs(b));
+          // Pre-filter expired trails (>45 min old) to avoid array
+          // allocations and projection work for vehicles no longer visible.
+          const TRAIL_EXPIRE_MS = 45 * 60 * 1000;
+          const hasRefTime = pbTimeMs != null && isFinite(pbTimeMs);
 
-          // Incremental mode disabled - always do full redraw for proper fading
+          const alphaOther = selectedId ? 0.35 : 1.0;
+          const candidates = [];
+          for (const m of mobiles) {
+            if (selectedId && m.id === selectedId) continue;
+            const lastMs = trailLastMs(m);
+            m._cachedTrailLastMs = lastMs;
+            if (hasRefTime && isFinite(lastMs) && pbTimeMs - lastMs > TRAIL_EXPIRE_MS) continue;
+            candidates.push(m);
+          }
+          candidates.sort((a, b) => a._cachedTrailLastMs - b._cachedTrailLastMs);
+
           const timeFilter = null;
-          for (const m of nonSelected) {
+          for (const m of candidates) {
             drawTrailForCached(m, alphaOther, worldToScreenFast, timeFilter);
           }
 
