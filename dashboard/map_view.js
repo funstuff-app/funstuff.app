@@ -28,6 +28,55 @@ function _pm25ColorCat(v) {
 }
 
 const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
+const _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG = 0.55;
+const _PA_FIELD_FIXED_WEIGHT_MULTIPLIER = 10;
+
+function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH) {
+  const paLatLons = [];
+  for (const f of fixed) {
+    if (!f || !f.purpleair) continue;
+    const lat = Number(f.lat);
+    const lon = Number(f.lon);
+    if (isFinite(lat) && isFinite(lon)) paLatLons.push(lat, lon);
+  }
+
+  const sensors = [];
+  let fingerprint = "";
+  for (const f of fixed) {
+    if (!f) continue;
+    const lat = Number(f.lat);
+    const lon = Number(f.lon);
+    if (!isFinite(lat) || !isFinite(lon)) continue;
+    if (!f.purpleair) {
+      let nearPA = false;
+      for (let pi = 0; pi < paLatLons.length; pi += 2) {
+        const dlat = lat - paLatLons[pi];
+        const dlon = lon - paLatLons[pi + 1];
+        if (dlat * dlat + dlon * dlon < _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG * _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG) {
+          nearPA = true;
+          break;
+        }
+      }
+      if (!nearPA) continue;
+    }
+
+    const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
+    const pm = interp && (interp["PM25"] || interp["PM2.5"] || interp["pm25"] || interp["pm2.5"]);
+    const value = pm && pm.value != null ? Number(pm.value) : NaN;
+    if (!isFinite(value) || value < 0) continue;
+
+    const wp = latLonToWorld(lat, lon, zoom);
+    sensors.push({
+      sx: wp.x - centerW.x + cssW / 2,
+      sy: wp.y - centerW.y + cssH / 2,
+      value,
+      weightMultiplier: f.purpleair ? 1 : _PA_FIELD_FIXED_WEIGHT_MULTIPLIER,
+    });
+    fingerprint += _pm25ColorCat(value);
+  }
+
+  return { sensors, fingerprint };
+}
 
 /** PM2.5 → [r,g,b] with continuous linear interpolation between AQI color stops.
  *  Stops placed at band midpoints (_BAND_MIDS) so colors match dot palette at
@@ -5266,44 +5315,10 @@ class MapView {
 
     // ── Collect sensors, project to screen coords + build color fingerprint ──
     const centerW = latLonToWorld(clat, clon, z);
-    const sensors = [];
-    let fingerprint = "";
-
-    // Collect PurpleAir sensor lat/lons first (for proximity filtering of non-PA sensors)
-    const paLatLons = [];
-    for (const f of fixed) {
-      if (!f.purpleair) continue;
-      const lat = Number(f.lat), lon = Number(f.lon);
-      if (isFinite(lat) && isFinite(lon)) paLatLons.push(lat, lon);
-    }
-    // Max distance (in degrees) a non-PA sensor can be from any PA sensor to be included.
-    // ~60 km ≈ 0.55° at Utah latitudes.
-    const PA_PROXIMITY_DEG = 0.55;
-
-    for (const f of fixed) {
-      const lat = Number(f.lat), lon = Number(f.lon);
-      if (!isFinite(lat) || !isFinite(lon)) continue;
-      // Non-PurpleAir sensors: only include if within ~60 km of a PurpleAir sensor
-      if (!f.purpleair) {
-        let nearPA = false;
-        for (let pi = 0; pi < paLatLons.length; pi += 2) {
-          const dlat = lat - paLatLons[pi], dlon = lon - paLatLons[pi + 1];
-          if (dlat * dlat + dlon * dlon < PA_PROXIMITY_DEG * PA_PROXIMITY_DEG) { nearPA = true; break; }
-        }
-        if (!nearPA) continue;
-      }
-      // Use PM2.5 only — not worst-pollutant (which could be ozone, NO₂, etc.)
-      const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
-      const pm = interp && (interp["PM25"] || interp["PM2.5"] || interp["pm25"] || interp["pm2.5"]);
-      const v = pm && pm.value != null ? Number(pm.value) : NaN;
-      if (!isFinite(v) || v < 0) continue;
-      const wp = latLonToWorld(lat, lon, z);
-      const sx = wp.x - centerW.x + cssW / 2;
-      const sy = wp.y - centerW.y + cssH / 2;
-      sensors.push(sx, sy, v);
-      fingerprint += _pm25ColorCat(v);
-    }
-    const nSensors = sensors.length / 3;
+    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH);
+    const paSensors = paField.sensors;
+    const fingerprint = paField.fingerprint;
+    const nSensors = paSensors.length;
     if (nSensors === 0) { this._paFieldCanvas = null; return; }
 
     // ── Cache key: view geometry + color fingerprint ──
@@ -5343,7 +5358,7 @@ class MapView {
     const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
 
-    // ── Build stride-4 sensor array: [sx, sy, v, twoSigSq, ...] ──
+    // ── Build stride-5 sensor array: [sx, sy, v, twoSigSq, weightMultiplier, ...] ──
     // Per-sensor σ ratio (cached on fingerprint) controls Gaussian reach.
     // Outlier sensors get a tighter σ so their hotspot stays local.
     // Graduated: ratio ramps from 1.0 (≤2× nearest neighbor) down to 0.25
@@ -5352,12 +5367,12 @@ class MapView {
     if (!sigRatios || this._paSigRatioFP !== fingerprint) {
       sigRatios = new Float64Array(nSensors);
       for (let i = 0; i < nSensors; i++) {
-        const vi = sensors[i * 3 + 2];
+        const vi = paSensors[i].value;
         // Find the best (lowest) ratio between this sensor and any neighbor.
         let bestRatio = Infinity;
         for (let j = 0; j < nSensors; j++) {
           if (j === i) continue;
-          const vj = sensors[j * 3 + 2];
+          const vj = paSensors[j].value;
           const hi = vi > vj ? vi : vj, lo = vi > vj ? vj : vi;
           if (hi < 20) { bestRatio = 1; break; }
           const r = lo > 0 ? hi / lo : Infinity;
@@ -5376,25 +5391,27 @@ class MapView {
       this._paSigRatioFP = fingerprint;
     }
 
-    const s4 = new Float64Array(nSensors * 4);
+    const s5 = new Float64Array(nSensors * 5);
     for (let i = 0; i < nSensors; i++) {
-      const si3 = i * 3, si4 = i * 4;
-      s4[si4]     = sensors[si3];
-      s4[si4 + 1] = sensors[si3 + 1];
+      const sensor = paSensors[i];
+      const si5 = i * 5;
+      s5[si5] = sensor.sx;
+      s5[si5 + 1] = sensor.sy;
       // Log-space interpolation: geometric weighted mean prevents extreme
       // values from dominating at distance.  ln(3328)/ln(6) ≈ 4.5× instead
       // of 3327/5 = 665×.  Reconstructed with expm1 at output.
-      s4[si4 + 2] = Math.log1p(sensors[si3 + 2]);
+      s5[si5 + 2] = Math.log1p(sensor.value);
       const r = sigRatios[i];
-      s4[si4 + 3] = twoSigmaSq * r * r;
+      s5[si5 + 3] = twoSigmaSq * r * r;
+      s5[si5 + 4] = sensor.weightMultiplier;
     }
 
     // ── Always synchronous — IDW is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s4, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr);
+    this._computePaFieldSync(s5, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr);
   }
 
   /** Synchronous IDW computation.
-   *  sensors: stride-4 Float64Array [sx, sy, value, twoSigSq, ...]
+   *  sensors: stride-5 Float64Array [sx, sy, value, twoSigSq, weightMultiplier, ...]
    *  cutoffSq: max range² for early-out */
   _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr) {
     // ── Reuse tiny canvas + ImageData if grid size unchanged ──
@@ -5414,12 +5431,12 @@ class MapView {
         const pxx = (gx + 0.5) * cellSize;
 
         let wSum = 0, vSum = 0;
-        for (let i = 0; i < sensors.length; i += 4) {
+        for (let i = 0; i < sensors.length; i += 5) {
           const dx = pxx - sensors[i];
           const dy = py  - sensors[i + 1];
           const d2 = dx * dx + dy * dy;
           if (d2 > cutoffSq) continue;
-          const w = Math.exp(-d2 / sensors[i + 3]);
+          const w = sensors[i + 4] * Math.exp(-d2 / sensors[i + 3]);
           wSum += w;
           vSum += w * sensors[i + 2];
         }
@@ -5535,7 +5552,7 @@ class MapView {
     // Initialize worker on first use
     if (!this._paWorker) {
       try {
-        this._paWorker = new Worker("pa_field_worker.js");
+        this._paWorker = new Worker("pa_field_worker.js?v=20260320b");
         this._paWorker.onmessage = (e) => this._onPaWorkerResult(e.data);
       } catch (_) {
         this._paWorker = false;
@@ -5588,36 +5605,10 @@ class MapView {
     for (const tMs of sorted) {
       // Build sensor array and fingerprint at this time
       const centerW = latLonToWorld(clat, clon, z);
-      const sensors = [];
-      let fp = "";
-      // Collect PA lat/lons for proximity filtering
-      const _paLL = [];
-      for (const f of fixed) {
-        if (!f.purpleair) continue;
-        const lat = Number(f.lat), lon = Number(f.lon);
-        if (isFinite(lat) && isFinite(lon)) _paLL.push(lat, lon);
-      }
-      const _PA_DEG = 0.55;
-      for (const f of fixed) {
-        const lat = Number(f.lat), lon = Number(f.lon);
-        if (!isFinite(lat) || !isFinite(lon)) continue;
-        if (!f.purpleair) {
-          let nearPA = false;
-          for (let pi = 0; pi < _paLL.length; pi += 2) {
-            const dlat = lat - _paLL[pi], dlon = lon - _paLL[pi + 1];
-            if (dlat * dlat + dlon * dlon < _PA_DEG * _PA_DEG) { nearPA = true; break; }
-          }
-          if (!nearPA) continue;
-        }
-        const interp = interpolateFixedReadingsAtTime(f, tMs);
-        const pm = interp && (interp["PM25"] || interp["PM2.5"] || interp["pm25"] || interp["pm2.5"]);
-        const v = pm && pm.value != null ? Number(pm.value) : NaN;
-        if (!isFinite(v) || v < 0) continue;
-        const wp = latLonToWorld(lat, lon, z);
-        sensors.push(wp.x - centerW.x + cssW / 2, wp.y - centerW.y + cssH / 2, v);
-        fp += _pm25ColorCat(v);
-      }
-      if (sensors.length === 0) continue;
+      const paField = _collectPaFieldSensors(fixed, tMs, centerW, z, cssW, cssH);
+      const paSensors = paField.sensors;
+      const fp = paField.fingerprint;
+      if (paSensors.length === 0) continue;
       if (this._paFieldPrewarmed.has(fp)) continue;
 
       // Dispatch this one to the worker
@@ -5632,20 +5623,22 @@ class MapView {
       const FIELD_ALPHA = 46;
 
       // Build stride-3 array: [sx, sy, value, ...]
-      const nPw = sensors.length / 3;
-      const s3pw = new Float64Array(nPw * 3);
+      const nPw = paSensors.length;
+      const s4pw = new Float64Array(nPw * 4);
       for (let i = 0; i < nPw; i++) {
-        const si = i * 3;
-        s3pw[si] = sensors[si];
-        s3pw[si + 1] = sensors[si + 1];
-        s3pw[si + 2] = Math.min(sensors[si + 2], 75);
+        const sensor = paSensors[i];
+        const si = i * 4;
+        s4pw[si] = sensor.sx;
+        s4pw[si + 1] = sensor.sy;
+        s4pw[si + 2] = Math.min(sensor.value, 75);
+        s4pw[si + 3] = sensor.weightMultiplier;
       }
 
       const jobId = ++this._paWorkerJobId;
       this._paWorkerPending = true;
       this._paWorkerFingerprint = fp;
       this._paWorker.postMessage({
-        sensors: s3pw,
+        sensors: s4pw,
         gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, jobId
       });
       return; // one at a time

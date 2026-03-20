@@ -49,7 +49,7 @@ self.onmessage = function(e) {
       const pxx = (gx + 0.5) * cellSize;
 
       let kCount = 0;
-      for (let i = 0; i < sensors.length; i += 3) {
+      for (let i = 0; i < sensors.length; i += 4) {
         const dx = pxx - sensors[i];
         const dy = py  - sensors[i + 1];
         const d2 = dx * dx + dy * dy;
@@ -74,7 +74,7 @@ self.onmessage = function(e) {
         const si = kIdx[j];
         const t = d2 / cutoffSq;
         const envelope = (1 - t) * (1 - t);
-        const w = envelope / (d2 + eps2);
+        const w = sensors[si + 3] * envelope / (d2 + eps2);
         wSum += w;
         vSum += w * sensors[si + 2];
         gSum += Math.exp(-d2 / twoSigmaSq);
