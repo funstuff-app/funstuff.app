@@ -3692,61 +3692,46 @@ def wind_field_fetch_loop(
                 clear_wind_snapshots(data_dir)
                 _log("[Wind] Day rollover — cleared snapshots")
 
-            # Find the most recent 15-min slot we don't already have,
-            # working backwards from now (current slot is rarely available).
+            # Try each recent 15-min slot we don't have, newest first.
+            # Stop at the first successful fetch or after exhausting candidates.
             now_utc = _dt.datetime.now(_dt.timezone.utc)
-            analysis_time = None
-            key = None
+            fetched = False
             for offset_min in range(0, 60, 15):  # 0, 15, 30, 45 min ago
                 candidate = _round_to_15min(now_utc - _dt.timedelta(minutes=offset_min))
-                ckey = candidate.strftime("%H%M")
+                key = candidate.strftime("%H%M")
                 with app_state.lock:
-                    have_it = ckey in app_state.wind_snapshots
-                if not have_it:
-                    analysis_time = candidate
-                    key = ckey
-                    break
+                    have_it = key in app_state.wind_snapshots
+                if have_it:
+                    continue
 
-            if analysis_time is None:
-                # Have all recent slots — wait for the next one
-                delay = poller.get_next_poll_delay()
-                stop_event.wait(delay)
-                continue
+                grib2 = fetch_grib2(analysis_time=candidate)
+                if grib2 is None:
+                    continue  # not published yet, try older slot
 
-            grib2 = fetch_grib2(analysis_time=analysis_time)
-            if grib2 is None:
-                # Not available yet — let poller decide when to retry
-                delay = poller.get_next_poll_delay()
-                _log(f"[Wind] Snapshot {key} not available yet; retry in {delay:.0f}s")
-                stop_event.wait(delay)
-                continue
+                points = parse_grib2(grib2)
+                if not points:
+                    continue
 
-            points = parse_grib2(grib2)
-            if not points:
-                delay = poller.get_next_poll_delay()
-                _log(f"[Wind] GRIB2 parse returned no points for {key}; retry in {delay:.0f}s")
-                stop_event.wait(delay)
-                continue
+                # Success — record the change so poller learns the cadence
+                if last_key is not None and last_key != key:
+                    poller.last_update_utc = last_key
+                    poller.check_for_change_raw(key)
+                last_key = key
 
-            # Success — record the change so poller learns the cadence
-            if last_key is not None and last_key != key:
-                # Simulate change detection for the poller
-                poller.last_update_utc = last_key
-                poller.check_for_change_raw(key)
-            last_key = key
+                json_bytes = json.dumps(points).encode("utf-8")
+                with app_state.lock:
+                    app_state.wind_field_json = json_bytes
+                    app_state.wind_field_seq += 1
+                    app_state.wind_snapshots[key] = json_bytes
+                    app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
+                    app_state.wind_snapshot_date = today
+                    snapshot_count = len(app_state.wind_snapshots_keys)
 
-            json_bytes = json.dumps(points).encode("utf-8")
-            with app_state.lock:
-                app_state.wind_field_json = json_bytes
-                app_state.wind_field_seq += 1
-                app_state.wind_snapshots[key] = json_bytes
-                app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
-                app_state.wind_snapshot_date = today
-                snapshot_count = len(app_state.wind_snapshots_keys)
-
-            save_wind_field(points, data_dir, analysis_time=analysis_time)
-            save_wind_snapshot(points, data_dir, analysis_time)
-            _log(f"[Wind] Updated: {len(points)} pts, snapshot {key} ({snapshot_count} total)")
+                save_wind_field(points, data_dir, analysis_time=candidate)
+                save_wind_snapshot(points, data_dir, candidate)
+                _log(f"[Wind] Updated: {len(points)} pts, snapshot {key} ({snapshot_count} total)")
+                fetched = True
+                break  # got one, stop walking backwards
 
             delay = poller.get_next_poll_delay()
             stop_event.wait(delay)

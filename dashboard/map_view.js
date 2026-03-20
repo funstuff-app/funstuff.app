@@ -5353,30 +5353,86 @@ class MapView {
       .finally(() => { this._windFieldFetchInFlight = false; });
   }
 
+  /** Interpolate u,v components between two wind field snapshots.
+   *  Returns [{lat, lon, u: u_interp, v: v_interp}, ...] */
+  _interpolateWindFields(fieldA, fieldB, alpha) {
+    if (!fieldA || !fieldB || !Array.isArray(fieldA) || !Array.isArray(fieldB)) return fieldA;
+    if (fieldA.length !== fieldB.length) return fieldA;
+    
+    const result = [];
+    for (let i = 0; i < fieldA.length; i++) {
+      const ptA = fieldA[i], ptB = fieldB[i];
+      if (!ptA || !ptB) continue;
+      const lat = Number(ptA.lat), lon = Number(ptA.lon);
+      if (!isFinite(lat) || !isFinite(lon)) continue;
+      const uA = Number(ptA.u) || 0;
+      const vA = Number(ptA.v) || 0;
+      const uB = Number(ptB.u) || 0;
+      const vB = Number(ptB.v) || 0;
+      // Linear interpolation: (1-α)·u_A + α·u_B
+      const u = (1 - alpha) * uA + alpha * uB;
+      const v = (1 - alpha) * vA + alpha * vB;
+      result.push({ lat, lon, u, v });
+    }
+    return result.length > 0 ? result : fieldA;
+  }
+
   /** Pick the wind snapshot active at a given epoch-ms time (or latest if live).
-   *  Returns the most recent snapshot AT or BEFORE the target time.
-   *  Returns null if the target is before any available snapshot. */
-  _windFieldForTime(epochMs) {
+   *  Interpolates between snapshots during playback; returns discrete snapshot if scrubbing.
+   *  Returns null if no snapshots available. */
+  _windFieldForTime(epochMs, doInterpolate = false) {
     if (!this._windSnapshots || this._windSnapshotKeys.length === 0) return this._windField;
     if (epochMs == null || !isFinite(epochMs)) {
       // Live mode — use latest
       const latest = this._windSnapshotKeys[this._windSnapshotKeys.length - 1];
       return this._windSnapshots[latest] || this._windField;
     }
-    // Convert epoch ms to HHMM in UTC (floored to 15-min)
+    
+    // Convert epoch ms to minutes since midnight UTC
     const d = new Date(epochMs);
     const hh = String(d.getUTCHours()).padStart(2, "0");
-    const mm15 = String(Math.floor(d.getUTCMinutes() / 15) * 15).padStart(2, "0");
-    const target = hh + mm15;
-    // Find the latest snapshot key <= target
-    let best = null;
-    for (let i = this._windSnapshotKeys.length - 1; i >= 0; i--) {
-      if (this._windSnapshotKeys[i] <= target) {
-        best = this._windSnapshotKeys[i];
-        break;
+    const mm = d.getUTCMinutes();
+    const ss = d.getUTCSeconds();
+    const mmFrac = mm + ss / 60;
+    
+    // Find snapshots before and after this time
+    const mm15_floor = Math.floor(mm / 15) * 15;
+    const mm15_ceil = mm15_floor + 15;
+    const keyFloor = hh + String(mm15_floor).padStart(2, "0");
+    const keyCeil = hh + String(mm15_ceil % 60).padStart(2, "0");
+    
+    // Edge case: mm15_ceil wraps to next hour
+    let keyFloorIndex = -1, keyCeilIndex = -1;
+    for (let i = 0; i < this._windSnapshotKeys.length; i++) {
+      if (this._windSnapshotKeys[i] === keyFloor) keyFloorIndex = i;
+      if (this._windSnapshotKeys[i] === keyCeil) keyCeilIndex = i;
+    }
+    
+    // If we don't have both snapshots, return the latest one we have <= target
+    if (keyFloorIndex < 0 || keyCeilIndex < 0 || keyCeilIndex <= keyFloorIndex) {
+      let best = null;
+      for (let i = this._windSnapshotKeys.length - 1; i >= 0; i--) {
+        if (this._windSnapshotKeys[i] <= keyFloor) {
+          best = this._windSnapshotKeys[i];
+          break;
+        }
+      }
+      return best ? this._windSnapshots[best] : null;
+    }
+    
+    // Interpolate if requested and we have both boundaries
+    if (doInterpolate) {
+      const fieldA = this._windSnapshots[keyFloor];
+      const fieldB = this._windSnapshots[keyCeil];
+      if (fieldA && fieldB) {
+        // Alpha: progress from floor to ceil (0 at floor, 1 at ceil)
+        const alpha = (mmFrac - mm15_floor) / 15;
+        return this._interpolateWindFields(fieldA, fieldB, Math.max(0, Math.min(1, alpha)));
       }
     }
-    return best ? this._windSnapshots[best] : null;
+    
+    // No interpolation: return floor snapshot
+    return this._windSnapshots[keyFloor];
   }
 
   /** Initialize or re-initialize the advection worker with current sensors + wind. */
@@ -5500,6 +5556,7 @@ class MapView {
   /**
    * Tick the advection simulation and re-render.
    * Called from _compositePaFieldOnTiles when advection mode is active.
+   * During playback, uses interpolated wind field; otherwise discrete snapshot.
    */
   _tickAdvection(state, playbackTimeMs) {
     if (!this._advectionWorker || !this._advectionInitialized) return;
@@ -5518,11 +5575,18 @@ class MapView {
 
     const _fd = window._fieldDebug;
     const FIELD_ALPHA = _fd && _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
+    
+    // During playback, interpolate between wind snapshots; otherwise use discrete snapshot
+    const isPlaybackTick = this.playbackMode && playbackTimeMs != null && isFinite(playbackTimeMs);
+    const windField = isPlaybackTick 
+      ? this._windFieldForTime(playbackTimeMs, true) 
+      : this._windField;
 
     this._advectionWorker.postMessage({
       type: "tick",
       dt,
       sensors: sensorsChanged ? geoSensors : undefined,
+      windPoints: windField || [],
       fieldAlpha: FIELD_ALPHA,
     });
   }
@@ -7885,7 +7949,8 @@ class MapView {
 
     // ── Wind vector debug overlay ─────────────────────────────────────────
     if (this._windSnapshots && window._fieldDebug?.showWind) {
-      const wfPts = this._windFieldForTime(_framePbTimeMs);
+      const _playbackActive = this.playbackMode && _framePbTimeMs != null && isFinite(_framePbTimeMs);
+      const wfPts = this._windFieldForTime(_framePbTimeMs, _playbackActive);
       if (wfPts && wfPts.length > 0) {
         const _wCenter = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
         ctx.save();
