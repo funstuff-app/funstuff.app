@@ -3679,6 +3679,9 @@ def wind_field_fetch_loop(
         _log(f"[Wind] Error loading snapshots: {e}")
 
     last_key: str | None = None
+    miss_streak = 0
+    _MISS_BASE_S = 60.0
+    _MISS_MAX_S = 900.0
 
     while not stop_event.is_set():
         try:
@@ -3731,7 +3734,15 @@ def wind_field_fetch_loop(
                 fetched = True
                 break  # got one, stop walking backwards
 
-            delay = poller.get_next_poll_delay()
+            if fetched:
+                miss_streak = 0
+                delay = poller.get_next_poll_delay()
+            else:
+                miss_streak += 1
+                delay = min(_MISS_BASE_S * (2 ** (miss_streak - 1)), _MISS_MAX_S)
+                if miss_streak <= 3:
+                    _log(f"[Wind] No new snapshots available; retry in {delay:.0f}s")
+
             stop_event.wait(delay)
         except Exception as e:
             _log(f"[Wind] Error: {e}")
