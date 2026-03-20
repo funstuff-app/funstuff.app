@@ -5353,7 +5353,9 @@ class MapView {
       .finally(() => { this._windFieldFetchInFlight = false; });
   }
 
-  /** Pick the wind snapshot nearest to a given epoch-ms time (or latest if live). */
+  /** Pick the wind snapshot active at a given epoch-ms time (or latest if live).
+   *  Returns the most recent snapshot AT or BEFORE the target time.
+   *  Returns null if the target is before any available snapshot. */
   _windFieldForTime(epochMs) {
     if (!this._windSnapshots || this._windSnapshotKeys.length === 0) return this._windField;
     if (epochMs == null || !isFinite(epochMs)) {
@@ -5366,8 +5368,15 @@ class MapView {
     const hh = String(d.getUTCHours()).padStart(2, "0");
     const mm15 = String(Math.floor(d.getUTCMinutes() / 15) * 15).padStart(2, "0");
     const target = hh + mm15;
-    // Exact slot match only
-    return this._windSnapshots[target] || null;
+    // Find the latest snapshot key <= target
+    let best = null;
+    for (let i = this._windSnapshotKeys.length - 1; i >= 0; i--) {
+      if (this._windSnapshotKeys[i] <= target) {
+        best = this._windSnapshotKeys[i];
+        break;
+      }
+    }
+    return best ? this._windSnapshots[best] : null;
   }
 
   /** Initialize or re-initialize the advection worker with current sensors + wind. */

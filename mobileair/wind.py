@@ -3,8 +3,9 @@ RTMA-RU wind vector field fetcher.
 
 Downloads a subsetted GRIB2 file from NOAA NOMADS containing the 2.5 km
 gridded 10 m wind analysis (U/V components) for the SLC region, parses it
-with cfgrib/xarray, and returns a flat list of {lat, lon, u, v} dicts ready
-for JSON serialization to the browser.
+with a built-in pure-Python GRIB2 decoder (no native libraries required),
+and returns a flat list of {lat, lon, u, v} dicts ready for JSON
+serialization to the browser.
 
 RTMA-RU (Real-Time Mesoscale Analysis – Rapid Update) assimilates real
 surface observations every 15 minutes.  New data is available with
@@ -15,8 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
-import tempfile
+import struct
 import time
 import urllib.error
 import urllib.request
@@ -105,85 +107,295 @@ def fetch_grib2(analysis_time: datetime | None = None,
 def parse_grib2(grib2_bytes: bytes) -> list[dict[str, float]]:
     """Parse GRIB2 bytes into a list of {lat, lon, u, v} dicts.
 
-    Requires cfgrib and xarray to be installed.
+    Pure-Python implementation — no xarray, cfgrib, or eccodes needed.
+    Supports Lambert Conformal (template 30) with simple packing (DRT 0),
+    which is what NOMADS RTMA-RU returns for our SLC subregion.
 
-    Raises RuntimeError when parsing fails or dependencies are missing.
+    Returns an empty list if parsing fails.
     """
     try:
-        import xarray as xr
-    except ImportError as e:
-        log.warning("xarray/cfgrib not available: %s — wind parsing disabled", e)
+        messages = _parse_grib2_messages(grib2_bytes)
+    except Exception as e:
+        log.error("GRIB2 parse failed: %s", e)
         return []
 
-    # Write to a temp file in a writable directory so cfgrib can create
-    # its .idx sidecar without errors.
-    with tempfile.TemporaryDirectory(prefix="rtma_") as tmp_dir:
-        grib_path = os.path.join(tmp_dir, "rtma.grib2")
-        with open(grib_path, "wb") as f:
-            f.write(grib2_bytes)
+    if len(messages) < 2:
+        log.error("Expected 2 GRIB2 messages (U, V), got %d", len(messages))
+        return []
 
-        try:
-            ds = xr.open_dataset(grib_path, engine="cfgrib")
-        except Exception as e:
-            raise RuntimeError(f"cfgrib parse error: {e}") from e
+    # Messages: cat=2/num=2 → UGRD, cat=2/num=3 → VGRD
+    u_msg = v_msg = None
+    for m in messages:
+        if m["param"] == (2, 2):
+            u_msg = m
+        elif m["param"] == (2, 3):
+            v_msg = m
+    if u_msg is None or v_msg is None:
+        log.error("Could not find U/V messages in GRIB2")
+        return []
 
-        # Discover variable names (cfgrib naming varies)
-        data_vars = list(ds.data_vars)
-        log.info("GRIB2 data_vars: %s", data_vars)
+    grid = u_msg["grid"]
+    u_vals = u_msg["values"]
+    v_vals = v_msg["values"]
 
-        u_var = v_var = None
-        for name in data_vars:
-            low = str(name).lower()
-            if low in ("u10", "u", "ugrd"):
-                u_var = name
-            elif low in ("v10", "v", "vgrd"):
-                v_var = name
+    ni, nj = grid["ni"], grid["nj"]
+    if len(u_vals) != ni * nj or len(v_vals) != ni * nj:
+        log.error("Grid size mismatch: ni*nj=%d, u=%d, v=%d",
+                  ni * nj, len(u_vals), len(v_vals))
+        return []
 
-        if u_var is None or v_var is None:
-            ds.close()
-            raise RuntimeError(f"Could not find U/V variables in {data_vars}")
-
-        u_vals = ds[u_var].values  # shape (y, x) — 2D
-        v_vals = ds[v_var].values
-        lat_vals = ds["latitude"].values  # shape (y, x)
-        lon_vals = ds["longitude"].values  # shape (y, x)
-        ds.close()
-
-    # Longitude: RTMA-RU uses 0-360 internally
-    if lon_vals.max() > 180:
-        lon_vals = lon_vals - 360
+    # Compute lat/lon for each grid point using Lambert Conformal projection
+    lats, lons = _lambert_conformal_grid(grid)
 
     points: list[dict[str, float]] = []
-    ny, nx = u_vals.shape
-    for iy in range(ny):
-        for ix in range(nx):
-            lat = float(lat_vals[iy, ix])
-            lon = float(lon_vals[iy, ix])
-            u = float(u_vals[iy, ix])
-            v = float(v_vals[iy, ix])
-            if not (lat == lat and lon == lon and u == u and v == v):
-                continue  # skip NaN
-            points.append({
-                "lat": round(lat, 4),
-                "lon": round(lon, 4),
-                "u": round(u, 2),
-                "v": round(v, 2),
-            })
+    for idx in range(ni * nj):
+        lat = lats[idx]
+        lon = lons[idx]
+        u = u_vals[idx]
+        v = v_vals[idx]
+        if not (lat == lat and lon == lon and u == u and v == v):
+            continue  # skip NaN
+        points.append({
+            "lat": round(lat, 4),
+            "lon": round(lon, 4),
+            "u": round(u, 2),
+            "v": round(v, 2),
+        })
 
     if not points:
-        raise RuntimeError("GRIB2 parsed but produced no valid wind points")
+        log.error("GRIB2 parsed but produced no valid wind points")
+        return []
 
-    log.info("Parsed %d wind grid points (%dx%d)", len(points), nx, ny)
+    log.info("Parsed %d wind grid points (%dx%d)", len(points), ni, nj)
     return points
+
+
+# ─── Pure-Python GRIB2 binary parser ────────────────────────────────────────
+
+def _parse_grib2_messages(data: bytes) -> list[dict]:
+    """Walk a GRIB2 byte buffer and extract all messages."""
+    messages = []
+    offset = 0
+    while offset < len(data) - 4:
+        idx = data.find(b"GRIB", offset)
+        if idx < 0:
+            break
+        if data[idx + 7] != 2:
+            offset = idx + 4
+            continue  # not GRIB edition 2
+        msg_len = struct.unpack(">Q", data[idx + 8:idx + 16])[0]
+        msg = _parse_single_message(data, idx, msg_len)
+        if msg is not None:
+            messages.append(msg)
+        offset = idx + msg_len
+    return messages
+
+
+def _parse_single_message(data: bytes, start: int, msg_len: int) -> dict | None:
+    """Parse one GRIB2 message starting at `start`."""
+    pos = start + 16  # skip Section 0 (Indicator)
+
+    # Section 1 (Identification)
+    s1_len = struct.unpack(">I", data[pos:pos + 4])[0]
+    pos += s1_len
+
+    grid = None
+    param = None
+    ref_val = 0.0
+    bin_scale = 0
+    dec_scale = 0
+    nbits = 0
+    num_points = 0
+    values = None
+
+    end = start + msg_len
+    while pos < end - 4:
+        if data[pos:pos + 4] == b"7777":
+            break
+        sec_len = struct.unpack(">I", data[pos:pos + 4])[0]
+        sec_num = data[pos + 4]
+
+        if sec_num == 3:
+            grid = _parse_grid_definition(data, pos, sec_len)
+
+        elif sec_num == 4:
+            pcat = data[pos + 9]
+            pnum = data[pos + 10]
+            param = (pcat, pnum)
+
+        elif sec_num == 5:
+            num_points = struct.unpack(">I", data[pos + 5:pos + 9])[0]
+            drt = struct.unpack(">H", data[pos + 9:pos + 11])[0]
+            if drt != 0:
+                log.warning("Unsupported DRT %d (only simple packing supported)", drt)
+                return None
+            ref_val = struct.unpack(">f", data[pos + 11:pos + 15])[0]
+            bin_scale = struct.unpack(">h", data[pos + 15:pos + 17])[0]
+            dec_scale = struct.unpack(">h", data[pos + 17:pos + 19])[0]
+            nbits = data[pos + 19]
+
+        elif sec_num == 7:
+            payload = data[pos + 5:pos + sec_len]
+            values = _unpack_simple(payload, num_points, nbits,
+                                    ref_val, bin_scale, dec_scale)
+
+        pos += sec_len
+
+    if grid is None or param is None or values is None:
+        return None
+    return {"grid": grid, "param": param, "values": values}
+
+
+def _parse_grid_definition(data: bytes, pos: int, sec_len: int) -> dict:
+    """Parse Section 3 grid definition. Supports template 30 (Lambert Conformal)."""
+    num_pts = struct.unpack(">I", data[pos + 6:pos + 10])[0]
+    template = struct.unpack(">H", data[pos + 12:pos + 14])[0]
+
+    if template != 30:
+        log.warning("Grid template %d not supported (expected 30)", template)
+        return {"template": template, "ni": 0, "nj": 0}
+
+    ni = struct.unpack(">I", data[pos + 30:pos + 34])[0]
+    nj = struct.unpack(">I", data[pos + 34:pos + 38])[0]
+    lat1 = struct.unpack(">i", data[pos + 38:pos + 42])[0] / 1e6
+    lon1 = struct.unpack(">i", data[pos + 42:pos + 46])[0] / 1e6
+    laD = struct.unpack(">i", data[pos + 47:pos + 51])[0] / 1e6
+    loV = struct.unpack(">i", data[pos + 51:pos + 55])[0] / 1e6
+    dx = struct.unpack(">I", data[pos + 55:pos + 59])[0] / 1e3
+    dy = struct.unpack(">I", data[pos + 59:pos + 63])[0] / 1e3
+    latin1 = struct.unpack(">i", data[pos + 65:pos + 69])[0] / 1e6
+    latin2 = struct.unpack(">i", data[pos + 69:pos + 73])[0] / 1e6
+
+    # Convert lon from 0–360 to -180–180
+    if lon1 > 180:
+        lon1 -= 360
+    if loV > 180:
+        loV -= 360
+
+    return {
+        "template": template,
+        "ni": ni, "nj": nj,
+        "lat1": lat1, "lon1": lon1,
+        "laD": laD, "loV": loV,
+        "dx": dx, "dy": dy,
+        "latin1": latin1, "latin2": latin2,
+    }
+
+
+def _unpack_simple(payload: bytes, num_points: int, nbits: int,
+                   R: float, E: int, D: int) -> list[float]:
+    """Unpack GRIB2 simple packing (DRT 0) into float values.
+
+    Formula: Y = (R + X * 2^E) / 10^D
+    where X is the packed integer value.
+    """
+    if nbits == 0 or len(payload) == 0:
+        return [R / (10 ** D)] * num_points
+
+    factor_e = 2.0 ** E
+    factor_d = 10.0 ** D
+
+    # Bit-stream extraction
+    values = []
+    bit_pos = 0
+    total_bits = len(payload) * 8
+    for _ in range(num_points):
+        if bit_pos + nbits > total_bits:
+            break
+        byte_idx = bit_pos >> 3
+        bit_off = bit_pos & 7
+        # Read up to 4 bytes to cover nbits
+        raw = 0
+        bits_remaining = nbits
+        while bits_remaining > 0:
+            available = 8 - bit_off
+            take = min(available, bits_remaining)
+            mask = (1 << take) - 1
+            shift = available - take
+            raw = (raw << take) | ((payload[byte_idx] >> shift) & mask)
+            bits_remaining -= take
+            bit_off = 0
+            byte_idx += 1
+        values.append((R + raw * factor_e) / factor_d)
+        bit_pos += nbits
+
+    return values
+
+
+def _lambert_conformal_grid(grid: dict) -> tuple[list[float], list[float]]:
+    """Compute lat/lon for each grid point on a Lambert Conformal Conic grid.
+
+    Uses the standard GRIB2 Lambert Conformal formulas (template 3.30).
+    Returns (lats, lons) as flat lists of length ni*nj.
+    """
+    ni = grid["ni"]
+    nj = grid["nj"]
+    lat1 = grid["lat1"]
+    lon1 = grid["lon1"]
+    loV = grid["loV"]
+    latin1 = grid["latin1"]
+    latin2 = grid["latin2"]
+    dx = grid["dx"]
+    dy = grid["dy"]
+
+    deg2rad = math.pi / 180.0
+
+    # Compute cone constant n
+    if abs(latin1 - latin2) < 1e-6:
+        n = math.sin(latin1 * deg2rad)
+    else:
+        n = (math.log(math.cos(latin1 * deg2rad) / math.cos(latin2 * deg2rad)) /
+             math.log(math.tan((45 + latin2 / 2) * deg2rad) /
+                      math.tan((45 + latin1 / 2) * deg2rad)))
+
+    F = (math.cos(latin1 * deg2rad) *
+         math.tan((45 + latin1 / 2) * deg2rad) ** n) / n
+
+    R_earth = 6371229.0  # GRIB2 standard Earth radius in meters
+
+    def _rho(lat_deg: float) -> float:
+        return R_earth * F / (math.tan((45 + lat_deg / 2) * deg2rad) ** n)
+
+    rho0 = _rho(lat1)
+    theta0 = n * (lon1 - loV) * deg2rad
+
+    # x, y of the first grid point
+    x0 = rho0 * math.sin(theta0)
+    y0 = -rho0 * math.cos(theta0)  # negative because rho decreases with lat
+
+    lats = []
+    lons = []
+    for j in range(nj):
+        for i in range(ni):
+            x = x0 + i * dx
+            y = y0 + j * dy
+
+            # Inverse projection: (x, y) → (lat, lon)
+            rho = math.copysign(math.sqrt(x * x + y * y), n)
+            theta = math.atan2(x, -y)
+
+            if abs(rho) < 1e-10:
+                lat = 90.0 if n > 0 else -90.0
+            else:
+                lat = (2 * math.atan((R_earth * F / rho) ** (1 / n)) - math.pi / 2) / deg2rad
+
+            lon = loV + theta / (n * deg2rad)
+
+            # Normalize longitude to -180..180
+            while lon > 180:
+                lon -= 360
+            while lon < -180:
+                lon += 360
+
+            lats.append(lat)
+            lons.append(lon)
+
+    return lats, lons
 
 
 def fetch_wind_field(analysis_time: datetime | None = None,
                      timeout_s: int = 30) -> list[dict[str, float]]:
-    """Fetch + parse in one call.
-
-    Returns [] when the GRIB2 file is not available yet.
-    Raises RuntimeError on parse/dependency failures.
-    """
+    """Fetch + parse in one call.  Returns [] on any failure."""
     grib = fetch_grib2(analysis_time=analysis_time, timeout_s=timeout_s)
     if grib is None:
         return []

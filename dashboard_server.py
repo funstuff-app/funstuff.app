@@ -3608,8 +3608,8 @@ def wind_field_fetch_loop(
             clear_wind_snapshots,
             _latest_analysis_time,
         )
-    except Exception as e:
-        _log(f"[Wind] Cannot import mobileair.wind: {e} — wind disabled")
+    except ImportError as e:
+        _log(f"[Wind] Cannot import mobileair.wind: {e}")
         return
 
     import datetime as _dt
