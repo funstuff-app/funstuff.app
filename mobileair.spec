@@ -30,9 +30,14 @@ spec_dir = os.path.dirname(os.path.abspath(SPEC))
 EXCLUDES = [
     # Data science / visualization (not needed)
     'matplotlib',
-    'numpy',
     'pandas',
     'scipy',
+    'xarray',
+    'cfgrib',
+    'eccodes',
+    'eccodeslib',
+    'eckitlib',
+    'numpy',
     'PIL',
     'Pillow',
     'cv2',
@@ -77,7 +82,6 @@ EXCLUDES = [
     # Other unnecessary
     'setuptools',
     'pkg_resources',
-    'distutils',
     'wheel',
     'pip',
     'jedi',
@@ -136,6 +140,7 @@ a = Analysis(
         'mobileair.trails',
         'mobileair.tui_format',
         'mobileair.utils',
+        'mobileair.wind',
         'mobileair.dirigera_home',
         'dirigera',
         'dirigera.hub',

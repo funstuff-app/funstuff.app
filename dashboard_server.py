@@ -497,6 +497,14 @@ class AppState:
     # Wind/weather data from AirNow
     wind_data: dict[str, Any] = field(default_factory=dict)
 
+    # RTMA-RU wind vector field (pre-serialized JSON bytes for fast serving)
+    wind_field_json: bytes = b"[]"
+    wind_field_seq: int = 0  # bumped on each successful wind field update
+    # Time-indexed wind snapshots: {"HHMM": pre-serialized JSON bytes}
+    wind_snapshots: dict[str, bytes] = field(default_factory=dict)
+    wind_snapshots_keys: list[str] = field(default_factory=list)  # sorted HHMM keys
+    wind_snapshot_date: str = ""  # YYYYMMDD — cleared on day rollover
+
     # PurpleAir cached data
     purpleair_sensors: list[dict[str, Any]] = field(default_factory=list)
     purpleair_last_fetch: float = 0.0
@@ -988,6 +996,14 @@ def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         # so loaded snapshots are already clean and need no re-filtering.
         _trim_trails_to_day(state, today_str)
         _trim_history_to_date(state, today_str)
+
+        # Include wind snapshots in the daily save
+        with app_state.lock:
+            if app_state.wind_snapshots:
+                wind_snap = {}
+                for k, v in app_state.wind_snapshots.items():
+                    wind_snap[k] = json.loads(v.decode("utf-8"))
+                state["wind_snapshots"] = wind_snap
 
         result = save_snapshot(data_dir, today_str, state)
         _log(f"[Snapshot] Saved today's state: {result.get('filename')} ({result.get('size_bytes')} bytes)")
@@ -2971,6 +2987,26 @@ class AdaptivePoller:
         
         return False
     
+    def check_for_change_raw(self, current_key: str) -> bool:
+        """Check if data changed using an opaque key string.  Learns interval."""
+        if self.last_update_utc is None:
+            self.last_update_utc = current_key
+            self.last_change_ts = time.time()
+            return True
+        if current_key != self.last_update_utc:
+            now = time.time()
+            if self.last_change_ts:
+                interval = now - self.last_change_ts
+                if self.MIN_INTERVAL_S * 0.5 <= interval <= self.MAX_INTERVAL_S * 2:
+                    self.observed_intervals.append(interval)
+                    if len(self.observed_intervals) > self.MAX_HISTORY:
+                        self.observed_intervals.pop(0)
+                    self._update_prediction()
+            self.last_update_utc = current_key
+            self.last_change_ts = now
+            return True
+        return False
+
     def get_next_poll_delay(self) -> float:
         """Calculate how long to wait before the next poll."""
         self.poll_count += 1
@@ -3560,6 +3596,161 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
     validate_state_schema(parsed)
     return parsed
 
+
+# ── Wind vector field background fetch (RTMA-RU from NOMADS) ─────────────────
+
+def wind_field_fetch_loop(
+    *,
+    app_state: AppState,
+    data_dir: Path,
+    stop_event: threading.Event,
+) -> None:
+    """Background loop to fetch RTMA-RU wind vector field.
+
+    On startup, loads cached JSON if present, then fetches fresh data.
+    Uses AdaptivePoller to learn NOMADS publish cadence and poll efficiently.
+    """
+    _log("[Wind] wind_field_fetch_loop thread STARTED")
+
+    try:
+        from mobileair.wind import (
+            fetch_grib2,
+            parse_grib2,
+            _round_to_15min,
+            save_wind_field,
+            save_wind_snapshot,
+            load_wind_field,
+            load_wind_snapshots,
+            clear_wind_snapshots,
+        )
+    except ImportError as e:
+        _log(f"[Wind] Cannot import mobileair.wind: {e}")
+        return
+
+    import datetime as _dt
+
+    def _today_str():
+        return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d")
+
+    # Use the same adaptive polling as the main fetch loop, tuned for
+    # RTMA-RU's 15-minute cadence with ~20-minute publication lag.
+    poller = AdaptivePoller()
+    poller.DEFAULT_INTERVAL_S = 900.0   # 15 min nominal
+    poller.MIN_INTERVAL_S = 600.0       # 10 min floor
+    poller.MAX_INTERVAL_S = 1500.0      # 25 min ceiling
+    poller.predicted_interval = 900.0
+
+    # Load cached latest + any existing snapshots from disk
+    try:
+        cached = load_wind_field(data_dir)
+        if cached and cached.get("points"):
+            json_bytes = json.dumps(cached["points"]).encode("utf-8")
+            # Extract HHMM key from analysis_time if available
+            snap_key = None
+            at_str = cached.get("analysis_time")
+            if at_str:
+                try:
+                    at_dt = _dt.datetime.fromisoformat(at_str)
+                    snap_key = at_dt.strftime("%H%M")
+                except Exception:
+                    pass
+            with app_state.lock:
+                app_state.wind_field_json = json_bytes
+                app_state.wind_field_seq += 1
+                # Also seed the snapshots dict so the endpoint serves data
+                if snap_key:
+                    app_state.wind_snapshots[snap_key] = json_bytes
+                    app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
+                    app_state.wind_snapshot_date = _today_str()
+            _log(f"[Wind] Loaded cached wind field ({cached['count']} points, key={snap_key})")
+    except Exception as e:
+        _log(f"[Wind] Error loading cache: {e}")
+
+    try:
+        snaps = load_wind_snapshots(data_dir)
+        if snaps:
+            with app_state.lock:
+                for k, pts in snaps.items():
+                    app_state.wind_snapshots[k] = json.dumps(pts).encode("utf-8")
+                app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
+                app_state.wind_snapshot_date = _today_str()
+            _log(f"[Wind] Loaded {len(snaps)} cached snapshots from disk")
+    except Exception as e:
+        _log(f"[Wind] Error loading snapshots: {e}")
+
+    last_key: str | None = None
+    miss_streak = 0
+    _MISS_BASE_S = 60.0
+    _MISS_MAX_S = 900.0
+
+    while not stop_event.is_set():
+        try:
+            # Day rollover: clear stale snapshots
+            today = _today_str()
+            if app_state.wind_snapshot_date and app_state.wind_snapshot_date != today:
+                with app_state.lock:
+                    app_state.wind_snapshots.clear()
+                    app_state.wind_snapshots_keys = []
+                    app_state.wind_snapshot_date = today
+                clear_wind_snapshots(data_dir)
+                _log("[Wind] Day rollover — cleared snapshots")
+
+            # Try each recent 15-min slot we don't have, newest first.
+            # Stop at the first successful fetch or after exhausting candidates.
+            now_utc = _dt.datetime.now(_dt.timezone.utc)
+            fetched = False
+            for offset_min in range(0, 60, 15):  # 0, 15, 30, 45 min ago
+                candidate = _round_to_15min(now_utc - _dt.timedelta(minutes=offset_min))
+                key = candidate.strftime("%H%M")
+                with app_state.lock:
+                    have_it = key in app_state.wind_snapshots
+                if have_it:
+                    continue
+
+                grib2 = fetch_grib2(analysis_time=candidate, timeout_s=10)
+                if grib2 is None:
+                    continue  # not published yet, try older slot
+
+                points = parse_grib2(grib2)
+                if not points:
+                    continue
+
+                # Notify poller so it learns the cadence
+                poller.check_for_change_raw(key)
+                last_key = key
+
+                json_bytes = json.dumps(points).encode("utf-8")
+                with app_state.lock:
+                    app_state.wind_field_json = json_bytes
+                    app_state.wind_field_seq += 1
+                    app_state.wind_snapshots[key] = json_bytes
+                    app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
+                    app_state.wind_snapshot_date = today
+                    snapshot_count = len(app_state.wind_snapshots_keys)
+
+                save_wind_field(points, data_dir, analysis_time=candidate)
+                save_wind_snapshot(points, data_dir, candidate)
+                _log(f"[Wind] Updated: {len(points)} pts, snapshot {key} ({snapshot_count} total)")
+                fetched = True
+                break  # got one, stop walking backwards
+
+            if fetched:
+                miss_streak = 0
+                delay = poller.get_next_poll_delay()
+            else:
+                miss_streak += 1
+                delay = min(_MISS_BASE_S * (2 ** (miss_streak - 1)), _MISS_MAX_S)
+                if miss_streak <= 3:
+                    _log(f"[Wind] No new snapshots available; retry in {delay:.0f}s")
+
+            stop_event.wait(delay)
+        except Exception as e:
+            _log(f"[Wind] Error: {e}")
+            stop_event.wait(120)
+
+    _log("[Wind] wind_field_fetch_loop thread STOPPED")
+
+
 def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, server_config: dict | None = None):
     """Create HTTP request handler with injected dependencies.
     
@@ -3912,6 +4103,25 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._handle_match_segment()
             if self.path.startswith("/api/road_edges"):
                 return self._handle_road_edges()
+            if self.path.startswith("/api/wind-field"):
+                with app_state.lock:
+                    _wf_etag = f'"wf{app_state.wind_field_seq}"'
+                    if self.headers.get("If-None-Match", "") == _wf_etag:
+                        return self._send_304(_wf_etag, "public, max-age=60")
+                    # Serve all time-indexed snapshots so the client can scrub
+                    if app_state.wind_snapshots:
+                        # Build {HHMM: points_array, ...} envelope
+                        parts = []
+                        for k in app_state.wind_snapshots_keys:
+                            # Each value is already JSON-encoded bytes
+                            parts.append(f'"{k}":{app_state.wind_snapshots[k].decode("utf-8")}')
+                        body = ("{" + ",".join(parts) + "}").encode("utf-8")
+                    else:
+                        body = app_state.wind_field_json  # fallback: flat array (legacy)
+                    return self._send(200, body,
+                                      "application/json",
+                                      cache_control="public, max-age=60",
+                                      etag=_wf_etag)
             if self.path.startswith("/api/tram_line_edges"):
                 return self._handle_tram_line_edges()
             if self.path.startswith("/api/snapshots"):
@@ -4711,6 +4921,13 @@ def main() -> int:
         ).start()
         _log("[PurpleAir] SLC sensor integration enabled (3-min daytime / 30-min nighttime, batched requests)")
 
+    # Start wind vector field fetch loop (RTMA-RU from NOMADS, 15-min refresh)
+    threading.Thread(
+        target=wind_field_fetch_loop,
+        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+        daemon=True
+    ).start()
+
     # History prefetch disabled — Select Day now loads from local snapshots
     # threading.Thread(
     #     target=_history_prefetch_loop,
@@ -4870,6 +5087,13 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
             kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
             daemon=True
         ).start()
+
+    # Start wind vector field fetch loop (RTMA-RU from NOMADS, 15-min refresh)
+    threading.Thread(
+        target=wind_field_fetch_loop,
+        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+        daemon=True
+    ).start()
 
     # History prefetch disabled — Select Day now loads from local snapshots
     # threading.Thread(

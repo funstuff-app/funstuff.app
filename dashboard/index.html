@@ -287,10 +287,11 @@
   <script src="aqi.js?v=20260224a"></script>
   <script src="format_utils.js?v=20260224a"></script>
   <script src="data_utils.js?v=20260224a"></script>
-    <script src="map_view.js?v=20260320b"></script>
+  <script src="advection_solver.js?v=20260320a"></script>
+    <script src="map_view.js?v=20260320e"></script>
   <script src="sidebar_ui.js?v=20260224a"></script>
   <script src="jog_wheel.js?v=20260227a"></script>
-  <script src="app.js?v=20260318b"></script>
+  <script src="app.js?v=20260320a"></script>
 
   <!-- PA Field debug sliders — visible only with ?fieldDebug=1 -->
   <div id="fieldDebugPanel" style="display:none; position:fixed; bottom:60px; right:10px; z-index:9999;
@@ -302,13 +303,20 @@
       <span>cut°</span><span id="fdCutoffVal" style="text-align:right">0.15</span><input id="fdCutoff" type="range" min="0.02" max="0.5" step="0.01" value="0.15" style="height:14px;width:100%;">
       <span>blur</span><span id="fdBlurVal" style="text-align:right">2</span><input id="fdBlur" type="range" min="0" max="6" step="1" value="2" style="height:14px;width:100%;">
     </div>
+    <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
+      <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowWind" type="checkbox" style="margin:0;"> wind vectors</label>
+    </div>
   </div>
   <script>
   (function(){
     if(new URLSearchParams(location.search).get('fieldDebug')!=='1') return;
     document.getElementById('fieldDebugPanel').style.display='block';
     var ids=['fdSigma','fdCutoff','fdBlur'];
-    window._fieldDebug={sigmaDivisor:12,cutoffDeg:0.15,blur:2};
+    window._fieldDebug={sigmaDivisor:12,cutoffDeg:0.15,blur:2,showWind:false};
+    document.getElementById('fdShowWind').addEventListener('change',function(){
+      window._fieldDebug.showWind=this.checked;
+      if(window.__map) window.__map._redrawViewOnly();
+    });
 
     // ── Wheel-scroll physics (replicated from playback scrub bar) ──────────
     var _fdVel = {};       // per-slider velocity
