@@ -3712,10 +3712,8 @@ def wind_field_fetch_loop(
                 if not points:
                     continue
 
-                # Success — record the change so poller learns the cadence
-                if last_key is not None and last_key != key:
-                    poller.last_update_utc = last_key
-                    poller.check_for_change_raw(key)
+                # Notify poller so it learns the cadence
+                poller.check_for_change_raw(key)
                 last_key = key
 
                 json_bytes = json.dumps(points).encode("utf-8")

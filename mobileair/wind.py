@@ -69,22 +69,28 @@ def fetch_grib2(analysis_time: datetime,
     Returns raw GRIB2 bytes on success, or None on failure.
     """
     url = _build_nomads_url(analysis_time)
-    log.info("Fetching RTMA-RU: %s", url)
+    log.debug("Fetching RTMA-RU: %s", url)
 
     req = urllib.request.Request(url, headers={"User-Agent": "DustyTrails/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             content_type = resp.headers.get("Content-Type", "")
             if "text/html" in content_type:
-                log.warning("NOMADS returned HTML (file not ready): %s", url)
+                log.debug("NOMADS returned HTML (file not ready): %s", url)
                 return None
             data = resp.read()
             if len(data) < 100:
-                log.warning("NOMADS response too small (%d bytes)", len(data))
+                log.debug("NOMADS response too small (%d bytes)", len(data))
                 return None
             log.info("RTMA-RU downloaded: %d bytes", len(data))
             return data
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            log.debug("RTMA-RU not available yet: %s", analysis_time.strftime("%H%M"))
+        else:
+            log.warning("RTMA-RU fetch failed: %s", e)
+        return None
+    except (urllib.error.URLError, OSError) as e:
         log.warning("RTMA-RU fetch failed: %s", e)
         return None
 
