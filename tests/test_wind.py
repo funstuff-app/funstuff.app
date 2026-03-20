@@ -31,22 +31,6 @@ class TestHelpers(unittest.TestCase):
         result = _round_to_15min(dt)
         self.assertEqual(result.minute, 0)
 
-    def test_latest_analysis_time(self):
-        from mobileair.wind import _latest_analysis_time
-        now = datetime(2026, 3, 20, 18, 45, 0, tzinfo=timezone.utc)
-        result = _latest_analysis_time(now)
-        # 18:45 - 30min lag = 18:15, rounded down to 18:15
-        self.assertEqual(result.hour, 18)
-        self.assertEqual(result.minute, 15)
-
-    def test_latest_analysis_time_rounds_down(self):
-        from mobileair.wind import _latest_analysis_time
-        now = datetime(2026, 3, 20, 18, 29, 0, tzinfo=timezone.utc)
-        result = _latest_analysis_time(now)
-        # 18:29 - 30min lag = 17:59, rounded down to 17:45
-        self.assertEqual(result.hour, 17)
-        self.assertEqual(result.minute, 45)
-
     def test_build_nomads_url(self):
         from mobileair.wind import _build_nomads_url
         dt = datetime(2026, 3, 20, 14, 30, 0, tzinfo=timezone.utc)

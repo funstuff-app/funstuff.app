@@ -37,10 +37,6 @@ _RIGHT_LON = -111
 # ── NOMADS base URL ──────────────────────────────────────────────────────────
 _NOMADS_BASE = "https://nomads.ncep.noaa.gov/cgi-bin/filter_rtma_ru.pl"
 
-# ── Availability lag: how far behind UTC to request ──────────────────────────
-_LAG_MINUTES = 30
-
-
 def _round_to_15min(dt: datetime) -> datetime:
     """Round a datetime DOWN to the nearest 15-minute boundary."""
     minute = (dt.minute // 15) * 15
@@ -66,23 +62,12 @@ def _build_nomads_url(analysis_time: datetime) -> str:
     )
 
 
-def _latest_analysis_time(now_utc: datetime | None = None) -> datetime:
-    """Return the most recent analysis time likely to be available."""
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    lagged = now_utc - timedelta(minutes=_LAG_MINUTES)
-    return _round_to_15min(lagged)
-
-
-def fetch_grib2(analysis_time: datetime | None = None,
+def fetch_grib2(analysis_time: datetime,
                 timeout_s: int = 30) -> bytes | None:
     """Download the RTMA-RU GRIB2 subset for SLC from NOMADS.
 
     Returns raw GRIB2 bytes on success, or None on failure.
     """
-    if analysis_time is None:
-        analysis_time = _latest_analysis_time()
-
     url = _build_nomads_url(analysis_time)
     log.info("Fetching RTMA-RU: %s", url)
 
@@ -356,12 +341,13 @@ def _lambert_conformal_grid(grid: dict) -> tuple[list[float], list[float]]:
     def _rho(lat_deg: float) -> float:
         return R_earth * F / (math.tan((45 + lat_deg / 2) * deg2rad) ** n)
 
-    rho0 = _rho(lat1)
-    theta0 = n * (lon1 - loV) * deg2rad
+    rho_origin = _rho(grid["laD"])  # rho at reference latitude (LaD)
 
-    # x, y of the first grid point
-    x0 = rho0 * math.sin(theta0)
-    y0 = -rho0 * math.cos(theta0)  # negative because rho decreases with lat
+    # Forward-project the first grid point to (x, y)
+    rho1 = _rho(lat1)
+    theta1 = n * (lon1 - loV) * deg2rad
+    x0 = rho1 * math.sin(theta1)
+    y0 = rho_origin - rho1 * math.cos(theta1)
 
     lats = []
     lons = []
@@ -371,8 +357,9 @@ def _lambert_conformal_grid(grid: dict) -> tuple[list[float], list[float]]:
             y = y0 + j * dy
 
             # Inverse projection: (x, y) → (lat, lon)
-            rho = math.copysign(math.sqrt(x * x + y * y), n)
-            theta = math.atan2(x, -y)
+            dy_from_origin = rho_origin - y
+            rho = math.copysign(math.sqrt(x * x + dy_from_origin * dy_from_origin), n)
+            theta = math.atan2(x, dy_from_origin)
 
             if abs(rho) < 1e-10:
                 lat = 90.0 if n > 0 else -90.0
@@ -393,7 +380,7 @@ def _lambert_conformal_grid(grid: dict) -> tuple[list[float], list[float]]:
     return lats, lons
 
 
-def fetch_wind_field(analysis_time: datetime | None = None,
+def fetch_wind_field(analysis_time: datetime,
                      timeout_s: int = 30) -> list[dict[str, float]]:
     """Fetch + parse in one call.  Returns [] on any failure."""
     grib = fetch_grib2(analysis_time=analysis_time, timeout_s=timeout_s)

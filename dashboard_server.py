@@ -2987,6 +2987,26 @@ class AdaptivePoller:
         
         return False
     
+    def check_for_change_raw(self, current_key: str) -> bool:
+        """Check if data changed using an opaque key string.  Learns interval."""
+        if self.last_update_utc is None:
+            self.last_update_utc = current_key
+            self.last_change_ts = time.time()
+            return True
+        if current_key != self.last_update_utc:
+            now = time.time()
+            if self.last_change_ts:
+                interval = now - self.last_change_ts
+                if self.MIN_INTERVAL_S * 0.5 <= interval <= self.MAX_INTERVAL_S * 2:
+                    self.observed_intervals.append(interval)
+                    if len(self.observed_intervals) > self.MAX_HISTORY:
+                        self.observed_intervals.pop(0)
+                    self._update_prediction()
+            self.last_update_utc = current_key
+            self.last_change_ts = now
+            return True
+        return False
+
     def get_next_poll_delay(self) -> float:
         """Calculate how long to wait before the next poll."""
         self.poll_count += 1
@@ -3585,28 +3605,23 @@ def wind_field_fetch_loop(
     data_dir: Path,
     stop_event: threading.Event,
 ) -> None:
-    """Background loop to fetch RTMA-RU wind vector field on publish schedule.
+    """Background loop to fetch RTMA-RU wind vector field.
 
     On startup, loads cached JSON if present, then fetches fresh data.
-    Uses RTMA-RU cadence (15-minute analysis with ~25-minute availability lag).
+    Uses AdaptivePoller to learn NOMADS publish cadence and poll efficiently.
     """
     _log("[Wind] wind_field_fetch_loop thread STARTED")
-
-    ONE_SHOT_RETRY_INTERVAL = 180.0  # retry once after 3 minutes
-    ANALYSIS_STEP_MINUTES = 15
-    PUBLISH_LAG_MINUTES = 25
-    MIN_WAIT_SECONDS = 30.0
 
     try:
         from mobileair.wind import (
             fetch_grib2,
             parse_grib2,
+            _round_to_15min,
             save_wind_field,
             save_wind_snapshot,
             load_wind_field,
             load_wind_snapshots,
             clear_wind_snapshots,
-            _latest_analysis_time,
         )
     except ImportError as e:
         _log(f"[Wind] Cannot import mobileair.wind: {e}")
@@ -3617,18 +3632,13 @@ def wind_field_fetch_loop(
     def _today_str():
         return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d")
 
-    def _next_expected_publish_time(analysis_time: _dt.datetime) -> _dt.datetime:
-        next_analysis = analysis_time + _dt.timedelta(minutes=ANALYSIS_STEP_MINUTES)
-        return next_analysis + _dt.timedelta(minutes=PUBLISH_LAG_MINUTES)
-
-    def _sleep_until(target_time: _dt.datetime) -> float:
-        now = _dt.datetime.now(_dt.timezone.utc)
-        sleep_s = (target_time - now).total_seconds()
-        if sleep_s <= 0:
-            sleep_s = MIN_WAIT_SECONDS
-        if sleep_s > 0:
-            stop_event.wait(sleep_s)
-        return sleep_s
+    # Use the same adaptive polling as the main fetch loop, tuned for
+    # RTMA-RU's 15-minute cadence with ~20-minute publication lag.
+    poller = AdaptivePoller()
+    poller.DEFAULT_INTERVAL_S = 900.0   # 15 min nominal
+    poller.MIN_INTERVAL_S = 600.0       # 10 min floor
+    poller.MAX_INTERVAL_S = 1500.0      # 25 min ceiling
+    poller.predicted_interval = 900.0
 
     # Load cached latest + any existing snapshots from disk
     try:
@@ -3668,8 +3678,7 @@ def wind_field_fetch_loop(
     except Exception as e:
         _log(f"[Wind] Error loading snapshots: {e}")
 
-    last_attempt_key: str | None = None
-    retried_for_key = False
+    last_key: str | None = None
 
     while not stop_event.is_set():
         try:
@@ -3683,51 +3692,46 @@ def wind_field_fetch_loop(
                 clear_wind_snapshots(data_dir)
                 _log("[Wind] Day rollover — cleared snapshots")
 
-            analysis_time = _latest_analysis_time()
+            # Try the latest 15-min slot we don't already have
+            now_utc = _dt.datetime.now(_dt.timezone.utc)
+            analysis_time = _round_to_15min(now_utc)
             key = analysis_time.strftime("%H%M")
-            next_fetch_time = _next_expected_publish_time(analysis_time)
 
-            if key != last_attempt_key:
-                last_attempt_key = key
-                retried_for_key = False
-
-            # Skip if we already have this snapshot
             with app_state.lock:
-                already_have_key = key in app_state.wind_snapshots
-            if already_have_key:
-                wait_s = _sleep_until(next_fetch_time)
-                _log(f"[Wind] Snapshot {key} already present; next fetch around {next_fetch_time.strftime('%H:%M')} UTC (sleep {wait_s:.0f}s)")
+                already_have = key in app_state.wind_snapshots
+
+            if already_have:
+                # We have this slot — notify poller of "no change" and wait
+                delay = poller.get_next_poll_delay()
+                stop_event.wait(delay)
                 continue
 
             grib2 = fetch_grib2(analysis_time=analysis_time)
             if grib2 is None:
-                if not retried_for_key:
-                    retried_for_key = True
-                    _log(f"[Wind] GRIB2 download failed for snapshot {key}; retrying once in 3 min")
-                    stop_event.wait(ONE_SHOT_RETRY_INTERVAL)
-                else:
-                    wait_s = _sleep_until(next_fetch_time)
-                    _log(f"[Wind] GRIB2 download failed again for snapshot {key}; next fetch around {next_fetch_time.strftime('%H:%M')} UTC (sleep {wait_s:.0f}s)")
+                # Not available yet — let poller decide when to retry
+                delay = poller.get_next_poll_delay()
+                _log(f"[Wind] Snapshot {key} not available yet; retry in {delay:.0f}s")
+                stop_event.wait(delay)
                 continue
 
-            try:
-                points = parse_grib2(grib2)
-            except Exception as parse_err:
-                if not retried_for_key:
-                    retried_for_key = True
-                    _log(f"[Wind] GRIB2 parse failed: {parse_err}; retrying once in 3 min")
-                    stop_event.wait(ONE_SHOT_RETRY_INTERVAL)
-                else:
-                    wait_s = _sleep_until(next_fetch_time)
-                    _log(f"[Wind] GRIB2 parse failed: {parse_err}; next fetch around {next_fetch_time.strftime('%H:%M')} UTC (sleep {wait_s:.0f}s)")
+            points = parse_grib2(grib2)
+            if not points:
+                delay = poller.get_next_poll_delay()
+                _log(f"[Wind] GRIB2 parse returned no points for {key}; retry in {delay:.0f}s")
+                stop_event.wait(delay)
                 continue
+
+            # Success — record the change so poller learns the cadence
+            if last_key is not None and last_key != key:
+                # Simulate change detection for the poller
+                poller.last_update_utc = last_key
+                poller.check_for_change_raw(key)
+            last_key = key
 
             json_bytes = json.dumps(points).encode("utf-8")
             with app_state.lock:
-                # Update latest
                 app_state.wind_field_json = json_bytes
                 app_state.wind_field_seq += 1
-                # Store snapshot
                 app_state.wind_snapshots[key] = json_bytes
                 app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
                 app_state.wind_snapshot_date = today
@@ -3735,13 +3739,13 @@ def wind_field_fetch_loop(
 
             save_wind_field(points, data_dir, analysis_time=analysis_time)
             save_wind_snapshot(points, data_dir, analysis_time)
-            retried_for_key = False
             _log(f"[Wind] Updated: {len(points)} pts, snapshot {key} ({snapshot_count} total)")
-            wait_s = _sleep_until(next_fetch_time)
-            _log(f"[Wind] Next expected fetch around {next_fetch_time.strftime('%H:%M')} UTC (sleep {wait_s:.0f}s)")
+
+            delay = poller.get_next_poll_delay()
+            stop_event.wait(delay)
         except Exception as e:
             _log(f"[Wind] Error: {e}")
-            stop_event.wait(ONE_SHOT_RETRY_INTERVAL)
+            stop_event.wait(120)
 
     _log("[Wind] wind_field_fetch_loop thread STOPPED")
 
