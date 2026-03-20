@@ -3692,16 +3692,23 @@ def wind_field_fetch_loop(
                 clear_wind_snapshots(data_dir)
                 _log("[Wind] Day rollover — cleared snapshots")
 
-            # Try the latest 15-min slot we don't already have
+            # Find the most recent 15-min slot we don't already have,
+            # working backwards from now (current slot is rarely available).
             now_utc = _dt.datetime.now(_dt.timezone.utc)
-            analysis_time = _round_to_15min(now_utc)
-            key = analysis_time.strftime("%H%M")
+            analysis_time = None
+            key = None
+            for offset_min in range(0, 60, 15):  # 0, 15, 30, 45 min ago
+                candidate = _round_to_15min(now_utc - _dt.timedelta(minutes=offset_min))
+                ckey = candidate.strftime("%H%M")
+                with app_state.lock:
+                    have_it = ckey in app_state.wind_snapshots
+                if not have_it:
+                    analysis_time = candidate
+                    key = ckey
+                    break
 
-            with app_state.lock:
-                already_have = key in app_state.wind_snapshots
-
-            if already_have:
-                # We have this slot — notify poller of "no change" and wait
+            if analysis_time is None:
+                # Have all recent slots — wait for the next one
                 delay = poller.get_next_poll_delay()
                 stop_event.wait(delay)
                 continue
