@@ -3707,7 +3707,7 @@ def wind_field_fetch_loop(
                 if have_it:
                     continue
 
-                grib2 = fetch_grib2(analysis_time=candidate)
+                grib2 = fetch_grib2(analysis_time=candidate, timeout_s=10)
                 if grib2 is None:
                     continue  # not published yet, try older slot
 

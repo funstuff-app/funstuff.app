@@ -5390,18 +5390,22 @@ class MapView {
     
     // Convert epoch ms to minutes since midnight UTC
     const d = new Date(epochMs);
-    const hh = String(d.getUTCHours()).padStart(2, "0");
-    const mm = d.getUTCMinutes();
-    const ss = d.getUTCSeconds();
-    const mmFrac = mm + ss / 60;
+    const totalMinUTC = d.getUTCHours() * 60 + d.getUTCMinutes() + d.getUTCSeconds() / 60;
     
-    // Find snapshots before and after this time
-    const mm15_floor = Math.floor(mm / 15) * 15;
-    const mm15_ceil = mm15_floor + 15;
-    const keyFloor = hh + String(mm15_floor).padStart(2, "0");
-    const keyCeil = hh + String(mm15_ceil % 60).padStart(2, "0");
+    // Floor/ceil to 15-min boundaries (in total minutes)
+    const floorMin = Math.floor(totalMinUTC / 15) * 15;
+    const ceilMin = floorMin + 15;
     
-    // Edge case: mm15_ceil wraps to next hour
+    // Convert total minutes → "HHMM" key
+    const minToKey = (m) => {
+      const h = Math.floor(m / 60) % 24;
+      const mn = m % 60;
+      return String(h).padStart(2, "0") + String(mn).padStart(2, "0");
+    };
+    const keyFloor = minToKey(floorMin);
+    const keyCeil = minToKey(ceilMin);
+    
+    // Look up snapshot indices
     let keyFloorIndex = -1, keyCeilIndex = -1;
     for (let i = 0; i < this._windSnapshotKeys.length; i++) {
       if (this._windSnapshotKeys[i] === keyFloor) keyFloorIndex = i;
@@ -5409,7 +5413,7 @@ class MapView {
     }
     
     // If we don't have both snapshots, return the latest one we have <= target
-    if (keyFloorIndex < 0 || keyCeilIndex < 0 || keyCeilIndex <= keyFloorIndex) {
+    if (keyFloorIndex < 0 || keyCeilIndex < 0) {
       let best = null;
       for (let i = this._windSnapshotKeys.length - 1; i >= 0; i--) {
         if (this._windSnapshotKeys[i] <= keyFloor) {
@@ -5426,7 +5430,7 @@ class MapView {
       const fieldB = this._windSnapshots[keyCeil];
       if (fieldA && fieldB) {
         // Alpha: progress from floor to ceil (0 at floor, 1 at ceil)
-        const alpha = (mmFrac - mm15_floor) / 15;
+        const alpha = (totalMinUTC - floorMin) / 15;
         return this._interpolateWindFields(fieldA, fieldB, Math.max(0, Math.min(1, alpha)));
       }
     }
