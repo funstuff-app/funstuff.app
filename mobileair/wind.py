@@ -112,7 +112,8 @@ def parse_grib2(grib2_bytes: bytes) -> list[dict[str, float]]:
     try:
         import xarray as xr
     except ImportError as e:
-        raise RuntimeError(f"xarray/cfgrib import failed: {e}") from e
+        log.warning("xarray/cfgrib not available: %s — wind parsing disabled", e)
+        return []
 
     # Write to a temp file in a writable directory so cfgrib can create
     # its .idx sidecar without errors.

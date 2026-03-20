@@ -239,6 +239,7 @@ build_staging() {
     cp "$REPO_ROOT/dashboard/aqi.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/format_utils.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/data_utils.js" "$STAGING_DIR/dashboard/"
+    cp "$REPO_ROOT/dashboard/advection_solver.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/map_view.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/sidebar_ui.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/styles.css" "$STAGING_DIR/dashboard/"
@@ -246,6 +247,7 @@ build_staging() {
     cp "$REPO_ROOT/dashboard/tui.css" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/tui.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/manifest.json" "$STAGING_DIR/dashboard/"
+    cp "$REPO_ROOT/dashboard/pa_advection_worker.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/pa_field_worker.js" "$STAGING_DIR/dashboard/"
     
     # Patch dashboard files for subpath deployment
@@ -348,7 +350,7 @@ deploy_data() {
 setup_service() {
     log_step "Setting up service on Pi..."
     
-    # First, do the non-sudo parts: venv + deps
+    # First, do the non-sudo parts: venv + deps + system libs
     ssh "$PI_TARGET" bash <<REMOTE_VENV
 set -euo pipefail
 echo "Creating Python virtual environment..."
@@ -362,6 +364,18 @@ chmod 700 "$INSTALL_DIR/data"
 echo "Python environment ready!"
 REMOTE_VENV
     log_info "Python environment set up."
+
+    # Install system-level native libraries needed by cfgrib/eccodes on ARM
+    log_info "Ensuring native ecCodes library is installed..."
+    ssh "$PI_TARGET" bash <<'REMOTE_APT'
+if ! dpkg -s libeccodes-dev >/dev/null 2>&1; then
+    echo "Installing libeccodes-dev..."
+    sudo apt-get install -y libeccodes-dev
+else
+    echo "libeccodes-dev already installed."
+fi
+REMOTE_APT
+    log_info "Native dependencies OK."
 
     # Template the service file from the repo copy (single source of truth).
     # Replace the hardcoded user/paths with values from deploy.config.
