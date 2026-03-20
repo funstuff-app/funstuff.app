@@ -39,8 +39,6 @@ self.onmessage = function(e) {
   const px = new Uint8ClampedArray(gw * gh * 4);
 
   // KNN-IDW interpolation with Gaussian alpha.
-  // sensors: stride-4 Float64Array [sx, sy, value, credWeight, ...]
-  const STRIDE = 4;
   const K = 8;
   const eps2 = 1;
   const kD2  = new Float64Array(K);
@@ -51,7 +49,7 @@ self.onmessage = function(e) {
       const pxx = (gx + 0.5) * cellSize;
 
       let kCount = 0;
-      for (let i = 0; i < sensors.length; i += STRIDE) {
+      for (let i = 0; i < sensors.length; i += 3) {
         const dx = pxx - sensors[i];
         const dy = py  - sensors[i + 1];
         const d2 = dx * dx + dy * dy;
@@ -76,8 +74,7 @@ self.onmessage = function(e) {
         const si = kIdx[j];
         const t = d2 / cutoffSq;
         const envelope = (1 - t) * (1 - t);
-        const cred = sensors[si + 3] || 1;
-        const w = envelope / (d2 + eps2) * cred;
+        const w = envelope / (d2 + eps2);
         wSum += w;
         vSum += w * sensors[si + 2];
         gSum += Math.exp(-d2 / twoSigmaSq);
