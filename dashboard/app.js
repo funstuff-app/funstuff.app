@@ -3111,6 +3111,12 @@ function main() {
       map._playbackNowMs = null;
       map._playbackInitialized = false;
       map._playbackLiveFollow = true;
+      // Clear historical wind — live fetch will repopulate
+      map._windSnapshots = null;
+      map._windSnapshotKeys = [];
+      map._windField = null;
+      map._windFieldEtag = null;
+      map._windFieldLastFetch = 0;
       // Restore live state to the map immediately
       const liveSt = window.__lastState || { mobile: [], fixed: [] };
       map.lastState = liveSt;
@@ -3417,6 +3423,20 @@ function main() {
       
       window._historicalState = loadedState;
       
+      // Load wind snapshots from the historical snapshot if present
+      if (loadedState.wind_snapshots && typeof loadedState.wind_snapshots === "object") {
+        map._windSnapshots = loadedState.wind_snapshots;
+        map._windSnapshotKeys = Object.keys(loadedState.wind_snapshots).sort();
+        if (map._windSnapshotKeys.length > 0) {
+          const latest = map._windSnapshotKeys[map._windSnapshotKeys.length - 1];
+          map._windField = loadedState.wind_snapshots[latest];
+        }
+      } else {
+        map._windSnapshots = null;
+        map._windSnapshotKeys = [];
+        map._windField = null;
+      }
+
       // Cache raw GPS coordinates only if debug mode is enabled
       if (map._pbDebugPath) {
         map._rawGpsById = new Map();

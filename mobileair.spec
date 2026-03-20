@@ -14,6 +14,9 @@ This bundles:
 import os
 from pathlib import Path
 
+import eccodeslib
+import eckitlib
+
 # Get certifi CA bundle path for SSL
 try:
     import certifi
@@ -25,13 +28,14 @@ block_cipher = None
 
 # Get the directory containing this spec file
 spec_dir = os.path.dirname(os.path.abspath(SPEC))
+_eccodeslib_dir = os.path.dirname(eccodeslib.__file__)
+_eckitlib_dir = os.path.dirname(eckitlib.__file__)
+_eccodeslib_lib_dir = os.path.join(_eccodeslib_dir, 'lib')
 
 # Exclude heavy unnecessary dependencies
 EXCLUDES = [
     # Data science / visualization (not needed)
     'matplotlib',
-    'numpy',
-    'pandas',
     'scipy',
     'PIL',
     'Pillow',
@@ -77,7 +81,6 @@ EXCLUDES = [
     # Other unnecessary
     'setuptools',
     'pkg_resources',
-    'distutils',
     'wheel',
     'pip',
     'jedi',
@@ -93,7 +96,9 @@ EXCLUDES = [
 a = Analysis(
     ['mobile_air.py'],
     pathex=[spec_dir],
-    binaries=[],
+    binaries=[
+        *[(str(p), 'eccodeslib/lib') for p in Path(_eccodeslib_lib_dir).glob('*.dylib')],
+    ],
     datas=[
         # Dashboard static files (browser UI) — glob all web assets so new
         # modules don't cause 404s after the app.js modularization.
@@ -109,7 +114,12 @@ a = Analysis(
         ('dashboard_server.py', '.'),
         ('airnow_slc.py', '.'),
         ('airnow_api.py', '.'),
-    ] + ([(CERTIFI_CA_BUNDLE, 'certifi')] if CERTIFI_CA_BUNDLE else []),
+    ] + ([(CERTIFI_CA_BUNDLE, 'certifi')] if CERTIFI_CA_BUNDLE else [])
+    + [
+        # eccodeslib package data (native GRIB2 libraries)
+        (_eccodeslib_dir, 'eccodeslib'),
+        (_eckitlib_dir, 'eckitlib'),
+    ],
     hiddenimports=[
         'certifi',
         'textual',
@@ -136,6 +146,7 @@ a = Analysis(
         'mobileair.trails',
         'mobileair.tui_format',
         'mobileair.utils',
+        'mobileair.wind',
         'mobileair.dirigera_home',
         'dirigera',
         'dirigera.hub',
@@ -145,6 +156,15 @@ a = Analysis(
         'dotenv',
         'requests',
         'urllib3',
+        'xarray',
+        'xarray.backends',
+        'cfgrib',
+        'cfgrib.xarray_store',
+        'eccodes',
+        'eccodeslib',
+        'eckitlib',
+        'findlibs',
+        'numpy',
     ],
     hookspath=[],
     hooksconfig={},
