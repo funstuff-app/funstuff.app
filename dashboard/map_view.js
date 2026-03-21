@@ -5670,7 +5670,7 @@ class MapView {
     // Fetch wind field in background for debug vector overlay (does not affect PA field rendering)
     if (!_isLite) this._fetchWindField();
 
-    // ── Static IDW path (unchanged) ──
+    // ── Static Nadaraya-Watson interpolation path ──
     this._ensurePaField(state, pbMs);
     if (pbMs != null && isFinite(pbMs)) this._preWarmPaFields(state, pbMs);
     const ctx = this.pfctx;
@@ -5708,14 +5708,15 @@ class MapView {
   }
 
   /**
-   * Precipitation-radar style: IDW-interpolate raw PM2.5 values on a coarse
-   * grid, map each to a color via _pm25ToRgb, bilinear-upscale.
+   * Precipitation-radar style: Nadaraya-Watson kernel regression of PM2.5 values
+   * on a coarse grid, map each to a color via _pm25ToRgbSmooth, bilinear-upscale.
    *
-   * V(P) = Σ(w_i · v_i) / Σ(w_i),  w_i = 1/d_i²   (screen-pixel distance)
+   * V(P) = expm1(Σ(w_i · ln(1+v_i)) / Σ(w_i)),  w_i = exp(-d²/2σ²)
+   * (Gaussian kernel, log-space geometric weighted mean, per-sensor adaptive σ)
    *
    * Optimized for real-time scrubbing:
-   *  - Always synchronous (IDW is <2ms on a 16px grid)
-   *  - Color-fingerprint cache: only recompute IDW when a sensor changes AQI
+   *  - Always synchronous (kernel regression is <2ms on a 16px grid)
+   *  - Color-fingerprint cache: only recompute when a sensor changes AQI
    *    color category, not on every minor PM2.5 fluctuation
    *  - Web Worker pre-warms upcoming color transitions ahead of playhead
    *  - Reuses tiny canvas + ImageData across frames
@@ -5770,7 +5771,7 @@ class MapView {
     const cutoffPx = Math.abs(refW.x - centerW.x);
     const cutoffSq = cutoffPx * cutoffPx;
     const FIELD_ALPHA = _fd && _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
-    // Gaussian kernel: σ = cutoff/sigmaDivisor (~2.5km effective radius per sensor).
+    // Nadaraya-Watson Gaussian kernel bandwidth: σ = cutoff/sigmaDivisor (~2.5km 2σ-radius per sensor).
     const sigmaDivisor = _fd ? _fd.sigmaDivisor : 12;
     const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
@@ -5823,13 +5824,14 @@ class MapView {
       s5[si5 + 4] = sensor.weightMultiplier;
     }
 
-    // ── Always synchronous — IDW is fast (<2ms on 16px grid) ──
+    // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
     this._computePaFieldSync(s5, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr);
   }
 
-  /** Synchronous IDW computation.
-   *  sensors: stride-5 Float64Array [sx, sy, value, twoSigSq, weightMultiplier, ...]
-   *  cutoffSq: max range² for early-out */
+  /** Synchronous Nadaraya-Watson kernel regression with Gaussian weights.
+   *  Interpolation in log-space (log1p/expm1) produces a geometric weighted mean.
+   *  sensors: stride-5 Float64Array [sx, sy, log1p(value), twoSigSq, weightMultiplier, ...]
+   *  cutoffSq: max range² for early-out (at 12σ, Gaussian is negligible) */
   _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr) {
     // ── Reuse tiny canvas + ImageData if grid size unchanged ──
     if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
@@ -5841,7 +5843,7 @@ class MapView {
     const { tc, tctx, imgData } = this._paGrid;
     const px = imgData.data;
 
-    // ── Gaussian-kernel IDW with weight-sum fading ──
+    // ── Nadaraya-Watson Gaussian kernel regression with weight-sum alpha fading ──
     for (let gy = 0; gy < gh; gy++) {
       const py = (gy + 0.5) * cellSize;
       for (let gx = 0; gx < gw; gx++) {
@@ -5874,7 +5876,7 @@ class MapView {
       }
     }
 
-    // ── Gaussian blur to soften edges ──
+    // ── Cauchy blur (1/(1+d²) kernel) to soften band-edge staircase artifacts ──
     const _fd = window._fieldDebug;
     const BLUR_R = _fd ? _fd.blur : 2;
     // Reuse blur buffer across frames when grid dimensions match
@@ -5923,7 +5925,7 @@ class MapView {
     this._upscalePaField(tc, cssW, cssH, dpr);
   }
 
-  /** Upscale the coarse IDW grid to viewport size with bilinear smoothing. */
+  /** Upscale the coarse interpolation grid to viewport size with bilinear smoothing. */
   _upscalePaField(tc, cssW, cssH, dpr) {
     if (!this._paFieldCanvas) this._paFieldCanvas = document.createElement("canvas");
     const pw = Math.floor(cssW * dpr), ph = Math.floor(cssH * dpr);

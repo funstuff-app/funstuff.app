@@ -1,5 +1,9 @@
 /**
- * Web Worker for PurpleAir scalar field IDW computation.
+ * Web Worker for PurpleAir scalar field pre-warm computation.
+ * Uses KNN with a Wendland-compacted regularized inverse-distance kernel
+ * and Gaussian-sum alpha fading.  (The main-thread sync path in map_view.js
+ * uses Nadaraya-Watson Gaussian kernel regression instead — the two algorithms
+ * differ in kernel shape, value space, and neighbor selection.)
  * Offloads the O(gridCells × sensors) interpolation off the main thread
  * so scrubbing never blocks the UX.
  */
@@ -38,7 +42,8 @@ self.onmessage = function(e) {
   const { sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, blurRadius, jobId } = e.data;
   const px = new Uint8ClampedArray(gw * gh * 4);
 
-  // KNN-IDW interpolation with Gaussian alpha.
+  // KNN interpolation: Wendland-compacted regularized inverse-distance kernel
+  // w = weightMultiplier × (1 − d²/R²)² / (d² + ε²), with Gaussian-sum alpha fading.
   const K = 8;
   const eps2 = 1;
   const kD2  = new Float64Array(K);
@@ -96,7 +101,7 @@ self.onmessage = function(e) {
     }
   }
 
-  // ── Gaussian blur to soften jagged band edges ──
+  // ── Cauchy blur (1/(1+d²) kernel) to soften jagged band edges ──
   const BLUR_R = blurRadius != null ? blurRadius : 2;
   const tmp = new Uint8ClampedArray(px.length);
   // Horizontal pass
