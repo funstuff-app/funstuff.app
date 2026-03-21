@@ -6284,6 +6284,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
+          // Hide outlier PurpleAir sensors
+          if (f.outlier && !isSel) { ctx.restore(); return; }
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
           if (!isSel && f.last_seen) {
@@ -7697,6 +7699,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
+          // Hide outlier PurpleAir sensors
+          if (f.outlier && !isSel) { ctx.restore(); return; }
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
           if (!isSel && f.last_seen) {
