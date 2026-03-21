@@ -5824,15 +5824,74 @@ class MapView {
       s5[si5 + 4] = sensor.weightMultiplier;
     }
 
+    // ── Wind-anisotropic kernel: single wind vector at map center ──
+    // Wind field is smooth (~10s of km scale) — uniform across viewport at zoom 11-13.
+    // No per-cell grid needed; one sample avoids view-dependent recomputation on pan.
+    const wind = this._sampleWindAtCenter(centerW, z, clat, clon, playbackTimeMs, _fd);
+    const effectiveCutoffSq = wind ? cutoffSq * wind.stretch * wind.stretch : cutoffSq;
+
     // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s5, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr);
+    this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind);
+  }
+
+  /** Sample wind at map center, return { wx, wy, stretch, upwindShrink } in screen-pixel
+   *  space, or null if no wind data / calm. Cached on wind field identity + zoom. */
+  _sampleWindAtCenter(centerW, z, clat, clon, playbackTimeMs, _fd) {
+    const windField = (this.playbackMode && playbackTimeMs != null && isFinite(playbackTimeMs))
+      ? this._windFieldForTime(playbackTimeMs, true) : this._windField;
+    if (!windField || !Array.isArray(windField) || windField.length < 2) return null;
+
+    // Cache on wind field identity + zoom (not center — wind direction doesn't change on pan)
+    if (this._windVecCache && this._windVecField === windField && this._windVecZoom === z)
+      return this._windVecCache;
+
+    const wspdMin  = _fd && _fd.wspdMin != null ? _fd.wspdMin : 0.3;
+    const wspdMax  = _fd && _fd.wspdMax != null ? _fd.wspdMax : 5.0;
+    const stretchMax   = _fd && _fd.stretchMax != null ? _fd.stretchMax : 2.5;
+    const upwindShrink = _fd && _fd.upwindShrink != null ? _fd.upwindShrink : 0.5;
+
+    // IDW sample wind at map center from existing wind field points
+    let uSum = 0, vSum = 0, wt = 0;
+    for (let i = 0; i < windField.length; i++) {
+      const wp = windField[i];
+      const dlat = clat - wp.lat, dlon = clon - wp.lon;
+      const d2 = dlat * dlat + dlon * dlon + 1e-8;
+      const w = 1 / d2;
+      uSum += w * wp.u; vSum += w * wp.v; wt += w;
+    }
+    if (wt < 1e-12) { this._windVecCache = null; this._windVecField = windField; this._windVecZoom = z; return null; }
+
+    const u = uSum / wt, v = vSum / wt;
+    const wspd = Math.sqrt(u * u + v * v);
+    if (wspd < wspdMin) { this._windVecCache = null; this._windVecField = windField; this._windVecZoom = z; return null; }
+
+    // Transform u/v (m/s geographic) → screen-pixel unit vector
+    const eps = 0.001;
+    const dxPerDegLon = (latLonToWorld(clat, clon + eps, z).x - centerW.x) / eps;
+    const dyPerDegLat = (latLonToWorld(clat + eps, clon, z).y - centerW.y) / eps;
+    const cosLat = Math.cos(clat * Math.PI / 180);
+    const pxU = u * dxPerDegLon / (111320 * cosLat);
+    const pxV = v * dyPerDegLat / 111320;
+    const pxSpd = Math.sqrt(pxU * pxU + pxV * pxV);
+    if (pxSpd < 1e-9) { this._windVecCache = null; this._windVecField = windField; this._windVecZoom = z; return null; }
+
+    const t = Math.max(0, Math.min(1, (wspd - wspdMin) / (wspdMax - wspdMin)));
+    const stretch = 1.0 + (stretchMax - 1.0) * t * t * (3 - 2 * t);
+    const result = { wx: pxU / pxSpd, wy: pxV / pxSpd, stretch, upwindShrink };
+    this._windVecCache = result;
+    this._windVecField = windField;
+    this._windVecZoom = z;
+    return result;
   }
 
   /** Synchronous Nadaraya-Watson kernel regression with Gaussian weights.
+   *  Optionally wind-anisotropic: kernels stretch along wind direction (teardrop shape).
    *  Interpolation in log-space (log1p/expm1) produces a geometric weighted mean.
    *  sensors: stride-5 Float64Array [sx, sy, log1p(value), twoSigSq, weightMultiplier, ...]
-   *  cutoffSq: max range² for early-out (at 12σ, Gaussian is negligible) */
-  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr) {
+   *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
+   *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
+   *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind) {
     // ── Reuse tiny canvas + ImageData if grid size unchanged ──
     if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
       const tc = document.createElement("canvas");
@@ -5843,7 +5902,14 @@ class MapView {
     const { tc, tctx, imgData } = this._paGrid;
     const px = imgData.data;
 
-    // ── Nadaraya-Watson Gaussian kernel regression with weight-sum alpha fading ──
+    // Hoist wind parameters — uniform across viewport, no per-cell lookup
+    const isAniso = wind != null && wind.stretch > 1.001;
+    const wwx = isAniso ? wind.wx : 0;
+    const wwy = isAniso ? wind.wy : 0;
+    const wStretch = isAniso ? wind.stretch : 1;
+    const wUpwind  = isAniso ? wind.upwindShrink : 1;
+
+    // ── Nadaraya-Watson kernel regression with optional wind-anisotropic Gaussian weights ──
     for (let gy = 0; gy < gh; gy++) {
       const py = (gy + 0.5) * cellSize;
       for (let gx = 0; gx < gw; gx++) {
@@ -5853,8 +5919,26 @@ class MapView {
         for (let i = 0; i < sensors.length; i += 5) {
           const dx = pxx - sensors[i];
           const dy = py  - sensors[i + 1];
-          const d2 = dx * dx + dy * dy;
-          if (d2 > cutoffSq) continue;
+          const rawD2 = dx * dx + dy * dy;
+          if (rawD2 > cutoffSq) {
+            // Beyond expanded cutoff — always skip
+            continue;
+          }
+
+          let d2;
+          if (isAniso) {
+            const along = dx * wwx + dy * wwy;
+            if (rawD2 > isoCutoffSq && along <= 0) continue; // upwind/crosswind beyond iso range — skip
+            // Decompose into wind-parallel and perpendicular components.
+            // Downwind (along > 0): full stretch. Upwind: partial (teardrop kernel).
+            const cross = dx * (-wwy) + dy * wwx;
+            const sf = along > 0 ? wStretch : wStretch * wUpwind;
+            const ea = along / sf;
+            d2 = ea * ea + cross * cross;
+          } else {
+            d2 = rawD2;
+          }
+
           const w = sensors[i + 4] * Math.exp(-d2 / sensors[i + 3]);
           wSum += w;
           vSum += w * sensors[i + 2];
