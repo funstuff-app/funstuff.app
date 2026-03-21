@@ -1833,10 +1833,13 @@ html.ios .playbackBar {
   bottom: 100px;
 }
 
-html.ios-landscape #topbar,
-html.ios-landscape #appFooter {
+html.ios-landscape #topbar {
   display: none !important;
 }
-html.ios-landscape .playbackBar {
+html.ios-was-landscape #appFooter {
+  display: none !important;
+}
+html.ios-landscape .playbackBar,
+html.ios-was-landscape .playbackBar {
   bottom: 46px;
 }

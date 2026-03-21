@@ -58,17 +58,26 @@ test("html.ios .playbackBar sets bottom: 100px", () => {
   assert.equal(decls["bottom"], "100px");
 });
 
-test("html.ios-landscape hides #topbar and #appFooter", () => {
-  // Check that both selectors exist with display: none
+test("html.ios-landscape hides #topbar", () => {
   assert.ok(css.includes("html.ios-landscape #topbar"), "should hide #topbar in landscape");
-  assert.ok(css.includes("html.ios-landscape #appFooter"), "should hide #appFooter in landscape");
-  const decls = getDeclarations(css, "html.ios-landscape #appFooter");
+  const decls = getDeclarations(css, "html.ios-landscape #topbar");
   assert.ok(decls["display"] && decls["display"].includes("none"),
-    "html.ios-landscape #appFooter should have display: none");
+    "html.ios-landscape #topbar should have display: none");
 });
 
-test("html.ios-landscape .playbackBar sets bottom: 46px", () => {
-  const decls = getDeclarations(css, "html.ios-landscape .playbackBar");
+test("html.ios-was-landscape permanently hides #appFooter", () => {
+  assert.ok(css.includes("html.ios-was-landscape #appFooter"), "should hide #appFooter after landscape");
+  const decls = getDeclarations(css, "html.ios-was-landscape #appFooter");
+  assert.ok(decls["display"] && decls["display"].includes("none"),
+    "html.ios-was-landscape #appFooter should have display: none");
+});
+
+test("playbackBar bottom: 46px when footer is hidden (landscape or was-landscape)", () => {
+  assert.ok(css.includes("html.ios-landscape .playbackBar"),
+    "should set playbackBar bottom in landscape");
+  assert.ok(css.includes("html.ios-was-landscape .playbackBar"),
+    "should set playbackBar bottom after landscape (footer permanently hidden)");
+  const decls = getDeclarations(css, "html.ios-was-landscape .playbackBar");
   assert.equal(decls["bottom"], "46px");
 });
 
@@ -100,6 +109,18 @@ test("base @media (max-width: 768px) sets small footer sizing", () => {
 test("app.js adds 'ios' class to documentElement", () => {
   assert.ok(appJs.includes("classList.add(\"ios\")") || appJs.includes("classList.add('ios')"),
     "app.js should add 'ios' class to html element");
+});
+
+test("app.js iOS detection has UA fallback for PWA standalone mode", () => {
+  assert.ok(appJs.includes("iPad|iPhone|iPod") || appJs.includes("navigator.userAgent"),
+    "app.js should fall back to UA sniffing for iOS detection in PWA mode");
+});
+
+test("app.js adds ios-was-landscape permanently on first landscape", () => {
+  assert.ok(appJs.includes("ios-was-landscape"),
+    "app.js should add ios-was-landscape class");
+  assert.ok(appJs.includes("classList.add(\"ios-was-landscape\")"),
+    "ios-was-landscape should only be added, never removed");
 });
 
 test("app.js toggles 'ios-landscape' class on orientation change", () => {

@@ -31,13 +31,17 @@ const _authReady = (async () => {
 // ── iOS orientation class toggling ──────────────────────────────────────
 // Safari doesn't reliably re-evaluate nested @media inside @supports on
 // viewport changes (toolbar show/hide). Use JS to toggle classes instead.
+// CSS.supports check fails in PWA standalone mode, so fall back to UA sniffing.
 (() => {
-  const isIOS = CSS.supports("-webkit-touch-callout", "none");
+  const isIOS = CSS.supports("-webkit-touch-callout", "none")
+    || (/iPad|iPhone|iPod/.test(navigator.userAgent)
+        && !window.MSStream);
   if (!isIOS) return;
   document.documentElement.classList.add("ios");
   const mql = window.matchMedia("(orientation: landscape)");
   function applyOrientation(e) {
     document.documentElement.classList.toggle("ios-landscape", e.matches);
+    if (e.matches) document.documentElement.classList.add("ios-was-landscape");
   }
   applyOrientation(mql);
   mql.addEventListener("change", applyOrientation);
