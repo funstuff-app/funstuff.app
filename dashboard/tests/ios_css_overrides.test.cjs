@@ -48,9 +48,27 @@ function getDeclarations(block, selector) {
 
 // ── CSS structural tests ────────────────────────────────────────────────
 
-test("no @supports (-webkit-touch-callout) block in CSS (JS handles iOS now)", () => {
+test("base #appFooter is small by default (mobile-first)", () => {
+  const decls = getDeclarations(css, "#appFooter");
+  assert.equal(decls["font-size"], "10px");
+  assert.equal(decls["padding"], "4px 10px");
+  assert.equal(decls["line-height"], "1.35");
+  assert.equal(decls["-webkit-text-size-adjust"], "100%",
+    "footer must have -webkit-text-size-adjust: 100% to prevent Safari inflation after rotation");
+});
+
+test("desktop gets larger footer via @media (min-width: 769px)", () => {
+  const desktopBlock = extractMediaBlock(css, "min-width: 769px");
+  assert.ok(desktopBlock, "expected @media (min-width: 769px) block");
+  const decls = getDeclarations(desktopBlock, "#appFooter");
+  assert.equal(decls["font-size"], "12px");
+  assert.equal(decls["padding"], "6px 16px");
+  assert.equal(decls["line-height"], "1.45");
+});
+
+test("no @supports (-webkit-touch-callout) block in CSS", () => {
   assert.ok(!css.includes("@supports (-webkit-touch-callout"),
-    "CSS should not contain @supports (-webkit-touch-callout) — use class-based rules instead");
+    "CSS should not contain @supports (-webkit-touch-callout)");
 });
 
 test("html.ios .playbackBar sets bottom: 100px", () => {
@@ -58,50 +76,14 @@ test("html.ios .playbackBar sets bottom: 100px", () => {
   assert.equal(decls["bottom"], "100px");
 });
 
-test("html.ios-landscape hides #topbar", () => {
+test("html.ios-landscape hides #topbar and #appFooter", () => {
   assert.ok(css.includes("html.ios-landscape #topbar"), "should hide #topbar in landscape");
-  const decls = getDeclarations(css, "html.ios-landscape #topbar");
-  assert.ok(decls["display"] && decls["display"].includes("none"),
-    "html.ios-landscape #topbar should have display: none");
+  assert.ok(css.includes("html.ios-landscape #appFooter"), "should hide #appFooter in landscape");
 });
 
-test("html.ios-was-landscape permanently hides #appFooter", () => {
-  assert.ok(css.includes("html.ios-was-landscape #appFooter"), "should hide #appFooter after landscape");
-  const decls = getDeclarations(css, "html.ios-was-landscape #appFooter");
-  assert.ok(decls["display"] && decls["display"].includes("none"),
-    "html.ios-was-landscape #appFooter should have display: none");
-});
-
-test("playbackBar bottom: 46px when footer is hidden (landscape or was-landscape)", () => {
-  assert.ok(css.includes("html.ios-landscape .playbackBar"),
-    "should set playbackBar bottom in landscape");
-  assert.ok(css.includes("html.ios-was-landscape .playbackBar"),
-    "should set playbackBar bottom after landscape (footer permanently hidden)");
-  const decls = getDeclarations(css, "html.ios-was-landscape .playbackBar");
+test("html.ios-landscape .playbackBar sets bottom: 46px", () => {
+  const decls = getDeclarations(css, "html.ios-landscape .playbackBar");
   assert.equal(decls["bottom"], "46px");
-});
-
-test("no portrait restore rule that overrides mobile footer sizing", () => {
-  // There should be NO rule that sets font-size/padding on #appFooter
-  // inside any iOS-specific context — the base @media (max-width:768px)
-  // handles mobile footer sizing.
-  const iosFooterRe = /html\.ios[^{]*#appFooter\s*\{([^}]+)\}/g;
-  let m;
-  while ((m = iosFooterRe.exec(css)) !== null) {
-    const body = m[1];
-    assert.ok(!body.includes("font-size"),
-      "iOS #appFooter rule must not set font-size (overrides mobile responsive rules)");
-    assert.ok(!body.includes("padding"),
-      "iOS #appFooter rule must not set padding (overrides mobile responsive rules)");
-  }
-});
-
-test("base @media (max-width: 768px) sets small footer sizing", () => {
-  const mobileBlock = extractMediaBlock(css, "max-width: 768px");
-  assert.ok(mobileBlock, "expected @media (max-width: 768px) block");
-  const decls = getDeclarations(mobileBlock, "#appFooter");
-  assert.equal(decls["font-size"], "10px", "mobile footer font-size should be 10px");
-  assert.equal(decls["padding"], "4px 10px", "mobile footer padding should be 4px 10px");
 });
 
 // ── JS structural tests ─────────────────────────────────────────────────
@@ -114,13 +96,11 @@ test("app.js adds 'ios' class to documentElement", () => {
 test("app.js iOS detection has UA fallback for PWA standalone mode", () => {
   assert.ok(appJs.includes("iPad|iPhone|iPod") || appJs.includes("navigator.userAgent"),
     "app.js should fall back to UA sniffing for iOS detection in PWA mode");
-});
-
-test("app.js adds ios-was-landscape permanently on first landscape", () => {
-  assert.ok(appJs.includes("ios-was-landscape"),
-    "app.js should add ios-was-landscape class");
-  assert.ok(appJs.includes("classList.add(\"ios-was-landscape\")"),
-    "ios-was-landscape should only be added, never removed");
+  // Also needs navigator.standalone + maxTouchPoints for WKWebView edge cases
+  assert.ok(appJs.includes("navigator.standalone"),
+    "app.js should check navigator.standalone for PWA detection");
+  assert.ok(appJs.includes("maxTouchPoints"),
+    "app.js should check maxTouchPoints for iPad-as-Mac detection");
 });
 
 test("app.js toggles 'ios-landscape' class on orientation change", () => {

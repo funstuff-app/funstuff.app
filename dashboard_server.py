@@ -3926,16 +3926,16 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             if path_no_query in ("/", "/index.html"):
                 if not self._is_owner():
                     maybe_log_visitor(self.headers, self.client_address, data_dir)
-                return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="public, max-age=300")
+                return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="no-cache")
             # JavaScript assets - serve any .js file from dashboard dir
-            # Cache for 1 day (use cache-busting query params like ?v=20260205 for updates)
+            # Short cache — cache-busting query params (?v=…) handle versioning
             if path_no_query.endswith(".js") and "/" not in path_no_query.lstrip("/"):
                 js_file = static_dir / path_no_query.lstrip("/")
                 if js_file.exists():
-                    return self._send(200, js_file.read_bytes(), "text/javascript", cache_control="public, max-age=86400")
-            # CSS - cache for 1 day
+                    return self._send(200, js_file.read_bytes(), "text/javascript", cache_control="public, max-age=60")
+            # CSS - short cache, versioned via ?v= in HTML
             if path_no_query == "/styles.css":
-                return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css", cache_control="public, max-age=86400")
+                return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css", cache_control="public, max-age=60")
             if path_no_query == "/manifest.json":
                 # Use relative URLs — avoids Host-header injection and works
                 # behind any reverse proxy or CDN without scheme/host mismatch.

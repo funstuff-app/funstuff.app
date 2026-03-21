@@ -31,11 +31,13 @@ const _authReady = (async () => {
 // ── iOS orientation class toggling ──────────────────────────────────────
 // Safari doesn't reliably re-evaluate nested @media inside @supports on
 // viewport changes (toolbar show/hide). Use JS to toggle classes instead.
-// CSS.supports check fails in PWA standalone mode, so fall back to UA sniffing.
+// Multiple detection paths: CSS.supports fails in PWA standalone, UA may
+// omit device name on iPad, so also check navigator.standalone + touch.
 (() => {
   const isIOS = CSS.supports("-webkit-touch-callout", "none")
-    || (/iPad|iPhone|iPod/.test(navigator.userAgent)
-        && !window.MSStream);
+    || /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.standalone !== undefined && navigator.maxTouchPoints > 1)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
   if (!isIOS) return;
   document.documentElement.classList.add("ios");
   const mql = window.matchMedia("(orientation: landscape)");
