@@ -5518,7 +5518,7 @@ class MapView {
     if (!this._advectionWorker) return;
 
     const params = {
-      cutoffDeg: 0.15,
+      cutoffDeg: 0.5,
       D: 500,
       lambda: 0.2,
       windScale: 1.0,
@@ -5766,7 +5766,7 @@ class MapView {
 
     // ── Cutoff in screen pixels ──
     const _fd = window._fieldDebug;
-    const cutoffDeg = _fd ? _fd.cutoffDeg : 0.15;
+    const cutoffDeg = _fd ? _fd.cutoffDeg : 0.5;
     const refW = latLonToWorld(clat, clon + cutoffDeg, z);
     const cutoffPx = Math.abs(refW.x - centerW.x);
     const cutoffSq = cutoffPx * cutoffPx;
