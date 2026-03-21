@@ -28,6 +28,21 @@ const _authReady = (async () => {
   } catch (_) { /* server may not support it yet — silent fallback */ }
 })();
 
+// ── iOS orientation class toggling ──────────────────────────────────────
+// Safari doesn't reliably re-evaluate nested @media inside @supports on
+// viewport changes (toolbar show/hide). Use JS to toggle classes instead.
+(() => {
+  const isIOS = CSS.supports("-webkit-touch-callout", "none");
+  if (!isIOS) return;
+  document.documentElement.classList.add("ios");
+  const mql = window.matchMedia("(orientation: landscape)");
+  function applyOrientation(e) {
+    document.documentElement.classList.toggle("ios-landscape", e.matches);
+  }
+  applyOrientation(mql);
+  mql.addEventListener("change", applyOrientation);
+})();
+
 // ── Prefs sync ──────────────────────────────────────────────────────────────
 // Collects all owner-namespaced localStorage keys and POSTs them to the
 // server on page hide/unload. The server appends each entry as an NDJSON

@@ -336,7 +336,7 @@ aside, section { min-height: 0; }
 .playbackBar {
   position: absolute;
   left: 50%;
-  bottom: 48px;
+  bottom: 60px;
   transform: translateX(-50%);
   z-index: 12;
   display: flex;
@@ -1826,4 +1826,17 @@ body.screensaver #camReplayBtn,
 body.screensaver .pbMenuBtn {
   opacity: 0 !important;
   pointer-events: none !important;
+}
+
+/* ── iOS overrides (class-based, toggled by JS in app.js) ──── */
+html.ios .playbackBar {
+  bottom: 100px;
+}
+
+html.ios-landscape #topbar,
+html.ios-landscape #appFooter {
+  display: none !important;
+}
+html.ios-landscape .playbackBar {
+  bottom: 46px;
 }
