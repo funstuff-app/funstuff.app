@@ -156,6 +156,11 @@ class MapView {
     this._traceLastFrameTs = 0;
     this._traceTargetFPS = 30; // reduce CPU while staying smooth
 
+    this._followRAF = null;
+    this._followSuppressUntilMs = 0;
+    this._followTargetLat = null;
+    this._followTargetLon = null;
+
     // Cached viewport metrics to avoid per-frame layout reads (getBoundingClientRect is expensive).
     this._dpr = window.devicePixelRatio || 1;
     this._cssW = 1;
@@ -430,11 +435,13 @@ class MapView {
     this._cancelCameraAnimations();
     this._autoCameraCooldownMs = 300000; // 5 minutes after any user interaction
     this._suppressAutoCamera();
+    this._followSuppressUntilMs = performance.now() + 4000;
   }
 
   _canRunAutoCamera() {
     const now = performance.now();
     if (this._touchActive || this._mouseDragging || this._pinchZooming) return false;
+    if (this._followRAF) return false; // follow loop is running — it owns the camera
     return now >= (this._autoCameraSuppressedUntilPerfMs || 0);
   }
 
@@ -1368,6 +1375,7 @@ class MapView {
     if (this.selectedId === next) return;
     this.selectedId = next;
     if (!next) this._selectedPollutantKey = null;
+    this._followSuppressUntilMs = 0;
     this._invalidateOverlayStatic();
     this.drawOverlay(this.lastState);
   }
@@ -1666,6 +1674,40 @@ class MapView {
     this._traceLastFrameTs = now;
     this.drawOverlay(this.lastState, { nowMs: now, fromTraceTick: true });
     this._traceRAF = requestAnimationFrame(() => this._traceTick());
+  }
+
+  _followTick() {
+    this._followRAF = null;
+    if (!this.selectedId || this._followTargetLat === null) return;
+    if (this._touchActive || this._mouseDragging || this._pinchZooming ||
+        performance.now() < this._followSuppressUntilMs) {
+      this._followRAF = requestAnimationFrame(() => this._followTick());
+      return;
+    }
+    // Always use the rendered marker position (interpolated), not raw GPS.
+    let tLat = this._followTargetLat;
+    let tLon = this._followTargetLon;
+    if (this.lastState) {
+      const fp = parseKey(this.selectedId);
+      if (fp && fp.type === 'mobile') {
+        const mob = Array.isArray(this.lastState.mobile) ? this.lastState.mobile : [];
+        const fm = mob.find(v => String(v.id) === String(fp.id));
+        if (fm) {
+          const pose = this._mobilePoseForRender(fm, performance.now());
+          if (pose && isFinite(Number(pose.lat)) && isFinite(Number(pose.lon))) {
+            tLat = Number(pose.lat);
+            tLon = Number(pose.lon);
+          }
+        }
+      }
+    }
+    const dLat = tLat - this.center.lat;
+    const dLon = tLon - this.center.lon;
+    if (Math.abs(dLat) > 0.00005 || Math.abs(dLon) > 0.00005) {
+      this.center = { lat: this.center.lat + dLat * 0.03, lon: this.center.lon + dLon * 0.03 };
+      this._redrawViewOnly();
+    }
+    this._followRAF = requestAnimationFrame(() => this._followTick());
   }
 
   _hash01(s) {
@@ -2294,6 +2336,29 @@ class MapView {
 
   draw(state) {
     this.lastState = state;
+
+    // Soft-follow: keep target fresh and ensure the loop is running.
+    {
+      const _fp = this.selectedId ? parseKey(this.selectedId) : null;
+      if (_fp && _fp.type === 'mobile') {
+        const _mob = Array.isArray(state?.mobile) ? state.mobile : [];
+        const _fm = _mob.find(v => String(v.id) === String(_fp.id));
+        if (_fm) {
+          const _pose = this.playbackMode ? this._mobilePoseForRender(_fm, performance.now()) : null;
+          const _tlat = _pose ? Number(_pose.lat) : Number(_fm.lat);
+          const _tlon = _pose ? Number(_pose.lon) : Number(_fm.lon);
+          if (isFinite(_tlat) && isFinite(_tlon)) {
+            this._followTargetLat = _tlat;
+            this._followTargetLon = _tlon;
+          }
+        }
+        if (!this._followRAF) this._followRAF = requestAnimationFrame(() => this._followTick());
+      } else {
+        this._followTargetLat = null;
+        this._followTargetLon = null;
+        if (this._followRAF) { cancelAnimationFrame(this._followRAF); this._followRAF = null; }
+      }
+    }
 
     // Update the data-time clock from the newest trail timestamp we can see.
     // Use only the last point of each trail for efficiency.
