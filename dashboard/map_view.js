@@ -78,6 +78,61 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
   return { sensors, fingerprint };
 }
 
+/** Compute the playback time range over which the PA field fingerprint is unchanged.
+ *  Scans each sensor's PM2.5 timeline to find the nearest past and future points
+ *  where _pm25ColorCat would change. Returns { fromMs, toMs }. */
+function _findFingerprintValidRange(fixed, playbackTimeMs) {
+  let nextChangeMs = Infinity;
+  let prevChangeMs = -Infinity;
+
+  for (const f of fixed) {
+    if (!f) continue;
+    const readings = f && f.readings;
+    if (!readings) continue;
+    // Check PM2.5-like keys (same keys _collectPaFieldSensors uses)
+    const r = readings["PM25"] || readings["PM2.5"] || readings["pm25"] || readings["pm2.5"];
+    if (!r || !r._parsedTimeline) continue;
+    const { timesMs, valuesF } = r._parsedTimeline;
+    if (!timesMs || timesMs.length < 2) continue;
+
+    // Binary search for current index
+    let idx;
+    if (playbackTimeMs <= timesMs[0]) {
+      idx = 0;
+    } else if (playbackTimeMs >= timesMs[timesMs.length - 1]) {
+      idx = timesMs.length - 1;
+    } else {
+      let lo = 0, hi = timesMs.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (timesMs[mid] <= playbackTimeMs) lo = mid;
+        else hi = mid - 1;
+      }
+      idx = lo;
+    }
+
+    const curCat = _pm25ColorCat(valuesF[idx]);
+
+    // Forward: find the next data point that changes color category
+    for (let i = idx + 1; i < timesMs.length; i++) {
+      if (_pm25ColorCat(valuesF[i]) !== curCat) {
+        if (timesMs[i] < nextChangeMs) nextChangeMs = timesMs[i];
+        break;
+      }
+    }
+    // Backward: find when the current category segment started
+    for (let i = idx - 1; i >= 0; i--) {
+      if (_pm25ColorCat(valuesF[i]) !== curCat) {
+        // Current segment started at timesMs[i+1]
+        if (timesMs[i + 1] > prevChangeMs) prevChangeMs = timesMs[i + 1];
+        break;
+      }
+    }
+  }
+
+  return { fromMs: prevChangeMs, toMs: nextChangeMs };
+}
+
 /** PM2.5 → [r,g,b] with continuous linear interpolation between AQI color stops.
  *  Stops placed at band midpoints (_BAND_MIDS) so colors match dot palette at
  *  typical readings; transitions occur near band boundaries. */
@@ -184,6 +239,11 @@ class MapView {
     this._paFieldPrevCanvas = null;
     this._paFieldFadeStart = 0;
     this._paFieldFadeMs = 300;
+    // Fingerprint validity window: playback time range where no sensor changes
+    // color category, so _collectPaFieldSensors can be skipped entirely.
+    this._paFieldValidRange = null; // { fromMs, toMs }
+    this._paFieldValidViewKey = null;
+    this._paFieldValidFixed = null; // reference to fixed array (invalidates on new data)
     // Worker-based pre-warming: compute upcoming color transition fields off-thread.
     this._paWorker = null;
     this._paWorkerJobId = 0;
@@ -192,6 +252,9 @@ class MapView {
     // Pre-warmed pixel buffers keyed by color fingerprint (view-independent).
     this._paFieldPrewarmed = new Map(); // fingerprint → { px, gw, gh }
     this._paFieldCacheMax = 16;
+    // Pre-warm scan throttle: avoid re-scanning sensor history every frame.
+    this._preWarmScanValidUntilMs = null;
+    this._preWarmScanFixed = null;
 
     // ── Advection-diffusion wind field state ──────────────────────────────
     this._advectionWorker = null;
@@ -457,6 +520,8 @@ class MapView {
   _invalidateOverlayStatic() {
     this._overlayStaticDirty = true;
     this._paFieldKey = "";
+    this._paFieldValidRange = null;
+    this._preWarmScanValidUntilMs = null;
   }
 
   setMaxTrailLen(val) {
@@ -5731,6 +5796,19 @@ class MapView {
     const clon = Number(this.center?.lon);
     const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
 
+    // ── Fast skip: if view and data are unchanged and playback time is within
+    // the validity window of the current fingerprint, no sensor can have changed
+    // color category — skip the expensive _collectPaFieldSensors entirely. ──
+    const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
+    if (this._paFieldCanvas
+        && this._paFieldValidViewKey === viewKey
+        && this._paFieldValidFixed === fixed
+        && this._paFieldValidRange
+        && playbackTimeMs >= this._paFieldValidRange.fromMs
+        && playbackTimeMs < this._paFieldValidRange.toMs) {
+      return;
+    }
+
     // ── Collect sensors, project to screen coords + build color fingerprint ──
     const centerW = latLonToWorld(clat, clon, z);
     const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH);
@@ -5740,9 +5818,16 @@ class MapView {
     if (nSensors === 0) { this._paFieldCanvas = null; return; }
 
     // ── Cache key: view geometry + color fingerprint ──
-    const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
     const key = `pa:${viewKey}|f:${fingerprint}`;
-    if (this._paFieldCanvas && this._paFieldKey === key) return;
+    if (this._paFieldCanvas && this._paFieldKey === key) {
+      // Cache hit — update validity window so future frames skip _collectPaFieldSensors.
+      if (!this._paFieldValidRange) {
+        this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
+        this._paFieldValidViewKey = viewKey;
+        this._paFieldValidFixed = fixed;
+      }
+      return;
+    }
     // Only cross-fade when the color fingerprint changes (sensor crosses AQI
     // boundary).  View-only changes (zoom/pan) recompute silently — no fade,
     // no stacking.
@@ -5832,6 +5917,11 @@ class MapView {
 
     // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
     this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind);
+
+    // ── Update fingerprint validity window for fast-path skipping ──
+    this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
+    this._paFieldValidViewKey = viewKey;
+    this._paFieldValidFixed = fixed;
   }
 
   /** Sample wind at map center, return { wx, wy, stretch, upwindShrink } in screen-pixel
@@ -6043,6 +6133,8 @@ class MapView {
       const first = this._paFieldPrewarmed.keys().next().value;
       this._paFieldPrewarmed.delete(first);
     }
+    // Allow _preWarmPaFields to re-scan for more transitions on the next frame.
+    this._preWarmScanValidUntilMs = null;
   }
 
   /**
@@ -6073,6 +6165,16 @@ class MapView {
     // Find sensor color transition times ahead of the playhead (up to 30 min).
     const lookAheadMs = 30 * 60 * 1000;
     const maxTime = playbackTimeMs + lookAheadMs;
+
+    // Skip re-scanning if we already scanned this time window and found nothing
+    // new to pre-warm. Only re-scan when playback advances past the horizon or
+    // new data arrives (different fixed array).
+    if (this._preWarmScanValidUntilMs != null
+        && this._preWarmScanFixed === fixed
+        && playbackTimeMs < this._preWarmScanValidUntilMs
+        && playbackTimeMs >= (this._preWarmScanFromMs || -Infinity)) {
+      return;
+    }
 
     // Collect unique transition fingerprints and their sensor arrays
     // Walk forward in time through each sensor's history and find points
@@ -6144,8 +6246,16 @@ class MapView {
         sensors: s4pw,
         gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, jobId
       });
+      // Dispatched a job — don't cache scan result yet (more transitions may
+      // become uncached after this job completes).
       return; // one at a time
     }
+
+    // All upcoming transitions are already pre-warmed. Cache the scan window
+    // so we don't re-scan every frame.
+    this._preWarmScanValidUntilMs = maxTime;
+    this._preWarmScanFromMs = playbackTimeMs;
+    this._preWarmScanFixed = fixed;
   }
 
   _overlayStaticKeyForState(state) {
