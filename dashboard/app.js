@@ -3876,6 +3876,9 @@ function main() {
       case "about":
         showAboutModal();
         break;
+      case "debug":
+        if (window._fdToggle) window._fdToggle();
+        break;
     }
     closePlaybackMenu();
   }
@@ -3885,6 +3888,12 @@ function main() {
       e.stopPropagation();
       togglePlaybackMenu();
     });
+  }
+
+  // Debug button in playback bar
+  {
+    const dbBtn = document.getElementById("pbDebugBtn");
+    if (dbBtn) dbBtn.addEventListener("click", () => { if (window._fdToggle) window._fdToggle(); });
   }
   
   // Share button - opens native share dialog.

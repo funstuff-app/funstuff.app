@@ -32,7 +32,7 @@
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260320j" />
+  <link rel="stylesheet" href="/styles.css?v=20260321f" />
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -104,6 +104,10 @@
             </div>
           </div>
           <div class="pbMenuDivider"></div>
+          <div class="pbMenuItem" data-action="debug" id="pbDebugItem" style="display:none">
+            <span class="pbMenuIcon">🔧</span>
+            <span class="pbMenuLabel">Debug</span>
+          </div>
           <div class="pbMenuItem" data-action="about">
             <span class="pbMenuIcon">ℹ️</span>
             <span class="pbMenuLabel">About</span>
@@ -203,6 +207,7 @@
                 <option value="60">60×</option>
               </select>
             </label>
+            <button id="pbDebugBtn" type="button" class="pbDebugBtn" title="Toggle field debug panel" aria-label="Toggle field debug panel">🔧</button>
           </div>
           <!-- A/B toggle for jog wheel style — SHUNTED -->
           <div class="pbRow0" id="pbRow0" style="display:none">
@@ -291,16 +296,14 @@
     <script src="map_view.js?v=20260320f"></script>
   <script src="sidebar_ui.js?v=20260224a"></script>
   <script src="jog_wheel.js?v=20260227a"></script>
-  <script src="app.js?v=20260320e"></script>
+  <script src="app.js?v=20260321b"></script>
 
-  <!-- PA Field debug sliders — visible only with ?fieldDebug=1 -->
-  <div id="fieldDebugPanel" style="display:none; position:fixed; bottom:60px; right:10px; z-index:9999;
-    background:var(--panel); border:1px solid #333; border-radius:6px; padding:6px 10px;
-    font:10px/1.4 monospace; color:#aaa; width:210px; pointer-events:auto;">
+  <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
+  <div id="fieldDebugPanel" class="fdHidden">
     <div style="font-weight:bold; margin-bottom:4px; color:#fff; font-size:10px;">Field Debug</div>
     <div style="display:grid; grid-template-columns:42px 30px 1fr; gap:2px 4px; align-items:center;">
       <span>sigma÷</span><span id="fdSigmaVal" style="text-align:right">12</span><input id="fdSigma" type="range" min="1" max="20" step="0.5" value="12" style="height:14px;width:100%;">
-      <span>cut°</span><span id="fdCutoffVal" style="text-align:right">0.15</span><input id="fdCutoff" type="range" min="0.02" max="0.5" step="0.01" value="0.15" style="height:14px;width:100%;">
+      <span>cut°</span><span id="fdCutoffVal" style="text-align:right">0.5</span><input id="fdCutoff" type="range" min="0.02" max="1.0" step="0.01" value="0.5" style="height:14px;width:100%;">
       <span>blur</span><span id="fdBlurVal" style="text-align:right">2</span><input id="fdBlur" type="range" min="0" max="6" step="1" value="2" style="height:14px;width:100%;">
     </div>
     <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
@@ -309,12 +312,26 @@
   </div>
   <script>
   (function(){
-    if(new URLSearchParams(location.search).get('fieldDebug')!=='1') return;
-    document.getElementById('fieldDebugPanel').style.display='block';
     var ids=['fdSigma','fdCutoff','fdBlur'];
-    window._fieldDebug={sigmaDivisor:12,cutoffDeg:0.15,blur:2,showWind:false};
+    var _fdState={sigmaDivisor:12,cutoffDeg:0.5,blur:2,showWind:false};
+    window._fieldDebug=_fdState;
+    function _fdEnable() {
+      document.getElementById('fieldDebugPanel').classList.remove('fdHidden');
+      var di=document.getElementById('pbDebugBtn');
+      if(di) di.classList.add('active');
+    }
+    function _fdDisable() {
+      document.getElementById('fieldDebugPanel').classList.add('fdHidden');
+      var di=document.getElementById('pbDebugBtn');
+      if(di) di.classList.remove('active');
+    }
+    window._fdToggle=function(){
+      var panel=document.getElementById('fieldDebugPanel');
+      panel.classList.contains('fdHidden') ? _fdEnable() : _fdDisable();
+    };
+    if(new URLSearchParams(location.search).get('fieldDebug')==='1') _fdEnable();
     document.getElementById('fdShowWind').addEventListener('change',function(){
-      window._fieldDebug.showWind=this.checked;
+      _fdState.showWind=this.checked;
       if(window.__map) window.__map._redrawViewOnly();
     });
 
@@ -366,11 +383,19 @@
         // Ensure coast loop is running
         if (!_fdRAF) { _fdLastPerf = performance.now(); _fdRAF = requestAnimationFrame(_fdCoastLoop); }
       },{passive:false});
+      // Detents: snap to default when within threshold
+      var _fdDefaults={fdSigma:12,fdCutoff:0.5};
+      var _fdSnap={fdSigma:0.8,fdCutoff:0.03};
       el.addEventListener('input',function(){
+        var def=_fdDefaults[id], snap=_fdSnap[id];
+        if(def!=null && snap!=null){
+          var v=parseFloat(el.value);
+          if(Math.abs(v-def)<=snap){ el.value=def; }
+        }
         document.getElementById(id+'Val').textContent=el.value;
-        window._fieldDebug.sigmaDivisor=parseFloat(document.getElementById('fdSigma').value);
-        window._fieldDebug.cutoffDeg=parseFloat(document.getElementById('fdCutoff').value);
-        window._fieldDebug.blur=parseInt(document.getElementById('fdBlur').value);
+        _fdState.sigmaDivisor=parseFloat(document.getElementById('fdSigma').value);
+        _fdState.cutoffDeg=parseFloat(document.getElementById('fdCutoff').value);
+        _fdState.blur=parseInt(document.getElementById('fdBlur').value);
         if(window.__map){window.__map._paFieldKey=null;window.__map._redrawViewOnly();}
       });
     });

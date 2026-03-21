@@ -372,6 +372,36 @@ aside, section { min-height: 0; }
   pointer-events: none;
 }
 
+/* ── Field Debug Panel ── */
+#fieldDebugPanel {
+  position: fixed;
+  bottom: 60px;
+  right: 10px;
+  z-index: 9999;
+  background: var(--panel);
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: 10px/1.4 monospace;
+  color: #aaa;
+  width: 210px;
+  pointer-events: auto;
+}
+#fieldDebugPanel.fdHidden {
+  display: none;
+}
+
+/* Overlap: playbar (center, 680px) reaches debug panel (right:10px, 210px) below ~1120px */
+@media (max-width: 1120px) {
+  #fieldDebugPanel {
+    bottom: 160px;
+    transition: bottom 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  html:has(.playbackBar.pb-hidden) #fieldDebugPanel {
+    bottom: 60px;
+  }
+}
+
 .pbRow1 {
   display: flex;
   align-items: center;
@@ -775,6 +805,26 @@ button#pbPlay.isLive {
 .pbSpeed select:hover { border-color: rgba(255,255,255,0.16); }
 
 /* Debug toggle in playback bar */
+.pbDebugBtn {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: rgba(147,164,186,0.5);
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 6px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+  flex-shrink: 0;
+}
+.pbDebugBtn:hover {
+  color: rgba(232,238,247,0.8);
+  border-color: rgba(255,255,255,0.12);
+}
+.pbDebugBtn.active {
+  color: var(--accent);
+  border-color: rgba(108,195,255,0.25);
+}
 .pbDebugLabel {
   display: inline-flex;
   align-items: center;
@@ -953,6 +1003,9 @@ button#pbPlay.isLive {
 }
 .pbMenuItem:active {
   background: rgba(108, 195, 255, 0.22);
+}
+.pbMenuItem.active .pbMenuLabel {
+  color: var(--accent);
 }
 .pbMenuIcon {
   width: 22px;
@@ -1829,6 +1882,17 @@ body.screensaver .pbMenuBtn {
 /* ── iOS overrides (class-based, toggled by JS in app.js) ──── */
 html.ios .playbackBar {
   bottom: 100px;
+}
+html.ios #fieldDebugPanel {
+  bottom: 100px;
+}
+@media (max-width: 1120px) {
+  html.ios #fieldDebugPanel {
+    bottom: 200px;
+  }
+  html.ios:has(.playbackBar.pb-hidden) #fieldDebugPanel {
+    bottom: 100px;
+  }
 }
 
 html.ios-landscape #topbar,
