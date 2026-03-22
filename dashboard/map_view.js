@@ -5589,14 +5589,12 @@ class MapView {
       windScale: 1.0,
       settlingTicks: 20,
     };
-    // Apply any debug overrides
+    // Apply field debug overrides
     const _fd = window._fieldDebug;
-    if (_fd) {
-      if (_fd.cutoffDeg != null) params.cutoffDeg = _fd.cutoffDeg;
-      if (_fd.diffusion != null) params.D = _fd.diffusion;
-      if (_fd.lambda != null) params.lambda = _fd.lambda;
-      if (_fd.windScale != null) params.windScale = _fd.windScale;
-    }
+    if (_fd.cutoffDeg != null) params.cutoffDeg = _fd.cutoffDeg;
+    if (_fd.diffusion != null) params.D = _fd.diffusion;
+    if (_fd.lambda != null) params.lambda = _fd.lambda;
+    if (_fd.windScale != null) params.windScale = _fd.windScale;
 
     this._advectionWorker.postMessage({
       type: "init",
@@ -5708,7 +5706,7 @@ class MapView {
     this._advectionSensorFP = fp;
 
     const _fd = window._fieldDebug;
-    const FIELD_ALPHA = _fd && _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
+    const FIELD_ALPHA = _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
     
     // During playback, interpolate between wind snapshots; otherwise use discrete snapshot
     const isPlaybackTick = this.playbackMode && playbackTimeMs != null && isFinite(playbackTimeMs);
@@ -5851,13 +5849,13 @@ class MapView {
 
     // ── Cutoff in screen pixels ──
     const _fd = window._fieldDebug;
-    const cutoffDeg = _fd ? _fd.cutoffDeg : 0.5;
+    const cutoffDeg = _fd.cutoffDeg;
     const refW = latLonToWorld(clat, clon + cutoffDeg, z);
     const cutoffPx = Math.abs(refW.x - centerW.x);
     const cutoffSq = cutoffPx * cutoffPx;
-    const FIELD_ALPHA = _fd && _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
+    const FIELD_ALPHA = _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
     // Nadaraya-Watson Gaussian kernel bandwidth: σ = cutoff/sigmaDivisor (~2.5km 2σ-radius per sensor).
-    const sigmaDivisor = _fd ? _fd.sigmaDivisor : 12;
+    const sigmaDivisor = _fd.sigmaDivisor;
     const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
 
@@ -5935,10 +5933,10 @@ class MapView {
     if (this._windVecCache && this._windVecField === windField && this._windVecZoom === z)
       return this._windVecCache;
 
-    const wspdMin  = _fd && _fd.wspdMin != null ? _fd.wspdMin : 0.3;
-    const wspdMax  = _fd && _fd.wspdMax != null ? _fd.wspdMax : 5.0;
-    const stretchMax   = _fd && _fd.stretchMax != null ? _fd.stretchMax : 2.5;
-    const upwindShrink = _fd && _fd.upwindShrink != null ? _fd.upwindShrink : 0.5;
+    const wspdMin  = _fd.wspdMin != null ? _fd.wspdMin : 0.3;
+    const wspdMax  = _fd.wspdMax != null ? _fd.wspdMax : 5.0;
+    const stretchMax   = _fd.stretchMax != null ? _fd.stretchMax : 2.5;
+    const upwindShrink = _fd.upwindShrink != null ? _fd.upwindShrink : 0.5;
 
     // IDW sample wind at map center from existing wind field points
     let uSum = 0, vSum = 0, wt = 0;

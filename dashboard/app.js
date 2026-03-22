@@ -3928,7 +3928,7 @@ function main() {
   {
     const raw = localStorage.getItem(PA_ALPHA_STORAGE_KEY);
     const v = raw != null ? Number(raw) : 18;
-    const pct = Math.max(0, Math.min(100, isFinite(v) ? v : 18));
+    const pct = Math.max(0, Math.min(80, isFinite(v) ? v : 18));
     window._paFieldAlpha = Math.round(pct * 2.55);
     if (menuAlphaEl) menuAlphaEl.value = pct;
   }
@@ -3942,7 +3942,7 @@ function main() {
       if (menuAlphaEl) {
         const raw = localStorage.getItem(PA_ALPHA_STORAGE_KEY);
         const v = raw != null ? Number(raw) : 18;
-        menuAlphaEl.value = Math.max(0, Math.min(100, isFinite(v) ? v : 18));
+        menuAlphaEl.value = Math.max(0, Math.min(80, isFinite(v) ? v : 18));
       }
     }
     
@@ -3973,7 +3973,7 @@ function main() {
         const pct = Math.max(0, Math.min(100, Number(menuAlphaEl.value) || 0));
         window._paFieldAlpha = Math.round(pct * 2.55);
         localStorage.setItem(PA_ALPHA_STORAGE_KEY, String(pct));
-        if (map) { map._paFieldKey = null; map._redrawViewOnly(); }
+        if (map) { map._paFieldKey = null; map._paFieldValidRange = null; map._redrawViewOnly(); }
       });
     }
   }
