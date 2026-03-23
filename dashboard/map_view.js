@@ -44,6 +44,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
   let fingerprint = "";
   for (const f of fixed) {
     if (!f) continue;
+    if (f.outlier) continue;
     const lat = Number(f.lat);
     const lon = Number(f.lon);
     if (!isFinite(lat) || !isFinite(lon)) continue;
@@ -153,6 +154,55 @@ function _pm25ToRgbSmooth(v) {
   for (let i = 1; i < stops.length; i++) {
     if (v <= stops[i][0]) {
       const t = (v - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+      return [
+        Math.round(stops[i-1][1] + t * (stops[i][1] - stops[i-1][1])),
+        Math.round(stops[i-1][2] + t * (stops[i][2] - stops[i-1][2])),
+        Math.round(stops[i-1][3] + t * (stops[i][3] - stops[i-1][3]))
+      ];
+    }
+  }
+  const last = stops[stops.length - 1];
+  return [last[1], last[2], last[3]];
+}
+
+/** PM2.5 concentration → AQI index (EPA piecewise-linear, PM2.5 24-hr breakpoints). */
+function _pm25ToAqi(v) {
+  const bp = [
+    [0.0,   9.0,   0,   50],
+    [9.1,   35.4,  51,  100],
+    [35.5,  55.4,  101, 150],
+    [55.5,  125.4, 151, 200],
+    [125.5, 225.4, 201, 300],
+    [225.5, 325.4, 301, 500],
+  ];
+  if (v < 0) return 0;
+  for (let i = 0; i < bp.length; i++) {
+    if (v <= bp[i][1]) {
+      const [cLo, cHi, aLo, aHi] = bp[i];
+      return cHi === cLo ? aHi : (aHi - aLo) / (cHi - cLo) * (v - cLo) + aLo;
+    }
+  }
+  return 500;
+}
+
+/** AQI index → RGB color.  Same colors as _pm25ToRgbSmooth, stops at AQI equivalents. */
+function _aqiToRgb(aqi) {
+  const stops = [
+    [0,     0x00,0xFF,0xFF],
+    [6,     0x00,0xFF,0xFF],  // cyan    – AQI ~6
+    [19,    0x00,0xCC,0xFF],  // lt-blue – AQI ~19
+    [39,    0x00,0xE4,0x00],  // green   – AQI ~39
+    [75,    0xFF,0xFF,0x00],  // yellow  – AQI ~75
+    [125,   0xFF,0x7E,0x00],  // orange  – AQI ~125
+    [176,   0xFF,0x00,0x00],  // red     – AQI ~176
+    [250,   0x8F,0x3F,0x97],  // purple  – AQI ~250
+    [350,   0x7E,0x00,0x23],  // maroon  – AQI ~350
+    [500,   0x7E,0x00,0x23]
+  ];
+  if (aqi <= stops[0][0]) return [stops[0][1], stops[0][2], stops[0][3]];
+  for (let i = 1; i < stops.length; i++) {
+    if (aqi <= stops[i][0]) {
+      const t = (aqi - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
       return [
         Math.round(stops[i-1][1] + t * (stops[i][1] - stops[i-1][1])),
         Math.round(stops[i-1][2] + t * (stops[i][2] - stops[i-1][2])),
@@ -5410,6 +5460,7 @@ class MapView {
     const sensors = [];
     for (const f of fixed) {
       if (!f) continue;
+      if (f.outlier) continue;
       const lat = Number(f.lat), lon = Number(f.lon);
       if (!isFinite(lat) || !isFinite(lon)) continue;
       if (!f.purpleair) {
@@ -5774,8 +5825,8 @@ class MapView {
    * Precipitation-radar style: Nadaraya-Watson kernel regression of PM2.5 values
    * on a coarse grid, map each to a color via _pm25ToRgbSmooth, bilinear-upscale.
    *
-   * V(P) = expm1(Σ(w_i · ln(1+v_i)) / Σ(w_i)),  w_i = exp(-d²/2σ²)
-   * (Gaussian kernel, log-space geometric weighted mean, per-sensor adaptive σ)
+   * V(P) = Σ(w_i · AQI_i) / Σ(w_i),  w_i = exp(-d²/2σ²)
+   * (Gaussian kernel, AQI-space weighted mean)
    *
    * Optimized for real-time scrubbing:
    *  - Always synchronous (kernel regression is <2ms on a 16px grid)
@@ -5859,51 +5910,18 @@ class MapView {
     const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
 
-    // ── Build stride-5 sensor array: [sx, sy, v, twoSigSq, weightMultiplier, ...] ──
-    // Per-sensor σ ratio (cached on fingerprint) controls Gaussian reach.
-    // Outlier sensors get a tighter σ so their hotspot stays local.
-    // Graduated: ratio ramps from 1.0 (≤2× nearest neighbor) down to 0.25
-    // (≥5× nearest neighbor) to avoid a visual cliff at the 2× boundary.
-    let sigRatios = this._paSigRatioCache;
-    if (!sigRatios || this._paSigRatioFP !== fingerprint) {
-      sigRatios = new Float64Array(nSensors);
-      for (let i = 0; i < nSensors; i++) {
-        const vi = paSensors[i].value;
-        // Find the best (lowest) ratio between this sensor and any neighbor.
-        let bestRatio = Infinity;
-        for (let j = 0; j < nSensors; j++) {
-          if (j === i) continue;
-          const vj = paSensors[j].value;
-          const hi = vi > vj ? vi : vj, lo = vi > vj ? vj : vi;
-          if (hi < 20) { bestRatio = 1; break; }
-          const r = lo > 0 ? hi / lo : Infinity;
-          if (r < bestRatio) bestRatio = r;
-        }
-        // Graduated ramp: 1.0 at ratio ≤2, 0.25 at ratio ≥5, linear between.
-        if (bestRatio <= 2) {
-          sigRatios[i] = 1.0;
-        } else if (bestRatio >= 5) {
-          sigRatios[i] = 0.25;
-        } else {
-          sigRatios[i] = 1.0 - 0.75 * (bestRatio - 2) / 3;
-        }
-      }
-      this._paSigRatioCache = sigRatios;
-      this._paSigRatioFP = fingerprint;
-    }
-
+    // ── Build stride-5 sensor array: [sx, sy, aqi, twoSigSq, weightMultiplier, ...] ──
+    // Blend in AQI space: the non-linear PM2.5→AQI transform gives high
+    // concentrations proportionally more weight in the kernel average,
+    // so a local spike stays visible instead of being diluted by neighbors.
     const s5 = new Float64Array(nSensors * 5);
     for (let i = 0; i < nSensors; i++) {
       const sensor = paSensors[i];
       const si5 = i * 5;
       s5[si5] = sensor.sx;
       s5[si5 + 1] = sensor.sy;
-      // Log-space interpolation: geometric weighted mean prevents extreme
-      // values from dominating at distance.  ln(3328)/ln(6) ≈ 4.5× instead
-      // of 3327/5 = 665×.  Reconstructed with expm1 at output.
-      s5[si5 + 2] = Math.log1p(sensor.value);
-      const r = sigRatios[i];
-      s5[si5 + 3] = twoSigmaSq * r * r;
+      s5[si5 + 2] = _pm25ToAqi(sensor.value);
+      s5[si5 + 3] = twoSigmaSq;
       s5[si5 + 4] = sensor.weightMultiplier;
     }
 
@@ -5974,8 +5992,8 @@ class MapView {
 
   /** Synchronous Nadaraya-Watson kernel regression with Gaussian weights.
    *  Optionally wind-anisotropic: kernels stretch along wind direction (teardrop shape).
-   *  Interpolation in log-space (log1p/expm1) produces a geometric weighted mean.
-   *  sensors: stride-5 Float64Array [sx, sy, log1p(value), twoSigSq, weightMultiplier, ...]
+   *  Blends in AQI space so high concentrations retain visual weight.
+   *  sensors: stride-5 Float64Array [sx, sy, aqi, twoSigSq, weightMultiplier, ...]
    *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
    *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
    *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
@@ -6038,8 +6056,8 @@ class MapView {
         } else {
           const fade = Math.min(1, wSum * 2);
           const alpha = Math.round(FIELD_ALPHA * fade);
-          const val = Math.expm1(vSum / wSum);
-          const rgb = _pm25ToRgbSmooth(val);
+          const val = vSum / wSum;
+          const rgb = _aqiToRgb(val);
           px[off]   = rgb[0];
           px[off+1] = rgb[1];
           px[off+2] = rgb[2];
@@ -6145,7 +6163,7 @@ class MapView {
     // Initialize worker on first use
     if (!this._paWorker) {
       try {
-        this._paWorker = new Worker("pa_field_worker.js?v=20260320b");
+        this._paWorker = new Worker("pa_field_worker.js?v=20260322b");
         this._paWorker.onmessage = (e) => this._onPaWorkerResult(e.data);
       } catch (_) {
         this._paWorker = false;
@@ -6225,7 +6243,7 @@ class MapView {
       const twoSigmaSq = 2 * sigma * sigma;
       const FIELD_ALPHA = 46;
 
-      // Build stride-3 array: [sx, sy, value, ...]
+      // Build stride-4 array: [sx, sy, aqi, weightMultiplier, ...]
       const nPw = paSensors.length;
       const s4pw = new Float64Array(nPw * 4);
       for (let i = 0; i < nPw; i++) {
@@ -6233,7 +6251,7 @@ class MapView {
         const si = i * 4;
         s4pw[si] = sensor.sx;
         s4pw[si + 1] = sensor.sy;
-        s4pw[si + 2] = Math.min(sensor.value, 75);
+        s4pw[si + 2] = _pm25ToAqi(Math.min(sensor.value, 75));
         s4pw[si + 3] = sensor.weightMultiplier;
       }
 
@@ -6478,8 +6496,7 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
-          // Hide outlier PurpleAir sensors
-          if (f.outlier && !isSel) { ctx.restore(); return; }
+          // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
           if (!isSel && f.last_seen) {
@@ -7893,8 +7910,7 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
-          // Hide outlier PurpleAir sensors
-          if (f.outlier && !isSel) { ctx.restore(); return; }
+          // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
           if (!isSel && f.last_seen) {

@@ -293,7 +293,7 @@
   <script src="format_utils.js?v=20260224a"></script>
   <script src="data_utils.js?v=20260224a"></script>
   <script src="advection_solver.js?v=20260320a"></script>
-    <script src="map_view.js?v=20260322a"></script>
+    <script src="map_view.js?v=20260322d"></script>
   <script src="sidebar_ui.js?v=20260224a"></script>
   <script src="jog_wheel.js?v=20260227a"></script>
   <script src="app.js?v=20260322a"></script>
@@ -303,7 +303,7 @@
     <div style="font-weight:bold; margin-bottom:4px; color:#fff; font-size:10px;">Field Debug</div>
     <div style="display:grid; grid-template-columns:42px 30px 1fr; gap:2px 4px; align-items:center;">
       <span>sigma÷</span><span id="fdSigmaVal" style="text-align:right">12</span><input id="fdSigma" type="range" min="1" max="20" step="0.5" value="12" style="height:14px;width:100%;">
-      <span>cut°</span><span id="fdCutoffVal" style="text-align:right">0.2</span><input id="fdCutoff" type="range" min="0.02" max="1.0" step="0.01" value="0.2" style="height:14px;width:100%;">
+      <span>cut°</span><span id="fdCutoffVal" style="text-align:right">0.15</span><input id="fdCutoff" type="range" min="0.02" max="1.0" step="0.01" value="0.15" style="height:14px;width:100%;">
       <span>blur</span><span id="fdBlurVal" style="text-align:right">2</span><input id="fdBlur" type="range" min="0" max="6" step="1" value="2" style="height:14px;width:100%;">
     </div>
     <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
@@ -313,7 +313,7 @@
   <script>
   (function(){
     var ids=['fdSigma','fdCutoff','fdBlur'];
-    var _fdState={sigmaDivisor:12,cutoffDeg:0.2,blur:2,showWind:false};
+    var _fdState={sigmaDivisor:12,cutoffDeg:0.15,blur:2,showWind:false};
     window._fieldDebug=_fdState;
     function _fdEnable() {
       document.getElementById('fieldDebugPanel').classList.remove('fdHidden');
@@ -384,7 +384,7 @@
         if (!_fdRAF) { _fdLastPerf = performance.now(); _fdRAF = requestAnimationFrame(_fdCoastLoop); }
       },{passive:false});
       // Detents: snap to default when within threshold
-      var _fdDefaults={fdSigma:12,fdCutoff:0.2};
+      var _fdDefaults={fdSigma:12,fdCutoff:0.15};
       var _fdSnap={fdSigma:0.8,fdCutoff:0.03};
       el.addEventListener('input',function(){
         var def=_fdDefaults[id], snap=_fdSnap[id];

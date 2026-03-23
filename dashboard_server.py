@@ -2214,6 +2214,7 @@ def detect_pa_outliers(
     sensor_values: list[tuple[float, float, float]],
     *,
     neighbor_radius_km: float = 5.0,
+    max_radius_km: float = 40.0,
     min_neighbors: int = 3,
     ratio_threshold: float = 5.0,
     abs_diff_threshold: float = 30.0,
@@ -2226,22 +2227,38 @@ def detect_pa_outliers(
     A sensor is an outlier if it is dramatically higher than its local
     neighborhood median AND fewer than *agreement_count* neighbors are
     also elevated (ruling out correlated real events like fires).
+
+    When fewer than *min_neighbors* are within *neighbor_radius_km*,
+    the radius expands (up to *max_radius_km*) so isolated sensors
+    are still compared against the broader network.
     """
     cos_lat = math.cos(math.radians(40.7))
     km_per_deg_lat = 110.57
     km_per_deg_lon = 111.32 * cos_lat
-    r_sq = neighbor_radius_km * neighbor_radius_km
 
+    # Pre-compute all pairwise distances (km²) for radius expansion
+    n = len(sensor_values)
     outliers: set[int] = set()
     for i, (lat_i, lon_i, val_i) in enumerate(sensor_values):
-        neighbor_vals: list[float] = []
+        # Collect all neighbors with distances
+        all_neighbors: list[tuple[float, float]] = []  # (dist_km², value)
         for j, (lat_j, lon_j, val_j) in enumerate(sensor_values):
             if i == j:
                 continue
             dlat_km = (lat_j - lat_i) * km_per_deg_lat
             dlon_km = (lon_j - lon_i) * km_per_deg_lon
-            if dlat_km * dlat_km + dlon_km * dlon_km <= r_sq:
-                neighbor_vals.append(val_j)
+            d2 = dlat_km * dlat_km + dlon_km * dlon_km
+            all_neighbors.append((d2, val_j))
+
+        # Expand radius until we find enough neighbors
+        r_km = neighbor_radius_km
+        neighbor_vals: list[float] = []
+        while True:
+            r_sq = r_km * r_km
+            neighbor_vals = [v for d2, v in all_neighbors if d2 <= r_sq]
+            if len(neighbor_vals) >= min_neighbors or r_km >= max_radius_km:
+                break
+            r_km = min(max_radius_km, r_km * 2.0)
 
         if len(neighbor_vals) < min_neighbors:
             continue
@@ -2251,7 +2268,11 @@ def detect_pa_outliers(
         diff = val_i - median
 
         if diff >= abs_diff_threshold and (median < 1.0 or val_i >= ratio_threshold * median):
-            elevated = sum(1 for nv in neighbor_vals if nv >= agreement_floor)
+            # Agreement floor scales with the suspect value: neighbors must read
+            # at least max(fixed_floor, suspect/ratio_threshold) to count as
+            # corroboration.  A sensor at 3000 isn't validated by neighbors at 15.
+            eff_floor = max(agreement_floor, val_i / ratio_threshold)
+            elevated = sum(1 for nv in neighbor_vals if nv >= eff_floor)
             if elevated < agreement_count:
                 outliers.add(i)
 
@@ -2296,6 +2317,42 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
     # Build outlier set using local spatial comparison
     sensor_tuples = [(vs["_lat"], vs["_lon"], vs["_pm25"]) for vs in valid_sensors]
     outlier_indices = detect_pa_outliers(sensor_tuples)
+
+    # ── Temporal heuristics: catch broken hardware the spatial check misses ──
+    # Broken sensors show overflow patterns: stuck at extreme values, or
+    # flip-flopping between max-positive and 0 (unsigned overflow).
+    history = app_state.fixed_history
+    for i, s in enumerate(valid_sensors):
+        if i in outlier_indices:
+            continue
+        pm25_val = s["_pm25"]
+        if pm25_val < 500:
+            continue  # only inspect high readings
+        sid = f"PA_{s.get('sensor_index', '')}"
+        hist_entries = (history.get(sid, {}).get("PM25") or
+                        history.get(sid, {}).get("PM2.5") or [])
+        if not hist_entries:
+            continue
+        recent = hist_entries[-10:]  # last ~10 data points
+        vals = []
+        for h in recent:
+            try:
+                vals.append(float(h.get("val", h.get("value", float("nan")))))
+            except (TypeError, ValueError):
+                continue
+        if len(vals) < 2:
+            continue
+        # Overflow pattern: flip-flopping between extreme (>500) and near-zero (<2)
+        extremes = sum(1 for v in vals if v > 500)
+        zeros = sum(1 for v in vals if v < 2)
+        if extremes >= 1 and zeros >= 1:
+            outlier_indices.add(i)
+            continue
+        # Stuck sensor: all recent readings are extreme (real events fluctuate)
+        if all(v > 500 for v in vals) and len(vals) >= 3:
+            spread = max(vals) - min(vals)
+            if spread < max(vals) * 0.05:  # <5% variation = stuck
+                outlier_indices.add(i)
     # ─────────────────────────────────────────────────────────────────
 
     for i, s in enumerate(valid_sensors):
