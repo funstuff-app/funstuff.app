@@ -31,7 +31,7 @@ const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
 const _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG = 0.55;
 const _PA_FIELD_FIXED_WEIGHT_MULTIPLIER = 10;
 
-function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH) {
+function _collectPaFieldSensors(fixed, playbackTimeMs, zoom) {
   const paLatLons = [];
   for (const f of fixed) {
     if (!f || !f.purpleair) continue;
@@ -66,10 +66,11 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
     const value = pm && pm.value != null ? Number(pm.value) : NaN;
     if (!isFinite(value) || value < 0) continue;
 
+    // World-pixel coordinates: zoom-dependent but pan-independent.
     const wp = latLonToWorld(lat, lon, zoom);
     sensors.push({
-      sx: wp.x - centerW.x + cssW / 2,
-      sy: wp.y - centerW.y + cssH / 2,
+      wx: wp.x,
+      wy: wp.y,
       value,
       weightMultiplier: f.purpleair ? 1 : _PA_FIELD_FIXED_WEIGHT_MULTIPLIER,
     });
@@ -214,6 +215,18 @@ function _aqiToRgb(aqi) {
   return [last[1], last[2], last[3]];
 }
 
+// Precomputed AQI → RGB lookup table (501 entries × 3 channels).
+// Eliminates per-cell branching in the hot kernel regression loop.
+const _AQI_LUT = new Uint8Array(501 * 3);
+(function() {
+  for (let i = 0; i <= 500; i++) {
+    const rgb = _aqiToRgb(i);
+    _AQI_LUT[i * 3] = rgb[0];
+    _AQI_LUT[i * 3 + 1] = rgb[1];
+    _AQI_LUT[i * 3 + 2] = rgb[2];
+  }
+})();
+
 class MapView {
   constructor(tilesCanvas, paFieldCanvas, overlayCanvas) {
     this.tilesCanvas = tilesCanvas;
@@ -282,17 +295,25 @@ class MapView {
     this._overlayStaticKey = "";
     this._overlayStaticDirty = true;
 
-    // PurpleAir scalar field underlay: cached offscreen canvas of radial gradient discs.
-    this._paFieldCanvas = null;
-    this._paFieldKey = "";
-    // Cross-fade: previous field canvas + transition timing
-    this._paFieldPrevCanvas = null;
+    // PurpleAir scalar field underlay: oversized coarse grid in world coordinates.
+    // Panning reuses the cached grid via source-rect offset — no recompute.
+    this._paFieldCoarse = null;     // coarse grid canvas (cellSize px resolution)
+    this._paFieldFingerprint = "";  // color-category fingerprint of current field
+    this._paFieldZoomKey = "";      // cssW|cssH|zoom — invalidates on zoom/resize only
+    this._paFieldWorldX0 = 0;      // world-pixel origin of computed field
+    this._paFieldWorldY0 = 0;
+    this._paFieldWorldW = 0;       // world-pixel dimensions of computed field
+    this._paFieldWorldH = 0;
+    this._paFieldCellSize = 16;
+    // Cross-fade: previous coarse grid + world origin + transition timing
+    this._paFieldPrevCoarse = null;
+    this._paFieldPrevWorldX0 = 0;
+    this._paFieldPrevWorldY0 = 0;
     this._paFieldFadeStart = 0;
     this._paFieldFadeMs = 300;
     // Fingerprint validity window: playback time range where no sensor changes
     // color category, so _collectPaFieldSensors can be skipped entirely.
     this._paFieldValidRange = null; // { fromMs, toMs }
-    this._paFieldValidViewKey = null;
     this._paFieldValidFixed = null; // reference to fixed array (invalidates on new data)
     // Worker-based pre-warming: compute upcoming color transition fields off-thread.
     this._paWorker = null;
@@ -569,7 +590,8 @@ class MapView {
 
   _invalidateOverlayStatic() {
     this._overlayStaticDirty = true;
-    this._paFieldKey = "";
+    this._paFieldZoomKey = "";
+    this._paFieldWorldW = 0;
     this._paFieldValidRange = null;
     this._preWarmScanValidUntilMs = null;
   }
@@ -2223,7 +2245,7 @@ class MapView {
     // Snapshot is tied to canvas size; reset on resize to avoid distortion.
     this._tilesSnapshotCanvas = null;
     this._tilesSnapshotMeta = null;
-    this._paFieldCanvas = null;
+    this._paFieldCoarse = null;
     this._paGrid = null;
     this._invalidateOverlayStatic();
     // Invalidate trail cache on resize
@@ -5785,28 +5807,47 @@ class MapView {
     if (!_isLite) this._fetchWindField();
 
     // ── Static Nadaraya-Watson interpolation path ──
-    this._ensurePaField(state, pbMs);
-    if (pbMs != null && isFinite(pbMs)) this._preWarmPaFields(state, pbMs);
+    // Skip recompute during pinch zoom — scale existing field instead
+    if (!this._pinchZooming) {
+      this._ensurePaField(state, pbMs);
+      if (pbMs != null && isFinite(pbMs)) this._preWarmPaFields(state, pbMs);
+    }
     const ctx = this.pfctx;
     if (!ctx) return;
     const pw = this.paFieldCanvasEl.width;
     const ph = this.paFieldCanvasEl.height;
-    // Clear the dedicated PA field canvas every frame (no snapshot restore needed)
+    const dpr = this._dpr || (window.devicePixelRatio || 1);
+    const cssW = this._cssW || 1;
+    const cssH = this._cssH || 1;
+    // Clear the dedicated PA field canvas every frame
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, pw, ph);
-    if (!this._paFieldCanvas) { ctx.restore(); return; }
-    // Cross-fade from previous field canvas to current one
-    const fadeT = this._paFieldPrevCanvas
+    if (!this._paFieldCoarse && !this._paFieldPrevCoarse) { ctx.restore(); return; }
+
+    const z = Number(this.zoom);
+    const clat = Number(this.center?.lat);
+    const clon = Number(this.center?.lon);
+    const centerW = latLonToWorld(clat, clon, z);
+    const cellSize = this._paFieldCellSize || 16;
+
+    // Cross-fade from previous coarse grid to current one
+    const fadeT = this._paFieldPrevCoarse
       ? Math.min(1, (performance.now() - this._paFieldFadeStart) / this._paFieldFadeMs)
       : 1;
-    if (this._paFieldPrevCanvas && fadeT < 1) {
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+
+    if (this._paFieldPrevCoarse && fadeT < 1) {
+      // Draw previous coarse grid with its world origin
       ctx.globalAlpha = 1 - fadeT;
-      ctx.drawImage(this._paFieldPrevCanvas, 0, 0);
+      this._drawCoarseField(ctx, this._paFieldPrevCoarse, this._paFieldPrevWorldX0, this._paFieldPrevWorldY0, this._paFieldPrevZoom, centerW, cellSize, cssW, cssH, dpr);
+      // Draw current coarse grid
       ctx.globalAlpha = fadeT;
-      ctx.drawImage(this._paFieldCanvas, 0, 0);
+      this._drawCoarseField(ctx, this._paFieldCoarse, this._paFieldWorldX0, this._paFieldWorldY0, this._paFieldZoom, centerW, cellSize, cssW, cssH, dpr);
       ctx.globalAlpha = 1;
-      // Schedule another frame to complete the fade (no-op if playback loop is running)
+      // Schedule another frame to complete the fade
       if (!this._paFieldFadeRAF) {
         this._paFieldFadeRAF = requestAnimationFrame(() => {
           this._paFieldFadeRAF = null;
@@ -5815,10 +5856,28 @@ class MapView {
         });
       }
     } else {
-      if (this._paFieldPrevCanvas) this._paFieldPrevCanvas = null;
-      ctx.drawImage(this._paFieldCanvas, 0, 0);
+      if (this._paFieldPrevCoarse) this._paFieldPrevCoarse = null;
+      this._drawCoarseField(ctx, this._paFieldCoarse, this._paFieldWorldX0, this._paFieldWorldY0, this._paFieldZoom, centerW, cellSize, cssW, cssH, dpr);
     }
     ctx.restore();
+  }
+
+  /** Draw a coarse grid canvas onto the PA field display canvas with source-rect offset.
+   *  Bilinear upscale from coarse (cellSize px) grid to viewport via drawImage source rect. */
+  _drawCoarseField(ctx, coarse, worldX0, worldY0, fieldZoom, centerW, cellSize, cssW, cssH, dpr) {
+    // When current zoom differs from the zoom at which the field was computed,
+    // scale the world-space coordinates to account for the zoom delta.
+    const z = Number(this.zoom);
+    const scale = Math.pow(2, z - fieldZoom);
+    const scaledX0 = worldX0 * scale;
+    const scaledY0 = worldY0 * scale;
+    const scaledCell = cellSize * scale;
+    // Source rect in coarse grid coordinates: which portion maps to the viewport
+    const sx = (centerW.x - cssW / 2 - scaledX0) / scaledCell;
+    const sy = (centerW.y - cssH / 2 - scaledY0) / scaledCell;
+    const sw = cssW / scaledCell;
+    const sh = cssH / scaledCell;
+    ctx.drawImage(coarse, sx, sy, sw, sh, 0, 0, cssW * dpr, cssH * dpr);
   }
 
   /**
@@ -5838,106 +5897,125 @@ class MapView {
   _ensurePaField(state, playbackTimeMs) {
     const cssW = this._cssW || 1;
     const cssH = this._cssH || 1;
-    if (cssW < 2 || cssH < 2) return; // not sized yet
-    const dpr = this._dpr || (window.devicePixelRatio || 1);
+    if (cssW < 2 || cssH < 2) return;
     const z = Number(this.zoom);
     const clat = Number(this.center?.lat);
     const clon = Number(this.center?.lon);
     const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
 
-    // ── Fast skip: if view and data are unchanged and playback time is within
-    // the validity window of the current fingerprint, no sensor can have changed
-    // color category — skip the expensive _collectPaFieldSensors entirely. ──
-    const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
-    if (this._paFieldCanvas
-        && this._paFieldValidViewKey === viewKey
+    const centerW = latLonToWorld(clat, clon, z);
+    const zoomKey = `${cssW}|${cssH}|${z.toFixed(4)}`;
+
+    // ── Fast skip: fingerprint validity window (no sensor crossed AQI boundary) ──
+    if (this._paFieldCoarse
+        && this._paFieldZoomKey === zoomKey
         && this._paFieldValidFixed === fixed
         && this._paFieldValidRange
         && playbackTimeMs >= this._paFieldValidRange.fromMs
-        && playbackTimeMs < this._paFieldValidRange.toMs) {
+        && playbackTimeMs < this._paFieldValidRange.toMs
+        && this._paFieldInBounds(centerW, cssW, cssH)) {
       return;
     }
 
-    // ── Collect sensors, project to screen coords + build color fingerprint ──
-    const centerW = latLonToWorld(clat, clon, z);
-    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH);
+    // ── Collect sensors in world coordinates ──
+    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, z);
     const paSensors = paField.sensors;
     const fingerprint = paField.fingerprint;
     const nSensors = paSensors.length;
-    if (nSensors === 0) { this._paFieldCanvas = null; return; }
+    if (nSensors === 0) { this._paFieldCoarse = null; return; }
 
-    // ── Cache key: view geometry + color fingerprint ──
-    const key = `pa:${viewKey}|f:${fingerprint}`;
-    if (this._paFieldCanvas && this._paFieldKey === key) {
-      // Cache hit — update validity window so future frames skip _collectPaFieldSensors.
+    // ── Pan-only check: same zoom + fingerprint + viewport within margin → skip ──
+    if (this._paFieldCoarse
+        && this._paFieldZoomKey === zoomKey
+        && this._paFieldFingerprint === fingerprint
+        && this._paFieldInBounds(centerW, cssW, cssH)) {
+      // Update validity window for fast-path skipping
       if (!this._paFieldValidRange) {
         this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
-        this._paFieldValidViewKey = viewKey;
         this._paFieldValidFixed = fixed;
       }
       return;
     }
-    // Only cross-fade when the color fingerprint changes (sensor crosses AQI
-    // boundary).  View-only changes (zoom/pan) recompute silently — no fade,
-    // no stacking.
+
+    // ── Cross-fade on fingerprint change only ──
     const prevFingerprint = this._paFieldFingerprint || "";
     const fingerprintChanged = fingerprint !== prevFingerprint;
-    if (this._paFieldCanvas && fingerprintChanged) {
-      this._paFieldPrevCanvas = this._paFieldCanvas;
-      this._paFieldCanvas = null;
+    if (this._paFieldCoarse && fingerprintChanged) {
+      this._paFieldPrevCoarse = this._paFieldCoarse;
+      this._paFieldPrevWorldX0 = this._paFieldWorldX0;
+      this._paFieldPrevWorldY0 = this._paFieldWorldY0;
+      this._paFieldPrevZoom = this._paFieldZoom;
+      this._paFieldCoarse = null;
       this._paFieldFadeStart = performance.now();
-    } else {
-      // View-only change — drop the previous canvas to avoid stale fades
-      this._paFieldPrevCanvas = null;
+    } else if (!fingerprintChanged) {
+      this._paFieldPrevCoarse = null;
     }
-    this._paFieldKey = key;
     this._paFieldFingerprint = fingerprint;
+    this._paFieldZoomKey = zoomKey;
 
-    // ── Grid dimensions ──
+    // ── Oversized grid in world space (viewport + 50% margin each side) ──
     const cellSize = 16;
-    const gw = Math.ceil(cssW / cellSize);
-    const gh = Math.ceil(cssH / cellSize);
+    const margin = 0.5;
+    const fieldW = cssW * (1 + 2 * margin);
+    const fieldH = cssH * (1 + 2 * margin);
+    const fieldWorldX0 = centerW.x - fieldW / 2;
+    const fieldWorldY0 = centerW.y - fieldH / 2;
+    const gw = Math.ceil(fieldW / cellSize);
+    const gh = Math.ceil(fieldH / cellSize);
 
-    // ── Cutoff in screen pixels ──
+    this._paFieldWorldX0 = fieldWorldX0;
+    this._paFieldWorldY0 = fieldWorldY0;
+    this._paFieldWorldW = fieldW;
+    this._paFieldWorldH = fieldH;
+    this._paFieldCellSize = cellSize;
+    this._paFieldZoom = z;
+
+    // ── Cutoff in world pixels (same as screen pixels at this zoom) ──
     const _fd = window._fieldDebug;
     const cutoffDeg = _fd.cutoffDeg;
     const refW = latLonToWorld(clat, clon + cutoffDeg, z);
     const cutoffPx = Math.abs(refW.x - centerW.x);
     const cutoffSq = cutoffPx * cutoffPx;
     const FIELD_ALPHA = _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
-    // Nadaraya-Watson Gaussian kernel bandwidth: σ = cutoff/sigmaDivisor (~2.5km 2σ-radius per sensor).
     const sigmaDivisor = _fd.sigmaDivisor;
     const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
 
-    // ── Build stride-5 sensor array: [sx, sy, aqi, twoSigSq, weightMultiplier, ...] ──
-    // Blend in AQI space: the non-linear PM2.5→AQI transform gives high
-    // concentrations proportionally more weight in the kernel average,
-    // so a local spike stays visible instead of being diluted by neighbors.
+    // ── Build stride-5 sensor array in world coords ──
     const s5 = new Float64Array(nSensors * 5);
     for (let i = 0; i < nSensors; i++) {
       const sensor = paSensors[i];
       const si5 = i * 5;
-      s5[si5] = sensor.sx;
-      s5[si5 + 1] = sensor.sy;
+      s5[si5] = sensor.wx;
+      s5[si5 + 1] = sensor.wy;
       s5[si5 + 2] = _pm25ToAqi(sensor.value);
       s5[si5 + 3] = twoSigmaSq;
       s5[si5 + 4] = sensor.weightMultiplier;
     }
 
-    // ── Wind-anisotropic kernel: single wind vector at map center ──
-    // Wind field is smooth (~10s of km scale) — uniform across viewport at zoom 11-13.
-    // No per-cell grid needed; one sample avoids view-dependent recomputation on pan.
+    // ── Wind-anisotropic kernel ──
     const wind = this._sampleWindAtCenter(centerW, z, clat, clon, playbackTimeMs, _fd);
     const effectiveCutoffSq = wind ? cutoffSq * wind.stretch * wind.stretch : cutoffSq;
 
-    // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind);
+    // ── Synchronous compute onto oversized coarse grid ──
+    this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, wind, fieldWorldX0, fieldWorldY0);
 
-    // ── Update fingerprint validity window for fast-path skipping ──
+    // ── Update fingerprint validity window ──
     this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
-    this._paFieldValidViewKey = viewKey;
     this._paFieldValidFixed = fixed;
+  }
+
+  /** Check if the current viewport fits within the computed field's world bounds. */
+  _paFieldInBounds(centerW, cssW, cssH) {
+    if (!this._paFieldWorldW) return false;
+    const vpL = centerW.x - cssW / 2;
+    const vpT = centerW.y - cssH / 2;
+    const vpR = centerW.x + cssW / 2;
+    const vpB = centerW.y + cssH / 2;
+    return vpL >= this._paFieldWorldX0
+        && vpT >= this._paFieldWorldY0
+        && vpR <= this._paFieldWorldX0 + this._paFieldWorldW
+        && vpB <= this._paFieldWorldY0 + this._paFieldWorldH;
   }
 
   /** Sample wind at map center, return { wx, wy, stretch, upwindShrink } in screen-pixel
@@ -5997,7 +6075,7 @@ class MapView {
    *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
    *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
    *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
-  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind) {
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, wind, fieldWorldX0, fieldWorldY0) {
     // ── Reuse tiny canvas + ImageData if grid size unchanged ──
     if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
       const tc = document.createElement("canvas");
@@ -6015,28 +6093,23 @@ class MapView {
     const wStretch = isAniso ? wind.stretch : 1;
     const wUpwind  = isAniso ? wind.upwindShrink : 1;
 
-    // ── Nadaraya-Watson kernel regression with optional wind-anisotropic Gaussian weights ──
+    // ── Nadaraya-Watson kernel regression in world-pixel space ──
     for (let gy = 0; gy < gh; gy++) {
-      const py = (gy + 0.5) * cellSize;
+      const py = fieldWorldY0 + (gy + 0.5) * cellSize;
       for (let gx = 0; gx < gw; gx++) {
-        const pxx = (gx + 0.5) * cellSize;
+        const pxx = fieldWorldX0 + (gx + 0.5) * cellSize;
 
         let wSum = 0, vSum = 0;
         for (let i = 0; i < sensors.length; i += 5) {
           const dx = pxx - sensors[i];
           const dy = py  - sensors[i + 1];
           const rawD2 = dx * dx + dy * dy;
-          if (rawD2 > cutoffSq) {
-            // Beyond expanded cutoff — always skip
-            continue;
-          }
+          if (rawD2 > cutoffSq) continue;
 
           let d2;
           if (isAniso) {
             const along = dx * wwx + dy * wwy;
-            if (rawD2 > isoCutoffSq && along <= 0) continue; // upwind/crosswind beyond iso range — skip
-            // Decompose into wind-parallel and perpendicular components.
-            // Downwind (along > 0): full stretch. Upwind: partial (teardrop kernel).
+            if (rawD2 > isoCutoffSq && along <= 0) continue;
             const cross = dx * (-wwy) + dy * wwx;
             const sf = along > 0 ? wStretch : wStretch * wUpwind;
             const ea = along / sf;
@@ -6056,11 +6129,10 @@ class MapView {
         } else {
           const fade = Math.min(1, wSum * 2);
           const alpha = Math.round(FIELD_ALPHA * fade);
-          const val = vSum / wSum;
-          const rgb = _aqiToRgb(val);
-          px[off]   = rgb[0];
-          px[off+1] = rgb[1];
-          px[off+2] = rgb[2];
+          const li = Math.max(0, Math.min(500, Math.round(vSum / wSum))) * 3;
+          px[off]   = _AQI_LUT[li];
+          px[off+1] = _AQI_LUT[li + 1];
+          px[off+2] = _AQI_LUT[li + 2];
           px[off+3] = alpha;
         }
       }
@@ -6069,7 +6141,6 @@ class MapView {
     // ── Cauchy blur (1/(1+d²) kernel) to soften band-edge staircase artifacts ──
     const _fd = window._fieldDebug;
     const BLUR_R = _fd ? _fd.blur : 2;
-    // Reuse blur buffer across frames when grid dimensions match
     const bufLen = px.length;
     if (!this._paGrid.blurBuf || this._paGrid.blurBuf.length !== bufLen) {
       this._paGrid.blurBuf = new Uint8ClampedArray(bufLen);
@@ -6112,24 +6183,8 @@ class MapView {
     }
 
     tctx.putImageData(imgData, 0, 0);
-    this._upscalePaField(tc, cssW, cssH, dpr);
-  }
-
-  /** Upscale the coarse interpolation grid to viewport size with bilinear smoothing. */
-  _upscalePaField(tc, cssW, cssH, dpr) {
-    if (!this._paFieldCanvas) this._paFieldCanvas = document.createElement("canvas");
-    const pw = Math.floor(cssW * dpr), ph = Math.floor(cssH * dpr);
-    if (this._paFieldCanvas.width !== pw || this._paFieldCanvas.height !== ph) {
-      this._paFieldCanvas.width = pw;
-      this._paFieldCanvas.height = ph;
-    }
-    const ctx = this._paFieldCanvas.getContext("2d");
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, cssW, cssH);
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(tc, 0, 0, cssW, cssH);
+    // Store the coarse grid canvas — composite step does viewport-clipped bilinear upscale
+    this._paFieldCoarse = tc;
   }
 
   /** Handle worker result — cache pre-warmed pixel data for future scrub hits. */
@@ -6163,7 +6218,7 @@ class MapView {
     // Initialize worker on first use
     if (!this._paWorker) {
       try {
-        this._paWorker = new Worker("pa_field_worker.js?v=20260322b");
+        this._paWorker = new Worker("pa_field_worker.js?v=20260322c");
         this._paWorker.onmessage = (e) => this._onPaWorkerResult(e.data);
       } catch (_) {
         this._paWorker = false;
@@ -6226,16 +6281,21 @@ class MapView {
     for (const tMs of sorted) {
       // Build sensor array and fingerprint at this time
       const centerW = latLonToWorld(clat, clon, z);
-      const paField = _collectPaFieldSensors(fixed, tMs, centerW, z, cssW, cssH);
+      const paField = _collectPaFieldSensors(fixed, tMs, z);
       const paSensors = paField.sensors;
       const fp = paField.fingerprint;
       if (paSensors.length === 0) continue;
       if (this._paFieldPrewarmed.has(fp)) continue;
 
-      // Dispatch this one to the worker
+      // Dispatch to worker with oversized grid in world coords
       const cellSize = 16;
-      const gw = Math.ceil(cssW / cellSize);
-      const gh = Math.ceil(cssH / cellSize);
+      const margin = 0.5;
+      const fieldW = cssW * (1 + 2 * margin);
+      const fieldH = cssH * (1 + 2 * margin);
+      const fieldWorldX0 = centerW.x - fieldW / 2;
+      const fieldWorldY0 = centerW.y - fieldH / 2;
+      const gw = Math.ceil(fieldW / cellSize);
+      const gh = Math.ceil(fieldH / cellSize);
       const refW = latLonToWorld(clat, clon + 0.15, z);
       const cutoffPx = Math.abs(refW.x - centerW.x);
       const cutoffSq = cutoffPx * cutoffPx;
@@ -6243,14 +6303,14 @@ class MapView {
       const twoSigmaSq = 2 * sigma * sigma;
       const FIELD_ALPHA = 46;
 
-      // Build stride-4 array: [sx, sy, aqi, weightMultiplier, ...]
+      // Build stride-4 array in world coords: [wx, wy, aqi, weightMultiplier, ...]
       const nPw = paSensors.length;
       const s4pw = new Float64Array(nPw * 4);
       for (let i = 0; i < nPw; i++) {
         const sensor = paSensors[i];
         const si = i * 4;
-        s4pw[si] = sensor.sx;
-        s4pw[si + 1] = sensor.sy;
+        s4pw[si] = sensor.wx;
+        s4pw[si + 1] = sensor.wy;
         s4pw[si + 2] = _pm25ToAqi(Math.min(sensor.value, 75));
         s4pw[si + 3] = sensor.weightMultiplier;
       }
@@ -6260,7 +6320,8 @@ class MapView {
       this._paWorkerFingerprint = fp;
       this._paWorker.postMessage({
         sensors: s4pw,
-        gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, jobId
+        gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, jobId,
+        fieldWorldX0, fieldWorldY0
       });
       // Dispatched a job — don't cache scan result yet (more transitions may
       // become uncached after this job completes).

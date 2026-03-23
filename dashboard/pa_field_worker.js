@@ -8,39 +8,56 @@
  * so scrubbing never blocks the UX.
  */
 
-// AQI → [r,g,b] with continuous interpolation — must match main-thread _aqiToRgb
-// Input sensor values are already converted to AQI by the main thread.
-function aqiToRgb(aqi) {
+// Precomputed AQI → RGB lookup table (501 entries × 3 channels).
+const _AQI_LUT = new Uint8Array(501 * 3);
+(function() {
   const stops = [
     [0,     0x00,0xFF,0xFF],
-    [6,     0x00,0xFF,0xFF],  // cyan    – AQI ~6
-    [19,    0x00,0xCC,0xFF],  // lt-blue – AQI ~19
-    [39,    0x00,0xE4,0x00],  // green   – AQI ~39
-    [75,    0xFF,0xFF,0x00],  // yellow  – AQI ~75
-    [125,   0xFF,0x7E,0x00],  // orange  – AQI ~125
-    [176,   0xFF,0x00,0x00],  // red     – AQI ~176
-    [250,   0x8F,0x3F,0x97],  // purple  – AQI ~250
-    [350,   0x7E,0x00,0x23],  // maroon  – AQI ~350
+    [6,     0x00,0xFF,0xFF],
+    [19,    0x00,0xCC,0xFF],
+    [39,    0x00,0xE4,0x00],
+    [75,    0xFF,0xFF,0x00],
+    [125,   0xFF,0x7E,0x00],
+    [176,   0xFF,0x00,0x00],
+    [250,   0x8F,0x3F,0x97],
+    [350,   0x7E,0x00,0x23],
     [500,   0x7E,0x00,0x23]
   ];
-  if (aqi <= stops[0][0]) return [stops[0][1], stops[0][2], stops[0][3]];
-  for (let i = 1; i < stops.length; i++) {
-    if (aqi <= stops[i][0]) {
-      const t = (aqi - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
-      return [
-        Math.round(stops[i-1][1] + t * (stops[i][1] - stops[i-1][1])),
-        Math.round(stops[i-1][2] + t * (stops[i][2] - stops[i-1][2])),
-        Math.round(stops[i-1][3] + t * (stops[i][3] - stops[i-1][3]))
-      ];
+  for (let aqi = 0; aqi <= 500; aqi++) {
+    let r, g, b;
+    if (aqi <= stops[0][0]) {
+      r = stops[0][1]; g = stops[0][2]; b = stops[0][3];
+    } else {
+      let found = false;
+      for (let i = 1; i < stops.length; i++) {
+        if (aqi <= stops[i][0]) {
+          const t = (aqi - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+          r = Math.round(stops[i-1][1] + t * (stops[i][1] - stops[i-1][1]));
+          g = Math.round(stops[i-1][2] + t * (stops[i][2] - stops[i-1][2]));
+          b = Math.round(stops[i-1][3] + t * (stops[i][3] - stops[i-1][3]));
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        const last = stops[stops.length - 1];
+        r = last[1]; g = last[2]; b = last[3];
+      }
     }
+    _AQI_LUT[aqi * 3] = r;
+    _AQI_LUT[aqi * 3 + 1] = g;
+    _AQI_LUT[aqi * 3 + 2] = b;
   }
-  const last = stops[stops.length - 1];
-  return [last[1], last[2], last[3]];
-}
+})();
 
 self.onmessage = function(e) {
-  const { sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, blurRadius, jobId } = e.data;
+  const { sensors, gw, gh, cellSize, cutoffSq, twoSigmaSq, FIELD_ALPHA, blurRadius, jobId,
+          fieldWorldX0, fieldWorldY0 } = e.data;
   const px = new Uint8ClampedArray(gw * gh * 4);
+
+  // Grid origin: world-space if provided, else 0 (legacy screen-space)
+  const ox = fieldWorldX0 || 0;
+  const oy = fieldWorldY0 || 0;
 
   // KNN interpolation: Wendland-compacted regularized inverse-distance kernel
   // w = weightMultiplier × (1 − d²/R²)² / (d² + ε²), with Gaussian-sum alpha fading.
@@ -49,9 +66,9 @@ self.onmessage = function(e) {
   const kD2  = new Float64Array(K);
   const kIdx = new Int32Array(K);
   for (let gy = 0; gy < gh; gy++) {
-    const py = (gy + 0.5) * cellSize;
+    const py = oy + (gy + 0.5) * cellSize;
     for (let gx = 0; gx < gw; gx++) {
-      const pxx = (gx + 0.5) * cellSize;
+      const pxx = ox + (gx + 0.5) * cellSize;
 
       let kCount = 0;
       for (let i = 0; i < sensors.length; i += 4) {
@@ -91,11 +108,10 @@ self.onmessage = function(e) {
       } else {
         const fade = Math.min(1, gSum * 2);
         const alpha = Math.round(FIELD_ALPHA * fade);
-        const val = vSum / wSum;
-        const rgb = aqiToRgb(val);
-        px[off]     = rgb[0];
-        px[off + 1] = rgb[1];
-        px[off + 2] = rgb[2];
+        const li = Math.max(0, Math.min(500, Math.round(vSum / wSum))) * 3;
+        px[off]     = _AQI_LUT[li];
+        px[off + 1] = _AQI_LUT[li + 1];
+        px[off + 2] = _AQI_LUT[li + 2];
         px[off + 3] = alpha;
       }
     }

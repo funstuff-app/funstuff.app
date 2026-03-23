@@ -3973,7 +3973,7 @@ function main() {
         const pct = Math.max(0, Math.min(100, Number(menuAlphaEl.value) || 0));
         window._paFieldAlpha = Math.round(pct * 2.55);
         localStorage.setItem(PA_ALPHA_STORAGE_KEY, String(pct));
-        if (map) { map._paFieldKey = null; map._redrawViewOnly(); }
+        if (map) { map._paFieldZoomKey = ''; map._paFieldWorldW = 0; map._redrawViewOnly(); }
       });
     }
   }
