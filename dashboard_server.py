@@ -3687,7 +3687,7 @@ def wind_field_fetch_loop(
     import datetime as _dt
 
     def _today_str():
-        return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d")
+        return _dt.datetime.now(_MOUNTAIN_TZ).strftime("%Y%m%d")
 
     # Use the same adaptive polling as the main fetch loop, tuned for
     # RTMA-RU's 15-minute cadence with ~20-minute publication lag.
