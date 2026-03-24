@@ -12,6 +12,7 @@ Also integrates AirNow hourly data for fixed EPA monitoring sites.
 from __future__ import annotations
 
 import argparse
+import gzip as _gzip_mod
 import hashlib
 import json
 import math
@@ -3954,9 +3955,15 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 # TLS handshake failed - common with untrusted certs
                 pass
         
+        # Content types eligible for gzip compression.
+        _COMPRESSIBLE_TYPES = frozenset((
+            "application/json", "text/javascript", "text/html", "text/css",
+            "application/manifest+json", "application/xml", "text/plain",
+        ))
+
         def _send(self, code: int, body: bytes, content_type: str, cache_control: str | None = None, etag: str | None = None):
             """Send HTTP response with optional cache control and ETag.
-            
+
             Args:
                 code: HTTP status code
                 body: Response body bytes
@@ -3967,9 +3974,21 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             if cache_control is None:
                 cache_control = "no-store, max-age=0"
             try:
+                # Gzip if client supports it and payload is worth compressing
+                use_gzip = (
+                    len(body) > 1024
+                    and "gzip" in self.headers.get("Accept-Encoding", "")
+                    and content_type.split(";")[0].strip() in self._COMPRESSIBLE_TYPES
+                )
+                if use_gzip:
+                    body = _gzip_mod.compress(body, compresslevel=6)
+
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
+                if use_gzip:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Vary", "Accept-Encoding")
                 self.send_header("Cache-Control", cache_control)
                 if etag:
                     self.send_header("ETag", etag)
@@ -4085,16 +4104,19 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             if path_no_query in ("/", "/index.html"):
                 if not self._is_owner():
                     maybe_log_visitor(self.headers, self.client_address, data_dir)
-                return self._send(200, (static_dir / "index.html").read_bytes(), "text/html", cache_control="no-cache")
+                return self._send(200, (static_dir / "index.html").read_bytes(), "text/html",
+                                  cache_control="public, no-cache, s-maxage=60")
             # JavaScript assets - serve any .js file from dashboard dir
             # Short cache — cache-busting query params (?v=…) handle versioning
             if path_no_query.endswith(".js") and "/" not in path_no_query.lstrip("/"):
                 js_file = static_dir / path_no_query.lstrip("/")
                 if js_file.exists():
-                    return self._send(200, js_file.read_bytes(), "text/javascript", cache_control="public, max-age=60")
+                    return self._send(200, js_file.read_bytes(), "text/javascript",
+                                      cache_control="public, max-age=3600, s-maxage=86400")
             # CSS - short cache, versioned via ?v= in HTML
             if path_no_query == "/styles.css":
-                return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css", cache_control="public, max-age=60")
+                return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css",
+                                  cache_control="public, max-age=3600, s-maxage=86400")
             if path_no_query == "/manifest.json":
                 # Use relative URLs — avoids Host-header injection and works
                 # behind any reverse proxy or CDN without scheme/host mismatch.
@@ -4114,7 +4136,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         {"src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
                     ]
                 }
-                return self._send(200, json.dumps(manifest).encode(), "application/manifest+json")
+                return self._send(200, json.dumps(manifest).encode(), "application/manifest+json",
+                                  cache_control="public, max-age=86400")
             # Icons - cache for 1 week (rarely change)
             if self.path == "/icon.svg":
                 return self._send(200, (static_dir / "icon.svg").read_bytes(), "image/svg+xml", cache_control="public, max-age=604800, immutable")
@@ -4188,7 +4211,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                     # ETag from state_seq (bumped by ANY state mutation:
                     # fetch loop, PurpleAir, Home sensor, force-refresh)
                     _etag = f'"s{app_state.state_seq}"'
-                    _cc_public = "public, max-age=0, s-maxage=30, stale-while-revalidate=5"
+                    _cc_public = "public, max-age=0, s-maxage=15, stale-while-revalidate=5"
 
                     # Owner token path: no ETag, no CDN cache (debug gets full fresh data)
                     if self._is_owner():
@@ -4238,8 +4261,11 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                                 _mv["trail"] = _trail[_cut:]
                             st_copy.setdefault("meta", {})["delta"] = True
 
+                    # Delta responses are per-client — must not be cached at the CDN.
+                    _is_delta = st_copy.get("meta", {}).get("delta")
+                    _cc = "private, max-age=0" if _is_delta else _cc_public
                     return self._send(200, json.dumps(st_copy).encode("utf-8"),
-                                      "application/json", cache_control=_cc_public, etag=_etag)
+                                      "application/json", cache_control=_cc, etag=_etag)
             if self.path.startswith("/api/fixed"):
                 # Return just the fixed sensor array (lightweight for TUI remote mode)
                 with app_state.lock:
@@ -4279,7 +4305,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         body = app_state.wind_field_json  # fallback: flat array (legacy)
                     return self._send(200, body,
                                       "application/json",
-                                      cache_control="public, max-age=60",
+                                      cache_control="public, max-age=60, s-maxage=900, stale-while-revalidate=120",
                                       etag=_wf_etag)
             if self.path.startswith("/api/tram_line_edges"):
                 return self._handle_tram_line_edges()
@@ -4485,7 +4511,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         "demo": True,
                     })
                 body = json.dumps({"snapshots": snapshots}).encode("utf-8")
-                return self._send(200, body, "application/json")
+                return self._send(200, body, "application/json",
+                                  cache_control="public, max-age=300, s-maxage=300")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 return self._send(500, body, "application/json")
@@ -4690,8 +4717,9 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         oldest = next(iter(self._snapshot_window_cache))
                         del self._snapshot_window_cache[oldest]
                     return self._send(200, body, "application/json",
-                                      cache_control="public, max-age=3600")
-                return self._send(200, body, "application/json")
+                                      cache_control="public, max-age=3600, s-maxage=86400")
+                return self._send(200, body, "application/json",
+                                  cache_control="public, max-age=86400, s-maxage=86400, immutable")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 return self._send(500, body, "application/json")
