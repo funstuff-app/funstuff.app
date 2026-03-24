@@ -524,6 +524,10 @@ class AppState:
     fixed_history_path: Path | None = None
     fixed_history_dirty: bool = False
 
+    # PA sensors detected as stuck-elevated: { sensor_id: stuck_start_recorded_at }
+    # Used by _inject_fixed_history to retroactively null stuck readings.
+    stuck_pa_sensors: dict[str, float] = field(default_factory=dict)
+
     # Cached fixed sensor locations so offline sensors can still be rendered.
     # Structure: { sensor_id: { "lat": float, "lon": float, "name": str } }
     fixed_sensor_locations: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -1340,6 +1344,10 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
             hci = []
             history_times = []
 
+            # If this PA sensor is stuck-elevated, null readings in the
+            # stuck window so playback doesn't show the frozen value.
+            stuck_since = app_state.stuck_pa_sensors.get(sensor_id) if sensor_id.startswith("PA_") else None
+
             for entry in hist_entries:
                 t = entry.get("time") or ""
                 if t[:10] not in prefixes:
@@ -1351,6 +1359,11 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
                         fval = int(fval)
                 except (ValueError, TypeError):
                     fval = None
+                # Retroactively null readings during the stuck period
+                if stuck_since is not None and fval is not None:
+                    rec = entry.get("recorded_at", 0)
+                    if rec >= stuck_since:
+                        fval = None
                 history_values.append(fval)
                 hci.append(color_to_idx(_get_aqi_color(pollutant, fval)) if fval is not None else 0)
                 history_times.append(t)
@@ -2353,6 +2366,95 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
             spread = max(vals) - min(vals)
             if spread < max(vals) * 0.05:  # <5% variation = stuck
                 outlier_indices.add(i)
+
+    # ── Stuck-elevated detection ─────────────────────────────────────
+    # A sensor reporting the exact same value for ≥1 hour while reading
+    # notably above its neighbors is malfunctioning (e.g. stuck at 157
+    # when neighbors read 5–10).  Flag it and record the stuck window so
+    # _inject_fixed_history can retroactively null those readings.
+    STUCK_MIN_DURATION_S = 3600  # 1 hour
+    _cos_lat = math.cos(math.radians(40.7))
+    _km_deg_lat = 110.57
+    _km_deg_lon = 111.32 * _cos_lat
+    cleared_stuck = set()  # track sensors that are no longer stuck
+    for i, s in enumerate(valid_sensors):
+        if i in outlier_indices:
+            continue
+        sid = f"PA_{s.get('sensor_index', '')}"
+        hist_entries = (history.get(sid, {}).get("PM25") or
+                        history.get(sid, {}).get("PM2.5") or [])
+        if len(hist_entries) < 2:
+            # Not enough history — clear any previous stuck flag
+            cleared_stuck.add(sid)
+            continue
+
+        current_val_str = hist_entries[-1].get("val")
+        if current_val_str is None:
+            cleared_stuck.add(sid)
+            continue
+
+        # Walk backwards to find the start of the stuck run
+        stuck_start_idx = len(hist_entries) - 1
+        for k in range(len(hist_entries) - 2, -1, -1):
+            if hist_entries[k].get("val") != current_val_str:
+                break
+            stuck_start_idx = k
+
+        stuck_start_ts = hist_entries[stuck_start_idx].get("recorded_at", 0)
+        latest_ts = hist_entries[-1].get("recorded_at", 0)
+        if latest_ts - stuck_start_ts < STUCK_MIN_DURATION_S:
+            cleared_stuck.add(sid)
+            continue
+
+        # Value frozen ≥1 hour — check spatial disagreement with neighbors
+        val_i = s["_pm25"]
+        lat_i, lon_i = s["_lat"], s["_lon"]
+
+        neighbor_vals: list[float] = []
+        r_km = 5.0
+        while True:
+            r_sq = r_km * r_km
+            neighbor_vals = []
+            for j, other in enumerate(valid_sensors):
+                if i == j or j in outlier_indices:
+                    continue
+                dlat = (other["_lat"] - lat_i) * _km_deg_lat
+                dlon = (other["_lon"] - lon_i) * _km_deg_lon
+                if dlat * dlat + dlon * dlon <= r_sq:
+                    neighbor_vals.append(other["_pm25"])
+            if len(neighbor_vals) >= 3 or r_km >= 40.0:
+                break
+            r_km = min(40.0, r_km * 2.0)
+
+        if len(neighbor_vals) < 3:
+            cleared_stuck.add(sid)
+            continue
+
+        neighbor_vals.sort()
+        median = neighbor_vals[len(neighbor_vals) // 2]
+        diff = val_i - median
+
+        # Sensor must be meaningfully above the neighborhood.
+        # Lenient thresholds because "frozen for 1+ hour" is strong evidence.
+        if diff < 10.0 or (median >= 1.0 and val_i < 2.0 * median):
+            cleared_stuck.add(sid)
+            continue
+
+        # Neighbor corroboration: if 2+ neighbors are also significantly
+        # elevated, the frozen reading may reflect a real prolonged event
+        # (e.g. wildfire smoke sitting in a valley).  Don't flag.
+        eff_floor = max(15.0, val_i / 5.0)
+        elevated = sum(1 for nv in neighbor_vals if nv >= eff_floor)
+        if elevated >= 2:
+            cleared_stuck.add(sid)
+            continue
+
+        outlier_indices.add(i)
+        app_state.stuck_pa_sensors[sid] = stuck_start_ts
+
+    # Clear stuck flags for sensors that are no longer stuck
+    for sid in cleared_stuck:
+        app_state.stuck_pa_sensors.pop(sid, None)
     # ─────────────────────────────────────────────────────────────────
 
     for i, s in enumerate(valid_sensors):

@@ -463,5 +463,199 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertEqual(r["history"], [5, 6, 7])
 
 
+    # ── stuck-elevated sensor detection ──────────────────────────────
+
+    def _make_stuck_history(self, sensor_id, value, num_entries=15, interval_s=300, start_ts=1000000):
+        """Build history entries all at the same value spanning num_entries * interval_s."""
+        entries = []
+        for k in range(num_entries):
+            ts = start_ts + k * interval_s
+            entries.append({
+                "val": str(value),
+                "ci": 1,
+                "time": "2026-03-01T18:00:00Z",
+                "recorded_at": ts,
+            })
+        return {sensor_id: {"PM25": entries}}
+
+    def test_stuck_elevated_sensor_flagged(self):
+        """A sensor frozen at 157 for >1 hour while neighbors read 5–10 → outlier."""
+        sensors = [
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=5.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=8.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=6.0),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=7.0),
+            self._make_sensor(sensor_index=99, lat=40.780, lon=-111.870, name="Northcliffe", pm25=157.0),
+        ]
+        app = self._make_app_state(sensors)
+        # 15 entries × 300s = 4500s > 3600s (1 hour)
+        app.fixed_history = self._make_stuck_history("PA_99", 157.0)
+        st = {"fixed": [], "mobile": []}
+        _merge_purpleair_into_fixed(st, app)
+
+        entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
+        self.assertTrue(entry.get("outlier"), "Sensor stuck at 157 for >1h should be outlier")
+        self.assertIsNone(entry["primary_value"])
+
+    def test_stuck_low_value_not_flagged(self):
+        """A sensor frozen at 0.2 for >1 hour should NOT be flagged (low value)."""
+        sensors = [
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=0.1),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=0.3),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=0.2),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=0.15),
+            self._make_sensor(sensor_index=99, lat=40.780, lon=-111.870, pm25=0.2),
+        ]
+        app = self._make_app_state(sensors)
+        app.fixed_history = self._make_stuck_history("PA_99", 0.2)
+        st = {"fixed": [], "mobile": []}
+        _merge_purpleair_into_fixed(st, app)
+
+        entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
+        self.assertFalse(entry.get("outlier"), "Low stuck value should NOT be flagged")
+        self.assertIsNotNone(entry["primary_value"])
+
+    def test_stuck_under_one_hour_not_flagged(self):
+        """A sensor frozen for <1 hour should NOT be flagged even if elevated.
+        Uses pm25=35 — below the spatial outlier threshold (diff<30) so only
+        the stuck check is relevant."""
+        sensors = [
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=5.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=6.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=7.0),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=5.0),
+            self._make_sensor(sensor_index=99, lat=40.780, lon=-111.870, pm25=35.0),
+        ]
+        app = self._make_app_state(sensors)
+        # 5 entries × 300s = 1500s < 3600s → under threshold
+        app.fixed_history = self._make_stuck_history("PA_99", 35.0, num_entries=5)
+        st = {"fixed": [], "mobile": []}
+        _merge_purpleair_into_fixed(st, app)
+
+        entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
+        self.assertFalse(entry.get("outlier"), "Stuck <1 hour should NOT be flagged")
+
+    def test_stuck_but_neighbors_agree_not_flagged(self):
+        """A sensor frozen at 50 when neighbors also read ~40–50 → NOT flagged."""
+        sensors = [
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=40.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=45.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=42.0),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=48.0),
+            self._make_sensor(sensor_index=99, lat=40.780, lon=-111.870, pm25=50.0),
+        ]
+        app = self._make_app_state(sensors)
+        app.fixed_history = self._make_stuck_history("PA_99", 50.0)
+        st = {"fixed": [], "mobile": []}
+        _merge_purpleair_into_fixed(st, app)
+
+        entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
+        self.assertFalse(entry.get("outlier"),
+                         "Stuck sensor agreeing with neighbors should NOT be flagged")
+
+    def test_stuck_elevated_history_retroactively_nulled(self):
+        """When a stuck-elevated sensor is detected, its history values in the
+        stuck window should be nulled for playback.  Uses pm25=35 so the
+        spatial outlier check doesn't catch it — only stuck detection does."""
+        sensors = [
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=5.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=6.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=7.0),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=5.0),
+            self._make_sensor(sensor_index=99, lat=40.780, lon=-111.870, name="Stuck", pm25=35.0),
+        ]
+        app = self._make_app_state(sensors)
+
+        # Build history: first 3 entries at real values, then 15 stuck entries
+        start_ts = 1000000
+        entries = [
+            {"val": "5.0", "ci": 1, "time": "2026-03-01T15:00:00Z", "recorded_at": start_ts},
+            {"val": "10.0", "ci": 1, "time": "2026-03-01T15:05:00Z", "recorded_at": start_ts + 300},
+            {"val": "8.0", "ci": 1, "time": "2026-03-01T15:10:00Z", "recorded_at": start_ts + 600},
+        ]
+        stuck_start = start_ts + 900
+        for k in range(15):
+            entries.append({
+                "val": "35.0", "ci": 1,
+                "time": "2026-03-01T16:00:00Z",
+                "recorded_at": stuck_start + k * 300,
+            })
+        app.fixed_history = {"PA_99": {"PM25": entries}}
+
+        # Run merge to detect stuck sensor
+        st = {"fixed": [], "mobile": []}
+        _merge_purpleair_into_fixed(st, app)
+
+        # Verify it was flagged by stuck detection
+        entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
+        self.assertTrue(entry.get("outlier"))
+        self.assertIn("PA_99", app.stuck_pa_sensors)
+
+        # Now inject history and check retroactive nulling
+        fake_now = datetime(2026, 3, 1, 21, 0, 0, tzinfo=timezone.utc)
+        with patch("dashboard_server.datetime") as mock_dt:
+            mock_dt.now = lambda tz=None: fake_now.astimezone(tz) if tz else fake_now
+            mock_dt.strptime = datetime.strptime
+            mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+            _inject_fixed_history(app, st)
+
+        hist = entry["readings"]["PM25"].get("history", [])
+        # The first 3 entries (real readings) should be preserved
+        self.assertEqual(hist[0], 5)
+        self.assertEqual(hist[1], 10)
+        self.assertEqual(hist[2], 8)
+        # The stuck entries should all be None
+        for val in hist[3:]:
+            self.assertIsNone(val, f"Stuck history value should be None, got {val}")
+
+    def test_stuck_elevated_with_corroborating_neighbors_not_flagged(self):
+        """A sensor frozen at 157 but with 2+ neighbors also elevated → NOT flagged.
+        This could be a real prolonged event like wildfire smoke."""
+        sensors = [
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=80.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=100.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=6.0),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=7.0),
+            self._make_sensor(sensor_index=99, lat=40.780, lon=-111.870, pm25=157.0),
+        ]
+        app = self._make_app_state(sensors)
+        app.fixed_history = self._make_stuck_history("PA_99", 157.0)
+        st = {"fixed": [], "mobile": []}
+        _merge_purpleair_into_fixed(st, app)
+
+        entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
+        self.assertFalse(entry.get("outlier"),
+                         "Stuck sensor with corroborating elevated neighbors should NOT be flagged")
+
+    def test_stuck_sensor_cleared_when_value_changes(self):
+        """If a previously stuck sensor starts reporting new values, it should
+        be cleared from stuck_pa_sensors."""
+        sensors = [
+            self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=5.0),
+            self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=6.0),
+            self._make_sensor(sensor_index=3, lat=40.770, lon=-111.880, pm25=7.0),
+            self._make_sensor(sensor_index=4, lat=40.775, lon=-111.875, pm25=5.0),
+            self._make_sensor(sensor_index=99, lat=40.780, lon=-111.870, pm25=8.0),
+        ]
+        app = self._make_app_state(sensors)
+        # Seed a previous stuck detection
+        app.stuck_pa_sensors["PA_99"] = 1000000.0
+
+        # History shows the value is now changing (not stuck anymore)
+        entries = [
+            {"val": "157.0", "ci": 1, "time": "2026-03-01T15:00:00Z", "recorded_at": 1000000},
+            {"val": "8.0", "ci": 1, "time": "2026-03-01T16:00:00Z", "recorded_at": 1003600},
+        ]
+        app.fixed_history = {"PA_99": {"PM25": entries}}
+
+        st = {"fixed": [], "mobile": []}
+        _merge_purpleair_into_fixed(st, app)
+
+        # Should be cleared
+        self.assertNotIn("PA_99", app.stuck_pa_sensors)
+        entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
+        self.assertFalse(entry.get("outlier"))
+
+
 if __name__ == "__main__":
     unittest.main()
