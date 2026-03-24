@@ -784,12 +784,12 @@ function main() {
     });
   }
 
-  // ── Camera history replay (visitors only, not owner) ───────────────────────
+  // ── Camera history replay (owner only) ──────────────────────────────────────
   // Fetches /api/view/clients, shows a picker of client IDs, and
   // replays the selected client's camera positions on the map.
   const camReplayBtn = document.getElementById("camReplayBtn");
   const camClientPicker = document.getElementById("camClientPicker");
-  if (camReplayBtn && !_ownerTok) {
+  if (camReplayBtn && _ownerTok) {
     camReplayBtn.classList.add("visible");
     let _camReplaying = false;
     let _camReplayStopped = false;
