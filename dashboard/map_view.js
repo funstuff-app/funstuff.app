@@ -6000,7 +6000,14 @@ class MapView {
   _sampleWindAtCenter(centerW, z, clat, clon, playbackTimeMs, _fd) {
     const windField = (this.playbackMode && playbackTimeMs != null && isFinite(playbackTimeMs))
       ? this._windFieldForTime(playbackTimeMs, true) : this._windField;
-    if (!windField || !Array.isArray(windField) || windField.length < 2) return null;
+    if (!windField) return null;
+
+    // Resolve data source: structured {u,v} + grid, or legacy [{lat,lon,u,v},...]
+    const _wGrid = this._windGrid;
+    const _isStruct = _wGrid && _wGrid.lats && windField.u && Array.isArray(windField.u);
+    const _isLeg = Array.isArray(windField) && windField.length > 0;
+    const _nPts = _isStruct ? _wGrid.lats.length : (_isLeg ? windField.length : 0);
+    if (_nPts < 2) return null;
 
     // Cache on wind field identity + zoom (not center — wind direction doesn't change on pan)
     if (this._windVecCache && this._windVecField === windField && this._windVecZoom === z)
@@ -6013,12 +6020,15 @@ class MapView {
 
     // IDW sample wind at map center from existing wind field points
     let uSum = 0, vSum = 0, wt = 0;
-    for (let i = 0; i < windField.length; i++) {
-      const wp = windField[i];
-      const dlat = clat - wp.lat, dlon = clon - wp.lon;
+    for (let i = 0; i < _nPts; i++) {
+      const ptLat = _isStruct ? _wGrid.lats[i] : windField[i].lat;
+      const ptLon = _isStruct ? _wGrid.lons[i] : windField[i].lon;
+      const ptU   = _isStruct ? (windField.u[i] || 0) : (windField[i].u || 0);
+      const ptV   = _isStruct ? (windField.v[i] || 0) : (windField[i].v || 0);
+      const dlat = clat - ptLat, dlon = clon - ptLon;
       const d2 = dlat * dlat + dlon * dlon + 1e-8;
       const w = 1 / d2;
-      uSum += w * wp.u; vSum += w * wp.v; wt += w;
+      uSum += w * ptU; vSum += w * ptV; wt += w;
     }
     if (wt < 1e-12) { this._windVecCache = null; this._windVecField = windField; this._windVecZoom = z; return null; }
 
@@ -8288,21 +8298,28 @@ class MapView {
     // ── Wind vector debug overlay ─────────────────────────────────────────
     if (this._windSnapshots && window._fieldDebug?.showWind) {
       const _playbackActive = this.playbackMode && _framePbTimeMs != null && isFinite(_framePbTimeMs);
-      const wfPts = this._windFieldForTime(_framePbTimeMs, _playbackActive);
-      if (wfPts && wfPts.length > 0) {
+      const wfData = this._windFieldForTime(_framePbTimeMs, _playbackActive);
+      // Resolve grid + uv: structured {u,v} uses this._windGrid, legacy is [{lat,lon,u,v},...]
+      const _wGrid = this._windGrid;
+      const _isStructured = wfData && _wGrid && _wGrid.lats && wfData.u;
+      const _isLegacy = wfData && Array.isArray(wfData) && wfData.length > 0;
+      const _nPts = _isStructured ? _wGrid.lats.length : (_isLegacy ? wfData.length : 0);
+      if (_nPts > 0) {
         const _wCenter = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
         ctx.save();
         ctx.strokeStyle = "rgba(80,180,255,0.6)";
         ctx.fillStyle = "rgba(80,180,255,0.6)";
         ctx.lineWidth = 1.2;
         const arrowScale = window._fieldDebug.windArrowScale || 6;
-        for (let i = 0; i < wfPts.length; i++) {
-          const wp = wfPts[i];
-          const wpt = latLonToWorld(wp.lat, wp.lon, this.zoom);
+        for (let i = 0; i < _nPts; i++) {
+          const ptLat = _isStructured ? _wGrid.lats[i] : wfData[i].lat;
+          const ptLon = _isStructured ? _wGrid.lons[i] : wfData[i].lon;
+          const u = _isStructured ? (wfData.u[i] || 0) : (wfData[i].u || 0);
+          const v = _isStructured ? (wfData.v[i] || 0) : (wfData[i].v || 0);
+          const wpt = latLonToWorld(ptLat, ptLon, this.zoom);
           const sx = wpt.x - _wCenter.x + w / 2;
           const sy = wpt.y - _wCenter.y + h / 2;
           if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
-          const u = wp.u || 0, v = wp.v || 0;
           const speed = Math.sqrt(u * u + v * v);
           if (speed < 0.3) continue;
           const len = Math.min(speed * arrowScale, 30);
