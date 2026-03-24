@@ -281,22 +281,47 @@
   // ── Wind field interpolation ──────────────────────────────────────────────
 
   /**
-   * Interpolate wind point data onto the geographic grid.
-   * Wind points: [{lat, lon, u, v}, ...] where u=eastward, v=northward (m/s).
-   * Returns u,v in cells/second (ready for semi-Lagrangian).
+   * IDW-interpolate wind data onto the advection simulation grid.
    *
-   * @param {Array} windPoints - [{lat, lon, u, v}, ...]
+   * Accepts either structured format (windGrid + windField) or legacy
+   * point-array format (windPoints).
+   *
+   * @param {Object|null} windGrid   - {lats, lons} arrays (structured format)
+   * @param {Object|null} windField  - {u, v} arrays (structured format)
    * @param {number} gw
    * @param {number} gh
    * @param {Object} bounds
    * @param {number} windScale - multiplier for visual exaggeration
+   * @param {Array|null} windPoints - [{lat,lon,u,v},...] (legacy format)
    * @returns {{uGrid: Float32Array, vGrid: Float32Array}}
    */
-  function interpolateWindField(windPoints, gw, gh, bounds, windScale) {
+  function interpolateWindField(windGrid, windField, gw, gh, bounds, windScale, windPoints) {
     const uGrid = new Float32Array(gw * gh);
     const vGrid = new Float32Array(gw * gh);
 
-    if (!windPoints || windPoints.length === 0) return { uGrid, vGrid };
+    // Determine source data: prefer structured, fall back to legacy
+    let srcLats, srcLons, srcU, srcV, nPts;
+    if (windGrid && windField && windGrid.lats && windField.u) {
+      srcLats = windGrid.lats;
+      srcLons = windGrid.lons;
+      srcU = windField.u;
+      srcV = windField.v;
+      nPts = srcLats.length;
+    } else if (windPoints && windPoints.length > 0) {
+      nPts = windPoints.length;
+      srcLats = new Array(nPts);
+      srcLons = new Array(nPts);
+      srcU = new Array(nPts);
+      srcV = new Array(nPts);
+      for (let i = 0; i < nPts; i++) {
+        srcLats[i] = windPoints[i].lat;
+        srcLons[i] = windPoints[i].lon;
+        srcU[i] = windPoints[i].u;
+        srcV[i] = windPoints[i].v;
+      }
+    } else {
+      return { uGrid, vGrid };
+    }
 
     const { dLon, dLat } = cellSizeDeg(bounds, gw, gh);
     // Convert m/s to cells/s
@@ -315,16 +340,15 @@
         const idx = iy * gw + ix;
 
         let wSum = 0, uSum = 0, vSum = 0;
-        for (let wi = 0; wi < windPoints.length; wi++) {
-          const wp = windPoints[wi];
-          const dlat = lat - wp.lat;
-          const dlon = lon - wp.lon;
+        for (let wi = 0; wi < nPts; wi++) {
+          const dlat = lat - srcLats[wi];
+          const dlon = lon - srcLons[wi];
           const d2 = dlat * dlat + dlon * dlon;
           if (d2 > cutoffSq) continue;
           const w = 1 / (d2 + 0.001);
           wSum += w;
-          uSum += w * wp.u;
-          vSum += w * wp.v;
+          uSum += w * srcU[wi];
+          vSum += w * srcV[wi];
         }
 
         if (wSum > 1e-12) {

@@ -313,8 +313,9 @@ class MapView {
     this._advectionInitialized = false;
     this._advectionLastTickMs = 0;  // performance.now() of last tick
     this._advectionSensorFP = "";   // fingerprint to detect sensor changes
-    this._windField = null;         // current [{lat,lon,u,v}, ...] for rendering
-    this._windSnapshots = null;      // {"HHMM": [{lat,lon,u,v},...], ...} all day's snapshots
+    this._windGrid = null;           // {ni, nj, lats, lons} — shared grid geometry
+    this._windField = null;          // current {u, v} arrays for rendering
+    this._windSnapshots = null;      // {"HHMM": {u,v}, ...} all day's snapshots
     this._windSnapshotKeys = [];     // sorted ["0000","0015",...]
     this._windFieldEtag = null;
     this._windFieldLastFetch = 0;   // performance.now() of last fetch
@@ -5536,18 +5537,28 @@ class MapView {
       .then(data => {
         if (!data || typeof data !== "object") return;
         const wasNull = !this._windSnapshots;
-        if (Array.isArray(data)) {
+        if (data.grid && data.snapshots) {
+          // Structured grid format: {grid: {ni,nj,lats,lons}, snapshots: {HHMM: {u,v}}}
+          this._windGrid = data.grid;
+          this._windSnapshots = data.snapshots;
+          this._windSnapshotKeys = Object.keys(data.snapshots).sort();
+          if (this._windSnapshotKeys.length > 0) {
+            const latest = this._windSnapshotKeys[this._windSnapshotKeys.length - 1];
+            this._windField = data.snapshots[latest];
+          }
+        } else if (Array.isArray(data)) {
           // Legacy flat array — treat as single "now" entry
           if (data.length > 0) {
+            this._windGrid = null;
             this._windSnapshots = { "0000": data };
             this._windSnapshotKeys = ["0000"];
             this._windField = data;
           }
         } else {
-          // Time-indexed: {"HHMM": [...], ...}
+          // Legacy time-indexed: {"HHMM": [{lat,lon,u,v},...], ...}
+          this._windGrid = null;
           this._windSnapshots = data;
           this._windSnapshotKeys = Object.keys(data).sort();
-          // Set current field to latest snapshot
           if (this._windSnapshotKeys.length > 0) {
             const latest = this._windSnapshotKeys[this._windSnapshotKeys.length - 1];
             this._windField = data[latest];
@@ -5565,24 +5576,34 @@ class MapView {
   }
 
   /** Interpolate u,v components between two wind field snapshots.
-   *  Returns [{lat, lon, u: u_interp, v: v_interp}, ...] */
+   *  Supports both structured {u,v} arrays and legacy [{lat,lon,u,v},...] format.
+   *  Returns same format as inputs. */
   _interpolateWindFields(fieldA, fieldB, alpha) {
-    if (!fieldA || !fieldB || !Array.isArray(fieldA) || !Array.isArray(fieldB)) return fieldA;
+    if (!fieldA || !fieldB) return fieldA;
+
+    // Structured format: {u: [...], v: [...]}
+    if (fieldA.u && fieldB.u && Array.isArray(fieldA.u) && Array.isArray(fieldB.u)) {
+      if (fieldA.u.length !== fieldB.u.length) return fieldA;
+      const u = new Array(fieldA.u.length);
+      const v = new Array(fieldA.v.length);
+      for (let i = 0; i < fieldA.u.length; i++) {
+        u[i] = (1 - alpha) * (fieldA.u[i] || 0) + alpha * (fieldB.u[i] || 0);
+        v[i] = (1 - alpha) * (fieldA.v[i] || 0) + alpha * (fieldB.v[i] || 0);
+      }
+      return { u, v };
+    }
+
+    // Legacy format: [{lat, lon, u, v}, ...]
+    if (!Array.isArray(fieldA) || !Array.isArray(fieldB)) return fieldA;
     if (fieldA.length !== fieldB.length) return fieldA;
-    
     const result = [];
     for (let i = 0; i < fieldA.length; i++) {
       const ptA = fieldA[i], ptB = fieldB[i];
       if (!ptA || !ptB) continue;
       const lat = Number(ptA.lat), lon = Number(ptA.lon);
       if (!isFinite(lat) || !isFinite(lon)) continue;
-      const uA = Number(ptA.u) || 0;
-      const vA = Number(ptA.v) || 0;
-      const uB = Number(ptB.u) || 0;
-      const vB = Number(ptB.v) || 0;
-      // Linear interpolation: (1-α)·u_A + α·u_B
-      const u = (1 - alpha) * uA + alpha * uB;
-      const v = (1 - alpha) * vA + alpha * vB;
+      const u = (1 - alpha) * (Number(ptA.u) || 0) + alpha * (Number(ptB.u) || 0);
+      const v = (1 - alpha) * (Number(ptA.v) || 0) + alpha * (Number(ptB.v) || 0);
       result.push({ lat, lon, u, v });
     }
     return result.length > 0 ? result : fieldA;
@@ -5680,7 +5701,9 @@ class MapView {
     this._advectionWorker.postMessage({
       type: "init",
       sensors,
-      windPoints: this._windField || [],
+      windGrid: this._windGrid || null,
+      windField: this._windField || null,
+      windPoints: (!this._windGrid && this._windField) ? this._windField : undefined,
       params,
       fieldAlpha: fieldAlpha || 46,
     });
@@ -5799,7 +5822,9 @@ class MapView {
       type: "tick",
       dt,
       sensors: sensorsChanged ? geoSensors : undefined,
-      windPoints: windField || [],
+      windGrid: this._windGrid || null,
+      windField: windField || null,
+      windPoints: (!this._windGrid && windField) ? windField : undefined,
       fieldAlpha: FIELD_ALPHA,
     });
   }

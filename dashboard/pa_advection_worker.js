@@ -5,10 +5,14 @@
  * and evolves it via semi-Lagrangian advection + explicit diffusion + sensor nudging.
  *
  * Messages IN:
- *   init:   { type:"init", sensors, windPoints, params, fieldAlpha }
- *   tick:   { type:"tick", dt, sensors?, windPoints?, params?, fieldAlpha? }
- *   wind:   { type:"wind", windPoints }
+ *   init:   { type:"init", sensors, windGrid?, windField?, windPoints?, params, fieldAlpha }
+ *   tick:   { type:"tick", dt, sensors?, windGrid?, windField?, windPoints?, params?, fieldAlpha? }
+ *   wind:   { type:"wind", windGrid?, windField?, windPoints? }
  *   reset:  { type:"reset" }
+ *
+ * windGrid = {ni, nj, lats, lons}  — grid geometry (structured format)
+ * windField = {u, v}               — per-point wind components (structured format)
+ * windPoints = [{lat,lon,u,v},...]  — legacy format (backward compat)
  *
  * Messages OUT:
  *   { px: Uint8ClampedArray, gw, gh, type:"frame" }
@@ -145,10 +149,45 @@ function nudge(c, cIdw, wSumGrid, lambdaBase, dt, gw, gh) {
   }
 }
 
-function interpolateWindField(windPoints, gw, gh, bounds, windScale) {
+/**
+ * IDW-interpolate wind data onto the advection simulation grid.
+ *
+ * Accepts either structured format (windGrid + windField) or legacy
+ * point-array format (windPoints).
+ *
+ * @param {Object|null} windGrid   - {lats, lons} arrays (structured format)
+ * @param {Object|null} windField  - {u, v} arrays (structured format)
+ * @param {Array|null}  windPoints - [{lat,lon,u,v},...] (legacy format)
+ */
+function interpolateWindField(windGrid, windField, gw, gh, bounds, windScale, windPoints) {
   const uGrid = new Float32Array(gw * gh);
   const vGrid = new Float32Array(gw * gh);
-  if (!windPoints || windPoints.length === 0) return { uGrid, vGrid };
+
+  // Determine source data: prefer structured, fall back to legacy
+  let srcLats, srcLons, srcU, srcV, nPts;
+  if (windGrid && windField && windGrid.lats && windField.u) {
+    srcLats = windGrid.lats;
+    srcLons = windGrid.lons;
+    srcU = windField.u;
+    srcV = windField.v;
+    nPts = srcLats.length;
+  } else if (windPoints && windPoints.length > 0) {
+    // Legacy format
+    nPts = windPoints.length;
+    srcLats = new Array(nPts);
+    srcLons = new Array(nPts);
+    srcU = new Array(nPts);
+    srcV = new Array(nPts);
+    for (let i = 0; i < nPts; i++) {
+      srcLats[i] = windPoints[i].lat;
+      srcLons[i] = windPoints[i].lon;
+      srcU[i] = windPoints[i].u;
+      srcV[i] = windPoints[i].v;
+    }
+  } else {
+    return { uGrid, vGrid };
+  }
+
   const { dLon, dLat } = cellSizeDeg(bounds, gw, gh);
   const dxM = dLon * M_PER_DEG_LON, dyM = dLat * M_PER_DEG_LAT;
   const scale = windScale || 1.0;
@@ -160,13 +199,12 @@ function interpolateWindField(windPoints, gw, gh, bounds, windScale) {
       const lon = bounds.lonMin + (ix + 0.5) * dLon;
       const idx = iy * gw + ix;
       let wSum = 0, uSum = 0, vSum = 0;
-      for (let wi = 0; wi < windPoints.length; wi++) {
-        const wp = windPoints[wi];
-        const dlat = lat - wp.lat, dlon = lon - wp.lon;
+      for (let wi = 0; wi < nPts; wi++) {
+        const dlat = lat - srcLats[wi], dlon = lon - srcLons[wi];
         const d2 = dlat * dlat + dlon * dlon;
         if (d2 > cutoffSq) continue;
         const w = 1 / (d2 + 0.001);
-        wSum += w; uSum += w * wp.u; vSum += w * wp.v;
+        wSum += w; uSum += w * srcU[wi]; vSum += w * srcV[wi];
       }
       if (wSum > 1e-12) {
         uGrid[idx] = scale * (uSum / wSum) / dxM;
@@ -195,7 +233,7 @@ function uniformWindField(speedMs, dirDeg, gw, gh, bounds, windScale) {
 
 let sim = null;  // { c, uGrid, vGrid, cIdw, wSumGrid, alphaGrid, gw, gh, bounds, initialized }
 
-function initSim(sensors, windPoints, params, fieldAlpha) {
+function initSim(sensors, windGrid, windField, windPoints, params, fieldAlpha) {
   const gw = DEFAULT_GW, gh = DEFAULT_GH, bounds = GEO_BOUNDS;
   const n = gw * gh;
 
@@ -209,11 +247,14 @@ function initSim(sensors, windPoints, params, fieldAlpha) {
     gw, gh, bounds,
     initialized: false,
     fieldAlpha: fieldAlpha || 46,
+    windGrid: windGrid || null,  // cache grid geometry for tick updates
   };
 
-  // Set up wind field
-  if (windPoints && windPoints.length > 0) {
-    const wf = interpolateWindField(windPoints, gw, gh, bounds, (params && params.windScale) || 1.0);
+  // Set up wind field (prefer structured, fallback to legacy)
+  const hasStructured = windGrid && windField && windGrid.lats && windField.u;
+  const hasLegacy = windPoints && windPoints.length > 0;
+  if (hasStructured || hasLegacy) {
+    const wf = interpolateWindField(windGrid, windField, gw, gh, bounds, (params && params.windScale) || 1.0, windPoints);
     sim.uGrid = wf.uGrid;
     sim.vGrid = wf.vGrid;
   } else if (params && params.windSpeed != null && params.windDir != null) {
@@ -246,10 +287,13 @@ function initSim(sensors, windPoints, params, fieldAlpha) {
   return renderFrame();
 }
 
-function tickSim(dt, sensors, windPoints, params, fieldAlpha) {
+function tickSim(dt, sensors, windGrid, windField, windPoints, params, fieldAlpha) {
   if (!sim || !sim.initialized) return null;
 
   if (fieldAlpha != null) sim.fieldAlpha = fieldAlpha;
+
+  // Update cached grid geometry if provided
+  if (windGrid && windGrid.lats) sim.windGrid = windGrid;
 
   // Update sensors if provided
   if (sensors && sensors.length > 0) {
@@ -260,9 +304,12 @@ function tickSim(dt, sensors, windPoints, params, fieldAlpha) {
     sim.alphaGrid = idw.alpha;
   }
 
-  // Update wind if provided
-  if (windPoints && windPoints.length > 0) {
-    const wf = interpolateWindField(windPoints, sim.gw, sim.gh, sim.bounds, (params && params.windScale) || 1.0);
+  // Update wind if provided (prefer structured, fallback to legacy)
+  const _wg = windGrid || sim.windGrid;
+  const hasStructured = _wg && windField && _wg.lats && windField.u;
+  const hasLegacy = windPoints && windPoints.length > 0;
+  if (hasStructured || hasLegacy) {
+    const wf = interpolateWindField(_wg, windField, sim.gw, sim.gh, sim.bounds, (params && params.windScale) || 1.0, windPoints);
     sim.uGrid = wf.uGrid;
     sim.vGrid = wf.vGrid;
   }
@@ -312,19 +359,24 @@ self.onmessage = function(e) {
 
   switch (msg.type) {
     case "init":
-      result = initSim(msg.sensors, msg.windPoints, msg.params, msg.fieldAlpha);
+      result = initSim(msg.sensors, msg.windGrid, msg.windField, msg.windPoints, msg.params, msg.fieldAlpha);
       break;
     case "tick":
-      result = tickSim(msg.dt, msg.sensors, msg.windPoints, msg.params, msg.fieldAlpha);
+      result = tickSim(msg.dt, msg.sensors, msg.windGrid, msg.windField, msg.windPoints, msg.params, msg.fieldAlpha);
       break;
-    case "wind":
-      if (sim && msg.windPoints) {
-        const wf = interpolateWindField(msg.windPoints, sim.gw, sim.gh, sim.bounds,
-          (msg.params && msg.params.windScale) || 1.0);
+    case "wind": {
+      const _wg = msg.windGrid || (sim && sim.windGrid);
+      const _hasStructured = _wg && msg.windField && _wg.lats && msg.windField.u;
+      const _hasLegacy = msg.windPoints && msg.windPoints.length > 0;
+      if (sim && (_hasStructured || _hasLegacy)) {
+        if (_wg && _wg.lats) sim.windGrid = _wg;
+        const wf = interpolateWindField(_wg, msg.windField, sim.gw, sim.gh, sim.bounds,
+          (msg.params && msg.params.windScale) || 1.0, msg.windPoints);
         sim.uGrid = wf.uGrid;
         sim.vGrid = wf.vGrid;
       }
       return; // no frame needed
+    }
     case "reset":
       sim = null;
       return;

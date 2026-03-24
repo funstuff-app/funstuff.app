@@ -498,10 +498,16 @@ class AppState:
     # Wind/weather data from AirNow
     wind_data: dict[str, Any] = field(default_factory=dict)
 
-    # RTMA-RU wind vector field (pre-serialized JSON bytes for fast serving)
+    # RTMA-RU wind vector field — structured grid format.
+    # wind_field_grid: pre-serialized JSON bytes for grid geometry
+    #   {"ni":N, "nj":M, "lats":[...], "lons":[...]}  — sent once per response.
+    # wind_field_json: pre-serialized JSON for the latest snapshot's u/v
+    #   {"u":[...], "v":[...]}
+    # wind_snapshots: per-HHMM pre-serialized JSON of {"u":[...], "v":[...]}
+    wind_field_grid: bytes = b""
     wind_field_json: bytes = b"[]"
     wind_field_seq: int = 0  # bumped on each successful wind field update
-    # Time-indexed wind snapshots: {"HHMM": pre-serialized JSON bytes}
+    # Time-indexed wind snapshots: {"HHMM": pre-serialized JSON bytes of {"u":[],"v":[]}}
     wind_snapshots: dict[str, bytes] = field(default_factory=dict)
     wind_snapshots_keys: list[str] = field(default_factory=list)  # sorted HHMM keys
     wind_snapshot_date: str = ""  # YYYYMMDD — cleared on day rollover
@@ -3800,11 +3806,20 @@ def wind_field_fetch_loop(
     poller.MAX_INTERVAL_S = 1500.0      # 25 min ceiling
     poller.predicted_interval = 900.0
 
+    def _grid_to_state(grid_dict):
+        """Extract grid geometry + u/v from structured wind grid dict.
+        Returns (grid_json_bytes, uv_json_bytes)."""
+        grid_meta = {"ni": grid_dict["ni"], "nj": grid_dict["nj"],
+                     "lats": grid_dict["lats"], "lons": grid_dict["lons"]}
+        uv = {"u": grid_dict["u"], "v": grid_dict["v"]}
+        return json.dumps(grid_meta).encode("utf-8"), json.dumps(uv).encode("utf-8")
+
     # Load cached latest + any existing snapshots from disk
     try:
         cached = load_wind_field(data_dir)
-        if cached and cached.get("points"):
-            json_bytes = json.dumps(cached["points"]).encode("utf-8")
+        if cached and cached.get("grid"):
+            grid_dict = cached["grid"]
+            grid_bytes, uv_bytes = _grid_to_state(grid_dict)
             # Extract HHMM key from analysis_time if available
             snap_key = None
             at_str = cached.get("analysis_time")
@@ -3815,11 +3830,12 @@ def wind_field_fetch_loop(
                 except Exception:
                     pass
             with app_state.lock:
-                app_state.wind_field_json = json_bytes
+                app_state.wind_field_grid = grid_bytes
+                app_state.wind_field_json = uv_bytes
                 app_state.wind_field_seq += 1
                 # Also seed the snapshots dict so the endpoint serves data
                 if snap_key:
-                    app_state.wind_snapshots[snap_key] = json_bytes
+                    app_state.wind_snapshots[snap_key] = uv_bytes
                     app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
                     app_state.wind_snapshot_date = _today_str()
             _log(f"[Wind] Loaded cached wind field ({cached['count']} points, key={snap_key})")
@@ -3830,8 +3846,12 @@ def wind_field_fetch_loop(
         snaps = load_wind_snapshots(data_dir)
         if snaps:
             with app_state.lock:
-                for k, pts in snaps.items():
-                    app_state.wind_snapshots[k] = json.dumps(pts).encode("utf-8")
+                for k, grid_dict in snaps.items():
+                    grid_bytes, uv_bytes = _grid_to_state(grid_dict)
+                    app_state.wind_snapshots[k] = uv_bytes
+                    # Use grid from any snapshot (all identical)
+                    if not app_state.wind_field_grid:
+                        app_state.wind_field_grid = grid_bytes
                 app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
                 app_state.wind_snapshot_date = _today_str()
             _log(f"[Wind] Loaded {len(snaps)} cached snapshots from disk")
@@ -3871,26 +3891,28 @@ def wind_field_fetch_loop(
                 if grib2 is None:
                     continue  # not published yet, try older slot
 
-                points = parse_grib2(grib2)
-                if not points:
+                grid_result = parse_grib2(grib2)
+                if not grid_result:
                     continue
 
                 # Notify poller so it learns the cadence
                 poller.check_for_change_raw(key)
                 last_key = key
 
-                json_bytes = json.dumps(points).encode("utf-8")
+                grid_bytes, uv_bytes = _grid_to_state(grid_result)
                 with app_state.lock:
-                    app_state.wind_field_json = json_bytes
+                    app_state.wind_field_grid = grid_bytes
+                    app_state.wind_field_json = uv_bytes
                     app_state.wind_field_seq += 1
-                    app_state.wind_snapshots[key] = json_bytes
+                    app_state.wind_snapshots[key] = uv_bytes
                     app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
                     app_state.wind_snapshot_date = today
                     snapshot_count = len(app_state.wind_snapshots_keys)
 
-                save_wind_field(points, data_dir, analysis_time=candidate)
-                save_wind_snapshot(points, data_dir, candidate)
-                _log(f"[Wind] Updated: {len(points)} pts, snapshot {key} ({snapshot_count} total)")
+                save_wind_field(grid_result, data_dir, analysis_time=candidate)
+                save_wind_snapshot(grid_result, data_dir, candidate)
+                n_pts = len(grid_result.get("lats", []))
+                _log(f"[Wind] Updated: {n_pts} pts, snapshot {key} ({snapshot_count} total)")
                 fetched = True
                 break  # got one, stop walking backwards
 
@@ -4293,16 +4315,24 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                     _wf_etag = f'"wf{app_state.wind_field_seq}"'
                     if self.headers.get("If-None-Match", "") == _wf_etag:
                         return self._send_304(_wf_etag, "public, max-age=60")
-                    # Serve all time-indexed snapshots so the client can scrub
-                    if app_state.wind_snapshots:
-                        # Build {HHMM: points_array, ...} envelope
-                        parts = []
+                    # Build structured envelope: {grid: {...}, snapshots: {HHMM: {u,v}, ...}}
+                    _grid_json = app_state.wind_field_grid
+                    if app_state.wind_snapshots and _grid_json:
+                        snap_parts = []
                         for k in app_state.wind_snapshots_keys:
-                            # Each value is already JSON-encoded bytes
-                            parts.append(f'"{k}":{app_state.wind_snapshots[k].decode("utf-8")}')
-                        body = ("{" + ",".join(parts) + "}").encode("utf-8")
+                            snap_parts.append(f'"{k}":{app_state.wind_snapshots[k].decode("utf-8")}')
+                        body = (
+                            '{"grid":' + _grid_json.decode("utf-8")
+                            + ',"snapshots":{' + ",".join(snap_parts) + '}}'
+                        ).encode("utf-8")
+                    elif _grid_json and app_state.wind_field_json:
+                        # Single snapshot fallback
+                        body = (
+                            '{"grid":' + _grid_json.decode("utf-8")
+                            + ',"snapshots":{"0000":' + app_state.wind_field_json.decode("utf-8") + '}}'
+                        ).encode("utf-8")
                     else:
-                        body = app_state.wind_field_json  # fallback: flat array (legacy)
+                        body = b'{"grid":null,"snapshots":{}}'
                     return self._send(200, body,
                                       "application/json",
                                       cache_control="public, max-age=60, s-maxage=900, stale-while-revalidate=120",

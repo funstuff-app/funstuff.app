@@ -287,9 +287,23 @@ describe("Wind field", () => {
   });
 
   it("interpolateWindField handles empty input", () => {
-    const { uGrid, vGrid } = AS.interpolateWindField([], 4, 4, AS.GEO_BOUNDS, 1.0);
+    const { uGrid, vGrid } = AS.interpolateWindField(null, null, 4, 4, AS.GEO_BOUNDS, 1.0, []);
     assert.equal(uGrid.length, 16);
     assert.equal(uGrid[0], 0);
+  });
+
+  it("interpolateWindField works with structured grid format", () => {
+    const windGrid = { lats: [40.5], lons: [-112.0] };
+    const windField = { u: [2.0], v: [0.0] };
+    const { uGrid } = AS.interpolateWindField(windGrid, windField, 4, 4, AS.GEO_BOUNDS, 1.0);
+    // Should have non-zero values near the wind point
+    assert.equal(uGrid.length, 16);
+  });
+
+  it("interpolateWindField works with legacy point format", () => {
+    const pts = [{ lat: 40.5, lon: -112.0, u: 2.0, v: 0.0 }];
+    const { uGrid } = AS.interpolateWindField(null, null, 4, 4, AS.GEO_BOUNDS, 1.0, pts);
+    assert.equal(uGrid.length, 16);
   });
 });
 

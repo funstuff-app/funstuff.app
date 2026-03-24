@@ -95,14 +95,25 @@ def fetch_grib2(analysis_time: datetime,
         return None
 
 
-def parse_grib2(grib2_bytes: bytes) -> list[dict[str, float]]:
-    """Parse GRIB2 bytes into a list of {lat, lon, u, v} dicts.
+def parse_grib2(grib2_bytes: bytes) -> dict[str, Any] | list:
+    """Parse GRIB2 bytes into a structured wind grid dict.
 
     Pure-Python implementation — no xarray, cfgrib, or eccodes needed.
     Supports Lambert Conformal (template 30) with simple packing (DRT 0),
     which is what NOMADS RTMA-RU returns for our SLC subregion.
 
-    Returns an empty list if parsing fails.
+    Returns a structured dict::
+
+        {"ni": int, "nj": int,
+         "lats": [float, ...], "lons": [float, ...],
+         "u": [float, ...], "v": [float, ...]}
+
+    Lat/lon rounded to 2 decimals (~1 km, sufficient for 2.5 km grid).
+    U/V rounded to 1 decimal (0.1 m/s, below physical noise floor).
+    NaN values are replaced with 0.0 to keep the grid rectangular.
+
+    Returns an empty list if parsing fails (backward compat with callers
+    that check ``if not result``).
     """
     try:
         messages = _parse_grib2_messages(grib2_bytes)
@@ -136,29 +147,30 @@ def parse_grib2(grib2_bytes: bytes) -> list[dict[str, float]]:
         return []
 
     # Compute lat/lon for each grid point using Lambert Conformal projection
-    lats, lons = _lambert_conformal_grid(grid)
+    raw_lats, raw_lons = _lambert_conformal_grid(grid)
 
-    points: list[dict[str, float]] = []
+    # Build flat arrays — NaN → 0.0 to keep grid rectangular
+    lats: list[float] = []
+    lons: list[float] = []
+    u_out: list[float] = []
+    v_out: list[float] = []
     for idx in range(ni * nj):
-        lat = lats[idx]
-        lon = lons[idx]
+        lat = raw_lats[idx]
+        lon = raw_lons[idx]
         u = u_vals[idx]
         v = v_vals[idx]
-        if not (lat == lat and lon == lon and u == u and v == v):
-            continue  # skip NaN
-        points.append({
-            "lat": round(lat, 4),
-            "lon": round(lon, 4),
-            "u": round(u, 2),
-            "v": round(v, 2),
-        })
+        # Replace NaN with 0.0 (NaN != NaN trick)
+        lats.append(round(lat, 2) if lat == lat else 0.0)
+        lons.append(round(lon, 2) if lon == lon else 0.0)
+        u_out.append(round(u, 1) if u == u else 0.0)
+        v_out.append(round(v, 1) if v == v else 0.0)
 
-    if not points:
+    if not lats:
         log.error("GRIB2 parsed but produced no valid wind points")
         return []
 
-    log.info("Parsed %d wind grid points (%dx%d)", len(points), ni, nj)
-    return points
+    log.info("Parsed %d wind grid points (%dx%d)", len(lats), ni, nj)
+    return {"ni": ni, "nj": nj, "lats": lats, "lons": lons, "u": u_out, "v": v_out}
 
 
 # ─── Pure-Python GRIB2 binary parser ────────────────────────────────────────
@@ -387,7 +399,7 @@ def _lambert_conformal_grid(grid: dict) -> tuple[list[float], list[float]]:
 
 
 def fetch_wind_field(analysis_time: datetime,
-                     timeout_s: int = 30) -> list[dict[str, float]]:
+                     timeout_s: int = 30) -> dict[str, Any] | list:
     """Fetch + parse in one call.  Returns [] on any failure."""
     grib = fetch_grib2(analysis_time=analysis_time, timeout_s=timeout_s)
     if grib is None:
@@ -405,14 +417,24 @@ def _wind_snapshots_dir(data_dir: Path) -> Path:
     return data_dir / "wind_snapshots"
 
 
-def save_wind_field(points: list[dict[str, float]], data_dir: Path,
+def _legacy_points_to_grid(points: list[dict[str, float]]) -> dict[str, Any]:
+    """Convert old-format [{lat,lon,u,v}, ...] to structured grid dict."""
+    lats = [p.get("lat", 0.0) for p in points]
+    lons = [p.get("lon", 0.0) for p in points]
+    u = [p.get("u", 0.0) for p in points]
+    v = [p.get("v", 0.0) for p in points]
+    # We don't know ni/nj from the legacy format; use len as ni, nj=1
+    return {"ni": len(points), "nj": 1, "lats": lats, "lons": lons, "u": u, "v": v}
+
+
+def save_wind_field(grid: dict[str, Any], data_dir: Path,
                     analysis_time: datetime | None = None) -> None:
-    """Write wind field JSON with metadata to data_dir/wind_field.json."""
+    """Write structured wind grid JSON with metadata to data_dir/wind_field.json."""
     payload = {
         "ts": time.time(),
         "analysis_time": analysis_time.isoformat() if analysis_time else None,
-        "count": len(points),
-        "points": points,
+        "count": len(grid.get("lats", [])),
+        "grid": grid,
     }
     path = _wind_cache_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -421,7 +443,7 @@ def save_wind_field(points: list[dict[str, float]], data_dir: Path,
     tmp.replace(path)
 
 
-def save_wind_snapshot(points: list[dict[str, float]], data_dir: Path,
+def save_wind_snapshot(grid: dict[str, Any], data_dir: Path,
                        analysis_time: datetime) -> str:
     """Save a wind snapshot keyed by HHMM.  Returns the HHMM key."""
     key = analysis_time.strftime("%H%M")
@@ -430,8 +452,8 @@ def save_wind_snapshot(points: list[dict[str, float]], data_dir: Path,
     payload = {
         "ts": time.time(),
         "analysis_time": analysis_time.isoformat(),
-        "count": len(points),
-        "points": points,
+        "count": len(grid.get("lats", [])),
+        "grid": grid,
     }
     path = snap_dir / f"{key}.json"
     tmp = path.with_suffix(".tmp")
@@ -440,21 +462,30 @@ def save_wind_snapshot(points: list[dict[str, float]], data_dir: Path,
     return key
 
 
-def load_wind_snapshots(data_dir: Path) -> dict[str, list[dict[str, float]]]:
-    """Load all wind snapshots from disk.  Returns {HHMM: points_list}."""
+def load_wind_snapshots(data_dir: Path) -> dict[str, dict[str, Any]]:
+    """Load all wind snapshots from disk.  Returns {HHMM: grid_dict}.
+
+    Handles both new structured format (``grid`` key) and legacy
+    point-list format (``points`` key) for backward compatibility.
+    """
     snap_dir = _wind_snapshots_dir(data_dir)
     if not snap_dir.is_dir():
         return {}
-    result: dict[str, list[dict[str, float]]] = {}
+    result: dict[str, dict[str, Any]] = {}
     for p in sorted(snap_dir.glob("*.json")):
         key = p.stem  # "0815" etc.
         if len(key) != 4 or not key.isdigit():
             continue
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-            pts = data.get("points", [])
-            if isinstance(pts, list) and pts:
-                result[key] = pts
+            grid = data.get("grid")
+            if isinstance(grid, dict) and grid.get("lats"):
+                result[key] = grid
+            else:
+                # Legacy format: convert on the fly
+                pts = data.get("points", [])
+                if isinstance(pts, list) and pts:
+                    result[key] = _legacy_points_to_grid(pts)
         except Exception:
             pass
     return result
@@ -473,14 +504,26 @@ def clear_wind_snapshots(data_dir: Path) -> None:
 
 
 def load_wind_field(data_dir: Path) -> dict[str, Any] | None:
-    """Load cached wind field JSON.  Returns None if not present or corrupt."""
+    """Load cached wind field JSON.  Returns None if not present or corrupt.
+
+    Handles both new structured format (``grid`` key) and legacy
+    point-list format (``points`` key) for backward compatibility.
+    """
     path = _wind_cache_path(data_dir)
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("points"), list):
-            return data
+        if isinstance(data, dict):
+            grid = data.get("grid")
+            if isinstance(grid, dict) and grid.get("lats"):
+                data["grid"] = grid
+                return data
+            # Legacy format: convert on the fly
+            pts = data.get("points")
+            if isinstance(pts, list) and pts:
+                data["grid"] = _legacy_points_to_grid(pts)
+                return data
     except Exception:
         pass
     return None
