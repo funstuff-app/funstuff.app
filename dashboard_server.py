@@ -2475,14 +2475,8 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
         # Strip branding from name
         name = re.sub(r'(?:\s*-\s*|\s+)power(?:ed)?\s+by\s+uto[pi]{2}a(?:\s+fiber)?', '', name, flags=re.IGNORECASE).strip()
 
-        if is_outlier:
-            # Outlier: show in sidebar/map but with null value and grey color.
-            # Does NOT contribute to the PA field interpolation.
-            display_val = None
-            color = "#cccccc"
-        else:
-            display_val = round(pm25_val, 1)
-            color = _get_aqi_color("PM25", pm25_val)
+        display_val = round(pm25_val, 1)
+        color = _get_aqi_color("PM25", pm25_val)
 
         readings = {
             "PM25": {

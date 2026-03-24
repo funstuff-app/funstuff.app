@@ -13,7 +13,7 @@ function generateItemHTML(item, type, order) {
   const isGhost = !!item.ghosted;
   const isParked = !!item.parked;
   const emoji = item.purpleair ? "🟣" : (item.emoji || (type === "mobile" ? "🚌" : "📍"));
-  const nameText = (item.name && String(item.name) !== String(item.id)) ? item.name : item.id;
+  const nameText = ((item.name && String(item.name) !== String(item.id)) ? item.name : item.id) + (item.outlier ? " (Outlier)" : "");
   
   let pinText = "";
   if (type === "mobile") {

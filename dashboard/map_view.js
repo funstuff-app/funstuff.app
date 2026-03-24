@@ -6519,7 +6519,7 @@ class MapView {
         const keyF = f._key;
         const isSel = (this.selectedId === keyF);
         const emoji = f.purpleair ? "" : (f.emoji || "📍");
-        const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id;
+        const label = ((f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id) + (f.outlier ? " (Outlier)" : "");
         const color = safeHex(f.ci);
         const pr = primaryReadingForFixedAtTime(f, this.getPlaybackTimeMs());
 
@@ -6602,8 +6602,11 @@ class MapView {
           const bh = (line2Key || line2Val) ? 30 : 18;
           const bx = sp.x - bw / 2;
           const by = sp.y + 18;
+          const _markerColor = safeHex((pr && pr.color) || color);
+          const markerColor = f.outlier ? outlierHex(_markerColor) : _markerColor;
+          if (f.outlier) ctx.globalAlpha = 0.5;
           ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
-          ctx.strokeStyle = safeHex((pr && pr.color) || color);
+          ctx.strokeStyle = markerColor;
           ctx.lineWidth = 1.8;
           roundRect(ctx, bx, by, bw, bh, 9);
           ctx.fill();
@@ -6620,7 +6623,7 @@ class MapView {
             const x0 = sp.x - (m2aw + m2bw) / 2;
             ctx.fillStyle = "rgba(232,238,247,0.70)";
             ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
-            ctx.fillStyle = pr.color || "#ffffff";
+            ctx.fillStyle = f.outlier ? markerColor : (pr.color || "#ffffff");
             ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
           }
         }
@@ -7913,7 +7916,7 @@ class MapView {
         const key = f._key;
         const isSel = (this.selectedId === key);
         const emoji = f.purpleair ? "" : (f.emoji || "📍");
-        const label = (f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id;
+        const label = ((f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id) + (f.outlier ? " (Outlier)" : "");
         const color = safeHex(f.ci);
         let pr;
         const interpCacheKey = (fixedPbTimeMs != null && isFinite(fixedPbTimeMs))
@@ -8011,8 +8014,11 @@ class MapView {
           const bh = (line2Key || line2Val) ? 30 : 18;
           const bx = sp.x - bw/2;
           const by = sp.y + 18;
+          const _markerColor = safeHex((pr && pr.color) || color);
+          const markerColor = f.outlier ? outlierHex(_markerColor) : _markerColor;
+          if (f.outlier) ctx.globalAlpha = 0.5;
           ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
-          ctx.strokeStyle = safeHex((pr && pr.color) || color);
+          ctx.strokeStyle = markerColor;
           ctx.lineWidth = 1.8;
           roundRect(ctx, bx, by, bw, bh, 9);
           ctx.fill();
@@ -8030,7 +8036,7 @@ class MapView {
             const x0 = sp.x - (m2aw + m2bw) / 2;
             ctx.fillStyle = "rgba(232,238,247,0.70)";
             ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
-            ctx.fillStyle = pr.color || "#ffffff";
+            ctx.fillStyle = f.outlier ? markerColor : (pr.color || "#ffffff");
             ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
           }
         }

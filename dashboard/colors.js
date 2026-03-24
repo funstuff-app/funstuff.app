@@ -77,6 +77,11 @@ function desatHex(hex, amt = 0.25) {
   return `#${((1 << 24) + (rr << 16) + (gg2 << 8) + bb).toString(16).slice(1)}`;
 }
 
+function outlierHex(hex) {
+  // Slightly desaturate (~30%) for outlier markers.
+  return desatHex(hex, 0.30);
+}
+
 function darkenHex(hex, factor = 0.75) {
   // Darken a hex color by multiplying RGB by factor (0 = black, 1 = original).
   const h = safeHex(hex);

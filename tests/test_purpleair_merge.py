@@ -246,7 +246,9 @@ class TestPurpleAirMerge(unittest.TestCase):
         self.assertIn("PA_99", ids)
         outlier_entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
         self.assertTrue(outlier_entry.get("outlier"))
-        self.assertIsNone(outlier_entry["primary_value"])
+        # Outliers keep their real value (for display) — the outlier flag
+        # controls field exclusion, not value visibility.
+        self.assertAlmostEqual(outlier_entry["primary_value"], 3331.0, places=0)
 
     def test_negative_pm25_filtered(self):
         """Negative PM2.5 values should be filtered."""
@@ -500,7 +502,7 @@ class TestPurpleAirMerge(unittest.TestCase):
 
         entry = next(f for f in st["fixed"] if f["id"] == "PA_99")
         self.assertTrue(entry.get("outlier"), "Sensor stuck at 157 for >1h should be outlier")
-        self.assertIsNone(entry["primary_value"])
+        self.assertAlmostEqual(entry["primary_value"], 157.0, places=0)
 
     def test_stuck_low_value_not_flagged(self):
         """A sensor frozen at 0.2 for >1 hour should NOT be flagged (low value)."""
