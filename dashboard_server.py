@@ -2234,6 +2234,7 @@ def detect_pa_outliers(
     abs_diff_threshold: float = 30.0,
     agreement_count: int = 2,
     agreement_floor: float = 15.0,
+    min_value: float = 500.0,
 ) -> set[int]:
     """Detect spatial outliers in a list of (lat, lon, pm25) tuples.
 
@@ -2254,6 +2255,11 @@ def detect_pa_outliers(
     n = len(sensor_values)
     outliers: set[int] = set()
     for i, (lat_i, lon_i, val_i) in enumerate(sensor_values):
+        # Skip moderate values — real local events (construction, idling
+        # trucks) can legitimately spike a single sensor far above neighbors.
+        # Temporal checks (stuck-elevated, hardware overflow) handle those.
+        if val_i < min_value:
+            continue
         # Collect all neighbors with distances
         all_neighbors: list[tuple[float, float]] = []  # (dist_km², value)
         for j, (lat_j, lon_j, val_j) in enumerate(sensor_values):

@@ -35,10 +35,23 @@ def test_broken_sensor_flagged():
     assert 0 in outliers, f"Expected sensor 0 to be outlier, got {outliers}"
 
 
-def test_moderate_spike_flagged():
-    """One sensor at 200 among clean air (2 µg/m³) → outlier."""
+def test_moderate_spike_not_flagged():
+    """One sensor at 200 among clean air (2 µg/m³) → NOT outlier.
+
+    Moderate values are physically plausible for real local events
+    (construction, idling trucks).  Spatial detection is reserved for
+    implausibly high readings (>= 500); temporal checks handle the rest.
+    """
     sensors = _cluster_at(40.76, -111.89, 8, value=2.0)
     sensors[0] = (40.76, -111.89, 200.0)
+    outliers = detect_pa_outliers(sensors)
+    assert 0 not in outliers
+
+
+def test_extreme_spike_flagged():
+    """One sensor at 600 among clean air (2 µg/m³) → outlier."""
+    sensors = _cluster_at(40.76, -111.89, 8, value=2.0)
+    sensors[0] = (40.76, -111.89, 600.0)
     outliers = detect_pa_outliers(sensors)
     assert 0 in outliers
 

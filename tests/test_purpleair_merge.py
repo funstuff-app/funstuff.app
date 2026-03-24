@@ -275,8 +275,13 @@ class TestPurpleAirMerge(unittest.TestCase):
         _merge_purpleair_into_fixed(st, app)
         self.assertEqual(len(st["fixed"]), 4)
 
-    def test_hotspot_lone_sensor_flagged_as_outlier(self):
-        """A single sensor at 201 when all neighbors are 1-3 IS an outlier."""
+    def test_hotspot_lone_sensor_not_flagged_as_outlier(self):
+        """A single sensor at 201 when all neighbors are 1-3 is NOT an outlier.
+
+        Moderate values are physically plausible for real local events
+        (construction, idling trucks).  Spatial detection is reserved for
+        implausibly high readings (>= 500); temporal checks handle the rest.
+        """
         sensors = [
             self._make_sensor(sensor_index=1, lat=40.760, lon=-111.890, pm25=1.0),
             self._make_sensor(sensor_index=2, lat=40.765, lon=-111.885, pm25=2.0),
@@ -288,8 +293,8 @@ class TestPurpleAirMerge(unittest.TestCase):
         st = {"fixed": [], "mobile": []}
         _merge_purpleair_into_fixed(st, app)
         outlier_entry = next(f for f in st["fixed"] if f["id"] == "PA_5")
-        self.assertTrue(outlier_entry.get("outlier"),
-                        "201 µg/m³ lone sensor among clean air should be outlier")
+        self.assertFalse(outlier_entry.get("outlier"),
+                         "201 µg/m³ lone sensor should NOT be spatial outlier — could be real local event")
 
     def test_dust_storm_readings_not_filtered(self):
         """During dust storms, readings of 400+ are real and should be kept."""
