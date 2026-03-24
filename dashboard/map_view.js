@@ -306,13 +306,7 @@ class MapView {
     this._preWarmScanValidUntilMs = null;
     this._preWarmScanFixed = null;
 
-    // ── Advection-diffusion wind field state ──────────────────────────────
-    this._advectionWorker = null;
-    this._advectionFrame = null;    // latest { px, gw, gh } from worker
-    this._advectionCanvas = null;   // offscreen canvas for upscaling
-    this._advectionInitialized = false;
-    this._advectionLastTickMs = 0;  // performance.now() of last tick
-    this._advectionSensorFP = "";   // fingerprint to detect sensor changes
+    // ── Wind field state ────────────────────────────────────────────────
     this._windGrid = null;           // {ni, nj, lats, lons} — shared grid geometry
     this._windField = null;          // current {u, v} arrays for rendering
     this._windSnapshots = null;      // {"HHMM": {u,v}, ...} all day's snapshots
@@ -5474,49 +5468,7 @@ class MapView {
     }
   }
 
-  // ─── Advection-diffusion wind field integration ─────────────────────────
-
-  /**
-   * Collect sensor data in geographic coordinates for the advection worker.
-   * Returns [{lat, lon, value}, ...] — all fixed+PA sensors with valid PM2.5.
-   */
-  _collectGeoSensors(state, playbackTimeMs) {
-    const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
-    const paLatLons = [];
-    for (const f of fixed) {
-      if (!f || !f.purpleair) continue;
-      const lat = Number(f.lat), lon = Number(f.lon);
-      if (isFinite(lat) && isFinite(lon)) paLatLons.push(lat, lon);
-    }
-    const sensors = [];
-    for (const f of fixed) {
-      if (!f) continue;
-      if (f.outlier) continue;
-      const lat = Number(f.lat), lon = Number(f.lon);
-      if (!isFinite(lat) || !isFinite(lon)) continue;
-      if (!f.purpleair) {
-        let nearPA = false;
-        for (let pi = 0; pi < paLatLons.length; pi += 2) {
-          const dlat = lat - paLatLons[pi], dlon = lon - paLatLons[pi + 1];
-          if (dlat * dlat + dlon * dlon < _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG * _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG) { nearPA = true; break; }
-        }
-        if (!nearPA) continue;
-      }
-      const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
-      const pm = interp && (interp["PM25"] || interp["PM2.5"] || interp["pm25"] || interp["pm2.5"]);
-      const value = pm && pm.value != null ? Number(pm.value) : NaN;
-      if (!isFinite(value) || value < 0) continue;
-      sensors.push({ lat, lon, value });
-    }
-    return sensors;
-  }
-
-  /** Build a color-category fingerprint for geo sensors. */
-  _geoSensorFingerprint(sensors) {
-    let fp = "";
-    for (const s of sensors) fp += _pm25ColorCat(s.value);
-    return fp;
-  }
+  // ─── Wind field integration ─────────────────────────
 
   /** Fetch all wind snapshots from /api/wind-field (returns {HHMM: points[]}). */
   _fetchWindField() {
@@ -5671,163 +5623,6 @@ class MapView {
     return this._windSnapshots[keyFloor];
   }
 
-  /** Initialize or re-initialize the advection worker with current sensors + wind. */
-  _initAdvectionWorker(sensors, fieldAlpha) {
-    if (!this._advectionWorker) {
-      try {
-        this._advectionWorker = new Worker("pa_advection_worker.js?v=20260320a");
-        this._advectionWorker.onmessage = (e) => this._onAdvectionFrame(e.data);
-      } catch (_) {
-        this._advectionWorker = false;
-        return;
-      }
-    }
-    if (!this._advectionWorker) return;
-
-    const params = {
-      cutoffDeg: 0.5,
-      D: 500,
-      lambda: 0.2,
-      windScale: 1.0,
-      settlingTicks: 20,
-    };
-    // Apply field debug overrides
-    const _fd = window._fieldDebug;
-    if (_fd.cutoffDeg != null) params.cutoffDeg = _fd.cutoffDeg;
-    if (_fd.diffusion != null) params.D = _fd.diffusion;
-    if (_fd.lambda != null) params.lambda = _fd.lambda;
-    if (_fd.windScale != null) params.windScale = _fd.windScale;
-
-    this._advectionWorker.postMessage({
-      type: "init",
-      sensors,
-      windGrid: this._windGrid || null,
-      windField: this._windField || null,
-      windPoints: (!this._windGrid && this._windField) ? this._windField : undefined,
-      params,
-      fieldAlpha: fieldAlpha || 46,
-    });
-
-    this._advectionInitialized = true;
-    this._advectionLastTickMs = performance.now();
-  }
-
-  /** Handle a rendered frame from the advection worker. */
-  _onAdvectionFrame(data) {
-    if (data.type !== "frame") return;
-    const { px, gw, gh } = data;
-    this._advectionFrame = { px: new Uint8ClampedArray(px), gw, gh };
-    // Upscale to screen and store as offscreen canvas for compositing
-    this._projectAdvectionToScreen();
-    // Schedule a re-composite so the frame actually appears on screen
-    if (!this._advectionRAF) {
-      this._advectionRAF = requestAnimationFrame(() => {
-        this._advectionRAF = null;
-        if (this.lastState) {
-          this._compositePaFieldOnTiles(this.lastState);
-          this.drawOverlay(this.lastState, { cacheUnderlay: true });
-        }
-      });
-    }
-  }
-
-  /**
-   * Project the geographic-grid advection frame onto screen coordinates.
-   * Uses the current view (center, zoom) to map each geo-cell onto the canvas.
-   */
-  _projectAdvectionToScreen() {
-    const frame = this._advectionFrame;
-    if (!frame) return;
-    const { px, gw, gh } = frame;
-    const cssW = this._cssW || 1;
-    const cssH = this._cssH || 1;
-    const dpr = this._dpr || (window.devicePixelRatio || 1);
-
-    // Create a tiny canvas at geo-grid resolution
-    if (!this._advGeoCanvas) {
-      this._advGeoCanvas = document.createElement("canvas");
-    }
-    const gc = this._advGeoCanvas;
-    if (gc.width !== gw || gc.height !== gh) {
-      gc.width = gw; gc.height = gh;
-    }
-    const gctx = gc.getContext("2d");
-    const imgData = gctx.createImageData(gw, gh);
-    imgData.data.set(px);
-    gctx.putImageData(imgData, 0, 0);
-
-    // Now project geo grid onto screen: find the screen rect for the geo bounds
-    const AS = typeof AdvectionSolver !== "undefined" ? AdvectionSolver : null;
-    if (!AS) return;
-    const bounds = AS.GEO_BOUNDS;
-    const z = Number(this.zoom);
-    const clat = Number(this.center?.lat);
-    const clon = Number(this.center?.lon);
-    const centerW = latLonToWorld(clat, clon, z);
-
-    // Geo bounds corners → screen
-    const topLeft = latLonToWorld(bounds.latMax, bounds.lonMin, z);
-    const botRight = latLonToWorld(bounds.latMin, bounds.lonMax, z);
-    const sx = topLeft.x - centerW.x + cssW / 2;
-    const sy = topLeft.y - centerW.y + cssH / 2;
-    const sw = botRight.x - topLeft.x;
-    const sh = botRight.y - topLeft.y;
-
-    // Upscale to full viewport canvas
-    if (!this._advectionCanvas) this._advectionCanvas = document.createElement("canvas");
-    const pw = Math.floor(cssW * dpr), ph = Math.floor(cssH * dpr);
-    if (this._advectionCanvas.width !== pw || this._advectionCanvas.height !== ph) {
-      this._advectionCanvas.width = pw;
-      this._advectionCanvas.height = ph;
-    }
-    const ctx = this._advectionCanvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, cssW, cssH);
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    // Draw the geo-grid canvas stretched to the screen projection rect
-    ctx.drawImage(gc, sx, sy, sw, sh);
-  }
-
-  /**
-   * Tick the advection simulation and re-render.
-   * Called from _compositePaFieldOnTiles when advection mode is active.
-   * During playback, uses interpolated wind field; otherwise discrete snapshot.
-   */
-  _tickAdvection(state, playbackTimeMs) {
-    if (!this._advectionWorker || !this._advectionInitialized) return;
-
-    const nowPerf = performance.now();
-    // Real-time dt (capped to 2s by worker)
-    let dt = (nowPerf - this._advectionLastTickMs) / 1000;
-    this._advectionLastTickMs = nowPerf;
-    if (dt <= 0 || dt > 5) dt = 0.016; // default ~60fps
-
-    // Check if sensors changed → update IDW nudging target
-    const geoSensors = this._collectGeoSensors(state, playbackTimeMs);
-    const fp = this._geoSensorFingerprint(geoSensors);
-    const sensorsChanged = fp !== this._advectionSensorFP;
-    this._advectionSensorFP = fp;
-
-    const _fd = window._fieldDebug;
-    const FIELD_ALPHA = _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
-    
-    // During playback, interpolate between wind snapshots; otherwise use discrete snapshot
-    const isPlaybackTick = this.playbackMode && playbackTimeMs != null && isFinite(playbackTimeMs);
-    const windField = isPlaybackTick 
-      ? this._windFieldForTime(playbackTimeMs, true) 
-      : this._windField;
-
-    this._advectionWorker.postMessage({
-      type: "tick",
-      dt,
-      sensors: sensorsChanged ? geoSensors : undefined,
-      windGrid: this._windGrid || null,
-      windField: windField || null,
-      windPoints: (!this._windGrid && windField) ? windField : undefined,
-      fieldAlpha: FIELD_ALPHA,
-    });
-  }
 
   /**
    * Composite the PA scalar field onto the tiles canvas (above tiles, below overlay).
