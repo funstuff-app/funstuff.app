@@ -79,6 +79,88 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
   return { sensors, fingerprint };
 }
 
+/**
+ * Collect virtual PA sensors from mobile trail GPS points.
+ * Each trail point with a PM2.5 reading becomes a transient sensor
+ * that decays over the same time window as the trail fade.
+ */
+function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs) {
+  // Map keyed by quantized lat/lon — at most 1 virtual sensor per spatial slot.
+  // Iterating newest-first means the freshest reading at each location wins.
+  const sensorMap = new Map();
+
+  // Match trail fade timing exactly
+  const FADE_TIME_MS = isPlayback ? 45 * 60 * 1000 : 20 * 60 * 1000;
+  const FADE_TAIL_FRAC = 0.20;
+  const fadeStartAgeMs = FADE_TIME_MS * (1.0 - FADE_TAIL_FRAC);
+
+  if (!refNowMs || !isFinite(refNowMs)) return { sensors: [], fingerprint: "" };
+
+  const ws = worldSizeForZoom(zoom);
+
+  for (const m of mobiles) {
+    if (!m) continue;
+    const trail = Array.isArray(m.trail) ? m.trail : [];
+    if (trail.length < 1) continue;
+
+    // Iterate from newest (end) backward; break once past fade window
+    for (let i = trail.length - 1; i >= 0; i--) {
+      const p = trail[i];
+      if (!p) continue;
+
+      // Parse timestamp (use cached _tMs when available)
+      let tMs = p._tMs;
+      if (tMs === undefined) {
+        tMs = (typeof p.t === "string") ? parseUtcMs(p.t) : null;
+        try { p._tMs = tMs; } catch {}
+      }
+      if (tMs == null || !isFinite(tMs)) continue;
+
+      const ageMs = refNowMs - tMs;
+      if (ageMs < 0) continue;           // future point in playback
+      if (ageMs >= FADE_TIME_MS) break;   // past fade window (older points only get older)
+
+      // Extract PM2.5 — skip if absent
+      const pm25raw = p.readings?.PM25?.value ?? p.readings?.["PM2.5"]?.value ?? p.readings?.pm25?.value;
+      if (pm25raw == null) continue;
+      const pm25 = Number(pm25raw);
+      if (!isFinite(pm25) || pm25 < 0) continue;
+
+      // Decay weight: full for fresh, quadratic falloff in tail
+      let decayWeight = 1.0;
+      if (ageMs > fadeStartAgeMs) {
+        const u = (ageMs - fadeStartAgeMs) / (FADE_TIME_MS - fadeStartAgeMs);
+        decayWeight = (1 - u) * (1 - u);
+        if (decayWeight <= 0.01) continue;
+      }
+
+      // Spatial dedup: 1 sensor per ~220m cell. Newest-first → skip if slot taken.
+      const lat = Number(p.lat), lon = Number(p.lon);
+      if (!isFinite(lat) || !isFinite(lon)) continue;
+      const slotKey = `${(lat * 500) | 0},${(lon * 500) | 0}`;
+      if (sensorMap.has(slotKey)) continue;
+
+      // Project GPS to screen coords (use cached norm when available)
+      let u = p._u, v = p._v;
+      if (u === undefined) {
+        const norm = latLonToNorm(lat, lon);
+        u = norm.u; v = norm.v;
+        try { p._u = u; p._v = v; } catch {}
+      }
+      const wx = u * ws, wy = v * ws;
+      const sx = wx - centerW.x + cssW / 2;
+      const sy = wy - centerW.y + cssH / 2;
+
+      sensorMap.set(slotKey, { sx, sy, value: pm25, weightMultiplier: decayWeight });
+    }
+  }
+
+  const sensors = Array.from(sensorMap.values());
+  let fingerprint = "";
+  for (const s of sensors) fingerprint += _pm25ColorCat(s.value);
+  return { sensors, fingerprint };
+}
+
 /** Compute the playback time range over which the PA field fingerprint is unchanged.
  *  Scans each sensor's PM2.5 timeline to find the nearest past and future points
  *  where _pm25ColorCat would change. Returns { fromMs, toMs }. */
@@ -5892,9 +5974,25 @@ class MapView {
     const centerW = latLonToWorld(clat, clon, z);
     const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH);
     const paSensors = paField.sensors;
-    const fingerprint = paField.fingerprint;
-    const nSensors = paSensors.length;
+
+    // ── Inject virtual sensors from mobile trail GPS points ──
+    const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
+    const _pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    const _pbBounds = this.playbackMode ? this.getPlaybackBounds() : null;
+    const _boundsMaxMs = (_pbBounds?.maxMs != null && isFinite(_pbBounds.maxMs)) ? _pbBounds.maxMs : null;
+    const virtualRefNowMs = (_pbTimeMs != null && isFinite(_pbTimeMs)) ? Number(_pbTimeMs) : (_boundsMaxMs ?? this._dataNowMs());
+    const virtualField = _collectVirtualMobileSensors(
+      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs
+    );
+    this._virtualMobileSensors = virtualField.sensors;
+
+    const allSensors = paSensors.concat(virtualField.sensors);
+    const fingerprint = paField.fingerprint + (virtualField.fingerprint ? "|v:" + virtualField.fingerprint : "");
+    const nSensors = allSensors.length;
     if (nSensors === 0) { this._paFieldCanvas = null; return; }
+
+    // Disable validity-range fast-skip when virtual sensors are present (they age continuously)
+    if (virtualField.sensors.length > 0) this._paFieldValidRange = null;
 
     // ── Cache key: view geometry + color fingerprint ──
     const key = `pa:${viewKey}|f:${fingerprint}`;
@@ -5946,7 +6044,7 @@ class MapView {
     // so a local spike stays visible instead of being diluted by neighbors.
     const s5 = new Float64Array(nSensors * 5);
     for (let i = 0; i < nSensors; i++) {
-      const sensor = paSensors[i];
+      const sensor = allSensors[i];
       const si5 = i * 5;
       s5[si5] = sensor.sx;
       s5[si5 + 1] = sensor.sy;
@@ -8316,6 +8414,24 @@ class MapView {
         const top = mobiles.find(mm => (mm && mm.id != null && String(mm.id) === String(topMobileId))) || null;
         if (top) drawMobileMarker(top);
       }
+    }
+
+    // Debug: render virtual mobile sensors as ghost dots
+    if (window._fieldDebug?.showVirtual && this._virtualMobileSensors?.length > 0) {
+      ctx.save();
+      for (const vs of this._virtualMobileSensors) {
+        const rgb = _pm25ToRgb(vs.value);
+        const tint = 0.35;
+        const cr = Math.round(128 * (1 - tint) + rgb[0] * tint);
+        const cg = Math.round(128 * (1 - tint) + rgb[1] * tint);
+        const cb = Math.round(128 * (1 - tint) + rgb[2] * tint);
+        ctx.globalAlpha = 0.5 * (vs.weightMultiplier || 0.01);
+        ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
+        ctx.beginPath();
+        ctx.arc(vs.sx, vs.sy, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
     }
   }
 }
