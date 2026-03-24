@@ -309,12 +309,13 @@
     </div>
     <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
       <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowWind" type="checkbox" style="margin:0;"> wind vectors</label>
+      <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowVirtual" type="checkbox" style="margin:0;"> ghost sensors</label>
     </div>
   </div>
   <script>
   (function(){
     var ids=['fdSigma','fdCutoff','fdBlur'];
-    var _fdState={sigmaDivisor:8,cutoffDeg:0.14,blur:2,showWind:false};
+    var _fdState={sigmaDivisor:8,cutoffDeg:0.14,blur:2,showWind:false,showVirtual:false};
     window._fieldDebug=_fdState;
     function _fdEnable() {
       document.getElementById('fieldDebugPanel').classList.remove('fdHidden');
@@ -333,6 +334,10 @@
     if(new URLSearchParams(location.search).get('fieldDebug')==='1') _fdEnable();
     document.getElementById('fdShowWind').addEventListener('change',function(){
       _fdState.showWind=this.checked;
+      if(window.__map){window.__map._paFieldKey=null;window.__map._paFieldValidRange=null;window.__map._redrawViewOnly();}
+    });
+    document.getElementById('fdShowVirtual').addEventListener('change',function(){
+      _fdState.showVirtual=this.checked;
       if(window.__map){window.__map._paFieldKey=null;window.__map._paFieldValidRange=null;window.__map._redrawViewOnly();}
     });
 
