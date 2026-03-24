@@ -172,11 +172,13 @@ function _mergeStateDelta(acc, delta) {
       accById.set(id, dm);
       continue;
     }
-    // Append new trail points.
+    // Append new trail points, capping to prevent unbounded growth.
     const newPts = Array.isArray(dm.trail) ? dm.trail : [];
     if (newPts.length > 0) {
       const oldTrail = Array.isArray(existing.trail) ? existing.trail : [];
-      existing.trail = oldTrail.concat(newPts);
+      const merged = oldTrail.concat(newPts);
+      const cap = (typeof MAX_TRAIL_LEN === "number" && MAX_TRAIL_LEN > 0) ? MAX_TRAIL_LEN : 3000;
+      existing.trail = merged.length > cap ? merged.slice(merged.length - cap) : merged;
     }
     // Update non-trail fields (readings, ghosted, color, etc.)
     for (const k of Object.keys(dm)) {
@@ -3124,9 +3126,8 @@ function main() {
     if (dateStr === "live") {
       window._historicalState = null;
       map._historicalMode = false;
-      // Clear persisted trails so old data doesn't linger
-      map._persistedTrailById = new Map();
-      // Reset playback state so stale historical data doesn't render
+      // Clear all per-vehicle caches from historical viewing
+      map.clearVehicleCaches();
       map._playbackPtsById = new Map();
       map._playbackPtsKey = null;
       map._playbackNowMs = null;
@@ -3198,7 +3199,16 @@ function main() {
         }
       }
       
-      // Reset ALL playback state for fresh historical data
+      // Release accumulated live-polling state — not needed during history
+      // and can be very large (unbounded trail concatenation).
+      _accumulatedState = null;
+      _newestTrailMs = null;
+      _stateEtag = null;
+
+      // Reset ALL playback state and per-vehicle caches for fresh historical data.
+      // Without this, smooth-path, physics, and trace caches from prior snapshots
+      // accumulate and progressively slow the render loop.
+      map.clearVehicleCaches();
       map._historicalMode = true;
       map._playbackPtsById = new Map();
       map._playbackPtsKey = null;

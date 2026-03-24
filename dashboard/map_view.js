@@ -2538,6 +2538,36 @@ class MapView {
     this.drawOverlay(state, { cacheUnderlay: true });
   }
 
+  /** Clear all per-vehicle caches. Called when switching snapshots to prevent
+   *  stale data from prior loads accumulating in memory. */
+  clearVehicleCaches() {
+    this._tracePtsById = new Map();
+    this._tracePtsKey = "";
+    this._traceLastSideById = new Map();
+    this._traceActiveRouteById = new Map();
+    this._tracePendingRouteById = new Map();
+    this._traceCycleStartMsById = new Map();
+    this._traceInitialRunDoneById = new Map();
+    this._traceAngleById = new Map();
+    this._traceAngleLastMsById = new Map();
+    this._traceSelectionWarpById = new Map();
+    this._physicsStateById = new Map();
+    this._roadMatchedRangesById = new Map();
+    this._roadMatchPending = new Set();
+    this._vehicleActualPathById = new Map();
+    this._smoothPathCache = new Map();
+    this._pathDistCache = new Map();
+    this._vehiclePhysicsCache = new Map();
+    this._vehiclePathById = new Map();
+    this._curveLookaheadCache = new Map();
+    this._screenHeadingCache = new Map();
+    this._vehicleRevealDist = new Map();
+    this._scrubCooldownById = new Map();
+    this._trailCacheCanvas = null;
+    this._trailCacheViewKey = "";
+    this._trailCacheTimeMs = null;
+  }
+
   _prunePerMobileCachesForState(state) {
     // If a mobile disappears from the server payload, drop all cached state for it.
     // This prevents stale routes/pins/trails from being reused if it later returns.
