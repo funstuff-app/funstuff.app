@@ -100,10 +100,6 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
 
   for (const m of mobiles) {
     if (!m) continue;
-    // Temporary: skip TRX02 (parked, would overwhelm field with stacked points)
-    const mid = m.id != null ? String(m.id) : "";
-    if (mid === "TRX02") continue;
-
     const trail = Array.isArray(m.trail) ? m.trail : [];
     if (trail.length < 1) continue;
 
