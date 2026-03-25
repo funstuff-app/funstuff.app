@@ -1072,6 +1072,7 @@ def _scrub_broken_mobile_sensors(
     # 2. Per-pollutant: compute median and identify which sensors are flagged
     flagged_polls: dict[str, set[str]] = {k: set() for k in _POLLUTANTS}
     flagged_details: dict[str, list[str]] = {}
+    flagged_ratios: dict[str, dict[str, float]] = {}  # sid → {pollutant → ratio}
     for pk, entries in per_poll.items():
         if len(entries) < (min_peers + 1):
             continue
@@ -1082,6 +1083,7 @@ def _scrub_broken_mobile_sensors(
         for sid, fv in entries:
             if med > 0 and fv > med * ratio_thresh and fv >= floor:
                 flagged_polls[pk].add(sid)
+                flagged_ratios.setdefault(sid, {})[pk] = fv / med
                 flagged_details.setdefault(sid, []).append(
                     f"{pk}: {fv:.1f} vs median {med:.1f}"
                 )
@@ -1091,6 +1093,7 @@ def _scrub_broken_mobile_sensors(
                 # for OZNE) is a generous ceiling; no need to multiply by
                 # ratio_thresh which made the threshold unreachably high.
                 flagged_polls[pk].add(sid)
+                flagged_ratios.setdefault(sid, {})[pk] = float("inf")
                 flagged_details.setdefault(sid, []).append(
                     f"{pk}: {fv:.1f} vs median {med:.1f}"
                 )
@@ -1100,6 +1103,22 @@ def _scrub_broken_mobile_sensors(
     #    is broken regardless of what PM is doing.  If only PM is elevated
     #    and OZNE is normal, that's a real local source (train, dust, etc.).
     broken = flagged_polls.get("OZNE", set()).copy()
+
+    # Also flag sensors where any particle pollutant is *extremely* elevated
+    # vs peers (≥40x median), but only if it is the ONLY sensor flagged for
+    # that pollutant.  Multiple flagged sensors suggest a real regional event
+    # (dust storm, wildfire, freight train), not isolated hardware failure.
+    _EXTREME_PARTICLE_RATIO = 40.0
+    for sid, ratios in flagged_ratios.items():
+        if sid in broken:
+            continue
+        for pk in _PARTICLE_KEYS:
+            if pk in ratios and ratios[pk] >= _EXTREME_PARTICLE_RATIO:
+                # Only flag if this is the sole flagged sensor for this pollutant
+                peers_flagged = flagged_polls.get(pk, set()) - {sid}
+                if not peers_flagged:
+                    broken.add(sid)
+                break
 
     # 4. Remove broken sensors from the list entirely
     if broken:

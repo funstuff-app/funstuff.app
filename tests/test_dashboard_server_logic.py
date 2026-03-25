@@ -373,6 +373,21 @@ class TestScrubBrokenMobileSensors(unittest.TestCase):
         self.assertNotIn("BUS07", remaining_ids)
         self.assertEqual(remaining_ids, {"TRX01", "BUS12", "BUS11", "TRX02"})
 
+    def test_extreme_pm10_only_single_sensor_removed(self):
+        """A lone sensor with PM10 ≥40x median (OZNE normal) is broken hardware."""
+        mobiles = [
+            self._make_sensor("TRX01", pm25=1.1, pm10=10.1, ozne=18.9),
+            self._make_sensor("TRX03", pm25=1.1, pm10=5.3, ozne=22.1),
+            self._make_sensor("BUS08", pm25=0.9, pm10=8.3, ozne=25.0),
+            self._make_sensor("BUS11", pm25=1.0, pm10=9.2, ozne=20.0),
+            # TRX02: PM10=406 vs median ~8, ratio ~50x. Single outlier.
+            self._make_sensor("TRX02", pm25=13.9, pm10=405.8, ozne=0.5),
+        ]
+        broken = _scrub_broken_mobile_sensors(mobiles)
+        self.assertIn("TRX02", broken)
+        remaining_ids = {m["id"] for m in mobiles}
+        self.assertNotIn("TRX02", remaining_ids)
+
 
 class TestGpsSpikeRemoval(unittest.TestCase):
     def setUp(self):
