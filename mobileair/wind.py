@@ -484,3 +484,17 @@ def load_wind_field(data_dir: Path) -> dict[str, Any] | None:
     except Exception:
         pass
     return None
+
+
+# ── DB-backed wind snapshot functions ─────────────────────────────────────────
+
+
+def save_wind_snapshot_db(db_worker: Any, key: str, date: str,
+                          points: list[dict[str, float]]) -> None:
+    """Persist a wind snapshot to SQLite via the DbWorker queue."""
+    db_worker.enqueue_wind_snapshot(key, date, points)
+
+
+def load_wind_snapshots_db(db_worker: Any, date: str) -> dict[str, list[dict[str, float]]]:
+    """Load all wind snapshots for a date from SQLite."""
+    return db_worker.get_wind_snapshots(date)

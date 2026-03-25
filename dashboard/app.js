@@ -3184,8 +3184,9 @@ function main() {
         throw new Error("Invalid data structure in snapshot");
       }
       
+      _mapImmobileToParked(loadedState);
       window._historicalState = loadedState;
-      
+
       // Cache raw GPS coordinates only if debug mode is enabled
       // (Deep copying all trails is expensive and only needed for debug visualization)
       if (map._pbDebugPath) {
@@ -3452,8 +3453,9 @@ function main() {
         throw new Error("Invalid data structure in snapshot");
       }
       
+      _mapImmobileToParked(loadedState);
       window._historicalState = loadedState;
-      
+
       // Load wind snapshots from the historical snapshot if present
       if (loadedState.wind_snapshots && typeof loadedState.wind_snapshots === "object") {
         map._windSnapshots = loadedState.wind_snapshots;
@@ -4421,10 +4423,132 @@ function main() {
   let _tickLastForceRefreshSeq = null;
   let _tickConsecutiveFailures = 0; // for exponential backoff on errors
 
+  /**
+   * Map backend "immobile" field → frontend "parked" field on all mobile sensors.
+   * The backend sends `immobile: bool` but the UI reads `parked`.
+   */
+  function _mapImmobileToParked(st) {
+    if (!st || !Array.isArray(st.mobile)) return;
+    for (var i = 0; i < st.mobile.length; i++) {
+      var m = st.mobile[i];
+      if (m && m.immobile != null) m.parked = !!m.immobile;
+    }
+  }
+
   // ── SSE (Server-Sent Events) — push-based state change notifications ──
   let _sseConnected = false;
   let _sseLastSeq = null;
   let _sseSource = null;
+
+  // ── Client ID (persistent across sessions) ──
+  var _clientId = localStorage.getItem("dusty_client_id");
+  if (!_clientId) {
+    _clientId = (typeof crypto !== "undefined" && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : "c_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    localStorage.setItem("dusty_client_id", _clientId);
+  }
+
+  // ── Analytics batching ──
+  var _analyticsQueue = [];
+  var _analyticsLastFlush = 0;
+  var _ANALYTICS_FLUSH_MS = 300000; // 5 min
+
+  function _flushAnalytics() {
+    if (!_analyticsQueue.length) return;
+    var events = _analyticsQueue.splice(0, 50);
+    var body = JSON.stringify({ client_id: _clientId, events: events });
+    try {
+      fetch((appConfig.apiBaseUrl || "/api") + "/analytics", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: body
+      }).catch(function() {});
+    } catch (e) {}
+    _analyticsLastFlush = Date.now();
+  }
+
+  function pushAnalyticsEvent(type, payload) {
+    _analyticsQueue.push({ type: type, payload: payload });
+    if (Date.now() - _analyticsLastFlush > _ANALYTICS_FLUSH_MS) {
+      _flushAnalytics();
+    }
+  }
+
+  /**
+   * Merge an SSE delta into the current live state.
+   * delta.trail_new: { sensorId: [points...], ... }
+   * delta.mobile: [ { id, lat, lon, idle, readings }, ... ]
+   */
+  function _mergeDelta(delta) {
+    var st = window.__lastState;
+    if (!st || !st.mobile) return false;
+
+    var changed = false;
+
+    // Merge new trail points
+    var trailNew = delta.trail_new;
+    if (trailNew && typeof trailNew === "object") {
+      var mobileById = {};
+      for (var i = 0; i < st.mobile.length; i++) {
+        var m = st.mobile[i];
+        if (m && m.id) mobileById[m.id] = m;
+      }
+      for (var sid in trailNew) {
+        var sensor = mobileById[sid] || mobileById["mobile:" + sid];
+        if (!sensor) continue;
+        var existing = sensor.trail || [];
+        var incoming = trailNew[sid];
+        if (!Array.isArray(incoming) || !incoming.length) continue;
+        // Find the latest timestamp in existing trail to avoid duplicates
+        var maxExistingT = 0;
+        for (var j = existing.length - 1; j >= 0 && j >= existing.length - 5; j--) {
+          var pt = existing[j];
+          if (pt && typeof pt.t === "number" && pt.t > maxExistingT) maxExistingT = pt.t;
+        }
+        var appended = 0;
+        for (var k = 0; k < incoming.length; k++) {
+          var np = incoming[k];
+          if (np && typeof np.t === "number" && np.t > maxExistingT) {
+            existing.push(np);
+            appended++;
+          }
+        }
+        if (appended > 0) {
+          sensor.trail = existing;
+          changed = true;
+        }
+      }
+    }
+
+    // Merge mobile sensor summaries (readings, position)
+    var mobileSummaries = delta.mobile;
+    if (Array.isArray(mobileSummaries)) {
+      var byId = {};
+      for (var mi = 0; mi < st.mobile.length; mi++) {
+        if (st.mobile[mi] && st.mobile[mi].id) byId[st.mobile[mi].id] = st.mobile[mi];
+      }
+      for (var si = 0; si < mobileSummaries.length; si++) {
+        var summ = mobileSummaries[si];
+        if (!summ || !summ.id) continue;
+        var target = byId[summ.id];
+        if (!target) continue;
+        if (summ.lat != null) target.lat = summ.lat;
+        if (summ.lon != null) target.lon = summ.lon;
+        if (summ.immobile != null) { target.immobile = summ.immobile; target.parked = !!summ.immobile; }
+        if (summ.readings) target.readings = summ.readings;
+        changed = true;
+      }
+    }
+
+    // Update meta timestamps
+    if (delta.ts) {
+      st.ts = delta.ts;
+      if (st.meta) st.meta.ts = delta.ts;
+    }
+
+    return changed;
+  }
 
   function connectSSE() {
     if (_sseSource) { try { _sseSource.close(); } catch {} }
@@ -4440,6 +4564,38 @@ function main() {
       }
     };
 
+    // Named event: "delta" — incremental state update pushed by server
+    _sseSource.addEventListener("delta", function (ev) {
+      try {
+        var delta = JSON.parse(ev.data);
+        var seq = delta.seq;
+        if (seq != null && seq !== _sseLastSeq) {
+          _sseLastSeq = seq;
+          // Skip delta merge if viewing historical data
+          if (window._historicalState || _isLoadingData) return;
+          if (_mergeDelta(delta) && map) {
+            map.draw(window.__lastState);
+            try { renderLists(window.__lastState, selectedId); } catch (e) {}
+            try { renderDetails(window.__lastState, selectedId); } catch (e) {}
+          }
+          // Reschedule safety-net poll
+          if (_tickTimeout) clearTimeout(_tickTimeout);
+          _tickTimeout = setTimeout(tick, POLL_MS_SSE);
+        }
+      } catch (e) { try { console.warn("[SSE delta]", e); } catch {} }
+    });
+
+    // Named event: "wind" — new wind snapshot pushed by server
+    _sseSource.addEventListener("wind", function (ev) {
+      try {
+        var snap = JSON.parse(ev.data);
+        if (snap.key && snap.points && map) {
+          map.mergeWindSnapshot(snap.key, snap.points);
+        }
+      } catch (e) { try { console.warn("[SSE wind]", e); } catch {} }
+    });
+
+    // Default "message" event — backward-compatible notification
     _sseSource.onmessage = function (ev) {
       try {
         var msg = JSON.parse(ev.data);
@@ -4515,6 +4671,9 @@ function main() {
     try {
     // Ensure st.fixed is always an array (Home sensor now provided by backend)
     if (!Array.isArray(st.fixed)) st.fixed = [];
+
+    // Map backend "immobile" → frontend "parked" for all mobile sensors
+    _mapImmobileToParked(st);
 
     window.__lastState = st;
     _pbLastServerResponseMs = Date.now();

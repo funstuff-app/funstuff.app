@@ -45,6 +45,7 @@ def _get_bundle_dir() -> Path:
     return Path(__file__).resolve().parent
 
 # Import from the mobileair package
+from mobileair.db import DbWorker, migrate_from_json
 from mobileair import (
     parse_utc_timestamp,
     fetch_json_with_cache,
@@ -565,6 +566,9 @@ class AppState:
     # notification dict into every queue when state_seq bumps.
     sse_clients: list[queue.Queue] = field(default_factory=list)
 
+    # SQLite background writer (set during startup, None until then)
+    db_worker: DbWorker | None = None
+
     def __post_init__(self) -> None:
         try:
             self.cached_json_bytes = json.dumps(self.state).encode("utf-8")
@@ -646,7 +650,48 @@ def _sse_broadcast(app_state: AppState) -> None:
     (already held by the caller).  Dead queues are pruned lazily.
     """
     seq = app_state.state_seq
-    msg = {"seq": seq, "ts": time.time()}
+    msg = {"type": "notify", "seq": seq, "ts": time.time()}
+    dead: list[queue.Queue] = []
+    for q in app_state.sse_clients:
+        try:
+            q.put_nowait(msg)
+        except queue.Full:
+            dead.append(q)
+    for q in dead:
+        try:
+            app_state.sse_clients.remove(q)
+        except ValueError:
+            pass
+
+
+def _sse_broadcast_delta(app_state: AppState, delta_payload: dict[str, Any]) -> None:
+    """Push a typed 'delta' event with actual state data to all SSE subscribers.
+
+    Must be called under app_state.lock (already held by the caller).
+    The delta_payload carries new trail points, updated readings, etc.
+    """
+    seq = app_state.state_seq
+    msg = {"type": "delta", "seq": seq, "ts": time.time(), "data": delta_payload}
+    dead: list[queue.Queue] = []
+    for q in app_state.sse_clients:
+        try:
+            q.put_nowait(msg)
+        except queue.Full:
+            dead.append(q)
+    for q in dead:
+        try:
+            app_state.sse_clients.remove(q)
+        except ValueError:
+            pass
+
+
+def _sse_broadcast_wind(app_state: AppState, key: str, points_json: bytes) -> None:
+    """Push a typed 'wind' event with a new wind snapshot to all SSE subscribers.
+
+    Must be called under app_state.lock (already held by the caller).
+    """
+    seq = app_state.state_seq
+    msg = {"type": "wind", "seq": seq, "key": key, "points_json": points_json}
     dead: list[queue.Queue] = []
     for q in app_state.sse_clients:
         try:
@@ -1012,6 +1057,15 @@ def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
 
         result = save_snapshot(data_dir, today_str, state)
         _log(f"[Snapshot] Saved today's state: {result.get('filename')} ({result.get('size_bytes')} bytes)")
+
+        # Also persist to DB
+        if app_state.db_worker is not None:
+            try:
+                app_state.db_worker.save_daily_snapshot(today_str, state)
+                _log(f"[Snapshot] Also saved to DB for {today_str}")
+            except Exception as db_e:
+                _log(f"[Snapshot] DB save failed: {db_e}")
+
         return True
 
     except Exception as e:
@@ -2043,7 +2097,158 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
         app_state.state = st
         app_state.state_seq += 1
         app_state.cached_json_bytes = json.dumps(st).encode("utf-8")
-        _sse_broadcast(app_state)
+
+        # ── Build SSE delta payload from new data ──
+        # Collect new trail points and current mobile sensor summaries for
+        # clients that are already connected via SSE.
+        delta_payload: dict[str, Any] = {}
+        try:
+            start_ms = meta.get("trail_update_start_ms")
+            end_ms = meta.get("trail_update_end_ms")
+            if start_ms is not None and end_ms is not None:
+                new_trails: dict[str, list] = {}
+                for m in st.get("mobile", []):
+                    sid = m.get("id")
+                    trail = m.get("trail", [])
+                    if not sid or not trail:
+                        continue
+                    new_pts = [p for p in trail
+                               if isinstance(p, dict) and isinstance(p.get("t"), (int, float))
+                               and p["t"] >= start_ms]
+                    if new_pts:
+                        new_trails[sid] = new_pts
+                if new_trails:
+                    delta_payload["trail_new"] = new_trails
+
+            # Include concise mobile sensor summaries (latest reading, position, status)
+            mobile_summaries = []
+            for m in st.get("mobile", []):
+                summary = {
+                    "id": m.get("id"),
+                    "lat": m.get("lat"),
+                    "lon": m.get("lon"),
+                    "immobile": m.get("immobile") or m.get("_idle"),
+                }
+                readings = m.get("readings")
+                if isinstance(readings, dict):
+                    summary["readings"] = readings
+                mobile_summaries.append(summary)
+            if mobile_summaries:
+                delta_payload["mobile"] = mobile_summaries
+        except Exception:
+            pass
+
+        if delta_payload:
+            _sse_broadcast_delta(app_state, delta_payload)
+        else:
+            _sse_broadcast(app_state)
+
+        # ── Enqueue DB writes (non-blocking) ──
+        db = app_state.db_worker
+        if db is not None:
+            try:
+                _enqueue_state_to_db(db, st, now)
+            except Exception:
+                pass
+
+
+def _enqueue_state_to_db(db: DbWorker, st: dict[str, Any], now: float) -> None:
+    """Extract readings and trail points from state and enqueue to DbWorker.
+
+    Called under app_state.lock — must be fast (no I/O, just queue puts).
+    """
+    # Mobile sensor readings + trail points
+    trail_batch: list[tuple[str, float, float, float, float | None, str | None, int]] = []
+    for m in st.get("mobile", []):
+        sid = m.get("id")
+        if not sid:
+            continue
+        sensor_id = f"mobile:{sid}"
+        readings = m.get("readings", {})
+        if isinstance(readings, dict):
+            for pollutant, rdg in readings.items():
+                if not isinstance(rdg, dict):
+                    continue
+                val = rdg.get("value")
+                try:
+                    val = float(val) if val is not None else None
+                except (TypeError, ValueError):
+                    val = None
+                db.enqueue_reading(
+                    sensor_id=sensor_id,
+                    source="mobile",
+                    ts=now,
+                    lat=m.get("lat"),
+                    lon=m.get("lon"),
+                    pollutant=pollutant,
+                    value=val,
+                    aqi=rdg.get("aqi"),
+                    color=rdg.get("color"),
+                )
+        # Trail points
+        trail = m.get("trail", [])
+        if isinstance(trail, list):
+            for p in trail:
+                if not isinstance(p, dict):
+                    continue
+                t = p.get("t")
+                lat = p.get("lat")
+                lon = p.get("lon")
+                if t is None or lat is None or lon is None:
+                    continue
+                try:
+                    trail_batch.append((
+                        sensor_id,
+                        float(t) / 1000.0,  # trail timestamps are in ms
+                        float(lat),
+                        float(lon),
+                        float(p["v"]) if p.get("v") is not None else None,
+                        p.get("c"),
+                        1 if p.get("rm") else 0,
+                    ))
+                except (TypeError, ValueError):
+                    pass
+
+    if trail_batch:
+        db.enqueue_trail_points(trail_batch)
+
+    # Fixed sensor readings
+    for f in st.get("fixed", []):
+        sid = f.get("id")
+        if not sid:
+            continue
+        is_pa = f.get("purpleair")
+        is_airnow = f.get("airnow")
+        if is_pa:
+            source = "purpleair"
+            sensor_id = f"pa:{sid}"
+        elif is_airnow:
+            source = "airnow"
+            sensor_id = f"airnow:{sid}"
+        else:
+            source = "fixed"
+            sensor_id = f"fixed:{sid}"
+        readings = f.get("readings", {})
+        if isinstance(readings, dict):
+            for pollutant, rdg in readings.items():
+                if not isinstance(rdg, dict):
+                    continue
+                val = rdg.get("value")
+                try:
+                    val = float(val) if val is not None else None
+                except (TypeError, ValueError):
+                    val = None
+                db.enqueue_reading(
+                    sensor_id=sensor_id,
+                    source=source,
+                    ts=now,
+                    lat=f.get("lat"),
+                    lon=f.get("lon"),
+                    pollutant=pollutant,
+                    value=val,
+                    aqi=rdg.get("aqi"),
+                    color=rdg.get("color"),
+                )
 
 
 def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
@@ -3906,9 +4111,14 @@ def wind_field_fetch_loop(
                     app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
                     app_state.wind_snapshot_date = today
                     snapshot_count = len(app_state.wind_snapshots_keys)
+                    # Broadcast wind snapshot to SSE clients
+                    _sse_broadcast_wind(app_state, key, json_bytes)
 
                 save_wind_field(points, data_dir, analysis_time=candidate)
                 save_wind_snapshot(points, data_dir, candidate)
+                # Also persist to DB
+                if app_state.db_worker is not None:
+                    app_state.db_worker.enqueue_wind_snapshot(key, today, points)
                 _log(f"[Wind] Updated: {len(points)} pts, snapshot {key} ({snapshot_count} total)")
                 fetched = True
                 break  # got one, stop walking backwards
@@ -4204,7 +4414,25 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         try:
                             msg = q.get(timeout=25)
                             seq = msg.get("seq", 0)
-                            self.wfile.write(f"id: {seq}\ndata: {json.dumps(msg)}\n\n".encode())
+                            event_type = msg.get("type", "notify")
+                            if event_type == "delta":
+                                # Named SSE event with delta payload
+                                payload = {"seq": seq, "ts": msg.get("ts")}
+                                payload.update(msg.get("data", {}))
+                                self.wfile.write(f"event: delta\nid: {seq}\ndata: {json.dumps(payload)}\n\n".encode())
+                            elif event_type == "wind":
+                                # Named SSE event with wind snapshot
+                                wind_key = msg.get("key", "")
+                                points_json = msg.get("points_json", b"[]")
+                                if isinstance(points_json, bytes):
+                                    points_str = points_json.decode("utf-8")
+                                else:
+                                    points_str = str(points_json)
+                                payload_str = f'{{"key":"{wind_key}","points":{points_str}}}'
+                                self.wfile.write(f"event: wind\nid: {seq}\ndata: {payload_str}\n\n".encode())
+                            else:
+                                # Default notification (backward compatible)
+                                self.wfile.write(f"id: {seq}\ndata: {json.dumps(msg)}\n\n".encode())
                             self.wfile.flush()
                         except queue.Empty:
                             # Keepalive comment to prevent proxy/browser timeout
@@ -4349,6 +4577,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._handle_view_sync()
             if self.path.startswith("/api/snapshot/save"):
                 return self._handle_save_snapshot()
+            if self.path.startswith("/api/analytics"):
+                return self._handle_analytics()
             return self._send(404, b"not found", "text/plain")
 
         def do_DELETE(self):
@@ -4415,6 +4645,30 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                             pass
             body = json.dumps(entries).encode("utf-8")
             return self._send(200, body, "application/json")
+
+        def _handle_analytics(self):
+            """Accept analytics contributions from clients.
+
+            Body: {"client_id": "abc123", "events": [{"type": "...", "payload": {...}}, ...]}
+            """
+            content_length = int(self.headers.get("Content-Length", 0))
+            if not (0 < content_length <= 65536):
+                return self._send(400, b'{"error": "bad length"}', "application/json")
+            try:
+                raw = self.rfile.read(content_length)
+                incoming = json.loads(raw)
+                client_id = incoming.get("client_id")
+                events = incoming.get("events", [])
+                if not isinstance(events, list) or not events:
+                    return self._send(400, b'{"error": "events required"}', "application/json")
+                if app_state.db_worker is not None:
+                    # Cap at 50 events per request to prevent abuse
+                    app_state.db_worker.enqueue_analytics(client_id, events[:50])
+                return self._send(200, b'{"ok": true}', "application/json")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return self._send(400, b'{"error": "invalid JSON"}', "application/json")
+            except Exception as e:
+                return self._send(500, json.dumps({"error": str(e)}).encode("utf-8"), "application/json")
 
         def _handle_view_sync(self):
             """Append a camera-position entry to view_log.ndjson (visitors only).
@@ -4520,6 +4774,22 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             """List all saved snapshots."""
             try:
                 snapshots = list_snapshots(data_dir)
+                # Merge in DB snapshots that aren't on the filesystem
+                if app_state.db_worker is not None:
+                    try:
+                        fs_dates = {s["date"] for s in snapshots}
+                        db_snaps = app_state.db_worker.list_daily_snapshots()
+                        for ds in db_snaps:
+                            if ds["date"] not in fs_dates:
+                                snapshots.append({
+                                    "date": ds["date"],
+                                    "filename": f"{ds['date']}.db",
+                                    "size_bytes": ds.get("size_bytes") or 0,
+                                    "modified": datetime.fromtimestamp(ds["ts"]).isoformat() + "Z",
+                                })
+                        snapshots.sort(key=lambda s: s.get("date", ""), reverse=True)
+                    except Exception:
+                        pass
                 # In demo-pa mode, inject a synthetic "demo" day at the top
                 if app_state.demo_pa_date:
                     snapshots.insert(0, {
@@ -4569,6 +4839,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 _trim_history_to_date(state_to_save, date_str)
 
                 result = save_snapshot(data_dir, date_str, state_to_save)
+                # Also persist to DB
+                if app_state.db_worker is not None:
+                    try:
+                        app_state.db_worker.save_daily_snapshot(date_str, state_to_save)
+                    except Exception:
+                        pass
                 body = json.dumps(result).encode("utf-8")
                 return self._send(200, body, "application/json")
             except JsonValidationError as e:
@@ -4673,7 +4949,15 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 cache_key = None
 
             try:
-                state = load_snapshot(data_dir, date_str)
+                # Try DB first, then fall back to filesystem
+                state = None
+                if app_state.db_worker is not None:
+                    try:
+                        state = app_state.db_worker.get_daily_snapshot(date_str)
+                    except Exception:
+                        pass
+                if state is None:
+                    state = load_snapshot(data_dir, date_str)
                 if state is None:
                     return self._send(404, b'{"error": "snapshot not found"}', "application/json")
 
@@ -5011,14 +5295,24 @@ def main() -> int:
         persistent_mobile={},
     )
     app_state.demo_pa = getattr(args, "demo_pa", False)
-    
+
+    # ── Initialize SQLite database ──
+    db_path = data_dir / "dustytrails.db"
+    _log(f"[DB] Initializing SQLite at {db_path}")
+    db_worker = DbWorker(db_path)
+    db_worker.start()
+    app_state.db_worker = db_worker
+    # Migrate legacy JSON files to DB on first run
+    migrate_from_json(db_worker, data_dir)
+    _log("[DB] Database ready")
+
     # Load persistent fixed sensor history
     load_fixed_history(app_state, data_dir)
     _log(f"[FixedHistory] Loaded {len(app_state.fixed_history)} sensors from history")
-    
+
     # Load today's snapshot to restore trail history on restart
     load_today_snapshot(app_state, data_dir)
-    
+
     stop_event = threading.Event()
 
     # Synchronous initial fetch so cached_json_bytes has real data before clients connect
@@ -5195,6 +5489,9 @@ def main() -> int:
         # Save today's snapshot on graceful shutdown
         save_today_snapshot(app_state, data_dir)
         save_fixed_history(app_state)
+        # Flush and close the DB
+        if app_state.db_worker is not None:
+            app_state.db_worker.stop()
         httpd.shutdown()
     return 0
 
@@ -5218,12 +5515,19 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
         persistent_mobile={},
     )
     app_state.demo_pa = demo_pa
-    
+
+    # ── Initialize SQLite database ──
+    db_path = data_dir / "dustytrails.db"
+    db_worker = DbWorker(db_path)
+    db_worker.start()
+    app_state.db_worker = db_worker
+    migrate_from_json(db_worker, data_dir)
+
     load_fixed_history(app_state, data_dir)
-    
+
     # Load today's snapshot to restore trail history on restart
     load_today_snapshot(app_state, data_dir)
-    
+
     # Synchronous initial fetch so cached_json_bytes has real data before clients connect
     try:
         _log("[InitialFetch] Performing initial data fetch...")
@@ -5339,6 +5643,12 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
                 save_fixed_history(app_state)
             except Exception:
                 pass
+            # Flush and close the DB
+            if app_state.db_worker is not None:
+                try:
+                    app_state.db_worker.stop()
+                except Exception:
+                    pass
     
     server_thread = threading.Thread(target=serve, daemon=True)
     server_thread.start()
