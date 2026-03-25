@@ -158,7 +158,14 @@ function updateSidebarPlaybackValues() {
 
     // Get playback points for this sensor
     const pts = map._playbackPtsById.get(String(m.id));
-    if (!pts || !pts.length) continue;
+    if (!pts || !pts.length) {
+      // No playback data (e.g. parked sensor with no movement) — show "--" grayed out
+      for (const { k, vEl } of cached.readings) {
+        if (vEl.textContent !== "--") vEl.textContent = "--";
+        if (vEl.style.color !== "#666") vEl.style.color = "#666";
+      }
+      continue;
+    }
 
     // Binary search for current point
     let idxHi = 1;
