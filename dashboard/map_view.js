@@ -1892,7 +1892,7 @@ class MapView {
     this._followRAF = null;
     if (!this.selectedId || this._followTargetLat === null) return;
     if (this._touchActive || this._mouseDragging || this._pinchZooming ||
-        performance.now() < this._followSuppressUntilMs) {
+        this._scrubbing || performance.now() < this._followSuppressUntilMs) {
       this._followRAF = requestAnimationFrame(() => this._followTick());
       return;
     }
@@ -7383,7 +7383,11 @@ class MapView {
       const needsFullRedraw = viewChanged || timeChanged;
       // During gestures, skip full trail redraw for pan-only view changes;
       // translate the cached canvas instead (saves ~5ms/frame on iPad).
-      const skipTrailsForGesture = this._isAnimating() && viewChanged && !timeChanged
+      // NOTE: _followRAF is excluded — follow is a persistent background mode,
+      // not a brief gesture/animation, so it must not suppress trail redraws
+      // (otherwise a zoom-out during follow never re-renders trails at the new scale).
+      const _isGestureOrTransientAnim = this._isGesturing() || !!this._centerAnimRAF || !!this._selectOrchRAF;
+      const skipTrailsForGesture = _isGestureOrTransientAnim && viewChanged && !timeChanged
         && this._trailCacheCanvas && this._trailCacheCenterW;
       const needsIncrementalUpdate = false; // Disabled: incremental breaks fade animation
 
