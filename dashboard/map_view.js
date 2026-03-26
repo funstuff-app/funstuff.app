@@ -1892,11 +1892,7 @@ class MapView {
     this._followRAF = null;
     if (!this.selectedId || this._followTargetLat === null) return;
     if (this._touchActive || this._mouseDragging || this._pinchZooming ||
-        this._scrubbing || performance.now() < this._followSuppressUntilMs) {
-      // While suppressed, still refresh rendering if the view changed (e.g. user
-      // zoomed out). Without this, trails/PA field stay frozen at the old scale
-      // until the 4-second debounce expires.
-      if (!this._isGesturing() && !this._scrubbing) this._redrawViewOnly();
+        performance.now() < this._followSuppressUntilMs) {
       this._followRAF = requestAnimationFrame(() => this._followTick());
       return;
     }
@@ -2382,9 +2378,8 @@ class MapView {
       this._pinchAnchorSY = sy;
 
       const rawDy = clamp(e.deltaY, -300, 300);
-      // Mouse wheel: scroll-down = zoom out (positive rawDy = negative dz).
-      // Trackpad pinch: ctrlKey deltaY already maps correctly.
-      const dy = rawDy;
+      // Mouse wheel natural direction is inverted vs trackpad pinch
+      const dy = (isMouseWheel || isSmoothScrollZoom) ? -rawDy : rawDy;
       const dir = dy < 0 ? 1 : -1;
       // Adjust zoom sensitivity per input type.
       // Chrome trackpad pinch reports ~3-5x smaller deltaY than Safari for same gesture.
@@ -5955,11 +5950,7 @@ class MapView {
     if (!_isLite) this._fetchWindField();
 
     // ── Animation fast-path: transform existing PA field canvas instead of recomputing ──
-    // Exclude _followRAF — follow is persistent, not a brief gesture.  Skipping
-    // recomputation while follow is active causes the PA heatfield to stay at the
-    // stale zoom level until follow is suppressed.
-    const _paIsTransientAnim = this._isGesturing() || !!this._centerAnimRAF || !!this._selectOrchRAF;
-    if (_paIsTransientAnim && this._paFieldCanvas && this._paFieldComputedView) {
+    if (this._isAnimating() && this._paFieldCanvas && this._paFieldComputedView) {
       const ctx = this.pfctx;
       if (!ctx) return;
       const pw = this.paFieldCanvasEl.width;
@@ -6054,10 +6045,9 @@ class MapView {
     const cssH = this._cssH || 1;
     if (cssW < 2 || cssH < 2) return; // not sized yet
 
-    // During brief animations (gestures, ease-in), reuse cached PA field.
-    // Exclude _followRAF — follow is persistent and must not suppress recomputation.
-    const _paFieldTransientAnim = this._isGesturing() || !!this._centerAnimRAF || !!this._selectOrchRAF;
-    if (_paFieldTransientAnim && this._paFieldCanvas) return;
+    // During animations, reuse cached PA field (recomputed when animation ends).
+    // The composite step translates the cached canvas to match the current view.
+    if (this._isAnimating() && this._paFieldCanvas) return;
 
     const dpr = this._dpr || (window.devicePixelRatio || 1);
     const z = Number(this.zoom);
@@ -7393,11 +7383,7 @@ class MapView {
       const needsFullRedraw = viewChanged || timeChanged;
       // During gestures, skip full trail redraw for pan-only view changes;
       // translate the cached canvas instead (saves ~5ms/frame on iPad).
-      // NOTE: _followRAF is excluded — follow is a persistent background mode,
-      // not a brief gesture/animation, so it must not suppress trail redraws
-      // (otherwise a zoom-out during follow never re-renders trails at the new scale).
-      const _isGestureOrTransientAnim = this._isGesturing() || !!this._centerAnimRAF || !!this._selectOrchRAF;
-      const skipTrailsForGesture = _isGestureOrTransientAnim && viewChanged && !timeChanged
+      const skipTrailsForGesture = this._isAnimating() && viewChanged && !timeChanged
         && this._trailCacheCanvas && this._trailCacheCenterW;
       const needsIncrementalUpdate = false; // Disabled: incremental breaks fade animation
 
