@@ -515,6 +515,7 @@ class MapView {
     // Snapshot of the last rendered basemap frame to avoid flicker while tiles load.
     this._tilesSnapshotCanvas = null; // offscreen canvas
     this._tilesSnapshotMeta = null; // { zoom, centerLat, centerLon }
+    this._paFieldComputedView = null; // { zoom, centerLat, centerLon } — for gesture fast-path
 
     // Theme
     this.themeKey = "carto_dark_all";
@@ -633,6 +634,10 @@ class MapView {
     this._autoCameraCooldownMs = 300000; // 5 minutes after any user interaction
     this._suppressAutoCamera();
     this._followSuppressUntilMs = performance.now() + 4000;
+  }
+
+  _isGesturing() {
+    return this._touchActive || this._mouseDragging || this._pinchZooming || this._wheelPanning;
   }
 
   _isGesturing() {
@@ -5942,6 +5947,45 @@ class MapView {
 
     // Fetch wind field in background for debug vector overlay (does not affect PA field rendering)
     if (!_isLite) this._fetchWindField();
+
+    // ── Gesture fast-path: transform existing PA field canvas instead of recomputing ──
+    if (this._isGesturing() && this._paFieldCanvas && this._paFieldComputedView) {
+      const ctx = this.pfctx;
+      if (!ctx) return;
+      const pw = this.paFieldCanvasEl.width;
+      const ph = this.paFieldCanvasEl.height;
+      const dpr = this._dpr || (window.devicePixelRatio || 1);
+      const cssW = this._cssW || 1;
+      const cssH = this._cssH || 1;
+      const prev = this._paFieldComputedView;
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, pw, ph);
+      if (this._pinchZooming) {
+        // Scale + translate around viewport center (mirrors drawTiles pinch path)
+        const sZoom = Math.pow(2, this.zoom - prev.zoom);
+        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
+        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
+        const txPan = (prevC.x - currC.x) * sZoom;
+        const tyPan = (prevC.y - currC.y) * sZoom;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.translate(cssW / 2, cssH / 2);
+        ctx.scale(sZoom, sZoom);
+        ctx.translate((-cssW / 2) + (txPan / sZoom), (-cssH / 2) + (tyPan / sZoom));
+      } else {
+        // Pan only: translate (mirrors drawTiles pan path)
+        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
+        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
+        const tx = prevC.x - currC.x;
+        const ty = prevC.y - currC.y;
+        ctx.setTransform(dpr, 0, 0, dpr, dpr * tx, dpr * ty);
+      }
+      ctx.drawImage(this._paFieldCanvas, 0, 0, cssW, cssH);
+      ctx.restore();
+      // Drop in-progress cross-fade to avoid stale fades during gesture
+      this._paFieldPrevCanvas = null;
+      return;
+    }
 
     // ── Static Nadaraya-Watson interpolation path ──
     this._ensurePaField(state, pbMs);
