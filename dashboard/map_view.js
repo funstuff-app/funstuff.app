@@ -4054,7 +4054,18 @@ class MapView {
     if (!this._roadMatchedRangesById.has(sensorId)) {
       this._roadMatchedRangesById.set(sensorId, []);
     }
-    this._roadMatchedRangesById.get(sensorId).push({ fromMs, toMs });
+    const ranges = this._roadMatchedRangesById.get(sensorId);
+    // Merge with any overlapping/adjacent existing ranges to keep array compact
+    let newFrom = fromMs, newTo = toMs;
+    let i = 0;
+    while (i < ranges.length) {
+      const r = ranges[i];
+      if (r.toMs < newFrom || r.fromMs > newTo) { i++; continue; }
+      newFrom = Math.min(newFrom, r.fromMs);
+      newTo = Math.max(newTo, r.toMs);
+      ranges.splice(i, 1);
+    }
+    ranges.push({ fromMs: newFrom, toMs: newTo });
   }
 
   /**
@@ -6505,8 +6516,20 @@ class MapView {
 
     for (let i = startIdx; i < trail.length; i++) {
       const p = trail[i];
-      
-      // Get normalized world coordinates (cached on point)
+
+      // Cache properties in consistent order: _tMs → _u/_v → _cachedColor
+      // This MUST match the order in _collectVirtualMobileSensors to avoid
+      // V8 hidden class divergence (different insertion orders → different
+      // hidden classes → megamorphic inline caches → progressive slowdown).
+
+      // 1. Timestamp first (matches _collectVirtualMobileSensors)
+      let tMs = p._tMs;
+      if (tMs === undefined) {
+        tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
+        try { p._tMs = tMs; } catch {}
+      }
+
+      // 2. World coords second (matches _collectVirtualMobileSensors)
       let u = p._u, v = p._v;
       if (u === undefined) {
         const lat = Number(p.lat), lon = Number(p.lon);
@@ -6523,16 +6546,8 @@ class MapView {
         u = norm.u; v = norm.v;
         p._u = u; p._v = v;
       }
-      
-      // Get timestamp (cached on point)
-      let tMs = p?._tMs;
-      if (tMs === undefined) {
-        tMs = (p && typeof p.t === "string") ? parseUtcMs(p.t) : null;
-        try { p._tMs = tMs; } catch {}
-      }
-      
-      // Get color from point's recorded readings ONLY (immutable historical data).
-      // Cache on the point object — readings never change after data load.
+
+      // 3. Color last
       let base = p._cachedColor;
       if (base === undefined) {
         const pr = primaryReadingFromPoint(p);

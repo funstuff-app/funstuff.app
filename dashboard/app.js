@@ -4122,7 +4122,28 @@ function main() {
       }
     }
 
-    pbScrubEl.addEventListener("pointerdown", () => {
+    // ─── Mouse/pen track-drag: jogger sensitivity for clicks outside the nub ──
+    let _scrubPointerOnTrack = false;
+    let _scrubPointerStartX = null;
+    let _scrubPointerStartVal = null;
+    const _scrubPointerSensitivity = 0.3;
+
+    pbScrubEl.addEventListener("pointerdown", (e) => {
+      // Detect if pointer landed on the thumb vs the track (mouse/pen only)
+      _scrubPointerOnTrack = false;
+      if (e.pointerType !== "touch") {
+        const rect = pbScrubEl.getBoundingClientRect();
+        const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
+        const curVal = Number(pbScrubEl.value);
+        const thumbFrac = range > 0 ? (curVal - Number(pbScrubEl.min)) / range : 0;
+        const thumbX = rect.left + thumbFrac * rect.width;
+        if (Math.abs(e.clientX - thumbX) >= 12) {
+          _scrubPointerOnTrack = true;
+          _scrubPointerStartX = e.clientX;
+          _scrubPointerStartVal = curVal;
+          pbScrubEl.setPointerCapture(e.pointerId);
+        }
+      }
       // Cancel ALL physics immediately - user is taking control
       _pbVelocity = 0;
       _pbWheelAccum = 0;
@@ -4148,12 +4169,38 @@ function main() {
       }
       updatePlaybackUi();
     });
+    // Prevent native range-input snap when clicking the track (not the nub)
+    pbScrubEl.addEventListener("mousedown", (e) => {
+      if (_scrubPointerOnTrack) e.preventDefault();
+    }, { capture: true });
+    // Jogger-sensitivity drag when pointer started on the track
+    pbScrubEl.addEventListener("pointermove", (e) => {
+      if (!_scrubPointerOnTrack || !_pbScrubbing) return;
+      const dx = e.clientX - _scrubPointerStartX;
+      const rect = pbScrubEl.getBoundingClientRect();
+      const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
+      const delta = (dx / rect.width) * range * _scrubPointerSensitivity;
+      const newVal = clamp(_scrubPointerStartVal + delta, Number(pbScrubEl.min), Number(pbScrubEl.max));
+      pbScrubEl.value = String(newVal);
+      _pbDidDrag = true;
+      _pbLastScrubPos = newVal;
+      _pbLastScrubTime = performance.now();
+      if (!_scrubRAF) {
+        _scrubRAF = requestAnimationFrame(() => {
+          _scrubRAF = 0;
+          applyScrub();
+        });
+      }
+    });
     pbScrubEl.addEventListener("pointerup", () => {
       // On iOS Safari, pointerup fires BEFORE touchend during touch interactions.
       // Let touchend handle all cleanup/page-back to avoid double-fire issues
       // (e.g. pointerup pages back, then touchend undoes it via auto-follow).
       if (_scrubTouchStartX != null) return;
 
+      _scrubPointerOnTrack = false;
+      _scrubPointerStartX = null;
+      _scrubPointerStartVal = null;
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
       _pbScrubbing = false;
@@ -4194,6 +4241,7 @@ function main() {
     });
     var _scrubRAF = 0;
     pbScrubEl.addEventListener("input", () => {
+      if (_scrubPointerOnTrack) return; // track drag handled by pointermove
       const now = performance.now();
       const pos = Number(pbScrubEl.value);
 
@@ -4277,6 +4325,7 @@ function main() {
     let _scrubTouchStartX = null;
     let _scrubTouchStartVal = null;
     let _scrubTouchRawTarget = null;
+    let _scrubTouchOnThumb = false;
     const _scrubTouchSensitivity = 0.3;
 
     pbScrubEl.addEventListener("touchstart", (e) => {
@@ -4284,6 +4333,12 @@ function main() {
       const touch = e.touches[0];
       _scrubTouchStartX = touch.clientX;
       _scrubTouchStartVal = Number(pbScrubEl.value);
+      // Detect if touch landed on the thumb: 1:1 tracking for thumb, reduced for track
+      const rect = pbScrubEl.getBoundingClientRect();
+      const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
+      const thumbFrac = range > 0 ? (_scrubTouchStartVal - Number(pbScrubEl.min)) / range : 0;
+      const thumbX = rect.left + thumbFrac * rect.width;
+      _scrubTouchOnThumb = Math.abs(touch.clientX - thumbX) < 24;
       // Run the same setup as pointerdown (which won't fire since we prevented default)
       _pbVelocity = 0;
       _pbWheelAccum = 0;
@@ -4315,7 +4370,8 @@ function main() {
       const dx = touch.clientX - _scrubTouchStartX;
       const rect = pbScrubEl.getBoundingClientRect();
       const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
-      const delta = (dx / rect.width) * range * _scrubTouchSensitivity;
+      const sens = _scrubTouchOnThumb ? 1.0 : _scrubTouchSensitivity;
+      const delta = (dx / rect.width) * range * sens;
       _scrubTouchRawTarget = _scrubTouchStartVal + delta;
       pbScrubEl.value = String(clamp(_scrubTouchRawTarget, Number(pbScrubEl.min), Number(pbScrubEl.max)));
       _pbDidDrag = true;
@@ -4334,6 +4390,7 @@ function main() {
       _scrubTouchStartX = null;
       _scrubTouchStartVal = null;
       _scrubTouchRawTarget = null;
+      _scrubTouchOnThumb = false;
       // Cancel any pending applyScrub rAF so it doesn't overwrite page-back
       if (_scrubRAF) { cancelAnimationFrame(_scrubRAF); _scrubRAF = 0; }
       _pbStopEdgeJog();
