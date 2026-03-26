@@ -139,3 +139,11 @@ HEADERS = {
     "Sec-Fetch-Dest": "empty",
     "X-Requested-With": "XMLHttpRequest",
 }
+
+# ============================================================================
+# Database (SQLite) Tuning
+# ============================================================================
+DB_WRITE_BATCH_SIZE = 200          # Commit after this many queued writes
+DB_WRITE_FLUSH_INTERVAL_S = 30.0   # Commit at least this often (seconds)
+DB_READ_POOL_SIZE = 3              # Concurrent read-only connections
+DB_WAL_CHECKPOINT_INTERVAL_S = 300 # Passive WAL checkpoint every 5 min

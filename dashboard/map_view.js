@@ -5600,6 +5600,33 @@ class MapView {
   }
 
   /** Fetch all wind snapshots from /api/wind-field (returns {HHMM: points[]}). */
+  /**
+   * Merge a single wind snapshot received via SSE into the existing snapshots.
+   * Avoids a full /api/wind-field refetch.
+   * @param {string} key - HHMM key (e.g. "1430")
+   * @param {Array} points - Array of {lat, lon, u, v} objects
+   */
+  mergeWindSnapshot(key, points) {
+    if (!key || !Array.isArray(points) || !points.length) return;
+    if (!this._windSnapshots) this._windSnapshots = {};
+    this._windSnapshots[key] = points;
+    this._windSnapshotKeys = Object.keys(this._windSnapshots).sort();
+    // Update current field to latest snapshot
+    if (this._windSnapshotKeys.length > 0) {
+      const latest = this._windSnapshotKeys[this._windSnapshotKeys.length - 1];
+      this._windField = this._windSnapshots[latest];
+    }
+    // Bump the etag so the next _fetchWindField doesn't overwrite with stale data
+    this._windFieldEtag = null;
+    // Trigger a redraw if we have state
+    if (this.lastState) {
+      requestAnimationFrame(() => {
+        this._compositePaFieldOnTiles(this.lastState);
+        this.drawOverlay(this.lastState, { cacheUnderlay: true });
+      });
+    }
+  }
+
   _fetchWindField() {
     if (this._windFieldFetchInFlight) return;
     const now = performance.now();
