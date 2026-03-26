@@ -76,9 +76,11 @@ test("html.ios .playbackBar sets bottom: 100px", () => {
   assert.equal(decls["bottom"], "100px");
 });
 
-test("html.ios-landscape hides #topbar and #appFooter", () => {
-  assert.ok(css.includes("html.ios-landscape #topbar"), "should hide #topbar in landscape");
+test("html.ios-landscape hides #appFooter on iPhone (not topbar, not iPad)", () => {
+  assert.ok(!css.includes("html.ios-landscape #topbar"), "topbar must NOT be hidden in landscape");
   assert.ok(css.includes("html.ios-landscape #appFooter"), "should hide #appFooter in landscape");
+  // Footer hide must be scoped to iPhone heights (≤500px), not iPads
+  assert.ok(/max-height[^}]+html\.ios-landscape #appFooter|html\.ios-landscape #appFooter[^}]+max-height/.test(css.replace(/\s+/g, " ")) || css.includes("max-height: 500px"), "footer hide must be scoped by max-height for iPhone-only");
 });
 
 test("html.ios-landscape .playbackBar sets bottom: 46px", () => {

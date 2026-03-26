@@ -1908,9 +1908,10 @@ html.ios #fieldDebugPanel {
   }
 }
 
-html.ios-landscape #topbar,
-html.ios-landscape #appFooter {
-  display: none !important;
+@media (max-height: 500px) {
+  html.ios-landscape #appFooter {
+    display: none !important;
+  }
 }
 html.ios-landscape .playbackBar {
   bottom: 46px;

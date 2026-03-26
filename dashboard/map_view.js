@@ -640,6 +640,11 @@ class MapView {
     return this._touchActive || this._mouseDragging || this._pinchZooming || this._wheelPanning;
   }
 
+  /** True during any camera movement: user gestures, inertia, easing, follow, orchestration. */
+  _isAnimating() {
+    return this._isGesturing() || !!this._centerAnimRAF || !!this._selectOrchRAF || !!this._followRAF;
+  }
+
   _canRunAutoCamera() {
     const now = performance.now();
     if (this._touchActive || this._mouseDragging || this._pinchZooming) return false;
@@ -5944,9 +5949,8 @@ class MapView {
     // Fetch wind field in background for debug vector overlay (does not affect PA field rendering)
     if (!_isLite) this._fetchWindField();
 
-    // ── Gesture fast-path: transform existing PA field canvas instead of recomputing ──
-    // Only during active touch — during inertia, tiles render fresh so PA field must too.
-    if (this._touchActive && this._paFieldCanvas && this._paFieldComputedView) {
+    // ── Animation fast-path: transform existing PA field canvas instead of recomputing ──
+    if (this._isAnimating() && this._paFieldCanvas && this._paFieldComputedView) {
       const ctx = this.pfctx;
       if (!ctx) return;
       const pw = this.paFieldCanvasEl.width;
@@ -5958,9 +5962,9 @@ class MapView {
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, pw, ph);
-      if (this._pinchZooming) {
+      const sZoom = Math.pow(2, this.zoom - prev.zoom);
+      if (Math.abs(sZoom - 1) > 0.001) {
         // Scale + translate around viewport center (mirrors drawTiles pinch path)
-        const sZoom = Math.pow(2, this.zoom - prev.zoom);
         const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
         const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
         const txPan = (prevC.x - currC.x) * sZoom;
@@ -6041,9 +6045,9 @@ class MapView {
     const cssH = this._cssH || 1;
     if (cssW < 2 || cssH < 2) return; // not sized yet
 
-    // During active touch, reuse cached PA field (recomputed on gesture end).
+    // During animations, reuse cached PA field (recomputed when animation ends).
     // The composite step translates the cached canvas to match the current view.
-    if (this._touchActive && this._paFieldCanvas) return;
+    if (this._isAnimating() && this._paFieldCanvas) return;
 
     const dpr = this._dpr || (window.devicePixelRatio || 1);
     const z = Number(this.zoom);
@@ -7379,7 +7383,7 @@ class MapView {
       const needsFullRedraw = viewChanged || timeChanged;
       // During gestures, skip full trail redraw for pan-only view changes;
       // translate the cached canvas instead (saves ~5ms/frame on iPad).
-      const skipTrailsForGesture = this._touchActive && viewChanged && !timeChanged
+      const skipTrailsForGesture = this._isAnimating() && viewChanged && !timeChanged
         && this._trailCacheCanvas && this._trailCacheCenterW;
       const needsIncrementalUpdate = false; // Disabled: incremental breaks fade animation
 
