@@ -387,6 +387,8 @@ class MapView {
     // Pre-warm scan throttle: avoid re-scanning sensor history every frame.
     this._preWarmScanValidUntilMs = null;
     this._preWarmScanFixed = null;
+    // View state when PA field was last computed (for gesture translate)
+    this._paFieldComputedView = null; // { centerLat, centerLon, zoom }
 
     // ── Advection-diffusion wind field state ──────────────────────────────
     this._advectionWorker = null;
@@ -5950,15 +5952,47 @@ class MapView {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, pw, ph);
     if (!this._paFieldCanvas) { ctx.restore(); return; }
+
+    // During gestures, translate/scale the cached PA field to track the view.
+    let gestureOffset = null;
+    const cv = this._paFieldComputedView;
+    if (this._isGesturing() && cv) {
+      const dpr = this._dpr || 1;
+      const cachedCW = latLonToWorld(cv.centerLat, cv.centerLon, cv.zoom);
+      const currCW = latLonToWorld(this.center.lat, this.center.lon, cv.zoom);
+      gestureOffset = {
+        dx: (cachedCW.x - currCW.x) * dpr,
+        dy: (cachedCW.y - currCW.y) * dpr,
+        s: Math.pow(2, this.zoom - cv.zoom),
+      };
+    }
+    const drawField = (canvas) => {
+      if (gestureOffset) {
+        const { dx, dy, s } = gestureOffset;
+        if (Math.abs(s - 1) > 0.001) {
+          ctx.save();
+          ctx.translate(pw / 2, ph / 2);
+          ctx.scale(s, s);
+          ctx.translate(-pw / 2 + dx / s, -ph / 2 + dy / s);
+          ctx.drawImage(canvas, 0, 0);
+          ctx.restore();
+        } else {
+          ctx.drawImage(canvas, dx, dy);
+        }
+      } else {
+        ctx.drawImage(canvas, 0, 0);
+      }
+    };
+
     // Cross-fade from previous field canvas to current one
     const fadeT = this._paFieldPrevCanvas
       ? Math.min(1, (performance.now() - this._paFieldFadeStart) / this._paFieldFadeMs)
       : 1;
     if (this._paFieldPrevCanvas && fadeT < 1) {
       ctx.globalAlpha = 1 - fadeT;
-      ctx.drawImage(this._paFieldPrevCanvas, 0, 0);
+      drawField(this._paFieldPrevCanvas);
       ctx.globalAlpha = fadeT;
-      ctx.drawImage(this._paFieldCanvas, 0, 0);
+      drawField(this._paFieldCanvas);
       ctx.globalAlpha = 1;
       // Schedule another frame to complete the fade (no-op if playback loop is running)
       if (!this._paFieldFadeRAF) {
@@ -5970,7 +6004,7 @@ class MapView {
       }
     } else {
       if (this._paFieldPrevCanvas) this._paFieldPrevCanvas = null;
-      ctx.drawImage(this._paFieldCanvas, 0, 0);
+      drawField(this._paFieldCanvas);
     }
     ctx.restore();
   }
@@ -5993,6 +6027,11 @@ class MapView {
     const cssW = this._cssW || 1;
     const cssH = this._cssH || 1;
     if (cssW < 2 || cssH < 2) return; // not sized yet
+
+    // During gestures, reuse cached PA field (recomputed on gesture end).
+    // The composite step translates the cached canvas to match the current view.
+    if (this._isGesturing() && this._paFieldCanvas) return;
+
     const dpr = this._dpr || (window.devicePixelRatio || 1);
     const z = Number(this.zoom);
     const clat = Number(this.center?.lat);
@@ -6064,7 +6103,9 @@ class MapView {
     this._paFieldFingerprint = fingerprint;
 
     // ── Grid dimensions ──
-    const cellSize = 16;
+    // Scale cell size with viewport to keep grid cell count roughly constant (~1400 cells).
+    // iPhone (393×852) → 16px cells, iPad (1024×1366) → ~32px cells.
+    const cellSize = Math.max(16, Math.ceil(Math.sqrt(cssW * cssH / 1400)));
     const gw = Math.ceil(cssW / cellSize);
     const gh = Math.ceil(cssH / cellSize);
 
@@ -6108,6 +6149,8 @@ class MapView {
     this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
     this._paFieldValidViewKey = viewKey;
     this._paFieldValidFixed = fixed;
+    // Store view state for gesture-time translate offset
+    this._paFieldComputedView = { centerLat: clat, centerLon: clon, zoom: z };
   }
 
   /** Sample wind at map center, return { wx, wy, stretch, upwindShrink } in screen-pixel
@@ -6403,7 +6446,7 @@ class MapView {
       if (this._paFieldPrewarmed.has(fp)) continue;
 
       // Dispatch this one to the worker
-      const cellSize = 16;
+      const cellSize = Math.max(16, Math.ceil(Math.sqrt(cssW * cssH / 1400)));
       const gw = Math.ceil(cssW / cellSize);
       const gh = Math.ceil(cssH / cellSize);
       const refW = latLonToWorld(clat, clon + 0.15, z);
@@ -7321,6 +7364,11 @@ class MapView {
       // Time-based fading requires full redraw whenever playback time changes so all
       // trail segments get redrawn with correct fade alpha relative to current time.
       const needsFullRedraw = viewChanged || timeChanged;
+      // During gestures, skip full trail redraw for pan-only view changes;
+      // translate the cached canvas instead (saves ~5ms/frame on iPad).
+      const skipTrailsForGesture = this._isGesturing() && viewChanged && !timeChanged
+        && this._trailCacheCanvas && this._trailCacheCenterW
+        && Math.abs(this.zoom - (this._trailCacheZoom || 0)) < 0.001;
       const needsIncrementalUpdate = false; // Disabled: incremental breaks fade animation
 
       // Ensure trail cache canvas exists and is correctly sized (only resize when dimensions change)
@@ -7335,7 +7383,7 @@ class MapView {
         this._trailCacheCanvas.height = targetH;
       }
 
-      if (needsFullRedraw || needsIncrementalUpdate) {
+      if ((needsFullRedraw && !skipTrailsForGesture) || needsIncrementalUpdate) {
         const tctx = this._trailCacheCanvas.getContext("2d");
         if (tctx) {
           tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -7516,6 +7564,8 @@ class MapView {
         }
         this._trailCacheViewKey = trailViewKey;
         this._trailCacheTimeMs = pbTimeMs;
+        this._trailCacheCenterW = { x: centerW.x, y: centerW.y };
+        this._trailCacheZoom = this.zoom;
         this._lastTrailRedrawPerf = performance.now();
       }
 
@@ -7523,7 +7573,13 @@ class MapView {
       if (this._trailCacheCanvas) {
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.drawImage(this._trailCacheCanvas, 0, 0);
+        if (skipTrailsForGesture && this._trailCacheCenterW) {
+          const dx = (this._trailCacheCenterW.x - centerW.x) * dpr;
+          const dy = (this._trailCacheCenterW.y - centerW.y) * dpr;
+          ctx.drawImage(this._trailCacheCanvas, dx, dy);
+        } else {
+          ctx.drawImage(this._trailCacheCanvas, 0, 0);
+        }
         ctx.restore();
       }
     }
