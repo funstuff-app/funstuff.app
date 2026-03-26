@@ -944,8 +944,11 @@ class MapView {
     const midX = sumX / touches.length;
     const midY = sumY / touches.length;
 
-    // Pinch-zoom if 2+ fingers
-    if (touches.length >= 2) {
+    // Pinch-zoom if 2+ fingers.
+    // Skip when Safari gesture events are active (_gesture set by onGestureStart) —
+    // on iPad both gesture and touch events fire for the same pinch, and the two
+    // zoom computations (absolute vs incremental) fight each other.
+    if (touches.length >= 2 && !this._gesture) {
       this._pinchZooming = true;
       const dx = touches[0].clientX - touches[1].clientX;
       const dy = touches[0].clientY - touches[1].clientY;
@@ -7367,8 +7370,7 @@ class MapView {
       // During gestures, skip full trail redraw for pan-only view changes;
       // translate the cached canvas instead (saves ~5ms/frame on iPad).
       const skipTrailsForGesture = this._isGesturing() && viewChanged && !timeChanged
-        && this._trailCacheCanvas && this._trailCacheCenterW
-        && Math.abs(this.zoom - (this._trailCacheZoom || 0)) < 0.001;
+        && this._trailCacheCanvas && this._trailCacheCenterW;
       const needsIncrementalUpdate = false; // Disabled: incremental breaks fade animation
 
       // Ensure trail cache canvas exists and is correctly sized (only resize when dimensions change)
@@ -7574,9 +7576,22 @@ class MapView {
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         if (skipTrailsForGesture && this._trailCacheCenterW) {
-          const dx = (this._trailCacheCenterW.x - centerW.x) * dpr;
-          const dy = (this._trailCacheCenterW.y - centerW.y) * dpr;
-          ctx.drawImage(this._trailCacheCanvas, dx, dy);
+          const cachedZ = this._trailCacheZoom || this.zoom;
+          const sZoom = Math.pow(2, this.zoom - cachedZ);
+          const cachedCW = this._trailCacheCenterW;
+          const currCW = latLonToWorld(this.center.lat, this.center.lon, cachedZ);
+          const dx = (cachedCW.x - currCW.x) * dpr;
+          const dy = (cachedCW.y - currCW.y) * dpr;
+          if (Math.abs(sZoom - 1) > 0.001) {
+            // Pinch-zoom: scale + translate around screen center
+            ctx.translate(targetW / 2, targetH / 2);
+            ctx.scale(sZoom, sZoom);
+            ctx.translate(-targetW / 2 + dx / sZoom, -targetH / 2 + dy / sZoom);
+            ctx.drawImage(this._trailCacheCanvas, 0, 0);
+          } else {
+            // Pan only: simple translate
+            ctx.drawImage(this._trailCacheCanvas, dx, dy);
+          }
         } else {
           ctx.drawImage(this._trailCacheCanvas, 0, 0);
         }
