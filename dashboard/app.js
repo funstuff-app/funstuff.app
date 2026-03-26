@@ -4043,6 +4043,7 @@ function main() {
       _pbLoopStartMs = clampedT;
 
       updatePlaybackUi();
+      map._compositePaFieldOnTiles(map.lastState);
       map.drawOverlay(map.lastState);
 
       // Start or stop edge-jog during drag
@@ -4550,6 +4551,8 @@ function main() {
     return changed;
   }
 
+  var _sseDeferTimer = null; // deferred render after gesture settles
+
   function connectSSE() {
     if (_sseSource) { try { _sseSource.close(); } catch {} }
     var url = (appConfig.apiBaseUrl || "/api") + "/events";
@@ -4574,9 +4577,20 @@ function main() {
           // Skip delta merge if viewing historical data
           if (window._historicalState || _isLoadingData) return;
           if (_mergeDelta(delta) && map) {
-            map.draw(window.__lastState);
-            try { renderLists(window.__lastState, selectedId); } catch (e) {}
-            try { renderDetails(window.__lastState, selectedId); } catch (e) {}
+            if (map._isGesturing()) {
+              // State merged in-place; gesture redraws reflect it via lastState ref.
+              // Defer full render + sidebar until gesture settles.
+              clearTimeout(_sseDeferTimer);
+              _sseDeferTimer = setTimeout(function() {
+                map.draw(window.__lastState);
+                try { renderLists(window.__lastState, selectedId); } catch (e) {}
+                try { renderDetails(window.__lastState, selectedId); } catch (e) {}
+              }, 300);
+            } else {
+              map.draw(window.__lastState);
+              try { renderLists(window.__lastState, selectedId); } catch (e) {}
+              try { renderDetails(window.__lastState, selectedId); } catch (e) {}
+            }
           }
           // Reschedule safety-net poll
           if (_tickTimeout) clearTimeout(_tickTimeout);

@@ -633,6 +633,10 @@ class MapView {
     this._followSuppressUntilMs = performance.now() + 4000;
   }
 
+  _isGesturing() {
+    return this._touchActive || this._mouseDragging || this._pinchZooming || this._wheelPanning;
+  }
+
   _canRunAutoCamera() {
     const now = performance.now();
     if (this._touchActive || this._mouseDragging || this._pinchZooming) return false;
@@ -5618,8 +5622,8 @@ class MapView {
     }
     // Bump the etag so the next _fetchWindField doesn't overwrite with stale data
     this._windFieldEtag = null;
-    // Trigger a redraw if we have state
-    if (this.lastState) {
+    // Trigger a redraw if we have state (skip during gestures — next frame picks it up)
+    if (this.lastState && !this._isGesturing()) {
       requestAnimationFrame(() => {
         this._compositePaFieldOnTiles(this.lastState);
         this.drawOverlay(this.lastState, { cacheUnderlay: true });
