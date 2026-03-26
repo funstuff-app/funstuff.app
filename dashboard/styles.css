@@ -508,6 +508,43 @@ button#pbPlay.isLive {
   min-width: 140px;
   accent-color: var(--accent);
   touch-action: none;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(to right,
+    var(--accent) 0%, var(--accent) var(--pct, 0%),
+    rgba(255,255,255,0.12) var(--pct, 0%), rgba(255,255,255,0.12) 100%);
+  outline: none;
+  cursor: pointer;
+}
+.playbackBar input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--accent);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
+.playbackBar input[type="range"]::-moz-range-track {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.12);
+  border: none;
+}
+.playbackBar input[type="range"]::-moz-range-progress {
+  height: 6px;
+  border-radius: 3px 0 0 3px;
+  background: var(--accent);
+}
+.playbackBar input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--accent);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
 }
 
 /* Screen-reader-only: hide the native slider visually, keep for a11y + JS */

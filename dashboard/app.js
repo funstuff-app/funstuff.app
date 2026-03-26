@@ -2301,11 +2301,15 @@ function main() {
       if (!_pbScrubbing) {
         pbScrubEl.value = String(clamp(tRelMs, 0, durMs));
       }
+      // Update progress fill for browsers without accent-color range support
+      const pct = (clamp(Number(pbScrubEl.value), 0, durMs) / durMs) * 100;
+      pbScrubEl.style.setProperty("--pct", pct + "%");
     } else if (pbScrubEl) {
       pbScrubEl.disabled = true;
       pbScrubEl.min = "0";
       pbScrubEl.max = "1";
       pbScrubEl.value = "0";
+      pbScrubEl.style.setProperty("--pct", "0%");
     }
 
     // Page arrow visibility & disabled state
