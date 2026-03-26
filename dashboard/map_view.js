@@ -8257,6 +8257,9 @@ class MapView {
             pr = prHist;
           }
         }
+      } else if (this.playbackMode && !this.isPlaybackAtEnd(200) && !this._playbackPtsById.has(String(m.id))) {
+        // Sensor has no playback trail data (e.g. parked at depot) — show "--" instead of frozen live value
+        pr = { key: "", value: "--", color: "#666666" };
       }
       const prColor = isParked ? dimHex(pr.color || "#ffffff", 0.65) : (pr.color || "#ffffff");
       const colorUse = dimmed ? desatHex(color, 0.25) : color;
