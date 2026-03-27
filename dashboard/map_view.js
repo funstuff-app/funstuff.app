@@ -5562,7 +5562,7 @@ class MapView {
       totalDist
     });
 
-    return { lat, lon, angle: nextA, flipX: (side === "L"), speedMps, opacity, reading, beforeFirst: t < tMin };
+    return { lat, lon, angle: nextA, flipX: (side === "L"), speedMps, opacity, reading, readings: nextPoint.readings, beforeFirst: t < tMin };
   }
 
   _ensureTracePoints(state) {
@@ -6860,7 +6860,19 @@ class MapView {
               if (r && r.value != null) { found = r; break; }
             }
           }
-          base = found ? safeHex(found.ci != null ? found.ci : found.color) : "#333333";
+          if (found) {
+            // Derive color from AQI via continuous ramp (matches field + marker labels)
+            const aqiKey = _LEGEND_TAB_AQI_KEY[pollTab] || "pm2.5";
+            const aqi = valueToAqi(aqiKey, found.value);
+            if (aqi != null && isFinite(aqi)) {
+              const rgb = _aqiToRgb(aqi);
+              base = `#${((1 << 24) + (rgb[0] << 16) + (rgb[1] << 8) + rgb[2]).toString(16).slice(1)}`;
+            } else {
+              base = safeHex(found.ci != null ? found.ci : found.color);
+            }
+          } else {
+            base = "#333333";
+          }
           try {
             if (!p._cachedColorByTab) p._cachedColorByTab = {};
             p._cachedColorByTab[pollTab] = base;
@@ -6990,6 +7002,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
+          // Fade PurpleAir dots when a non-PM2.5 pollutant is selected (they only report PM2.5)
+          const paFadedForPollutant = !isSel && this._paFieldPollutant && this._paFieldPollutant !== "pm25";
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
@@ -7004,8 +7018,9 @@ class MapView {
               staleAlpha = (1 - u) * (1 - u);
             }
           }
+          if (paFadedForPollutant) staleAlpha *= 0.3;
           const dotR = isSel ? 8 : 6;
-          const dotColor = safeHex((pr && pr.color) || color);
+          const dotColor = paFadedForPollutant ? dimHex(safeHex((pr && pr.color) || color), 0.65) : safeHex((pr && pr.color) || color);
           if (isSel) {
             ctx.beginPath();
             ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
@@ -8452,6 +8467,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
+          // Fade PurpleAir dots when a non-PM2.5 pollutant is selected (they only report PM2.5)
+          const paFadedForPollutant = !isSel && this._paFieldPollutant && this._paFieldPollutant !== "pm25";
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
@@ -8466,8 +8483,9 @@ class MapView {
               staleAlpha = (1 - u) * (1 - u);
             }
           }
+          if (paFadedForPollutant) staleAlpha *= 0.3;
           const dotR = isSel ? 8 : 6;
-          const dotColor = safeHex((pr && pr.color) || color);
+          const dotColor = paFadedForPollutant ? dimHex(safeHex((pr && pr.color) || color), 0.65) : safeHex((pr && pr.color) || color);
           if (isSel) {
             ctx.beginPath();
             ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
