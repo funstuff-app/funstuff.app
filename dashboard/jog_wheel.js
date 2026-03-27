@@ -246,16 +246,31 @@
     }
 
     /* ── Wheel events ─────────────────────────────────────────────────────── */
+    const _isWin = /Win/.test(navigator.platform || "");
+    let _mwAccum = 0, _mwLastTs = 0; // Windows mouse-wheel velocity accumulator
     function onWheel(e) {
       if (_destroyed) return;
       e.preventDefault();
       const isH = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
       const isMouseWheel = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
-      // Normalize line-mode (deltaMode=1) to ~pixel equivalent (×40), then
-      // use a higher multiplier for mouse wheel vs trackpad.
+      // Normalize line-mode (deltaMode=1) to ~pixel equivalent (×40)
       const rawDy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
       const rawDx = e.deltaMode === 1 ? e.deltaX * 40 : e.deltaX;
-      const delta = isH ? rawDx : (isMouseWheel ? rawDy : -rawDy) * 0.15;
+      // Windows mouse wheel: velocity-adaptive boost (OS provides no acceleration).
+      // Mac mouse wheel: flat 3× boost (OS acceleration handles variable speed).
+      const _isMac = /Mac/.test(navigator.platform || "");
+      let mwBoost = 1;
+      if (isMouseWheel && _isWin) {
+        const now = performance.now();
+        if (now - _mwLastTs > 80) _mwAccum = 0;
+        _mwAccum += Math.abs(isH ? rawDx : rawDy);
+        _mwLastTs = now;
+        mwBoost = Math.max(0.55 * Math.sqrt(_mwAccum), 1);
+        mwBoost = Math.min(mwBoost, 60);
+      } else if (isMouseWheel && _isMac) {
+        mwBoost = 1;
+      }
+      const delta = isH ? rawDx * mwBoost : (isMouseWheel ? rawDy * mwBoost : -rawDy) * 0.15;
       if (onWheelCb) onWheelCb(delta);
     }
 

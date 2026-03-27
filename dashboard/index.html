@@ -295,8 +295,8 @@
   <script src="advection_solver.js?v=20260320a"></script>
     <script src="map_view.js?v=20260327n"></script>
   <script src="sidebar_ui.js?v=20260324b"></script>
-  <script src="jog_wheel.js?v=20260327a"></script>
-  <script src="app.js?v=20260327f"></script>
+  <script src="jog_wheel.js?v=20260327j"></script>
+  <script src="app.js?v=20260327p"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">
@@ -380,7 +380,20 @@
         var isMouseWheel = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
         var rawDy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
         var rawDx = e.deltaMode === 1 ? e.deltaX * 40 : e.deltaX;
-        var delta = isHoriz ? rawDx : (isMouseWheel ? rawDy : -rawDy) * 0.15;
+        var mwBoost = 1;
+        var _isWin = /Win/.test(navigator.platform || "");
+        var _isMac = /Mac/.test(navigator.platform || "");
+        if (isMouseWheel && _isWin) {
+          var now = performance.now();
+          if (!el._mwLastTs || now - el._mwLastTs > 80) el._mwAccum = 0;
+          el._mwAccum = (el._mwAccum || 0) + Math.abs(isHoriz ? rawDx : rawDy);
+          el._mwLastTs = now;
+          mwBoost = Math.max(0.55 * Math.sqrt(el._mwAccum), 1);
+          if (mwBoost > 60) mwBoost = 60;
+        } else if (isMouseWheel && _isMac) {
+          mwBoost = 1;
+        }
+        var delta = isHoriz ? rawDx * mwBoost : (isMouseWheel ? rawDy * mwBoost : -rawDy) * 0.15;
         // Nudge: scale by slider range (like playback scales by durMs)
         var lo = parseFloat(el.min), hi = parseFloat(el.max);
         var range = hi - lo;

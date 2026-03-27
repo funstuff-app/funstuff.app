@@ -1506,7 +1506,8 @@ function main() {
           }
           const b = map.getPlaybackBounds();
           const durMs = (b.maxMs - b.minMs) || 1;
-          const nudge = (delta / 1000) * (durMs / 480);
+          const nudgeDur = Math.min(durMs, 21600000); // cap at 6h so scroll speed is consistent
+          const nudge = (delta / 1000) * (nudgeDur / 480);
           const prevDir = Math.sign(_pbVelocity);
           _pbVelocity -= nudge;
           if (prevDir !== 0 && Math.sign(_pbVelocity) !== 0 && Math.sign(_pbVelocity) !== prevDir) {
@@ -2221,6 +2222,7 @@ function main() {
   let _pbDidDrag = false;             // did the user actually drag (vs click)?
   let _pbIsWheelCoasting = false;     // is current coast from wheel scroll?
   let _pbCommitLoopStartOnCoastEnd = false;
+  let _pbMwAccum = 0, _pbMwLastTs = 0; // mouse-wheel velocity accumulator for scrub bar
 
   // ─────────────────────────────────────────────────────────────────────────────
   // PAGING: Slider maps to an 8-hour page instead of the full day.
@@ -4378,12 +4380,27 @@ function main() {
       const durMs = (b.maxMs - b.minMs) || 1;
       const isHorizontal = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
       const isMouseWheel = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
-      // Normalize line-mode (deltaMode=1) to ~pixel equivalent (×40), then
-      // use a higher multiplier for mouse wheel vs trackpad.
+      // Normalize line-mode (deltaMode=1) to ~pixel equivalent (×40)
       const rawDy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
       const rawDx = e.deltaMode === 1 ? e.deltaX * 40 : e.deltaX;
-      const delta = isHorizontal ? rawDx : (isMouseWheel ? rawDy : -rawDy) * 0.15;
-      const nudge = (delta / 1000) * (durMs / 480);
+      // Windows mouse wheel: velocity-adaptive boost (OS provides no acceleration).
+      // Mac mouse wheel: flat 3× boost (OS acceleration handles variable speed).
+      const _isWin = /Win/.test(navigator.platform || "");
+      const _isMac = /Mac/.test(navigator.platform || "");
+      let mwBoost = 1;
+      if (isMouseWheel && _isWin) {
+        const now = performance.now();
+        if (now - _pbMwLastTs > 80) _pbMwAccum = 0;
+        _pbMwAccum += Math.abs(isHorizontal ? rawDx : rawDy);
+        _pbMwLastTs = now;
+        mwBoost = Math.max(0.55 * Math.sqrt(_pbMwAccum), 1);
+        mwBoost = Math.min(mwBoost, 60);
+      } else if (isMouseWheel && _isMac) {
+        mwBoost = 1;
+      }
+      const delta = isHorizontal ? rawDx * mwBoost : (isMouseWheel ? rawDy * mwBoost : -rawDy) * 0.15;
+      const nudgeDur = Math.min(durMs, 21600000); // cap at 6h so scroll speed is consistent
+      const nudge = (delta / 1000) * (nudgeDur / 480);
       const prevDir = Math.sign(_pbVelocity);
       _pbVelocity -= nudge;
       // On direction reversal, snap window so playhead stays just outside the jog zone
