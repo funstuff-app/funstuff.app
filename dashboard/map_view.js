@@ -5863,7 +5863,10 @@ class MapView {
    * @param {Array} points - Array of {lat, lon, u, v} objects
    */
   mergeWindSnapshot(key, points) {
-    if (!key || !Array.isArray(points) || !points.length) return;
+    if (!key || !points) return;
+    // Accept both grid objects and legacy point arrays
+    if (Array.isArray(points) && !points.length) return;
+    if (typeof points === "object" && !Array.isArray(points) && !points.uGrid) return;
     if (!this._windSnapshots) this._windSnapshots = {};
     this._windSnapshots[key] = points;
     this._windSnapshotKeys = Object.keys(this._windSnapshots).sort();
@@ -5902,14 +5905,19 @@ class MapView {
         if (!data || typeof data !== "object") return;
         const wasNull = !this._windSnapshots;
         if (Array.isArray(data)) {
-          // Legacy flat array — treat as single "now" entry
+          // Legacy flat point array — treat as single "now" entry
           if (data.length > 0) {
             this._windSnapshots = { "0000": data };
             this._windSnapshotKeys = ["0000"];
             this._windField = data;
           }
+        } else if (data.gw != null && data.uGrid != null) {
+          // Single grid object (legacy fallback from wind_field_json)
+          this._windSnapshots = { "0000": data };
+          this._windSnapshotKeys = ["0000"];
+          this._windField = data;
         } else {
-          // Time-indexed: {"HHMM": [...], ...}
+          // Time-indexed: {"HHMM": grid_or_array, ...}
           this._windSnapshots = data;
           this._windSnapshotKeys = Object.keys(data).sort();
           // Set current field to latest snapshot
@@ -5930,9 +5938,26 @@ class MapView {
   }
 
   /** Interpolate u,v components between two wind field snapshots.
-   *  Returns [{lat, lon, u: u_interp, v: v_interp}, ...] */
+   *  Supports both grid objects {gw, gh, uGrid, vGrid, bounds} and
+   *  legacy point arrays [{lat, lon, u, v}, ...].
+   *  Returns an interpolated snapshot in the same format as the inputs. */
   _interpolateWindFields(fieldA, fieldB, alpha) {
-    if (!fieldA || !fieldB || !Array.isArray(fieldA) || !Array.isArray(fieldB)) return fieldA;
+    if (!fieldA || !fieldB) return fieldA;
+    // Grid object path
+    if (fieldA.gw != null && fieldA.uGrid && fieldB.gw != null && fieldB.uGrid) {
+      const n = fieldA.gw * fieldA.gh;
+      const uA = fieldA.uGrid, vA = fieldA.vGrid;
+      const uB = fieldB.uGrid, vB = fieldB.vGrid;
+      if (uA.length !== n || uB.length !== n) return fieldA;
+      const uGrid = new Array(n), vGrid = new Array(n);
+      for (let i = 0; i < n; i++) {
+        uGrid[i] = Math.round(((1 - alpha) * (uA[i] || 0) + alpha * (uB[i] || 0)) * 1000) / 1000;
+        vGrid[i] = Math.round(((1 - alpha) * (vA[i] || 0) + alpha * (vB[i] || 0)) * 1000) / 1000;
+      }
+      return { gw: fieldA.gw, gh: fieldA.gh, bounds: fieldA.bounds, uGrid, vGrid };
+    }
+    // Legacy point-array path
+    if (!Array.isArray(fieldA) || !Array.isArray(fieldB)) return fieldA;
     if (fieldA.length !== fieldB.length) return fieldA;
     
     const result = [];
@@ -6019,7 +6044,7 @@ class MapView {
   _initAdvectionWorker(sensors, fieldAlpha) {
     if (!this._advectionWorker) {
       try {
-        this._advectionWorker = new Worker("pa_advection_worker.js?v=20260320a");
+        this._advectionWorker = new Worker("pa_advection_worker.js?v=20260327a");
         this._advectionWorker.onmessage = (e) => this._onAdvectionFrame(e.data);
       } catch (_) {
         this._advectionWorker = false;
@@ -8853,23 +8878,18 @@ class MapView {
     // ── Wind vector debug overlay ─────────────────────────────────────────
     if (this._windSnapshots && window._fieldDebug?.showWind) {
       const _playbackActive = this.playbackMode && _framePbTimeMs != null && isFinite(_framePbTimeMs);
-      const wfPts = this._windFieldForTime(_framePbTimeMs, _playbackActive);
-      if (wfPts && wfPts.length > 0) {
+      const wfData = this._windFieldForTime(_framePbTimeMs, _playbackActive);
+      if (wfData) {
         const _wCenter = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
         ctx.save();
         ctx.strokeStyle = "rgba(80,180,255,0.6)";
         ctx.fillStyle = "rgba(80,180,255,0.6)";
         ctx.lineWidth = 1.2;
         const arrowScale = window._fieldDebug.windArrowScale || 6;
-        for (let i = 0; i < wfPts.length; i++) {
-          const wp = wfPts[i];
-          const wpt = latLonToWorld(wp.lat, wp.lon, this.zoom);
-          const sx = wpt.x - _wCenter.x + w / 2;
-          const sy = wpt.y - _wCenter.y + h / 2;
-          if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
-          const u = wp.u || 0, v = wp.v || 0;
+
+        const _drawArrow = (sx, sy, u, v) => {
           const speed = Math.sqrt(u * u + v * v);
-          if (speed < 0.3) continue;
+          if (speed < 0.3) return;
           const len = Math.min(speed * arrowScale, 30);
           const dx = (u / speed) * len;
           const dy = -(v / speed) * len;
@@ -8885,6 +8905,35 @@ class MapView {
           ctx.lineTo(sx + dx - headLen * Math.cos(angle + 0.5), sy + dy - headLen * Math.sin(angle + 0.5));
           ctx.closePath();
           ctx.fill();
+        };
+
+        if (wfData.gw != null && wfData.uGrid) {
+          // Grid format — derive arrow positions from cell centers
+          const gw2 = wfData.gw, gh2 = wfData.gh, b = wfData.bounds;
+          const dLon = (b.lonMax - b.lonMin) / gw2;
+          const dLat = (b.latMax - b.latMin) / gh2;
+          for (let iy = 0; iy < gh2; iy++) {
+            const lat = b.latMin + (iy + 0.5) * dLat;
+            for (let ix = 0; ix < gw2; ix++) {
+              const lon = b.lonMin + (ix + 0.5) * dLon;
+              const idx = iy * gw2 + ix;
+              const wpt = latLonToWorld(lat, lon, this.zoom);
+              const sx = wpt.x - _wCenter.x + w / 2;
+              const sy = wpt.y - _wCenter.y + h / 2;
+              if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
+              _drawArrow(sx, sy, wfData.uGrid[idx] || 0, wfData.vGrid[idx] || 0);
+            }
+          }
+        } else if (Array.isArray(wfData) && wfData.length > 0) {
+          // Legacy point array
+          for (let i = 0; i < wfData.length; i++) {
+            const wp = wfData[i];
+            const wpt = latLonToWorld(wp.lat, wp.lon, this.zoom);
+            const sx = wpt.x - _wCenter.x + w / 2;
+            const sy = wpt.y - _wCenter.y + h / 2;
+            if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
+            _drawArrow(sx, sy, wp.u || 0, wp.v || 0);
+          }
         }
         ctx.restore();
       }

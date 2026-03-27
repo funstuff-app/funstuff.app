@@ -177,6 +177,30 @@ function interpolateWindField(windPoints, gw, gh, bounds, windScale) {
   return { uGrid, vGrid };
 }
 
+/** Convert a pre-interpolated wind grid (m/s) to grid-cells/s.
+ *  The server sends {gw, gh, bounds, uGrid, vGrid} in m/s;
+ *  the solver needs velocities in grid-cells per second. */
+function scaleWindGrid(gridObj, gw, gh, bounds, windScale) {
+  const uOut = new Float32Array(gw * gh);
+  const vOut = new Float32Array(gw * gh);
+  if (!gridObj || !gridObj.uGrid) return { uGrid: uOut, vGrid: vOut };
+  const { dLon, dLat } = cellSizeDeg(bounds, gw, gh);
+  const dxM = dLon * M_PER_DEG_LON, dyM = dLat * M_PER_DEG_LAT;
+  const scale = windScale || 1.0;
+  const src_u = gridObj.uGrid, src_v = gridObj.vGrid;
+  const n = gw * gh;
+  for (let i = 0; i < n; i++) {
+    uOut[i] = scale * (src_u[i] || 0) / dxM;
+    vOut[i] = scale * (src_v[i] || 0) / dyM;
+  }
+  return { uGrid: uOut, vGrid: vOut };
+}
+
+/** Detect whether windPoints is a pre-interpolated grid object. */
+function isWindGrid(wp) {
+  return wp && typeof wp === "object" && !Array.isArray(wp) && wp.gw != null;
+}
+
 function uniformWindField(speedMs, dirDeg, gw, gh, bounds, windScale) {
   const scale = windScale || 1.0;
   const dirRad = dirDeg * Math.PI / 180;
@@ -212,7 +236,11 @@ function initSim(sensors, windPoints, params, fieldAlpha) {
   };
 
   // Set up wind field
-  if (windPoints && windPoints.length > 0) {
+  if (isWindGrid(windPoints)) {
+    const wf = scaleWindGrid(windPoints, gw, gh, bounds, (params && params.windScale) || 1.0);
+    sim.uGrid = wf.uGrid;
+    sim.vGrid = wf.vGrid;
+  } else if (windPoints && windPoints.length > 0) {
     const wf = interpolateWindField(windPoints, gw, gh, bounds, (params && params.windScale) || 1.0);
     sim.uGrid = wf.uGrid;
     sim.vGrid = wf.vGrid;
@@ -261,7 +289,11 @@ function tickSim(dt, sensors, windPoints, params, fieldAlpha) {
   }
 
   // Update wind if provided
-  if (windPoints && windPoints.length > 0) {
+  if (isWindGrid(windPoints)) {
+    const wf = scaleWindGrid(windPoints, sim.gw, sim.gh, sim.bounds, (params && params.windScale) || 1.0);
+    sim.uGrid = wf.uGrid;
+    sim.vGrid = wf.vGrid;
+  } else if (windPoints && windPoints.length > 0) {
     const wf = interpolateWindField(windPoints, sim.gw, sim.gh, sim.bounds, (params && params.windScale) || 1.0);
     sim.uGrid = wf.uGrid;
     sim.vGrid = wf.vGrid;
@@ -319,8 +351,14 @@ self.onmessage = function(e) {
       break;
     case "wind":
       if (sim && msg.windPoints) {
-        const wf = interpolateWindField(msg.windPoints, sim.gw, sim.gh, sim.bounds,
-          (msg.params && msg.params.windScale) || 1.0);
+        let wf;
+        if (isWindGrid(msg.windPoints)) {
+          wf = scaleWindGrid(msg.windPoints, sim.gw, sim.gh, sim.bounds,
+            (msg.params && msg.params.windScale) || 1.0);
+        } else {
+          wf = interpolateWindField(msg.windPoints, sim.gw, sim.gh, sim.bounds,
+            (msg.params && msg.params.windScale) || 1.0);
+        }
         sim.uGrid = wf.uGrid;
         sim.vGrid = wf.vGrid;
       }

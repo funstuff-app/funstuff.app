@@ -395,6 +395,68 @@ def fetch_wind_field(analysis_time: datetime,
     return parse_grib2(grib)
 
 
+# ─── Pre-interpolation to advection grid ─────────────────────────────────────
+
+# Must match pa_advection_worker.js GEO_BOUNDS / DEFAULT_GW / DEFAULT_GH
+_GRID_BOUNDS = {"latMin": 39.5, "latMax": 41.5, "lonMin": -113.0, "lonMax": -111.0}
+_DEFAULT_GW = 80
+_DEFAULT_GH = 60
+
+
+def wind_to_grid(points: list[dict[str, float]],
+                 gw: int = _DEFAULT_GW,
+                 gh: int = _DEFAULT_GH,
+                 bounds: dict | None = None) -> dict:
+    """IDW-interpolate raw wind points onto a fixed advection grid.
+
+    Returns ``{"gw": int, "gh": int, "bounds": {...},
+               "uGrid": [float, ...], "vGrid": [float, ...]}``
+    where uGrid/vGrid are flat row-major arrays of length gw*gh
+    (m/s, NOT grid-cell-scaled — the worker applies its own scaling).
+
+    The algorithm mirrors ``interpolateWindField()`` in
+    ``pa_advection_worker.js`` but outputs in m/s so the worker can
+    apply its own per-cell scaling without double-division.
+    """
+    b = bounds or _GRID_BOUNDS
+    n = gw * gh
+    u_grid = [0.0] * n
+    v_grid = [0.0] * n
+
+    if not points:
+        return {"gw": gw, "gh": gh, "bounds": b,
+                "uGrid": u_grid, "vGrid": v_grid}
+
+    d_lon = (b["lonMax"] - b["lonMin"]) / gw
+    d_lat = (b["latMax"] - b["latMin"]) / gh
+    cutoff_sq = 1.0  # 1°² — matches JS cutoff
+
+    for iy in range(gh):
+        lat = b["latMin"] + (iy + 0.5) * d_lat
+        for ix in range(gw):
+            lon = b["lonMin"] + (ix + 0.5) * d_lon
+            w_sum = 0.0
+            u_sum = 0.0
+            v_sum = 0.0
+            for wp in points:
+                dlat = lat - wp["lat"]
+                dlon = lon - wp["lon"]
+                d2 = dlat * dlat + dlon * dlon
+                if d2 > cutoff_sq:
+                    continue
+                w = 1.0 / (d2 + 0.001)
+                w_sum += w
+                u_sum += w * wp["u"]
+                v_sum += w * wp["v"]
+            idx = iy * gw + ix
+            if w_sum > 1e-12:
+                u_grid[idx] = round(u_sum / w_sum, 3)
+                v_grid[idx] = round(v_sum / w_sum, 3)
+
+    return {"gw": gw, "gh": gh, "bounds": b,
+            "uGrid": u_grid, "vGrid": v_grid}
+
+
 # ─── JSON cache file management ─────────────────────────────────────────────
 
 def _wind_cache_path(data_dir: Path) -> Path:
@@ -405,15 +467,28 @@ def _wind_snapshots_dir(data_dir: Path) -> Path:
     return data_dir / "wind_snapshots"
 
 
-def save_wind_field(points: list[dict[str, float]], data_dir: Path,
+def save_wind_field(data: list | dict, data_dir: Path,
                     analysis_time: datetime | None = None) -> None:
-    """Write wind field JSON with metadata to data_dir/wind_field.json."""
-    payload = {
-        "ts": time.time(),
-        "analysis_time": analysis_time.isoformat() if analysis_time else None,
-        "count": len(points),
-        "points": points,
-    }
+    """Write wind field JSON with metadata to data_dir/wind_field.json.
+
+    *data* may be either the legacy point list or a grid dict from
+    ``wind_to_grid()``.
+    """
+    if isinstance(data, dict) and "gw" in data:
+        # Grid format — store as-is with metadata
+        payload = {
+            "ts": time.time(),
+            "analysis_time": analysis_time.isoformat() if analysis_time else None,
+            "count": data["gw"] * data["gh"],
+            "grid": data,
+        }
+    else:
+        payload = {
+            "ts": time.time(),
+            "analysis_time": analysis_time.isoformat() if analysis_time else None,
+            "count": len(data),
+            "points": data,
+        }
     path = _wind_cache_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -421,18 +496,30 @@ def save_wind_field(points: list[dict[str, float]], data_dir: Path,
     tmp.replace(path)
 
 
-def save_wind_snapshot(points: list[dict[str, float]], data_dir: Path,
+def save_wind_snapshot(data: list | dict, data_dir: Path,
                        analysis_time: datetime) -> str:
-    """Save a wind snapshot keyed by HHMM.  Returns the HHMM key."""
+    """Save a wind snapshot keyed by HHMM.  Returns the HHMM key.
+
+    *data* may be either the legacy point list or a grid dict from
+    ``wind_to_grid()``.
+    """
     key = analysis_time.strftime("%H%M")
     snap_dir = _wind_snapshots_dir(data_dir)
     snap_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "ts": time.time(),
-        "analysis_time": analysis_time.isoformat(),
-        "count": len(points),
-        "points": points,
-    }
+    if isinstance(data, dict) and "gw" in data:
+        payload = {
+            "ts": time.time(),
+            "analysis_time": analysis_time.isoformat(),
+            "count": data["gw"] * data["gh"],
+            "grid": data,
+        }
+    else:
+        payload = {
+            "ts": time.time(),
+            "analysis_time": analysis_time.isoformat(),
+            "count": len(data),
+            "points": data,
+        }
     path = snap_dir / f"{key}.json"
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -440,18 +527,27 @@ def save_wind_snapshot(points: list[dict[str, float]], data_dir: Path,
     return key
 
 
-def load_wind_snapshots(data_dir: Path) -> dict[str, list[dict[str, float]]]:
-    """Load all wind snapshots from disk.  Returns {HHMM: points_list}."""
+def load_wind_snapshots(data_dir: Path) -> dict[str, list | dict]:
+    """Load all wind snapshots from disk.
+
+    Returns ``{HHMM: grid_dict_or_points_list}``.
+    """
     snap_dir = _wind_snapshots_dir(data_dir)
     if not snap_dir.is_dir():
         return {}
-    result: dict[str, list[dict[str, float]]] = {}
+    result: dict[str, list | dict] = {}
     for p in sorted(snap_dir.glob("*.json")):
         key = p.stem  # "0815" etc.
         if len(key) != 4 or not key.isdigit():
             continue
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
+            # New grid format
+            grid = data.get("grid")
+            if isinstance(grid, dict) and "uGrid" in grid:
+                result[key] = grid
+                continue
+            # Legacy point-list format
             pts = data.get("points", [])
             if isinstance(pts, list) and pts:
                 result[key] = pts
@@ -473,14 +569,21 @@ def clear_wind_snapshots(data_dir: Path) -> None:
 
 
 def load_wind_field(data_dir: Path) -> dict[str, Any] | None:
-    """Load cached wind field JSON.  Returns None if not present or corrupt."""
+    """Load cached wind field JSON.  Returns None if not present or corrupt.
+
+    The returned dict contains either ``"grid"`` (new format) or ``"points"``
+    (legacy format) alongside metadata (``ts``, ``analysis_time``, ``count``).
+    """
     path = _wind_cache_path(data_dir)
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("points"), list):
-            return data
+        if isinstance(data, dict):
+            if isinstance(data.get("grid"), dict) and "uGrid" in data["grid"]:
+                return data
+            if isinstance(data.get("points"), list):
+                return data
     except Exception:
         pass
     return None

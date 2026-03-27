@@ -4015,6 +4015,7 @@ def wind_field_fetch_loop(
         from mobileair.wind import (
             fetch_grib2,
             parse_grib2,
+            wind_to_grid,
             _round_to_15min,
             save_wind_field,
             save_wind_snapshot,
@@ -4042,26 +4043,32 @@ def wind_field_fetch_loop(
     # Load cached latest + any existing snapshots from disk
     try:
         cached = load_wind_field(data_dir)
-        if cached and cached.get("points"):
-            json_bytes = json.dumps(cached["points"]).encode("utf-8")
-            # Extract HHMM key from analysis_time if available
-            snap_key = None
-            at_str = cached.get("analysis_time")
-            if at_str:
-                try:
-                    at_dt = _dt.datetime.fromisoformat(at_str)
-                    snap_key = at_dt.strftime("%H%M")
-                except Exception:
-                    pass
-            with app_state.lock:
-                app_state.wind_field_json = json_bytes
-                app_state.wind_field_seq += 1
-                # Also seed the snapshots dict so the endpoint serves data
-                if snap_key:
-                    app_state.wind_snapshots[snap_key] = json_bytes
-                    app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
-                    app_state.wind_snapshot_date = _today_str()
-            _log(f"[Wind] Loaded cached wind field ({cached['count']} points, key={snap_key})")
+        if cached:
+            # New grid format or legacy points
+            wind_data = cached.get("grid") or cached.get("points")
+            if wind_data:
+                # Legacy point lists → convert to grid on the fly
+                if isinstance(wind_data, list):
+                    wind_data = wind_to_grid(wind_data)
+                json_bytes = json.dumps(wind_data).encode("utf-8")
+                # Extract HHMM key from analysis_time if available
+                snap_key = None
+                at_str = cached.get("analysis_time")
+                if at_str:
+                    try:
+                        at_dt = _dt.datetime.fromisoformat(at_str)
+                        snap_key = at_dt.strftime("%H%M")
+                    except Exception:
+                        pass
+                with app_state.lock:
+                    app_state.wind_field_json = json_bytes
+                    app_state.wind_field_seq += 1
+                    # Also seed the snapshots dict so the endpoint serves data
+                    if snap_key:
+                        app_state.wind_snapshots[snap_key] = json_bytes
+                        app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
+                        app_state.wind_snapshot_date = _today_str()
+                _log(f"[Wind] Loaded cached wind field ({cached['count']} cells, key={snap_key})")
     except Exception as e:
         _log(f"[Wind] Error loading cache: {e}")
 
@@ -4069,8 +4076,11 @@ def wind_field_fetch_loop(
         snaps = load_wind_snapshots(data_dir)
         if snaps:
             with app_state.lock:
-                for k, pts in snaps.items():
-                    app_state.wind_snapshots[k] = json.dumps(pts).encode("utf-8")
+                for k, data in snaps.items():
+                    # Legacy point lists → convert to grid
+                    if isinstance(data, list):
+                        data = wind_to_grid(data)
+                    app_state.wind_snapshots[k] = json.dumps(data).encode("utf-8")
                 app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
                 app_state.wind_snapshot_date = _today_str()
             _log(f"[Wind] Loaded {len(snaps)} cached snapshots from disk")
@@ -4114,11 +4124,14 @@ def wind_field_fetch_loop(
                 if not points:
                     continue
 
+                # Pre-interpolate to advection grid (80×60) — saves ~90% bandwidth
+                grid = wind_to_grid(points)
+
                 # Notify poller so it learns the cadence
                 poller.check_for_change_raw(key)
                 last_key = key
 
-                json_bytes = json.dumps(points).encode("utf-8")
+                json_bytes = json.dumps(grid).encode("utf-8")
                 with app_state.lock:
                     app_state.wind_field_json = json_bytes
                     app_state.wind_field_seq += 1
@@ -4129,12 +4142,12 @@ def wind_field_fetch_loop(
                     # Broadcast wind snapshot to SSE clients
                     _sse_broadcast_wind(app_state, key, json_bytes)
 
-                save_wind_field(points, data_dir, analysis_time=candidate)
-                save_wind_snapshot(points, data_dir, candidate)
+                save_wind_field(grid, data_dir, analysis_time=candidate)
+                save_wind_snapshot(grid, data_dir, candidate)
                 # Also persist to DB
                 if app_state.db_worker is not None:
-                    app_state.db_worker.enqueue_wind_snapshot(key, today, points)
-                _log(f"[Wind] Updated: {len(points)} pts, snapshot {key} ({snapshot_count} total)")
+                    app_state.db_worker.enqueue_wind_snapshot(key, today, grid)
+                _log(f"[Wind] Updated: {len(points)} pts → {grid['gw']}×{grid['gh']} grid, snapshot {key} ({snapshot_count} total)")
                 fetched = True
                 break  # got one, stop walking backwards
 
@@ -4557,7 +4570,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         return self._send_304(_wf_etag, "public, max-age=60")
                     # Serve all time-indexed snapshots so the client can scrub
                     if app_state.wind_snapshots:
-                        # Build {HHMM: points_array, ...} envelope
+                        # Build {HHMM: grid_dict, ...} envelope
                         parts = []
                         for k in app_state.wind_snapshots_keys:
                             # Each value is already JSON-encoded bytes
