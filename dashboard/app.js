@@ -411,8 +411,9 @@ function main() {
     if (!sensor || legendUserOverride) return;
     const pr = primaryReadingForSensor(sensor);
     const tab = pollutantToLegendTab(pr && pr.key);
-    if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
+    if (tab && LEGEND_DATA[tab]) {
       legendTab = tab;
+      userLegendTab = tab;
       buildLegend(true);
       _syncPaFieldDim();
     }
@@ -1313,8 +1314,8 @@ function main() {
     }
 
     selectedId = id || null;
+    legendUserOverride = false; // reset on every new selection so legend syncs to worst reading
     if (!selectedId) {
-      legendUserOverride = false;
       legendTab = "pm25";
       userLegendTab = "pm25";
       buildLegend();

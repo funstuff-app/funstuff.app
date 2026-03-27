@@ -8399,7 +8399,7 @@ class MapView {
 
         // Legend pollutant override: show the legend's chosen pollutant on the selected marker
         if (isSel && this._paFieldPollutant && this._paFieldPollutant !== "pm25") {
-          const interp2 = interpCacheKey ? this._fixedInterpCache.map.get(f.id) : interpolateFixedReadingsAtTime(f, fixedPbTimeMs);
+          const interp2 = interpolateFixedReadingsAtTime(f, fixedPbTimeMs);
           const legendPr = _readingForLegendTab(
             interp2 || (f && f.readings),
             this._paFieldPollutant
