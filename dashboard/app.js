@@ -444,6 +444,7 @@ function main() {
 
   const LEGEND_DATA = {
     pm25: {
+      name: "Fine Particles",
       unit: "\u00b5g/m\u00b3",
       // EPA AQI standard – colors match server _get_aqi_color
       // Sub-gradients within Good match Utah AQ API trail colors
@@ -462,6 +463,7 @@ function main() {
       ],
     },
     pm10: {
+      name: "Coarse Particles",
       unit: "\u00b5g/m\u00b3",
       // Pill widths proportional to concentration within PM10's own scale
       // (~600 µg/m³ max, 260px). PM10 harm rises more steadily than PM2.5.
@@ -478,6 +480,7 @@ function main() {
       ],
     },
     o3: {
+      name: "Ozone",
       unit: "ppb",
       entries: [
         // Pill widths proportional to concentration within O3's own scale
@@ -494,6 +497,7 @@ function main() {
       ],
     },
     no2: {
+      name: "Nitrogen Dioxide",
       unit: "ppb",
       // EPA NO2 1-hour breakpoints (ppb).
       // Good: 0–53, Moderate: 54–100, USG: 101–360, Unhealthy: 361–649,
@@ -510,6 +514,7 @@ function main() {
       ],
     },
     co: {
+      name: "Carbon Monoxide",
       unit: "ppm",
       // EPA CO 8-hour breakpoints (ppm).
       // Good: 0–4.4, Moderate: 4.5–9.4, USG: 9.5–12.4, Unhealthy: 12.5–15.4,
@@ -675,6 +680,8 @@ function main() {
   function buildLegend(animate = false) {
     if (!legendBodyEl) return;
     const data = (legendTab && LEGEND_DATA[legendTab]) || LEGEND_DATA.pm25;
+    const legendNameEl = document.getElementById("legendName");
+    if (legendNameEl) legendNameEl.textContent = legendTab ? data.name : "Show All";
     if (legendUnitEl) legendUnitEl.textContent = data.unit;
 
     const entries = data.entries;

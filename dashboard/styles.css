@@ -1429,13 +1429,22 @@ button#pbPlay.isLive {
   background: rgba(255,255,255,0.08);
   border-color: rgba(255,255,255,0.12);
 }
+.legendNameRow {
+  font-size: 10px;
+  font-weight: 700;
+  color: rgba(147,164,186,0.7);
+  letter-spacing: 0.2px;
+  padding: 4px 12px 0 6px;
+  text-align: right;
+  margin-right: 14px;
+}
 .legendUnit {
   font-size: 10px;
   color: rgba(147,164,186,0.7);
-  padding: 4px 12px 0 0;
+  padding: 2px 12px 0 0;
   text-align: center;
   letter-spacing: 0.2px;
-  margin-left: -55px; /* Align with range text in rows below */
+  margin-left: -55px;
 }
 .legendFooter {
   font-size: 9px;
