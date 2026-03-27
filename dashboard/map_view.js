@@ -52,6 +52,22 @@ const _LEGEND_TAB_TRAIL_KEYS = {
   co:   ["CO", "co"],
 };
 
+/** Extract a specific pollutant's reading from a sensor readings object.
+ *  Returns { key, value, color, aqi } or null if that pollutant isn't present. */
+function _readingForLegendTab(readings, legendTab) {
+  if (!readings || !legendTab) return null;
+  const keys = _LEGEND_TAB_READING_KEYS[legendTab];
+  if (!keys) return null;
+  for (const rk of keys) {
+    const r = readings[rk];
+    if (r && r.value != null) {
+      const aqi = valueToAqi(_LEGEND_TAB_AQI_KEY[legendTab] || "pm2.5", r.value);
+      return { key: rk, value: r.value, color: safeHex(r.ci), aqi };
+    }
+  }
+  return null;
+}
+
 function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab) {
   const isPm25 = !pollutantTab || pollutantTab === "pm25";
   const readingKeys = _LEGEND_TAB_READING_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_READING_KEYS.pm25;
@@ -8377,6 +8393,16 @@ class MapView {
         // Expose the selected sensor's displayed pollutant key for legend sync
         if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
+        // Legend pollutant override: show the legend's chosen pollutant on the selected marker
+        if (isSel && this._paFieldPollutant) {
+          const interp2 = interpCacheKey ? this._fixedInterpCache.map.get(f.id) : interpolateFixedReadingsAtTime(f, fixedPbTimeMs);
+          const legendPr = _readingForLegendTab(
+            interp2 || (f && f.readings),
+            this._paFieldPollutant
+          );
+          if (legendPr) { pr = legendPr; this._selectedPollutantKey = legendPr.key; }
+        }
+
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
@@ -8574,12 +8600,18 @@ class MapView {
         // Sensor has no playback trail data (e.g. parked at depot) — show "--" instead of frozen live value
         pr = { key: "", value: "--", color: "#666666" };
       }
+      // Expose the selected sensor's displayed pollutant key for legend sync
+      if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
+
+      // Legend pollutant override: show the legend's chosen pollutant on the selected marker
+      if (isSel && this._paFieldPollutant) {
+        const legendPr = _readingForLegendTab(m.readings, this._paFieldPollutant);
+        if (legendPr) { pr = legendPr; this._selectedPollutantKey = legendPr.key; }
+      }
+
       const prColor = isParked ? dimHex(pr.color || "#ffffff", 0.65) : (pr.color || "#ffffff");
       const colorUse = dimmed ? desatHex(color, 0.25) : color;
       const prColorUse = dimmed ? desatHex(prColor, 0.25) : prColor;
-
-      // Expose the selected sensor's displayed pollutant key for legend sync
-      if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
       ctx.save();
       const baseAlpha = clamp(opacity, 0, 1);

@@ -408,7 +408,7 @@ function main() {
 
   /** Switch legend tab to match a selected sensor's primary reading. */
   function syncLegendToSensor(sensor) {
-    if (!sensor) return;
+    if (!sensor || legendUserOverride) return;
     const pr = primaryReadingForSensor(sensor);
     const tab = pollutantToLegendTab(pr && pr.key);
     if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
@@ -765,8 +765,7 @@ function main() {
   function _syncPaFieldDim() {
     if (!map) return;
     // Switch field to show the selected pollutant (with correct sensors + color ramp)
-    const tab = (legendOpen && legendTab) ? legendTab : "pm25";
-    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(tab);
+    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(legendTab || "pm25");
   }
 
   buildLegend();
@@ -1314,8 +1313,8 @@ function main() {
     }
 
     selectedId = id || null;
-    legendUserOverride = false; // reset override on new selection
     if (!selectedId) {
+      legendUserOverride = false;
       legendTab = "pm25";
       userLegendTab = "pm25";
       buildLegend();
@@ -1345,7 +1344,8 @@ function main() {
     
     // Center camera when selected from sidebar (any sensor type), or for mobile from map click with cmd+click for fit
     if (item && isFinite(Number(item.lat)) && isFinite(Number(item.lon))) {
-      const shouldCenter = fromPanel || (sel?.type === "mobile");
+      const isMobile = sel?.type === "mobile";
+      const shouldCenter = fromPanel || isMobile;
       if (shouldCenter) {
         // Default: center on the marker.
         // Cmd+click: fit to breadcrumb path bbox (mobile only).
