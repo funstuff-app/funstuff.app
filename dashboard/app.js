@@ -424,8 +424,9 @@ function main() {
     if (!map || !selectedId || legendUserOverride) return;
     const key = map.getSelectedPollutantKey();
     const tab = pollutantToLegendTab(key);
-    if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
+    if (tab && LEGEND_DATA[tab]) {
       legendTab = tab;
+      userLegendTab = tab;
       buildLegend(true);
       _syncPaFieldDim();
     }
@@ -1377,8 +1378,10 @@ function main() {
     // Sync legend tab to selected marker's displayed pollutant
     // Only when on the default PM2.5 tab — don't override a user's manual pollutant choice
     if (legendTab === "pm25") {
-      if (item) syncLegendToSensor(item);
-      syncLegendToMapSelection();
+      // Defer sync: the map needs to render one frame with the new selection
+      // so _selectedPollutantKey reflects the actual displayed reading
+      // (which may differ from live data during playback).
+      requestAnimationFrame(() => { syncLegendToMapSelection(); });
     }
     
     // Center camera when selected from sidebar (any sensor type), or for mobile from map click with cmd+click for fit

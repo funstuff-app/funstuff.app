@@ -2333,6 +2333,7 @@ class MapView {
         speedMps,
         opacity,
         reading: smp?.reading || null,
+        readings: smp?.readings || null,
         held,
       };
     }
@@ -5110,7 +5111,7 @@ class MapView {
         d: targetD, visibleEnd: targetD, vehicleD: targetD, vehicleV: 0,
         vehicleTMs: t, controlScalar: 1, positionError: 0, totalDist
       });
-      return { lat: smp.lat, lon: smp.lon, angle: smp.heading, flipX: false, speedMps: 0, opacity, reading, beforeFirst: t < tMin };
+      return { lat: smp.lat, lon: smp.lon, angle: smp.heading, flipX: false, speedMps: 0, opacity, reading, readings: nextPt.readings, beforeFirst: t < tMin };
     }
     // ── END SCRUB FAST PATH ──────────────────────────────────────────────────
     
@@ -8669,8 +8670,10 @@ class MapView {
       if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
       // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers
+      // In playback mode, prefer trail-point readings (historical) over live m.readings
       if (this._paFieldPollutant && this._paFieldPollutant !== "pm25") {
-        const legendPr = _readingForLegendTab(m.readings, this._paFieldPollutant);
+        const src = (this.playbackMode && pose && pose.readings) ? pose.readings : m.readings;
+        const legendPr = _readingForLegendTab(src, this._paFieldPollutant);
         if (legendPr) {
           pr = legendPr;
           if (isSel) this._selectedPollutantKey = legendPr.key;
