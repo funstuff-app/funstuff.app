@@ -624,6 +624,10 @@ class MapView {
     this._winScrollLastTs = 0;      // timestamp of last wheel event
     this._winScrollFlushTimer = null;
 
+    // macOS scroll-velocity accumulator for adaptive zoom (mouse wheel only)
+    this._macScrollAccum = 0;
+    this._macScrollLastTs = 0;
+
     // ResizeObserver fires after layout settles — catches window resize, devtools
     // show/hide, and fullscreen toggle more reliably than window "resize".
     // Pass contentRect dimensions directly to avoid reading stale clientHeight:
@@ -2442,17 +2446,24 @@ class MapView {
     // and macOS convention is scroll=pan, pinch=zoom (like Apple Maps).
     const isSmoothScrollZoom = !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
 
+    // macOS mouse wheel: deltaMode is always 0, no ctrlKey. Detect via vertical-only
+    // + significant delta. Same heuristic as isSmoothScrollZoom but Mac-specific flag
+    // so it gets its own code path and isn't suppressed by the pan→zoom debounce.
+    const isMacMouseWheel = this._isMac && !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
+
     // Determine if this should be a zoom event:
     // 1. True mouse wheel (deltaMode !== 0) → zoom
     // 2. Ctrl+wheel (trackpad pinch gesture) → zoom
     // 3. Windows/Linux: vertical smooth-scroll (smooth-scroll mice) → zoom
-    let shouldZoom = isMouseWheel || e.ctrlKey || isSmoothScrollZoom;
+    // 4. macOS mouse wheel (detected via heuristic) → zoom
+    let shouldZoom = isMouseWheel || e.ctrlKey || isSmoothScrollZoom || isMacMouseWheel;
 
     // Debounce pan→zoom transitions: when lifting one finger during a two-finger
     // trackpad pan, macOS briefly interprets the finger separation as a pinch gesture,
     // firing ctrlKey=true wheel events. Ignore these artifacts if we were panning
     // within the last 100ms (a real intentional pinch starts well after pan ends).
-    if (shouldZoom && !isMouseWheel && this._lastWheelPanTime
+    // Do NOT suppress isMacMouseWheel — that's a real mouse wheel, not a finger-lift.
+    if (shouldZoom && !isMouseWheel && !isMacMouseWheel && this._lastWheelPanTime
         && (performance.now() - this._lastWheelPanTime) < 100) {
       shouldZoom = false;
     }
@@ -2471,30 +2482,41 @@ class MapView {
       this._pinchAnchorSY = sy;
 
       const rawDy = clamp(e.deltaY, -300, 300);
-      // Mouse wheel natural direction is inverted vs trackpad pinch
-      const dy = (isMouseWheel || isSmoothScrollZoom) ? -rawDy : rawDy;
+
+      // Platform-specific mouse-wheel flags (separate code paths, not combined)
+      const isWinWheel = this._isWindows && (isMouseWheel || isSmoothScrollZoom);
+
+      // Direction: mouse wheel on Win/Mac is reversed; everything else uses raw or inverted convention
+      const dy = isWinWheel ? rawDy
+              : isMacMouseWheel ? rawDy
+              : (isMouseWheel || isSmoothScrollZoom) ? -rawDy : rawDy;
       const dir = dy < 0 ? 1 : -1;
 
       // Windows mouse-wheel: velocity-adaptive zoom.
       // Accumulate deltas over a short burst window; fast scrolling ramps up
       // non-linearly but is capped so you never blow past the map.
       let dz;
-      const isWinWheel = this._isWindows && (isMouseWheel || isSmoothScrollZoom);
       if (isWinWheel) {
         const now = performance.now();
         const gap = now - this._winScrollLastTs;
-        // New burst if >80ms gap since last tick
         if (gap > 80) this._winScrollAccum = 0;
         this._winScrollAccum += Math.abs(dy);
         this._winScrollLastTs = now;
-        // velocity = accumulated ticks in this burst
         const v = this._winScrollAccum;
-        // Non-linear ramp: sqrt gives gentle acceleration; hard cap at 0.45 zoom-units
-        // per event prevents blowing past the map on a fast flick.
         dz = dir * Math.min(0.015 * Math.sqrt(v), 0.45);
+
+      // macOS mouse-wheel: same velocity-adaptive zoom, separate accumulator.
+      } else if (isMacMouseWheel) {
+        const now = performance.now();
+        const gap = now - this._macScrollLastTs;
+        if (gap > 80) this._macScrollAccum = 0;
+        this._macScrollAccum += Math.abs(dy);
+        this._macScrollLastTs = now;
+        const v = this._macScrollAccum;
+        dz = dir * Math.min(0.015 * Math.sqrt(v), 0.45);
+
       } else {
-        // Adjust zoom sensitivity per input type.
-        // Chrome trackpad pinch reports ~3-5x smaller deltaY than Safari for same gesture.
+        // Trackpad pinch (any OS) or Linux mouse wheel — original behavior
         const isChromePinch = e.ctrlKey && !isMouseWheel && /Chrome/.test(navigator.userAgent || "");
         const strength = (isMouseWheel || isSmoothScrollZoom) ? 0.018 : isChromePinch ? 0.055 : 0.020;
         dz = dir * Math.log1p(Math.abs(dy)) * strength;
@@ -2507,7 +2529,7 @@ class MapView {
       this._notePinchVelocity(z2 - prevZ, performance.now());
 
       // Trackpad pinch needs inertia; mouse wheel doesn't
-      if (!isMouseWheel && !isSmoothScrollZoom) {
+      if (!isMouseWheel && !isSmoothScrollZoom && !isMacMouseWheel) {
         this._wheelPinchEndTimer = window.setTimeout(() => this._startPinchInertia(), 28);
       } else {
         this._wheelPinchEndTimer = window.setTimeout(() => {
