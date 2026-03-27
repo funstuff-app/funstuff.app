@@ -619,6 +619,11 @@ class MapView {
     this._wheelPanning = false; // true during trackpad/keyboard-trackpad wheel-pan streams
     this._wheelPanEndTimer = null; // debounce timer to exit wheel-pan mode
 
+    // Windows scroll-velocity accumulator for adaptive zoom
+    this._winScrollAccum = 0;      // accumulated deltaY in current burst
+    this._winScrollLastTs = 0;      // timestamp of last wheel event
+    this._winScrollFlushTimer = null;
+
     // ResizeObserver fires after layout settles — catches window resize, devtools
     // show/hide, and fullscreen toggle more reliably than window "resize".
     // Pass contentRect dimensions directly to avoid reading stale clientHeight:
@@ -2469,11 +2474,31 @@ class MapView {
       // Mouse wheel natural direction is inverted vs trackpad pinch
       const dy = (isMouseWheel || isSmoothScrollZoom) ? -rawDy : rawDy;
       const dir = dy < 0 ? 1 : -1;
-      // Adjust zoom sensitivity per input type.
-      // Chrome trackpad pinch reports ~3-5x smaller deltaY than Safari for same gesture.
-      const isChromePinch = e.ctrlKey && !isMouseWheel && /Chrome/.test(navigator.userAgent || "");
-      const strength = (isMouseWheel || isSmoothScrollZoom) ? 0.018 : isChromePinch ? 0.055 : 0.020;
-      const dz = dir * Math.log1p(Math.abs(dy)) * strength;
+
+      // Windows mouse-wheel: velocity-adaptive zoom.
+      // Accumulate deltas over a short burst window; fast scrolling ramps up
+      // non-linearly but is capped so you never blow past the map.
+      let dz;
+      const isWinWheel = this._isWindows && (isMouseWheel || isSmoothScrollZoom);
+      if (isWinWheel) {
+        const now = performance.now();
+        const gap = now - this._winScrollLastTs;
+        // New burst if >80ms gap since last tick
+        if (gap > 80) this._winScrollAccum = 0;
+        this._winScrollAccum += Math.abs(dy);
+        this._winScrollLastTs = now;
+        // velocity = accumulated ticks in this burst
+        const v = this._winScrollAccum;
+        // Non-linear ramp: sqrt gives gentle acceleration; hard cap at 0.45 zoom-units
+        // per event prevents blowing past the map on a fast flick.
+        dz = dir * Math.min(0.015 * Math.sqrt(v), 0.45);
+      } else {
+        // Adjust zoom sensitivity per input type.
+        // Chrome trackpad pinch reports ~3-5x smaller deltaY than Safari for same gesture.
+        const isChromePinch = e.ctrlKey && !isMouseWheel && /Chrome/.test(navigator.userAgent || "");
+        const strength = (isMouseWheel || isSmoothScrollZoom) ? 0.018 : isChromePinch ? 0.055 : 0.020;
+        dz = dir * Math.log1p(Math.abs(dy)) * strength;
+      }
       const prevZ = this.zoom;
       const z2 = clamp(this.zoom + dz, this._zoomMin, this._zoomMax);
       this._setZoomAroundScreenPoint(z2, sx, sy);
