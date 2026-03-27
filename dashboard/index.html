@@ -295,8 +295,8 @@
   <script src="advection_solver.js?v=20260320a"></script>
     <script src="map_view.js?v=20260327n"></script>
   <script src="sidebar_ui.js?v=20260324b"></script>
-  <script src="jog_wheel.js?v=20260227a"></script>
-  <script src="app.js?v=20260327e"></script>
+  <script src="jog_wheel.js?v=20260327a"></script>
+  <script src="app.js?v=20260327f"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">
@@ -378,7 +378,9 @@
         // Delta calculation: exact replica of playback scrub bar (app.js L4170)
         var isHoriz = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
         var isMouseWheel = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
-        var delta = isHoriz ? e.deltaX : (isMouseWheel ? e.deltaY : -e.deltaY) * 0.15;
+        var rawDy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+        var rawDx = e.deltaMode === 1 ? e.deltaX * 40 : e.deltaX;
+        var delta = isHoriz ? rawDx : (isMouseWheel ? rawDy : -rawDy) * 0.15;
         // Nudge: scale by slider range (like playback scales by durMs)
         var lo = parseFloat(el.min), hi = parseFloat(el.max);
         var range = hi - lo;

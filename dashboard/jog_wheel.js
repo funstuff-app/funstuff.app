@@ -251,7 +251,11 @@
       e.preventDefault();
       const isH = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
       const isMouseWheel = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
-      const delta = isH ? e.deltaX : (isMouseWheel ? e.deltaY : -e.deltaY) * 0.15;
+      // Normalize line-mode (deltaMode=1) to ~pixel equivalent (×40), then
+      // use a higher multiplier for mouse wheel vs trackpad.
+      const rawDy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+      const rawDx = e.deltaMode === 1 ? e.deltaX * 40 : e.deltaX;
+      const delta = isH ? rawDx : (isMouseWheel ? rawDy : -rawDy) * 0.15;
       if (onWheelCb) onWheelCb(delta);
     }
 
