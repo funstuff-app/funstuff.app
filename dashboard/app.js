@@ -761,11 +761,12 @@ function main() {
     localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
   }
 
-  /** Dim PA field to 5% when legend is open and showing a non-PM2.5 tab. */
+  /** Sync PA field pollutant to match legend tab selection. */
   function _syncPaFieldDim() {
-    if (!map || typeof map.setPaFieldDim !== "function") return;
-    const shouldDim = legendOpen && legendTab !== "pm25";
-    map.setPaFieldDim(shouldDim ? 0.05 : 1.0);
+    if (!map) return;
+    // Switch field to show the selected pollutant (with correct sensors + color ramp)
+    const tab = (legendOpen && legendTab) ? legendTab : "pm25";
+    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(tab);
   }
 
   buildLegend();

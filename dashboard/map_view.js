@@ -31,7 +31,31 @@ const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
 const _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG = 0.55;
 const _PA_FIELD_FIXED_WEIGHT_MULTIPLIER = 10;
 
-function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH) {
+/** Map legend tab id → array of reading keys to search for in fixed sensor data. */
+const _LEGEND_TAB_READING_KEYS = {
+  pm25: ["PM25", "PM2.5", "pm25", "pm2.5"],
+  pm10: ["PM10", "pm10"],
+  o3:   ["OZNE", "O3", "OZONE", "ozone", "o3"],
+  no2:  ["NO2", "no2"],
+  co:   ["CO", "co"],
+};
+/** Map legend tab id → aqi.js pollutant key for valueToAqi(). */
+const _LEGEND_TAB_AQI_KEY = {
+  pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co",
+};
+/** Map legend tab id → mobile trail reading keys. */
+const _LEGEND_TAB_TRAIL_KEYS = {
+  pm25: ["PM25", "PM2.5", "pm25"],
+  pm10: ["PM10", "pm10"],
+  o3:   ["OZNE", "O3", "OZONE", "ozone", "o3"],
+  no2:  ["NO2", "no2"],
+  co:   ["CO", "co"],
+};
+
+function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab) {
+  const isPm25 = !pollutantTab || pollutantTab === "pm25";
+  const readingKeys = _LEGEND_TAB_READING_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_READING_KEYS.pm25;
+
   const paLatLons = [];
   for (const f of fixed) {
     if (!f || !f.purpleair) continue;
@@ -48,22 +72,32 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
     const lat = Number(f.lat);
     const lon = Number(f.lon);
     if (!isFinite(lat) || !isFinite(lon)) continue;
-    if (!f.purpleair) {
-      let nearPA = false;
-      for (let pi = 0; pi < paLatLons.length; pi += 2) {
-        const dlat = lat - paLatLons[pi];
-        const dlon = lon - paLatLons[pi + 1];
-        if (dlat * dlat + dlon * dlon < _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG * _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG) {
-          nearPA = true;
-          break;
+
+    if (isPm25) {
+      // PM2.5 mode: PurpleAir + nearby non-PA fixed (original behavior)
+      if (!f.purpleair) {
+        let nearPA = false;
+        for (let pi = 0; pi < paLatLons.length; pi += 2) {
+          const dlat = lat - paLatLons[pi];
+          const dlon = lon - paLatLons[pi + 1];
+          if (dlat * dlat + dlon * dlon < _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG * _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG) {
+            nearPA = true;
+            break;
+          }
         }
+        if (!nearPA) continue;
       }
-      if (!nearPA) continue;
+    } else {
+      // Non-PM2.5 mode: only non-PurpleAir fixed sensors (ghost markers)
+      if (f.purpleair) continue;
     }
 
     const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
-    const pm = interp && (interp["PM25"] || interp["PM2.5"] || interp["pm25"] || interp["pm2.5"]);
-    const value = pm && pm.value != null ? Number(pm.value) : NaN;
+    let value = NaN;
+    for (const rk of readingKeys) {
+      const r = interp && interp[rk];
+      if (r && r.value != null) { value = Number(r.value); break; }
+    }
     if (!isFinite(value) || value < 0) continue;
 
     const wp = latLonToWorld(lat, lon, zoom);
@@ -81,10 +115,11 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
 
 /**
  * Collect virtual PA sensors from mobile trail GPS points.
- * Each trail point with a PM2.5 reading becomes a transient sensor
+ * Each trail point with a reading for the selected pollutant becomes a transient sensor
  * that decays over the same time window as the trail fade.
  */
-function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs) {
+function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs, pollutantTab) {
+  const trailKeys = _LEGEND_TAB_TRAIL_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_TRAIL_KEYS.pm25;
   // Map keyed by quantized lat/lon — at most 1 virtual sensor per spatial slot.
   // Iterating newest-first means the freshest reading at each location wins.
   const sensorMap = new Map();
@@ -120,11 +155,19 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       if (ageMs < 0) continue;           // future point in playback
       if (ageMs >= FADE_TIME_MS) break;   // past fade window (older points only get older)
 
-      // Extract PM2.5 — skip if absent
-      const pm25raw = p.readings?.PM25?.value ?? p.readings?.["PM2.5"]?.value ?? p.readings?.pm25?.value;
-      if (pm25raw == null) continue;
-      const pm25 = Number(pm25raw);
-      if (!isFinite(pm25) || pm25 < 0) continue;
+      // Extract reading for selected pollutant — skip if absent
+      let rawVal = undefined;
+      const rd = p.readings;
+      if (rd) {
+        for (const rk of trailKeys) {
+          const rv = rd[rk]?.value ?? rd[rk];
+          if (rv != null && typeof rv !== "object") { rawVal = rv; break; }
+          if (rv != null && typeof rv === "object" && rv.value != null) { rawVal = rv.value; break; }
+        }
+      }
+      if (rawVal == null) continue;
+      const pollVal = Number(rawVal);
+      if (!isFinite(pollVal) || pollVal < 0) continue;
 
       // Decay weight: full for fresh, quadratic falloff in tail
       let decayWeight = 1.0;
@@ -151,7 +194,7 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       const sx = wx - centerW.x + cssW / 2;
       const sy = wy - centerW.y + cssH / 2;
 
-      sensorMap.set(slotKey, { sx, sy, value: pm25, weightMultiplier: decayWeight });
+      sensorMap.set(slotKey, { sx, sy, value: pollVal, weightMultiplier: decayWeight });
     }
   }
 
@@ -345,6 +388,8 @@ class MapView {
     this._paFieldDimTarget = 1.0;
     this._paFieldDimCurrent = 1.0;
     this._paFieldDimRAF = null;
+    // PA field pollutant: which pollutant the field should display
+    this._paFieldPollutant = "pm25";
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
     this._traceRAF = null;
@@ -6047,6 +6092,19 @@ class MapView {
   }
 
   /**
+   * Switch PA field to a different pollutant. Invalidates field cache and redraws.
+   * @param {string} tab - Legend tab id: "pm25", "pm10", "o3", "no2", "co"
+   */
+  setPaFieldPollutant(tab) {
+    const prev = this._paFieldPollutant;
+    this._paFieldPollutant = tab || "pm25";
+    if (prev !== this._paFieldPollutant) {
+      this._invalidateOverlayStatic();
+      this._redrawViewOnly();
+    }
+  }
+
+  /**
    * Animate PA field dim alpha toward target. Called from app.js when legend tab changes.
    * @param {number} target - 1.0 for full, 0.05 for dimmed
    */
@@ -6192,7 +6250,9 @@ class MapView {
     // the validity window of the current fingerprint, no sensor can have changed
     // color category — skip the expensive _collectPaFieldSensors entirely. ──
     const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
+    const pollutantTab = this._paFieldPollutant || "pm25";
     if (this._paFieldCanvas
+        && this._paFieldValidPollutant === pollutantTab
         && this._paFieldValidViewKey === viewKey
         && this._paFieldValidFixed === fixed
         && this._paFieldValidRange
@@ -6203,7 +6263,7 @@ class MapView {
 
     // ── Collect sensors, project to screen coords + build color fingerprint ──
     const centerW = latLonToWorld(clat, clon, z);
-    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH);
+    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab);
     const paSensors = paField.sensors;
 
     // ── Inject virtual sensors from mobile trail GPS points ──
@@ -6213,7 +6273,7 @@ class MapView {
     const _boundsMaxMs = (_pbBounds?.maxMs != null && isFinite(_pbBounds.maxMs)) ? _pbBounds.maxMs : null;
     const virtualRefNowMs = (_pbTimeMs != null && isFinite(_pbTimeMs)) ? Number(_pbTimeMs) : (_boundsMaxMs ?? this._dataNowMs());
     const virtualField = _collectVirtualMobileSensors(
-      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs
+      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab
     );
     this._virtualMobileSensors = virtualField.sensors;
 
@@ -6225,14 +6285,15 @@ class MapView {
     // Disable validity-range fast-skip when virtual sensors are present (they age continuously)
     if (virtualField.sensors.length > 0) this._paFieldValidRange = null;
 
-    // ── Cache key: view geometry + color fingerprint ──
-    const key = `pa:${viewKey}|f:${fingerprint}`;
+    // ── Cache key: view geometry + color fingerprint + pollutant ──
+    const key = `pa:${viewKey}|p:${pollutantTab}|f:${fingerprint}`;
     if (this._paFieldCanvas && this._paFieldKey === key) {
       // Cache hit — update validity window so future frames skip _collectPaFieldSensors.
       if (!this._paFieldValidRange) {
         this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
         this._paFieldValidViewKey = viewKey;
         this._paFieldValidFixed = fixed;
+        this._paFieldValidPollutant = pollutantTab;
       }
       return;
     }
@@ -6272,16 +6333,18 @@ class MapView {
     const twoSigmaSq = 2 * sigma * sigma;
 
     // ── Build stride-5 sensor array: [sx, sy, aqi, twoSigSq, weightMultiplier, ...] ──
-    // Blend in AQI space: the non-linear PM2.5→AQI transform gives high
+    // Blend in AQI space: the non-linear concentration→AQI transform gives high
     // concentrations proportionally more weight in the kernel average,
     // so a local spike stays visible instead of being diluted by neighbors.
+    const aqiKey = _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5";
     const s5 = new Float64Array(nSensors * 5);
     for (let i = 0; i < nSensors; i++) {
       const sensor = allSensors[i];
       const si5 = i * 5;
       s5[si5] = sensor.sx;
       s5[si5 + 1] = sensor.sy;
-      s5[si5 + 2] = _pm25ToAqi(sensor.value);
+      const aqi = valueToAqi(aqiKey, sensor.value);
+      s5[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
       s5[si5 + 3] = twoSigmaSq;
       s5[si5 + 4] = sensor.weightMultiplier;
     }
@@ -6299,6 +6362,7 @@ class MapView {
     this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
     this._paFieldValidViewKey = viewKey;
     this._paFieldValidFixed = fixed;
+    this._paFieldValidPollutant = pollutantTab;
     // Store view state for gesture-time translate offset
     this._paFieldComputedView = { centerLat: clat, centerLon: clon, zoom: z };
   }
