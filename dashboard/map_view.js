@@ -8650,14 +8650,16 @@ class MapView {
       // Expose the selected sensor's displayed pollutant key for legend sync
       if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
-      // Legend pollutant override: show the legend's chosen pollutant on the selected marker
-      if (isSel && this._paFieldPollutant && this._paFieldPollutant !== "pm25") {
+      // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers
+      if (this._paFieldPollutant && this._paFieldPollutant !== "pm25") {
         const legendPr = _readingForLegendTab(m.readings, this._paFieldPollutant);
-        if (legendPr) { pr = legendPr; this._selectedPollutantKey = legendPr.key; }
-        else {
+        if (legendPr) {
+          pr = legendPr;
+          if (isSel) this._selectedPollutantKey = legendPr.key;
+        } else {
           const lbl = _LEGEND_TAB_LABEL[this._paFieldPollutant] || this._paFieldPollutant.toUpperCase();
           pr = { key: lbl, value: "\u2014", color: "#666666" };
-          this._selectedPollutantKey = null;
+          if (isSel) this._selectedPollutantKey = null;
         }
       }
 

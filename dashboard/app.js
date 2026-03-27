@@ -1345,10 +1345,16 @@ function main() {
     }
 
     selectedId = id || null;
-    legendUserOverride = false; // reset on every new selection so legend syncs to worst reading
+    // Only reset legend override when on the default PM2.5 tab;
+    // if user has manually selected another pollutant, keep it.
+    if (legendTab === "pm25") legendUserOverride = false;
     if (!selectedId) {
-      legendTab = "pm25";
-      userLegendTab = "pm25";
+      if (legendTab !== "pm25") {
+        // Keep the user's non-default pollutant selection
+      } else {
+        legendTab = "pm25";
+        userLegendTab = "pm25";
+      }
       buildLegend();
       _syncPaFieldDim();
     }
@@ -1369,10 +1375,11 @@ function main() {
     }
 
     // Sync legend tab to selected marker's displayed pollutant
-    // Use item data directly (map render state may not be updated yet)
-    if (item) syncLegendToSensor(item);
-    // Also try map's render-resolved key as a fallback
-    syncLegendToMapSelection();
+    // Only when on the default PM2.5 tab — don't override a user's manual pollutant choice
+    if (legendTab === "pm25") {
+      if (item) syncLegendToSensor(item);
+      syncLegendToMapSelection();
+    }
     
     // Center camera when selected from sidebar (any sensor type), or for mobile from map click with cmd+click for fit
     if (item && isFinite(Number(item.lat)) && isFinite(Number(item.lon))) {
