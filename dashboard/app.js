@@ -389,8 +389,8 @@ function main() {
   let legendOpen = _isMobileWidth
     ? false
     : localStorage.getItem(LEGEND_OPEN_KEY) === "true";
-  let legendTab = localStorage.getItem(LEGEND_TAB_KEY) || "pm25";
-  let userLegendTab = legendTab; // what the user manually chose (restored on deselect)
+  let legendTab = "pm25";
+  let userLegendTab = "pm25"; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected
   let _legendAutoOpenedOnce = legendOpen; // skip auto-open if user already kept legend open
 
@@ -414,6 +414,7 @@ function main() {
     if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
       legendTab = tab;
       buildLegend(true);
+      _syncPaFieldDim();
     }
   }
 
@@ -425,6 +426,7 @@ function main() {
     if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
       legendTab = tab;
       buildLegend(true);
+      _syncPaFieldDim();
     }
   }
 
@@ -433,6 +435,7 @@ function main() {
     if (legendTab !== userLegendTab && LEGEND_DATA[userLegendTab]) {
       legendTab = userLegendTab;
       buildLegend(true);
+      _syncPaFieldDim();
     }
   }
 
@@ -758,6 +761,13 @@ function main() {
     localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
   }
 
+  /** Dim PA field to 5% when legend is open and showing a non-PM2.5 tab. */
+  function _syncPaFieldDim() {
+    if (!map || typeof map.setPaFieldDim !== "function") return;
+    const shouldDim = legendOpen && legendTab !== "pm25";
+    map.setPaFieldDim(shouldDim ? 0.05 : 1.0);
+  }
+
   buildLegend();
   updateLegendVisibility();
 
@@ -770,6 +780,7 @@ function main() {
         legendUserOverride = !!selectedId; // override auto-sync while a marker is selected
         localStorage.setItem(LEGEND_TAB_KEY, legendTab);
         buildLegend(true);
+        _syncPaFieldDim();
       });
     }
   }
@@ -777,6 +788,11 @@ function main() {
   if (legendCloseEl) {
     legendCloseEl.addEventListener("click", () => {
       legendOpen = false;
+      // Reset to PM2.5 on close so PA field is never hidden when legend is closed
+      legendTab = "pm25";
+      userLegendTab = "pm25";
+      buildLegend();
+      _syncPaFieldDim();
       updateLegendVisibility();
     });
   }
@@ -784,6 +800,7 @@ function main() {
     legendToggleEl.addEventListener("click", () => {
       legendOpen = true;
       updateLegendVisibility();
+      _syncPaFieldDim();
     });
   }
 
@@ -1287,6 +1304,7 @@ function main() {
       legendTab = "pm25";
       userLegendTab = "pm25";
       buildLegend();
+      _syncPaFieldDim();
       renderLists(_currentState(), selectedId);
       renderDetails(_currentState(), selectedId);
       return;
@@ -1298,6 +1316,7 @@ function main() {
       legendTab = "pm25";
       userLegendTab = "pm25";
       buildLegend();
+      _syncPaFieldDim();
     }
     map.setSelected(selectedId);
 
@@ -3998,7 +4017,7 @@ function main() {
         const pct = Math.max(0, Math.min(100, Number(menuAlphaEl.value) || 0));
         window._paFieldAlpha = Math.round(pct * 2.55);
         localStorage.setItem(PA_ALPHA_STORAGE_KEY, String(pct));
-        if (map) { map._paFieldKey = null; map._redrawViewOnly(); }
+        if (map) { map._paFieldKey = null; map._paFieldValidRange = null; map._redrawViewOnly(); }
       });
     }
   }

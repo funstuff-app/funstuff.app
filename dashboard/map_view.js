@@ -341,6 +341,10 @@ class MapView {
     // Label visibility is per-sensor-type (mobile vs fixed)
     this.showMobileLabels = false;
     this.showFixedLabels = false;
+    // PA field dim: 1.0 = full (PM2.5 selected or legend closed), 0.05 = dimmed (other pollutant)
+    this._paFieldDimTarget = 1.0;
+    this._paFieldDimCurrent = 1.0;
+    this._paFieldDimRAF = null;
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
     this._traceRAF = null;
@@ -6043,6 +6047,29 @@ class MapView {
   }
 
   /**
+   * Animate PA field dim alpha toward target. Called from app.js when legend tab changes.
+   * @param {number} target - 1.0 for full, 0.05 for dimmed
+   */
+  setPaFieldDim(target) {
+    this._paFieldDimTarget = target;
+    if (this._paFieldDimRAF) return; // animation already running
+    const animate = () => {
+      const diff = this._paFieldDimTarget - this._paFieldDimCurrent;
+      if (Math.abs(diff) < 0.01) {
+        this._paFieldDimCurrent = this._paFieldDimTarget;
+        this._paFieldDimRAF = null;
+        this._redrawViewOnly();
+        return;
+      }
+      // Ease toward target (~200ms settle)
+      this._paFieldDimCurrent += diff * 0.15;
+      this._redrawViewOnly();
+      this._paFieldDimRAF = requestAnimationFrame(animate);
+    };
+    this._paFieldDimRAF = requestAnimationFrame(animate);
+  }
+
+  /**
    * Composite the PA scalar field onto the tiles canvas (above tiles, below overlay).
    * Restores tiles from snapshot first to avoid opacity accumulation on repeated calls.
    */
@@ -6084,6 +6111,7 @@ class MapView {
         const ty = prevC.y - currC.y;
         ctx.setTransform(dpr, 0, 0, dpr, dpr * tx, dpr * ty);
       }
+      ctx.globalAlpha = this._paFieldDimCurrent;
       ctx.drawImage(this._paFieldCanvas, 0, 0, cssW, cssH);
       ctx.restore();
       // Drop in-progress cross-fade to avoid stale fades during gesture
@@ -6105,13 +6133,14 @@ class MapView {
     if (!this._paFieldCanvas) { ctx.restore(); return; }
 
     // Cross-fade from previous field canvas to current one
+    const dimAlpha = this._paFieldDimCurrent;
     const fadeT = this._paFieldPrevCanvas
       ? Math.min(1, (performance.now() - this._paFieldFadeStart) / this._paFieldFadeMs)
       : 1;
     if (this._paFieldPrevCanvas && fadeT < 1) {
-      ctx.globalAlpha = 1 - fadeT;
+      ctx.globalAlpha = (1 - fadeT) * dimAlpha;
       ctx.drawImage(this._paFieldPrevCanvas, 0, 0);
-      ctx.globalAlpha = fadeT;
+      ctx.globalAlpha = fadeT * dimAlpha;
       ctx.drawImage(this._paFieldCanvas, 0, 0);
       ctx.globalAlpha = 1;
       // Schedule another frame to complete the fade (no-op if playback loop is running)
@@ -6124,6 +6153,7 @@ class MapView {
       }
     } else {
       if (this._paFieldPrevCanvas) this._paFieldPrevCanvas = null;
+      ctx.globalAlpha = dimAlpha;
       ctx.drawImage(this._paFieldCanvas, 0, 0);
     }
     ctx.restore();
