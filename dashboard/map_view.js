@@ -414,6 +414,8 @@ class MapView {
     this._paFieldDimRAF = null;
     // PA field pollutant: which pollutant the field should display (null = default/highest AQI)
     this._paFieldPollutant = null;
+    // Marker pollutant override: only set from explicit legend tab clicks
+    this._markerPollutantOverride = null;
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
     this._traceRAF = null;
@@ -1683,6 +1685,7 @@ class MapView {
     if (this.selectedId === next) return;
     this.selectedId = next;
     if (!next) this._selectedPollutantKey = null;
+    if (!next) this._selectedNaturalPollutantKey = null;
     this._followSuppressUntilMs = 0;
     this._invalidateOverlayStatic();
     this.drawOverlay(this.lastState);
@@ -1691,6 +1694,10 @@ class MapView {
   /** Returns the pollutant key currently displayed on the selected marker (e.g. "PM25", "PM10", "OZNE"). */
   getSelectedPollutantKey() {
     return this._selectedPollutantKey || null;
+  }
+
+  getSelectedNaturalPollutantKey() {
+    return this._selectedNaturalPollutantKey || null;
   }
 
   setShowFixed(v) {
@@ -2688,7 +2695,7 @@ class MapView {
       ...(topMobileCand ? [topMobileCand] : []),
       ...[...otherMobileCands].reverse(),
       ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
-      ...[...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
+      ...(this._paFieldPollutant == null ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
     ];
     for (const m of candidates) {
       let lat = Number(m.lat), lon = Number(m.lon);
@@ -2739,7 +2746,7 @@ class MapView {
       ...(tapTopMobileCand ? [tapTopMobileCand] : []),
       ...[...tapOtherMobileCands].reverse(),
       ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
-      ...[...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
+      ...(this._paFieldPollutant == null ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
     ];
     for (const m of candidates) {
       let lat = Number(m.lat), lon = Number(m.lon);
@@ -6213,6 +6220,11 @@ class MapView {
     }
   }
 
+  /** Set marker pollutant override (only from explicit legend tab clicks). */
+  setMarkerPollutantOverride(tab) {
+    this._markerPollutantOverride = tab || null;
+  }
+
   /**
    * Animate PA field dim alpha toward target. Called from app.js when legend tab changes.
    * @param {number} target - 1.0 for full, 0.05 for dimmed
@@ -7066,8 +7078,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
-          // Fade PurpleAir dots when a non-PM2.5 pollutant is explicitly selected
-          const paFadedForPollutant = !isSel && this._paFieldPollutant != null && this._paFieldPollutant !== "pm25";
+          // Fade PurpleAir dots when any pollutant is active
+          const paFadedForPollutant = !isSel && this._paFieldPollutant != null;
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
@@ -7391,6 +7403,7 @@ class MapView {
     if (!ctx) return;
     // Reset per-frame: will be set by whichever marker is selected
     this._selectedPollutantKey = null;
+    this._selectedNaturalPollutantKey = null;
     const w = this._cssW || 1;
     const h = this._cssH || 1;
     const dpr = this._dpr || (window.devicePixelRatio || 1);
@@ -8511,18 +8524,19 @@ class MapView {
 
         // Expose the selected sensor's displayed pollutant key for legend sync
         if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
+        if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
 
         // Legend pollutant override: show the selected pollutant on ALL non-PurpleAir markers
-        if (this._paFieldPollutant != null && !f.purpleair) {
+        if (this._markerPollutantOverride != null && !f.purpleair) {
           const src = isSel
             ? (interpolateFixedReadingsAtTime(f, fixedPbTimeMs) || f.readings)
             : f.readings;
-          const legendPr = _readingForLegendTab(src, this._paFieldPollutant);
+          const legendPr = _readingForLegendTab(src, this._markerPollutantOverride);
           if (legendPr) {
             pr = legendPr;
             if (isSel) this._selectedPollutantKey = legendPr.key;
           } else {
-            const lbl = _LEGEND_TAB_LABEL[this._paFieldPollutant] || this._paFieldPollutant.toUpperCase();
+            const lbl = _LEGEND_TAB_LABEL[this._markerPollutantOverride] || this._markerPollutantOverride.toUpperCase();
             pr = { key: lbl, value: "\u2014", color: "#666666" };
             if (isSel) this._selectedPollutantKey = null;
           }
@@ -8531,8 +8545,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
-          // Fade PurpleAir dots when a non-PM2.5 pollutant is explicitly selected
-          const paFadedForPollutant = !isSel && this._paFieldPollutant != null && this._paFieldPollutant !== "pm25";
+          // Fade PurpleAir dots when any pollutant is active
+          const paFadedForPollutant = !isSel && this._paFieldPollutant != null;
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
@@ -8731,17 +8745,18 @@ class MapView {
       }
       // Expose the selected sensor's displayed pollutant key for legend sync
       if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
+      if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
 
       // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers
       // In playback mode, prefer trail-point readings (historical) over live m.readings
-      if (this._paFieldPollutant != null) {
+      if (this._markerPollutantOverride != null) {
         const src = (this.playbackMode && pose && pose.readings) ? pose.readings : m.readings;
-        const legendPr = _readingForLegendTab(src, this._paFieldPollutant);
+        const legendPr = _readingForLegendTab(src, this._markerPollutantOverride);
         if (legendPr) {
           pr = legendPr;
           if (isSel) this._selectedPollutantKey = legendPr.key;
         } else {
-          const lbl = _LEGEND_TAB_LABEL[this._paFieldPollutant] || this._paFieldPollutant.toUpperCase();
+          const lbl = _LEGEND_TAB_LABEL[this._markerPollutantOverride] || this._markerPollutantOverride.toUpperCase();
           pr = { key: lbl, value: "\u2014", color: "#666666" };
           if (isSel) this._selectedPollutantKey = null;
         }

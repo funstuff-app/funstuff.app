@@ -407,30 +407,25 @@ function main() {
     return null;
   }
 
-  /** Switch legend tab to match a selected sensor's primary reading. */
-  function syncLegendToSensor(sensor) {
-    if (!sensor || legendUserOverride || legendTab != null) return;
-    const pr = primaryReadingForSensor(sensor);
-    const tab = pollutantToLegendTab(pr && pr.key);
-    if (tab && LEGEND_DATA[tab]) {
-      legendTab = tab;
-      userLegendTab = tab;
-      buildLegend(true);
-      _syncPaFieldDim();
-    }
+  /** Get the natural (highest-AQI) pollutant tab for the currently selected sensor at playback time. */
+  function _selectedSensorPollutantTab() {
+    if (!selectedId || !map) return null;
+    const key = map.getSelectedNaturalPollutantKey();
+    return pollutantToLegendTab(key);
   }
 
-  /** Sync legend tab to whatever pollutant the map is currently showing on the selected marker. */
+  /** Switch legend content to match a selected sensor's primary reading (without selecting the tab). */
+  function syncLegendToSensor(sensor) {
+    if (!sensor || legendTab != null) return;
+    buildLegend(true);
+    _syncPaFieldDim();
+  }
+
+  /** Sync legend content to whatever pollutant the map is currently showing on the selected marker. */
   function syncLegendToMapSelection() {
-    if (!map || !selectedId || legendUserOverride || legendTab != null) return;
-    const key = map.getSelectedPollutantKey();
-    const tab = pollutantToLegendTab(key);
-    if (tab && LEGEND_DATA[tab]) {
-      legendTab = tab;
-      userLegendTab = tab;
-      buildLegend(true);
-      _syncPaFieldDim();
-    }
+    if (!map || !selectedId || legendTab != null) return;
+    buildLegend(true);
+    _syncPaFieldDim();
   }
 
   /** Revert legend tab to the user's manual choice. */
@@ -679,9 +674,14 @@ function main() {
 
   function buildLegend(animate = false) {
     if (!legendBodyEl) return;
-    const data = (legendTab && LEGEND_DATA[legendTab]) || LEGEND_DATA.pm25;
+    // Derive display pollutant: explicit tab wins, otherwise follow selected sensor
+    let displayTab = legendTab;
+    if (!displayTab && selectedId) {
+      displayTab = _selectedSensorPollutantTab();
+    }
+    const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const legendNameEl = document.getElementById("legendName");
-    if (legendNameEl) legendNameEl.textContent = legendTab ? data.name : "Show All";
+    if (legendNameEl) legendNameEl.textContent = displayTab ? data.name : "Show All";
     if (legendUnitEl) legendUnitEl.textContent = data.unit;
 
     const entries = data.entries;
@@ -802,11 +802,16 @@ function main() {
     localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
   }
 
-  /** Sync PA field pollutant to match legend tab selection. */
+  /** Sync PA field pollutant to match legend display (explicit tab or sensor-derived). */
   function _syncPaFieldDim() {
     if (!map) return;
-    // Switch field to show the selected pollutant (null = show worst/default)
-    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(legendTab);
+    let displayTab = legendTab;
+    if (!displayTab && selectedId) {
+      displayTab = _selectedSensorPollutantTab();
+    }
+    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(displayTab);
+    // Marker override only from explicit tab clicks
+    if (typeof map.setMarkerPollutantOverride === "function") map.setMarkerPollutantOverride(legendTab);
   }
 
   buildLegend();
@@ -2860,8 +2865,12 @@ function main() {
       _pbLastUiPerf = now;
     }
 
-    // Sync legend tab to selected marker's displayed pollutant (changes during scrub)
-    syncLegendToMapSelection();
+    // Sync legend + field only when not scrubbing with a sensor selected.
+    // Legend title/bars and PA field update when scrubbing stops or vehicle resumes.
+    if (!(_pbScrubbing || _pbIsWheelCoasting) || !selectedId) {
+      _syncPaFieldDim();
+      syncLegendToMapSelection();
+    }
 
     // ── Barrel jog wheel: sync position & render ──
     if (_barrelMode && _jogWheel) {
