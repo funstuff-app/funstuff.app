@@ -389,9 +389,10 @@ function main() {
   let legendOpen = _isMobileWidth
     ? false
     : localStorage.getItem(LEGEND_OPEN_KEY) === "true";
-  let legendTab = "pm25";
-  let userLegendTab = "pm25"; // what the user manually chose (restored on deselect)
+  let legendTab = null;
+  let userLegendTab = null; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected
+  let _wasAlreadyDeselected = true; // tracks if no sensor was selected on previous click
   let _legendAutoOpenedOnce = legendOpen; // skip auto-open if user already kept legend open
 
   /** Map a pollutant key (PM25, PM10, OZNE, O3, etc.) to a legend tab id. */
@@ -408,7 +409,7 @@ function main() {
 
   /** Switch legend tab to match a selected sensor's primary reading. */
   function syncLegendToSensor(sensor) {
-    if (!sensor || legendUserOverride) return;
+    if (!sensor || legendUserOverride || legendTab != null) return;
     const pr = primaryReadingForSensor(sensor);
     const tab = pollutantToLegendTab(pr && pr.key);
     if (tab && LEGEND_DATA[tab]) {
@@ -421,7 +422,7 @@ function main() {
 
   /** Sync legend tab to whatever pollutant the map is currently showing on the selected marker. */
   function syncLegendToMapSelection() {
-    if (!map || !selectedId || legendUserOverride) return;
+    if (!map || !selectedId || legendUserOverride || legendTab != null) return;
     const key = map.getSelectedPollutantKey();
     const tab = pollutantToLegendTab(key);
     if (tab && LEGEND_DATA[tab]) {
@@ -673,7 +674,7 @@ function main() {
 
   function buildLegend(animate = false) {
     if (!legendBodyEl) return;
-    const data = LEGEND_DATA[legendTab] || LEGEND_DATA.pm25;
+    const data = (legendTab && LEGEND_DATA[legendTab]) || LEGEND_DATA.pm25;
     if (legendUnitEl) legendUnitEl.textContent = data.unit;
 
     const entries = data.entries;
@@ -797,8 +798,8 @@ function main() {
   /** Sync PA field pollutant to match legend tab selection. */
   function _syncPaFieldDim() {
     if (!map) return;
-    // Switch field to show the selected pollutant (with correct sensors + color ramp)
-    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(legendTab || "pm25");
+    // Switch field to show the selected pollutant (null = show worst/default)
+    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(legendTab);
   }
 
   buildLegend();
@@ -809,11 +810,12 @@ function main() {
     for (const tab of legendEl.querySelectorAll(".legendTab")) {
       tab.addEventListener("click", () => {
         const clicked = tab.dataset.legend || "pm25";
-        // Clicking the active non-PM2.5 tab deselects back to PM2.5
-        legendTab = (clicked === legendTab && clicked !== "pm25") ? "pm25" : clicked;
+        // Clicking the active tab deselects back to default (null)
+        legendTab = (clicked === legendTab) ? null : clicked;
         userLegendTab = legendTab;
         legendUserOverride = !!selectedId; // override auto-sync while a marker is selected
-        localStorage.setItem(LEGEND_TAB_KEY, legendTab);
+        if (legendTab) localStorage.setItem(LEGEND_TAB_KEY, legendTab);
+        else localStorage.removeItem(LEGEND_TAB_KEY);
         buildLegend(true);
         _syncPaFieldDim();
       });
@@ -823,9 +825,9 @@ function main() {
   if (legendCloseEl) {
     legendCloseEl.addEventListener("click", () => {
       legendOpen = false;
-      // Reset to PM2.5 on close so PA field is never hidden when legend is closed
-      legendTab = "pm25";
-      userLegendTab = "pm25";
+      // Reset to default on close
+      legendTab = null;
+      userLegendTab = null;
       buildLegend();
       _syncPaFieldDim();
       updateLegendVisibility();
@@ -1334,10 +1336,9 @@ function main() {
     if (id && selectedId === id) {
       selectedId = null;
       legendUserOverride = false;
+      _wasAlreadyDeselected = false;
       if (map && typeof map.cancelSelectionOrchestration === "function") map.cancelSelectionOrchestration();
       map.setSelected(null);
-      legendTab = "pm25";
-      userLegendTab = "pm25";
       buildLegend();
       _syncPaFieldDim();
       renderLists(_currentState(), selectedId);
@@ -1346,20 +1347,23 @@ function main() {
     }
 
     selectedId = id || null;
-    // Only reset legend override when on the default PM2.5 tab;
-    // if user has manually selected another pollutant, keep it.
-    if (legendTab === "pm25") legendUserOverride = false;
+    // Only reset legend override when on default (null);
+    // if user has manually selected a pollutant, keep it.
+    if (legendTab == null) legendUserOverride = false;
     if (!selectedId) {
-      if (legendTab !== "pm25") {
-        // Keep the user's non-default pollutant selection
-      } else {
-        legendTab = "pm25";
-        userLegendTab = "pm25";
+      if (legendTab != null && _wasAlreadyDeselected) {
+        // Second background click: clear pollutant back to default
+        legendTab = null;
+        userLegendTab = null;
+        legendUserOverride = false;
       }
+      // Track whether we were already deselected (for next click)
+      _wasAlreadyDeselected = true;
       buildLegend();
       _syncPaFieldDim();
     }
     map.setSelected(selectedId);
+    if (selectedId) _wasAlreadyDeselected = false;
 
     const st = _currentState();
     const sel = parseKey(selectedId);
@@ -1377,7 +1381,7 @@ function main() {
 
     // Sync legend tab to selected marker's displayed pollutant
     // Only when on the default PM2.5 tab — don't override a user's manual pollutant choice
-    if (legendTab === "pm25") {
+    if (legendTab == null) {
       // Defer sync: the map needs to render one frame with the new selection
       // so _selectedPollutantKey reflects the actual displayed reading
       // (which may differ from live data during playback).
@@ -1441,10 +1445,10 @@ function main() {
     if (e.key === "Escape") {
       selectedId = null;
       legendUserOverride = false;
+      _wasAlreadyDeselected = false;
       map.setSelected(null);
-      legendTab = "pm25";
-      userLegendTab = "pm25";
       buildLegend();
+      _syncPaFieldDim();
       renderLists(_currentState(), selectedId);
       renderDetails(_currentState(), selectedId);
     }

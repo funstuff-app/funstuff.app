@@ -417,8 +417,8 @@ class MapView {
     this._paFieldDimTarget = 1.0;
     this._paFieldDimCurrent = 1.0;
     this._paFieldDimRAF = null;
-    // PA field pollutant: which pollutant the field should display
-    this._paFieldPollutant = "pm25";
+    // PA field pollutant: which pollutant the field should display (null = default/highest AQI)
+    this._paFieldPollutant = null;
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
     this._traceRAF = null;
@@ -6133,7 +6133,7 @@ class MapView {
    */
   setPaFieldPollutant(tab) {
     const prev = this._paFieldPollutant;
-    this._paFieldPollutant = tab || "pm25";
+    this._paFieldPollutant = tab || null;
     if (prev !== this._paFieldPollutant) {
       this._invalidateOverlayStatic();
       // Invalidate trail canvas cache so trails redraw with new pollutant colors
@@ -6844,9 +6844,9 @@ class MapView {
         p._u = u; p._v = v;
       }
 
-      // 3. Color last — pollutant-aware: use selected pollutant when non-PM2.5
-      const pollTab = this._paFieldPollutant || "pm25";
-      const usePollutantColor = pollTab !== "pm25";
+      // 3. Color last — pollutant-aware: use selected pollutant when explicitly chosen
+      const pollTab = this._paFieldPollutant;
+      const usePollutantColor = pollTab != null;
       let base;
       if (usePollutantColor) {
         // Per-pollutant color cache: _cachedColorByTab = { pm10: "#hex", o3: "#hex", ... }
@@ -7003,8 +7003,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
-          // Fade PurpleAir dots when a non-PM2.5 pollutant is selected (they only report PM2.5)
-          const paFadedForPollutant = !isSel && this._paFieldPollutant && this._paFieldPollutant !== "pm25";
+          // Fade PurpleAir dots when a non-PM2.5 pollutant is explicitly selected
+          const paFadedForPollutant = !isSel && this._paFieldPollutant != null && this._paFieldPollutant !== "pm25";
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
@@ -7428,7 +7428,7 @@ class MapView {
     // Playback-mode trail caching:
     // Cache trails to offscreen canvas; only redraw when view or time changes significantly.
     const pbTimeMs = _framePbTimeMs;
-    const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}|${this._paFieldPollutant || 'pm25'}`;
+    const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}|${this._paFieldPollutant || 'default'}`;
     const viewChanged = this._trailCacheViewKey !== trailViewKey;
     const timeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? (pbTimeMs - this._trailCacheTimeMs) : 0;
     // Trail fading uses 45-min window; 2-second threshold keeps fading visually smooth while allowing fast scrubbing
@@ -8450,7 +8450,7 @@ class MapView {
         if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
         // Legend pollutant override: show the selected pollutant on ALL non-PurpleAir markers
-        if (this._paFieldPollutant && this._paFieldPollutant !== "pm25" && !f.purpleair) {
+        if (this._paFieldPollutant != null && !f.purpleair) {
           const src = isSel
             ? (interpolateFixedReadingsAtTime(f, fixedPbTimeMs) || f.readings)
             : f.readings;
@@ -8468,8 +8468,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
-          // Fade PurpleAir dots when a non-PM2.5 pollutant is selected (they only report PM2.5)
-          const paFadedForPollutant = !isSel && this._paFieldPollutant && this._paFieldPollutant !== "pm25";
+          // Fade PurpleAir dots when a non-PM2.5 pollutant is explicitly selected
+          const paFadedForPollutant = !isSel && this._paFieldPollutant != null && this._paFieldPollutant !== "pm25";
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
@@ -8671,7 +8671,7 @@ class MapView {
 
       // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers
       // In playback mode, prefer trail-point readings (historical) over live m.readings
-      if (this._paFieldPollutant && this._paFieldPollutant !== "pm25") {
+      if (this._paFieldPollutant != null) {
         const src = (this.playbackMode && pose && pose.readings) ? pose.readings : m.readings;
         const legendPr = _readingForLegendTab(src, this._paFieldPollutant);
         if (legendPr) {
