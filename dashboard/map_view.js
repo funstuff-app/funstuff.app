@@ -66,7 +66,16 @@ function _readingForLegendTab(readings, legendTab) {
     const r = readings[rk];
     if (r && r.value != null) {
       const aqi = valueToAqi(_LEGEND_TAB_AQI_KEY[legendTab] || "pm2.5", r.value);
-      return { key: rk, value: r.value, color: safeHex(r.ci), aqi };
+      // Derive color from AQI via the same continuous ramp the field uses,
+      // so marker ring colors match the interpolated heatmap.
+      let color;
+      if (aqi != null && isFinite(aqi)) {
+        const rgb = _aqiToRgb(aqi);
+        color = `#${((1 << 24) + (rgb[0] << 16) + (rgb[1] << 8) + rgb[2]).toString(16).slice(1)}`;
+      } else {
+        color = safeHex(r.ci);
+      }
+      return { key: rk, value: r.value, color, aqi };
     }
   }
   return null;
@@ -6126,6 +6135,9 @@ class MapView {
     this._paFieldPollutant = tab || "pm25";
     if (prev !== this._paFieldPollutant) {
       this._invalidateOverlayStatic();
+      // Invalidate trail canvas cache so trails redraw with new pollutant colors
+      this._trailCacheViewKey = "";
+      this._trailCacheCanvas = null;
       this._redrawViewOnly();
     }
   }
@@ -6831,12 +6843,36 @@ class MapView {
         p._u = u; p._v = v;
       }
 
-      // 3. Color last
-      let base = p._cachedColor;
-      if (base === undefined) {
-        const pr = primaryReadingFromPoint(p);
-        base = safeHex(pr?.ci != null ? pr.ci : pr?.color);
-        try { p._cachedColor = base; } catch {}
+      // 3. Color last — pollutant-aware: use selected pollutant when non-PM2.5
+      const pollTab = this._paFieldPollutant || "pm25";
+      const usePollutantColor = pollTab !== "pm25";
+      let base;
+      if (usePollutantColor) {
+        // Per-pollutant color cache: _cachedColorByTab = { pm10: "#hex", o3: "#hex", ... }
+        const cbt = p._cachedColorByTab;
+        base = cbt && cbt[pollTab];
+        if (base === undefined) {
+          const rKeys = _LEGEND_TAB_READING_KEYS[pollTab];
+          let found = null;
+          if (rKeys && p.readings) {
+            for (const rk of rKeys) {
+              const r = p.readings[rk];
+              if (r && r.value != null) { found = r; break; }
+            }
+          }
+          base = found ? safeHex(found.ci != null ? found.ci : found.color) : "#333333";
+          try {
+            if (!p._cachedColorByTab) p._cachedColorByTab = {};
+            p._cachedColorByTab[pollTab] = base;
+          } catch {}
+        }
+      } else {
+        base = p._cachedColor;
+        if (base === undefined) {
+          const pr = primaryReadingFromPoint(p);
+          base = safeHex(pr?.ci != null ? pr.ci : pr?.color);
+          try { p._cachedColor = base; } catch {}
+        }
       }
       
       // Calculate screen position
@@ -7376,7 +7412,7 @@ class MapView {
     // Playback-mode trail caching:
     // Cache trails to offscreen canvas; only redraw when view or time changes significantly.
     const pbTimeMs = _framePbTimeMs;
-    const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}`;
+    const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}|${this._paFieldPollutant || 'pm25'}`;
     const viewChanged = this._trailCacheViewKey !== trailViewKey;
     const timeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? (pbTimeMs - this._trailCacheTimeMs) : 0;
     // Trail fading uses 45-min window; 2-second threshold keeps fading visually smooth while allowing fast scrubbing
@@ -7608,7 +7644,7 @@ class MapView {
       const needsFullRedraw = viewChanged || timeChanged;
       // During gestures, skip full trail redraw for pan-only view changes;
       // translate the cached canvas instead (saves ~5ms/frame on iPad).
-      const skipTrailsForGesture = this._isAnimating() && viewChanged && !timeChanged
+      const skipTrailsForGesture = this._isTransientAnimating() && viewChanged && !timeChanged
         && this._trailCacheCanvas && this._trailCacheCenterW;
       const needsIncrementalUpdate = false; // Disabled: incremental breaks fade animation
 
@@ -8397,18 +8433,19 @@ class MapView {
         // Expose the selected sensor's displayed pollutant key for legend sync
         if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
-        // Legend pollutant override: show the legend's chosen pollutant on the selected marker
-        if (isSel && this._paFieldPollutant && this._paFieldPollutant !== "pm25") {
-          const interp2 = interpolateFixedReadingsAtTime(f, fixedPbTimeMs);
-          const legendPr = _readingForLegendTab(
-            interp2 || (f && f.readings),
-            this._paFieldPollutant
-          );
-          if (legendPr) { pr = legendPr; this._selectedPollutantKey = legendPr.key; }
-          else {
+        // Legend pollutant override: show the selected pollutant on ALL non-PurpleAir markers
+        if (this._paFieldPollutant && this._paFieldPollutant !== "pm25" && !f.purpleair) {
+          const src = isSel
+            ? (interpolateFixedReadingsAtTime(f, fixedPbTimeMs) || f.readings)
+            : f.readings;
+          const legendPr = _readingForLegendTab(src, this._paFieldPollutant);
+          if (legendPr) {
+            pr = legendPr;
+            if (isSel) this._selectedPollutantKey = legendPr.key;
+          } else {
             const lbl = _LEGEND_TAB_LABEL[this._paFieldPollutant] || this._paFieldPollutant.toUpperCase();
             pr = { key: lbl, value: "\u2014", color: "#666666" };
-            this._selectedPollutantKey = null;
+            if (isSel) this._selectedPollutantKey = null;
           }
         }
 
