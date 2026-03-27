@@ -8599,7 +8599,8 @@ class MapView {
       // In live mode, hide ghosted sensors unless Debug/Selected.
       const hasPlaybackData = this.playbackMode && this._playbackPtsById.has(String(m.id));
       if (!!m.ghosted && !debug && !isSel && !hasPlaybackData) return;
-      const isParked = !!m.parked;
+      // In playback mode, ignore live parked state — vehicle was active at the playback time
+      const isParked = hasPlaybackData ? false : !!m.parked;
       const dimmed = (!debug && !isSel && isParked);
       if (!isFinite(lat) || !isFinite(lon)) return;
       const wpt = latLonToWorld(lat, lon, this.zoom);
