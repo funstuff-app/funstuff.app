@@ -512,7 +512,7 @@ class AppState:
     purpleair_last_fetch: float = 0.0
     purpleair_meta_last_fetch: float = 0.0  # last time we fetched name/lat/lon
     purpleair_last_seen_cache: dict[int, int] = field(default_factory=dict)  # sensor_index -> last_seen timestamp
-    purpleair_pm25_cache: dict[int, float] = field(default_factory=dict)  # sensor_index -> last known pm2.5 value
+    purpleair_pm25_cache: dict[int, str] = field(default_factory=dict)  # sensor_index -> committed AQI color category
 
     # Optional offline road graph cache for map-matching.
     road_graph: Any | None = None
@@ -2767,26 +2767,28 @@ def purpleair_fetch_loop(
     SPARSE SENTINEL STRATEGY:
     Each cycle polls one sentinel sensor per ~2 km grid cell (typically ~30–50
     sentinels for SLC's ~242 outdoor sensors).  If a sentinel's pm2.5 crosses
-    an AQI color boundary, every sensor in that cell is fetched immediately via
-    show_only.  Cells whose sentinel didn't change color are skipped entirely.
+    a visible color boundary, every sensor in that cell is fetched immediately
+    via show_only.  Cells whose sentinel didn't change color are skipped.
 
-    Metadata (name, lat, lon + full pm2.5 sweep) refreshes every 6 hours so
+    Color change detection uses 7 bands (the 8 display colors with lt-blue
+    and green merged to avoid jitter at the noisy 5.0 µg/m³ boundary).
+
+    Metadata (name, lat, lon + full pm2.5 sweep) refreshes every 3 hours so
     the complete sensor picture stays current regardless of sentinel activity.
 
-    Budget math (2,000,000 pts/month, ~392 sensors, ~1 pt/sensor/field):
+    Budget math (1,000,000 pts/month, ~392 sensors, ~1 pt/sensor/field):
       Sentinel poll  ~81 pts/cycle (one per occupied grid cell)
       Cluster fetch  up to ~792 pts if ALL cells trigger (worst case)
       Metadata       ~1,568 pts per refresh (392 sensors × 4 fields)
 
       Day  (19h, 5 min):   228 cycles × 81  =  18,468 pts (sentinel only)
-                           228 cycles × 792 = 180,576 pts (worst-case clusters)
       Night (5h, 30 min):   10 cycles × 81  =    810 pts
-      Metadata (4×/day):     4       × 1568 =  6,272 pts
+      Metadata (8×/day):     8       × 1568 = 12,544 pts
       ──────────────────────────────────────────────────────
-      Quiet day  (no clusters): ~25,550 pts/day  →  ~777K/month
-      Worst-case day (all clusters): ~207K pts/day → over budget
-      Typical day (~10% cluster rate): ~43K pts/day → ~1.32M/month
-      Budget: 2,000,000 pts/month ✓ comfortable margin
+      Sentinel-only day: ~31,822 pts/day → ~969K/month
+      Hysteresis means clusters only fire on genuine band changes,
+      not boundary jitter — observed ~270K/day should drop to ~32K.
+      Budget: 1,000,000 pts/month ✓
     """
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
@@ -2805,9 +2807,17 @@ def purpleair_fetch_loop(
         return DATA_INTERVAL_NIGHT if _is_night() else DATA_INTERVAL_DAY
 
     def _aqi_color_category(pm25: float) -> str:
-        """Return the AQI color string for a pm2.5 value.  Only the COLOR
-        matters — value changes within the same color are ignored."""
-        return _get_aqi_color("PM25", pm25)
+        """Return sentinel color category for change detection.
+        Uses the same hex colors as _get_aqi_color for PM2.5 but merges
+        the lt-blue/green sub-bands (2.0–9.0) whose 5.0 boundary is
+        the noisiest jitter source on low-cost sensors."""
+        if pm25 <= 2.0:   return "#00FFFF"   # cyan   – Good (very low)
+        if pm25 <= 9.0:   return "#00E400"   # green  – Good (lt-blue+green merged)
+        if pm25 <= 35.4:  return "#FFFF00"   # yellow – Moderate
+        if pm25 <= 55.4:  return "#FF7E00"   # orange – USG
+        if pm25 <= 125.4: return "#FF0000"   # red    – Unhealthy
+        if pm25 <= 225.4: return "#8F3F97"   # purple – Very Unhealthy
+        return "#7E0023"                     # maroon – Hazardous
 
     def _build_grid(sensors: list[dict]) -> dict[tuple[int, int], list[int]]:
         """Divide all sensors into spatial grid cells (NEIGHBOR_RADIUS_DEG × NEIGHBOR_RADIUS_DEG).
@@ -2957,7 +2967,11 @@ def purpleair_fetch_loop(
             sentinel_data = _fetch_purpleair_sensors(fields="pm2.5", sensor_indices=sentinel_ids)
             debug_info["calls"].append({"type": "sentinel_poll", "count": len(sentinel_ids)})
 
-            # Detect AQI color-category changes and queue full cluster fetches
+            # Detect AQI color-category changes and queue full cluster fetches.
+            # Uses hysteresis: we cache the *committed color* per sentinel
+            # (the color that last triggered a cluster fetch).  A new color
+            # only triggers if it differs from that committed color — so a
+            # sensor oscillating 8.9↔9.1 around a boundary won't flip-flop.
             cluster_ids_to_fetch: set[int] = set()
             for s in sentinel_data:
                 sid = s.get("sensor_index")
@@ -2969,11 +2983,12 @@ def purpleair_fetch_loop(
                 except (TypeError, ValueError):
                     continue
                 new_color = _aqi_color_category(pm25_val)
-                old_pm25  = app_state.purpleair_pm25_cache.get(sid)
-                old_color = _aqi_color_category(old_pm25) if old_pm25 is not None else None
-                app_state.purpleair_pm25_cache[sid] = pm25_val
-                if old_color is None or new_color != old_color:
-                    # First read (no baseline yet) or color changed — fetch the whole cluster
+                committed_color = app_state.purpleair_pm25_cache.get(sid)
+                app_state.purpleair_pm25_cache[sid] = committed_color or new_color
+                if committed_color is None or new_color != committed_color:
+                    # First read or genuine color band change — fetch cluster
+                    # and commit the new color as the baseline.
+                    app_state.purpleair_pm25_cache[sid] = new_color
                     with app_state.lock:
                         cluster = _cluster_of(sid, grid, app_state.purpleair_sensors)
                     cluster_ids_to_fetch.update(cluster)
