@@ -398,6 +398,7 @@ def fetch_wind_field(analysis_time: datetime,
 # ─── Pre-interpolation to advection grid ─────────────────────────────────────
 
 # Must match pa_advection_worker.js GEO_BOUNDS / DEFAULT_GW / DEFAULT_GH
+<<<<<<< Updated upstream
 _GRID_BOUNDS = {"latMin": 39.5, "latMax": 41.5, "lonMin": -113.0, "lonMax": -111.0}
 _DEFAULT_GW = 80
 _DEFAULT_GH = 60
@@ -452,6 +453,76 @@ def wind_to_grid(points: list[dict[str, float]],
             if w_sum > 1e-12:
                 u_grid[idx] = round(u_sum / w_sum, 3)
                 v_grid[idx] = round(v_sum / w_sum, 3)
+=======
+GRID_BOUNDS = {"latMin": 39.5, "latMax": 41.5, "lonMin": -113.0, "lonMax": -111.0}
+GRID_GW = 80
+GRID_GH = 60
+
+
+def wind_to_grid(points: list[dict[str, float]],
+                 gw: int = GRID_GW, gh: int = GRID_GH,
+                 bounds: dict | None = None) -> dict:
+    """Bin-average raw wind points onto a fixed advection grid.
+
+    Returns ``{"gw", "gh", "bounds", "uGrid": [...], "vGrid": [...]}``
+    with flat row-major arrays in m/s.
+
+    Uses simple bin-averaging (O(N) in point count) instead of IDW to
+    keep it fast on the Pi's ARM CPU.  The RTMA-RU grid is already
+    regular ~2.5 km so each output cell gets 0–few source points;
+    empty cells are filled from the nearest occupied cell via a fast
+    flood-fill pass.
+    """
+    b = bounds or GRID_BOUNDS
+    n = gw * gh
+    u_sum = [0.0] * n
+    v_sum = [0.0] * n
+    count = [0] * n
+
+    lat_min, lat_max = b["latMin"], b["latMax"]
+    lon_min, lon_max = b["lonMin"], b["lonMax"]
+    inv_dlat = gh / (lat_max - lat_min)
+    inv_dlon = gw / (lon_max - lon_min)
+
+    # O(N) binning pass
+    for wp in points:
+        iy = int((wp["lat"] - lat_min) * inv_dlat)
+        ix = int((wp["lon"] - lon_min) * inv_dlon)
+        if iy < 0 or iy >= gh or ix < 0 or ix >= gw:
+            continue
+        idx = iy * gw + ix
+        u_sum[idx] += wp["u"]
+        v_sum[idx] += wp["v"]
+        count[idx] += 1
+
+    # Average occupied cells
+    u_grid = [0.0] * n
+    v_grid = [0.0] * n
+    for i in range(n):
+        if count[i] > 0:
+            u_grid[i] = round(u_sum[i] / count[i], 3)
+            v_grid[i] = round(v_sum[i] / count[i], 3)
+
+    # Flood-fill empty cells from nearest occupied neighbor (BFS)
+    if any(c > 0 for c in count) and any(c == 0 for c in count):
+        from collections import deque
+        q: deque[int] = deque()
+        for i in range(n):
+            if count[i] > 0:
+                q.append(i)
+        while q:
+            i = q.popleft()
+            iy, ix = divmod(i, gw)
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = iy + dy, ix + dx
+                if 0 <= ny < gh and 0 <= nx < gw:
+                    ni = ny * gw + nx
+                    if count[ni] == 0:
+                        u_grid[ni] = u_grid[i]
+                        v_grid[ni] = v_grid[i]
+                        count[ni] = -1  # mark visited
+                        q.append(ni)
+>>>>>>> Stashed changes
 
     return {"gw": gw, "gh": gh, "bounds": b,
             "uGrid": u_grid, "vGrid": v_grid}
@@ -469,6 +540,7 @@ def _wind_snapshots_dir(data_dir: Path) -> Path:
 
 def save_wind_field(data: list | dict, data_dir: Path,
                     analysis_time: datetime | None = None) -> None:
+<<<<<<< Updated upstream
     """Write wind field JSON with metadata to data_dir/wind_field.json.
 
     *data* may be either the legacy point list or a grid dict from
@@ -476,6 +548,10 @@ def save_wind_field(data: list | dict, data_dir: Path,
     """
     if isinstance(data, dict) and "gw" in data:
         # Grid format — store as-is with metadata
+=======
+    """Write wind field JSON with metadata to data_dir/wind_field.json."""
+    if isinstance(data, dict) and "gw" in data:
+>>>>>>> Stashed changes
         payload = {
             "ts": time.time(),
             "analysis_time": analysis_time.isoformat() if analysis_time else None,
@@ -528,26 +604,36 @@ def save_wind_snapshot(data: list | dict, data_dir: Path,
 
 
 def load_wind_snapshots(data_dir: Path) -> dict[str, list | dict]:
+<<<<<<< Updated upstream
     """Load all wind snapshots from disk.
 
     Returns ``{HHMM: grid_dict_or_points_list}``.
     """
+=======
+    """Load all wind snapshots from disk.  Returns {HHMM: grid_or_points}."""
+>>>>>>> Stashed changes
     snap_dir = _wind_snapshots_dir(data_dir)
     if not snap_dir.is_dir():
         return {}
     result: dict[str, list | dict] = {}
     for p in sorted(snap_dir.glob("*.json")):
-        key = p.stem  # "0815" etc.
+        key = p.stem
         if len(key) != 4 or not key.isdigit():
             continue
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
+<<<<<<< Updated upstream
             # New grid format
+=======
+>>>>>>> Stashed changes
             grid = data.get("grid")
             if isinstance(grid, dict) and "uGrid" in grid:
                 result[key] = grid
                 continue
+<<<<<<< Updated upstream
             # Legacy point-list format
+=======
+>>>>>>> Stashed changes
             pts = data.get("points", [])
             if isinstance(pts, list) and pts:
                 result[key] = pts

@@ -177,9 +177,18 @@ function interpolateWindField(windPoints, gw, gh, bounds, windScale) {
   return { uGrid, vGrid };
 }
 
+<<<<<<< Updated upstream
 /** Convert a pre-interpolated wind grid (m/s) to grid-cells/s.
  *  The server sends {gw, gh, bounds, uGrid, vGrid} in m/s;
  *  the solver needs velocities in grid-cells per second. */
+=======
+/** Is windPoints a pre-interpolated grid object from the server? */
+function isWindGrid(wp) {
+  return wp && typeof wp === "object" && !Array.isArray(wp) && wp.gw != null;
+}
+
+/** Scale a pre-interpolated grid (m/s) to grid-cells/s for the solver. */
+>>>>>>> Stashed changes
 function scaleWindGrid(gridObj, gw, gh, bounds, windScale) {
   const uOut = new Float32Array(gw * gh);
   const vOut = new Float32Array(gw * gh);
@@ -196,9 +205,17 @@ function scaleWindGrid(gridObj, gw, gh, bounds, windScale) {
   return { uGrid: uOut, vGrid: vOut };
 }
 
+<<<<<<< Updated upstream
 /** Detect whether windPoints is a pre-interpolated grid object. */
 function isWindGrid(wp) {
   return wp && typeof wp === "object" && !Array.isArray(wp) && wp.gw != null;
+=======
+/** Resolve wind input to uGrid/vGrid arrays. Handles grid objects or legacy point arrays. */
+function resolveWind(windPoints, gw, gh, bounds, windScale) {
+  if (isWindGrid(windPoints)) return scaleWindGrid(windPoints, gw, gh, bounds, windScale);
+  if (windPoints && windPoints.length > 0) return interpolateWindField(windPoints, gw, gh, bounds, windScale);
+  return null;
+>>>>>>> Stashed changes
 }
 
 function uniformWindField(speedMs, dirDeg, gw, gh, bounds, windScale) {
@@ -236,6 +253,7 @@ function initSim(sensors, windPoints, params, fieldAlpha) {
   };
 
   // Set up wind field
+<<<<<<< Updated upstream
   if (isWindGrid(windPoints)) {
     const wf = scaleWindGrid(windPoints, gw, gh, bounds, (params && params.windScale) || 1.0);
     sim.uGrid = wf.uGrid;
@@ -244,6 +262,12 @@ function initSim(sensors, windPoints, params, fieldAlpha) {
     const wf = interpolateWindField(windPoints, gw, gh, bounds, (params && params.windScale) || 1.0);
     sim.uGrid = wf.uGrid;
     sim.vGrid = wf.vGrid;
+=======
+  const wfInit = resolveWind(windPoints, gw, gh, bounds, (params && params.windScale) || 1.0);
+  if (wfInit) {
+    sim.uGrid = wfInit.uGrid;
+    sim.vGrid = wfInit.vGrid;
+>>>>>>> Stashed changes
   } else if (params && params.windSpeed != null && params.windDir != null) {
     const wf = uniformWindField(params.windSpeed, params.windDir, gw, gh, bounds, (params && params.windScale) || 1.0);
     sim.uGrid = wf.uGrid;
@@ -289,6 +313,7 @@ function tickSim(dt, sensors, windPoints, params, fieldAlpha) {
   }
 
   // Update wind if provided
+<<<<<<< Updated upstream
   if (isWindGrid(windPoints)) {
     const wf = scaleWindGrid(windPoints, sim.gw, sim.gh, sim.bounds, (params && params.windScale) || 1.0);
     sim.uGrid = wf.uGrid;
@@ -297,6 +322,12 @@ function tickSim(dt, sensors, windPoints, params, fieldAlpha) {
     const wf = interpolateWindField(windPoints, sim.gw, sim.gh, sim.bounds, (params && params.windScale) || 1.0);
     sim.uGrid = wf.uGrid;
     sim.vGrid = wf.vGrid;
+=======
+  const wfTick = resolveWind(windPoints, sim.gw, sim.gh, sim.bounds, (params && params.windScale) || 1.0);
+  if (wfTick) {
+    sim.uGrid = wfTick.uGrid;
+    sim.vGrid = wfTick.vGrid;
+>>>>>>> Stashed changes
   }
 
   // Cap dt
@@ -351,6 +382,7 @@ self.onmessage = function(e) {
       break;
     case "wind":
       if (sim && msg.windPoints) {
+<<<<<<< Updated upstream
         let wf;
         if (isWindGrid(msg.windPoints)) {
           wf = scaleWindGrid(msg.windPoints, sim.gw, sim.gh, sim.bounds,
@@ -361,6 +393,14 @@ self.onmessage = function(e) {
         }
         sim.uGrid = wf.uGrid;
         sim.vGrid = wf.vGrid;
+=======
+        const wf = resolveWind(msg.windPoints, sim.gw, sim.gh, sim.bounds,
+          (msg.params && msg.params.windScale) || 1.0);
+        if (wf) {
+          sim.uGrid = wf.uGrid;
+          sim.vGrid = wf.vGrid;
+        }
+>>>>>>> Stashed changes
       }
       return; // no frame needed
     case "reset":
