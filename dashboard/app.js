@@ -776,7 +776,9 @@ function main() {
   if (legendEl) {
     for (const tab of legendEl.querySelectorAll(".legendTab")) {
       tab.addEventListener("click", () => {
-        legendTab = tab.dataset.legend || "pm25";
+        const clicked = tab.dataset.legend || "pm25";
+        // Clicking the active non-PM2.5 tab deselects back to PM2.5
+        legendTab = (clicked === legendTab && clicked !== "pm25") ? "pm25" : clicked;
         userLegendTab = legendTab;
         legendUserOverride = !!selectedId; // override auto-sync while a marker is selected
         localStorage.setItem(LEGEND_TAB_KEY, legendTab);

@@ -698,6 +698,12 @@ class MapView {
     return this._isGesturing() || !!this._centerAnimRAF || !!this._selectOrchRAF || !!this._followRAF;
   }
 
+  /** Like _isAnimating but excludes the persistent follow loop.
+   *  Used by PA field to allow recomputation after user gestures while following a vehicle. */
+  _isTransientAnimating() {
+    return this._isGesturing() || !!this._centerAnimRAF || !!this._selectOrchRAF;
+  }
+
   _canRunAutoCamera() {
     const now = performance.now();
     if (this._touchActive || this._mouseDragging || this._pinchZooming) return false;
@@ -6138,7 +6144,7 @@ class MapView {
     if (!_isLite) this._fetchWindField();
 
     // ── Animation fast-path: transform existing PA field canvas instead of recomputing ──
-    if (this._isAnimating() && this._paFieldCanvas && this._paFieldComputedView) {
+    if (this._isTransientAnimating() && this._paFieldCanvas && this._paFieldComputedView) {
       const ctx = this.pfctx;
       if (!ctx) return;
       const pw = this.paFieldCanvasEl.width;
@@ -6236,9 +6242,10 @@ class MapView {
     const cssH = this._cssH || 1;
     if (cssW < 2 || cssH < 2) return; // not sized yet
 
-    // During animations, reuse cached PA field (recomputed when animation ends).
+    // During transient animations (gestures, easing), reuse cached PA field.
     // The composite step translates the cached canvas to match the current view.
-    if (this._isAnimating() && this._paFieldCanvas) return;
+    // Excludes the persistent follow loop so the field recomputes after user pans.
+    if (this._isTransientAnimating() && this._paFieldCanvas) return;
 
     const dpr = this._dpr || (window.devicePixelRatio || 1);
     const z = Number(this.zoom);
