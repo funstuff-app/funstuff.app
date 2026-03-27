@@ -393,6 +393,8 @@ function main() {
   let userLegendTab = null; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected
   let _wasAlreadyDeselected = true; // tracks if no sensor was selected on previous click
+  let _lastBuiltDisplayTab = undefined; // cache key for buildLegend fast-skip
+  let _lastSyncedPaTab = undefined; // cache key for _syncPaFieldDim fast-skip
   let _legendAutoOpenedOnce = legendOpen; // skip auto-open if user already kept legend open
 
   /** Map a pollutant key (PM25, PM10, OZNE, O3, etc.) to a legend tab id. */
@@ -679,6 +681,10 @@ function main() {
     if (!displayTab && selectedId) {
       displayTab = _selectedSensorPollutantTab();
     }
+    // Fast-skip: nothing changed since last build
+    const buildKey = `${legendTab}|${displayTab}`;
+    if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) return;
+    _lastBuiltDisplayTab = buildKey;
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const legendNameEl = document.getElementById("legendName");
     if (legendNameEl) legendNameEl.textContent = displayTab ? data.name : "Show All";
@@ -809,6 +815,10 @@ function main() {
     if (!displayTab && selectedId) {
       displayTab = _selectedSensorPollutantTab();
     }
+    // Fast-skip: nothing changed since last sync
+    const syncKey = `${legendTab}|${displayTab}`;
+    if (syncKey === _lastSyncedPaTab) return;
+    _lastSyncedPaTab = syncKey;
     if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(displayTab);
     // Marker override only from explicit tab clicks
     if (typeof map.setMarkerPollutantOverride === "function") map.setMarkerPollutantOverride(legendTab);
