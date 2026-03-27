@@ -31,7 +31,55 @@ const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
 const _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG = 0.55;
 const _PA_FIELD_FIXED_WEIGHT_MULTIPLIER = 10;
 
-function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH) {
+/** Map legend tab id → array of reading keys to search for in fixed sensor data. */
+const _LEGEND_TAB_READING_KEYS = {
+  pm25: ["PM25", "PM2.5", "pm25", "pm2.5"],
+  pm10: ["PM10", "pm10"],
+  o3:   ["OZNE", "O3", "OZONE", "ozone", "o3"],
+  no2:  ["NO2", "no2"],
+  co:   ["CO", "co"],
+};
+/** Map legend tab id → aqi.js pollutant key for valueToAqi(). */
+const _LEGEND_TAB_AQI_KEY = {
+  pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co",
+};
+/** Map legend tab id → display label for marker. */
+const _LEGEND_TAB_LABEL = {
+  pm25: "PM25", pm10: "PM10", o3: "O\u2083", no2: "NO\u2082", co: "CO",
+};
+/** Map legend tab id → mobile trail reading keys. */
+const _LEGEND_TAB_TRAIL_KEYS = {
+  pm25: ["PM25", "PM2.5", "pm25"],
+  pm10: ["PM10", "pm10"],
+  o3:   ["OZNE", "O3", "OZONE", "ozone", "o3"],
+  no2:  ["NO2", "no2"],
+  co:   ["CO", "co"],
+};
+
+/** Extract a specific pollutant's reading from a sensor readings object.
+ *  Returns { key, value, color, aqi } or null if that pollutant isn't present. */
+function _readingForLegendTab(readings, legendTab) {
+  if (!readings || !legendTab) return null;
+  const keys = _LEGEND_TAB_READING_KEYS[legendTab];
+  if (!keys) return null;
+  for (const rk of keys) {
+    const r = readings[rk];
+    if (r && r.value != null) {
+      const aqi = valueToAqi(_LEGEND_TAB_AQI_KEY[legendTab] || "pm2.5", r.value);
+      // Use the server's precomputed discrete band color (r.ci) for markers.
+      // _aqiToRgb is a continuous ramp for the heatmap field; its intermediate
+      // colors don't align with pollutant-specific band boundaries.
+      const color = safeHex(r.ci);
+      return { key: rk, value: r.value, color, aqi };
+    }
+  }
+  return null;
+}
+
+function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab) {
+  const isPm25 = !pollutantTab || pollutantTab === "pm25";
+  const readingKeys = _LEGEND_TAB_READING_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_READING_KEYS.pm25;
+
   const paLatLons = [];
   for (const f of fixed) {
     if (!f || !f.purpleair) continue;
@@ -48,22 +96,32 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
     const lat = Number(f.lat);
     const lon = Number(f.lon);
     if (!isFinite(lat) || !isFinite(lon)) continue;
-    if (!f.purpleair) {
-      let nearPA = false;
-      for (let pi = 0; pi < paLatLons.length; pi += 2) {
-        const dlat = lat - paLatLons[pi];
-        const dlon = lon - paLatLons[pi + 1];
-        if (dlat * dlat + dlon * dlon < _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG * _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG) {
-          nearPA = true;
-          break;
+
+    if (isPm25) {
+      // PM2.5 mode: PurpleAir + nearby non-PA fixed (original behavior)
+      if (!f.purpleair) {
+        let nearPA = false;
+        for (let pi = 0; pi < paLatLons.length; pi += 2) {
+          const dlat = lat - paLatLons[pi];
+          const dlon = lon - paLatLons[pi + 1];
+          if (dlat * dlat + dlon * dlon < _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG * _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG) {
+            nearPA = true;
+            break;
+          }
         }
+        if (!nearPA) continue;
       }
-      if (!nearPA) continue;
+    } else {
+      // Non-PM2.5 mode: only non-PurpleAir fixed sensors (ghost markers)
+      if (f.purpleair) continue;
     }
 
     const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
-    const pm = interp && (interp["PM25"] || interp["PM2.5"] || interp["pm25"] || interp["pm2.5"]);
-    const value = pm && pm.value != null ? Number(pm.value) : NaN;
+    let value = NaN;
+    for (const rk of readingKeys) {
+      const r = interp && interp[rk];
+      if (r && r.value != null) { value = Number(r.value); break; }
+    }
     if (!isFinite(value) || value < 0) continue;
 
     const wp = latLonToWorld(lat, lon, zoom);
@@ -81,10 +139,11 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
 
 /**
  * Collect virtual PA sensors from mobile trail GPS points.
- * Each trail point with a PM2.5 reading becomes a transient sensor
+ * Each trail point with a reading for the selected pollutant becomes a transient sensor
  * that decays over the same time window as the trail fade.
  */
-function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs) {
+function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs, pollutantTab) {
+  const trailKeys = _LEGEND_TAB_TRAIL_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_TRAIL_KEYS.pm25;
   // Map keyed by quantized lat/lon — at most 1 virtual sensor per spatial slot.
   // Iterating newest-first means the freshest reading at each location wins.
   const sensorMap = new Map();
@@ -120,11 +179,19 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       if (ageMs < 0) continue;           // future point in playback
       if (ageMs >= FADE_TIME_MS) break;   // past fade window (older points only get older)
 
-      // Extract PM2.5 — skip if absent
-      const pm25raw = p.readings?.PM25?.value ?? p.readings?.["PM2.5"]?.value ?? p.readings?.pm25?.value;
-      if (pm25raw == null) continue;
-      const pm25 = Number(pm25raw);
-      if (!isFinite(pm25) || pm25 < 0) continue;
+      // Extract reading for selected pollutant — skip if absent
+      let rawVal = undefined;
+      const rd = p.readings;
+      if (rd) {
+        for (const rk of trailKeys) {
+          const rv = rd[rk]?.value ?? rd[rk];
+          if (rv != null && typeof rv !== "object") { rawVal = rv; break; }
+          if (rv != null && typeof rv === "object" && rv.value != null) { rawVal = rv.value; break; }
+        }
+      }
+      if (rawVal == null) continue;
+      const pollVal = Number(rawVal);
+      if (!isFinite(pollVal) || pollVal < 0) continue;
 
       // Decay weight: full for fresh, quadratic falloff in tail
       let decayWeight = 1.0;
@@ -151,7 +218,7 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       const sx = wx - centerW.x + cssW / 2;
       const sy = wy - centerW.y + cssH / 2;
 
-      sensorMap.set(slotKey, { sx, sy, value: pm25, weightMultiplier: decayWeight });
+      sensorMap.set(slotKey, { sx, sy, value: pollVal, weightMultiplier: decayWeight });
     }
   }
 
@@ -341,6 +408,12 @@ class MapView {
     // Label visibility is per-sensor-type (mobile vs fixed)
     this.showMobileLabels = false;
     this.showFixedLabels = false;
+    // PA field dim: 1.0 = full (PM2.5 selected or legend closed), 0.05 = dimmed (other pollutant)
+    this._paFieldDimTarget = 1.0;
+    this._paFieldDimCurrent = 1.0;
+    this._paFieldDimRAF = null;
+    // PA field pollutant: which pollutant the field should display (null = default/highest AQI)
+    this._paFieldPollutant = null;
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
     this._traceRAF = null;
@@ -546,6 +619,15 @@ class MapView {
     this._wheelPanning = false; // true during trackpad/keyboard-trackpad wheel-pan streams
     this._wheelPanEndTimer = null; // debounce timer to exit wheel-pan mode
 
+    // Windows scroll-velocity accumulator for adaptive zoom
+    this._winScrollAccum = 0;      // accumulated deltaY in current burst
+    this._winScrollLastTs = 0;      // timestamp of last wheel event
+    this._winScrollFlushTimer = null;
+
+    // macOS scroll-velocity accumulator for adaptive zoom (mouse wheel only)
+    this._macScrollAccum = 0;
+    this._macScrollLastTs = 0;
+
     // ResizeObserver fires after layout settles — catches window resize, devtools
     // show/hide, and fullscreen toggle more reliably than window "resize".
     // Pass contentRect dimensions directly to avoid reading stale clientHeight:
@@ -647,6 +729,12 @@ class MapView {
   /** True during any camera movement: user gestures, inertia, easing, follow, orchestration. */
   _isAnimating() {
     return this._isGesturing() || !!this._centerAnimRAF || !!this._selectOrchRAF || !!this._followRAF;
+  }
+
+  /** Like _isAnimating but excludes the persistent follow loop.
+   *  Used by PA field to allow recomputation after user gestures while following a vehicle. */
+  _isTransientAnimating() {
+    return this._isGesturing() || !!this._centerAnimRAF || !!this._selectOrchRAF;
   }
 
   _canRunAutoCamera() {
@@ -2249,6 +2337,7 @@ class MapView {
         speedMps,
         opacity,
         reading: smp?.reading || null,
+        readings: smp?.readings || null,
         held,
       };
     }
@@ -2357,17 +2446,24 @@ class MapView {
     // and macOS convention is scroll=pan, pinch=zoom (like Apple Maps).
     const isSmoothScrollZoom = !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
 
+    // macOS mouse wheel: deltaMode is always 0, no ctrlKey. Detect via vertical-only
+    // + significant delta. Same heuristic as isSmoothScrollZoom but Mac-specific flag
+    // so it gets its own code path and isn't suppressed by the pan→zoom debounce.
+    const isMacMouseWheel = this._isMac && !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
+
     // Determine if this should be a zoom event:
     // 1. True mouse wheel (deltaMode !== 0) → zoom
     // 2. Ctrl+wheel (trackpad pinch gesture) → zoom
     // 3. Windows/Linux: vertical smooth-scroll (smooth-scroll mice) → zoom
-    let shouldZoom = isMouseWheel || e.ctrlKey || isSmoothScrollZoom;
+    // 4. macOS mouse wheel (detected via heuristic) → zoom
+    let shouldZoom = isMouseWheel || e.ctrlKey || isSmoothScrollZoom || isMacMouseWheel;
 
     // Debounce pan→zoom transitions: when lifting one finger during a two-finger
     // trackpad pan, macOS briefly interprets the finger separation as a pinch gesture,
     // firing ctrlKey=true wheel events. Ignore these artifacts if we were panning
     // within the last 100ms (a real intentional pinch starts well after pan ends).
-    if (shouldZoom && !isMouseWheel && this._lastWheelPanTime
+    // Do NOT suppress isMacMouseWheel — that's a real mouse wheel, not a finger-lift.
+    if (shouldZoom && !isMouseWheel && !isMacMouseWheel && this._lastWheelPanTime
         && (performance.now() - this._lastWheelPanTime) < 100) {
       shouldZoom = false;
     }
@@ -2386,14 +2482,45 @@ class MapView {
       this._pinchAnchorSY = sy;
 
       const rawDy = clamp(e.deltaY, -300, 300);
-      // Mouse wheel natural direction is inverted vs trackpad pinch
-      const dy = (isMouseWheel || isSmoothScrollZoom) ? -rawDy : rawDy;
+
+      // Platform-specific mouse-wheel flags (separate code paths, not combined)
+      const isWinWheel = this._isWindows && (isMouseWheel || isSmoothScrollZoom);
+
+      // Direction: mouse wheel on Win/Mac is reversed; everything else uses raw or inverted convention
+      const dy = isWinWheel ? rawDy
+              : isMacMouseWheel ? rawDy
+              : (isMouseWheel || isSmoothScrollZoom) ? -rawDy : rawDy;
       const dir = dy < 0 ? 1 : -1;
-      // Adjust zoom sensitivity per input type.
-      // Chrome trackpad pinch reports ~3-5x smaller deltaY than Safari for same gesture.
-      const isChromePinch = e.ctrlKey && !isMouseWheel && /Chrome/.test(navigator.userAgent || "");
-      const strength = (isMouseWheel || isSmoothScrollZoom) ? 0.018 : isChromePinch ? 0.055 : 0.020;
-      const dz = dir * Math.log1p(Math.abs(dy)) * strength;
+
+      // Windows mouse-wheel: velocity-adaptive zoom.
+      // Accumulate deltas over a short burst window; fast scrolling ramps up
+      // non-linearly but is capped so you never blow past the map.
+      let dz;
+      if (isWinWheel) {
+        const now = performance.now();
+        const gap = now - this._winScrollLastTs;
+        if (gap > 80) this._winScrollAccum = 0;
+        this._winScrollAccum += Math.abs(dy);
+        this._winScrollLastTs = now;
+        const v = this._winScrollAccum;
+        dz = dir * Math.min(0.015 * Math.sqrt(v), 0.45);
+
+      // macOS mouse-wheel: same velocity-adaptive zoom, separate accumulator.
+      } else if (isMacMouseWheel) {
+        const now = performance.now();
+        const gap = now - this._macScrollLastTs;
+        if (gap > 80) this._macScrollAccum = 0;
+        this._macScrollAccum += Math.abs(dy);
+        this._macScrollLastTs = now;
+        const v = this._macScrollAccum;
+        dz = dir * Math.min(0.015 * Math.sqrt(v), 0.45);
+
+      } else {
+        // Trackpad pinch (any OS) or Linux mouse wheel — original behavior
+        const isChromePinch = e.ctrlKey && !isMouseWheel && /Chrome/.test(navigator.userAgent || "");
+        const strength = (isMouseWheel || isSmoothScrollZoom) ? 0.018 : isChromePinch ? 0.055 : 0.020;
+        dz = dir * Math.log1p(Math.abs(dy)) * strength;
+      }
       const prevZ = this.zoom;
       const z2 = clamp(this.zoom + dz, this._zoomMin, this._zoomMax);
       this._setZoomAroundScreenPoint(z2, sx, sy);
@@ -2402,7 +2529,7 @@ class MapView {
       this._notePinchVelocity(z2 - prevZ, performance.now());
 
       // Trackpad pinch needs inertia; mouse wheel doesn't
-      if (!isMouseWheel && !isSmoothScrollZoom) {
+      if (!isMouseWheel && !isSmoothScrollZoom && !isMacMouseWheel) {
         this._wheelPinchEndTimer = window.setTimeout(() => this._startPinchInertia(), 28);
       } else {
         this._wheelPinchEndTimer = window.setTimeout(() => {
@@ -5026,7 +5153,7 @@ class MapView {
         d: targetD, visibleEnd: targetD, vehicleD: targetD, vehicleV: 0,
         vehicleTMs: t, controlScalar: 1, positionError: 0, totalDist
       });
-      return { lat: smp.lat, lon: smp.lon, angle: smp.heading, flipX: false, speedMps: 0, opacity, reading, beforeFirst: t < tMin };
+      return { lat: smp.lat, lon: smp.lon, angle: smp.heading, flipX: false, speedMps: 0, opacity, reading, readings: nextPt.readings, beforeFirst: t < tMin };
     }
     // ── END SCRUB FAST PATH ──────────────────────────────────────────────────
     
@@ -5478,7 +5605,7 @@ class MapView {
       totalDist
     });
 
-    return { lat, lon, angle: nextA, flipX: (side === "L"), speedMps, opacity, reading, beforeFirst: t < tMin };
+    return { lat, lon, angle: nextA, flipX: (side === "L"), speedMps, opacity, reading, readings: nextPoint.readings, beforeFirst: t < tMin };
   }
 
   _ensureTracePoints(state) {
@@ -6043,6 +6170,45 @@ class MapView {
   }
 
   /**
+   * Switch PA field to a different pollutant. Invalidates field cache and redraws.
+   * @param {string} tab - Legend tab id: "pm25", "pm10", "o3", "no2", "co"
+   */
+  setPaFieldPollutant(tab) {
+    const prev = this._paFieldPollutant;
+    this._paFieldPollutant = tab || null;
+    if (prev !== this._paFieldPollutant) {
+      this._invalidateOverlayStatic();
+      // Invalidate trail canvas cache so trails redraw with new pollutant colors
+      this._trailCacheViewKey = "";
+      this._trailCacheCanvas = null;
+      this._redrawViewOnly();
+    }
+  }
+
+  /**
+   * Animate PA field dim alpha toward target. Called from app.js when legend tab changes.
+   * @param {number} target - 1.0 for full, 0.05 for dimmed
+   */
+  setPaFieldDim(target) {
+    this._paFieldDimTarget = target;
+    if (this._paFieldDimRAF) return; // animation already running
+    const animate = () => {
+      const diff = this._paFieldDimTarget - this._paFieldDimCurrent;
+      if (Math.abs(diff) < 0.01) {
+        this._paFieldDimCurrent = this._paFieldDimTarget;
+        this._paFieldDimRAF = null;
+        this._redrawViewOnly();
+        return;
+      }
+      // Ease toward target (~200ms settle)
+      this._paFieldDimCurrent += diff * 0.15;
+      this._redrawViewOnly();
+      this._paFieldDimRAF = requestAnimationFrame(animate);
+    };
+    this._paFieldDimRAF = requestAnimationFrame(animate);
+  }
+
+  /**
    * Composite the PA scalar field onto the tiles canvas (above tiles, below overlay).
    * Restores tiles from snapshot first to avoid opacity accumulation on repeated calls.
    */
@@ -6053,7 +6219,7 @@ class MapView {
     if (!_isLite) this._fetchWindField();
 
     // ── Animation fast-path: transform existing PA field canvas instead of recomputing ──
-    if (this._isAnimating() && this._paFieldCanvas && this._paFieldComputedView) {
+    if (this._isTransientAnimating() && this._paFieldCanvas && this._paFieldComputedView) {
       const ctx = this.pfctx;
       if (!ctx) return;
       const pw = this.paFieldCanvasEl.width;
@@ -6084,6 +6250,7 @@ class MapView {
         const ty = prevC.y - currC.y;
         ctx.setTransform(dpr, 0, 0, dpr, dpr * tx, dpr * ty);
       }
+      ctx.globalAlpha = this._paFieldDimCurrent;
       ctx.drawImage(this._paFieldCanvas, 0, 0, cssW, cssH);
       ctx.restore();
       // Drop in-progress cross-fade to avoid stale fades during gesture
@@ -6105,13 +6272,14 @@ class MapView {
     if (!this._paFieldCanvas) { ctx.restore(); return; }
 
     // Cross-fade from previous field canvas to current one
+    const dimAlpha = this._paFieldDimCurrent;
     const fadeT = this._paFieldPrevCanvas
       ? Math.min(1, (performance.now() - this._paFieldFadeStart) / this._paFieldFadeMs)
       : 1;
     if (this._paFieldPrevCanvas && fadeT < 1) {
-      ctx.globalAlpha = 1 - fadeT;
+      ctx.globalAlpha = (1 - fadeT) * dimAlpha;
       ctx.drawImage(this._paFieldPrevCanvas, 0, 0);
-      ctx.globalAlpha = fadeT;
+      ctx.globalAlpha = fadeT * dimAlpha;
       ctx.drawImage(this._paFieldCanvas, 0, 0);
       ctx.globalAlpha = 1;
       // Schedule another frame to complete the fade (no-op if playback loop is running)
@@ -6124,6 +6292,7 @@ class MapView {
       }
     } else {
       if (this._paFieldPrevCanvas) this._paFieldPrevCanvas = null;
+      ctx.globalAlpha = dimAlpha;
       ctx.drawImage(this._paFieldCanvas, 0, 0);
     }
     ctx.restore();
@@ -6148,9 +6317,10 @@ class MapView {
     const cssH = this._cssH || 1;
     if (cssW < 2 || cssH < 2) return; // not sized yet
 
-    // During animations, reuse cached PA field (recomputed when animation ends).
+    // During transient animations (gestures, easing), reuse cached PA field.
     // The composite step translates the cached canvas to match the current view.
-    if (this._isAnimating() && this._paFieldCanvas) return;
+    // Excludes the persistent follow loop so the field recomputes after user pans.
+    if (this._isTransientAnimating() && this._paFieldCanvas) return;
 
     const dpr = this._dpr || (window.devicePixelRatio || 1);
     const z = Number(this.zoom);
@@ -6162,7 +6332,9 @@ class MapView {
     // the validity window of the current fingerprint, no sensor can have changed
     // color category — skip the expensive _collectPaFieldSensors entirely. ──
     const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
+    const pollutantTab = this._paFieldPollutant || "pm25";
     if (this._paFieldCanvas
+        && this._paFieldValidPollutant === pollutantTab
         && this._paFieldValidViewKey === viewKey
         && this._paFieldValidFixed === fixed
         && this._paFieldValidRange
@@ -6173,7 +6345,7 @@ class MapView {
 
     // ── Collect sensors, project to screen coords + build color fingerprint ──
     const centerW = latLonToWorld(clat, clon, z);
-    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH);
+    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab);
     const paSensors = paField.sensors;
 
     // ── Inject virtual sensors from mobile trail GPS points ──
@@ -6183,7 +6355,7 @@ class MapView {
     const _boundsMaxMs = (_pbBounds?.maxMs != null && isFinite(_pbBounds.maxMs)) ? _pbBounds.maxMs : null;
     const virtualRefNowMs = (_pbTimeMs != null && isFinite(_pbTimeMs)) ? Number(_pbTimeMs) : (_boundsMaxMs ?? this._dataNowMs());
     const virtualField = _collectVirtualMobileSensors(
-      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs
+      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab
     );
     this._virtualMobileSensors = virtualField.sensors;
 
@@ -6195,14 +6367,15 @@ class MapView {
     // Disable validity-range fast-skip when virtual sensors are present (they age continuously)
     if (virtualField.sensors.length > 0) this._paFieldValidRange = null;
 
-    // ── Cache key: view geometry + color fingerprint ──
-    const key = `pa:${viewKey}|f:${fingerprint}`;
+    // ── Cache key: view geometry + color fingerprint + pollutant ──
+    const key = `pa:${viewKey}|p:${pollutantTab}|f:${fingerprint}`;
     if (this._paFieldCanvas && this._paFieldKey === key) {
       // Cache hit — update validity window so future frames skip _collectPaFieldSensors.
       if (!this._paFieldValidRange) {
         this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
         this._paFieldValidViewKey = viewKey;
         this._paFieldValidFixed = fixed;
+        this._paFieldValidPollutant = pollutantTab;
       }
       return;
     }
@@ -6242,16 +6415,18 @@ class MapView {
     const twoSigmaSq = 2 * sigma * sigma;
 
     // ── Build stride-5 sensor array: [sx, sy, aqi, twoSigSq, weightMultiplier, ...] ──
-    // Blend in AQI space: the non-linear PM2.5→AQI transform gives high
+    // Blend in AQI space: the non-linear concentration→AQI transform gives high
     // concentrations proportionally more weight in the kernel average,
     // so a local spike stays visible instead of being diluted by neighbors.
+    const aqiKey = _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5";
     const s5 = new Float64Array(nSensors * 5);
     for (let i = 0; i < nSensors; i++) {
       const sensor = allSensors[i];
       const si5 = i * 5;
       s5[si5] = sensor.sx;
       s5[si5 + 1] = sensor.sy;
-      s5[si5 + 2] = _pm25ToAqi(sensor.value);
+      const aqi = valueToAqi(aqiKey, sensor.value);
+      s5[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
       s5[si5 + 3] = twoSigmaSq;
       s5[si5 + 4] = sensor.weightMultiplier;
     }
@@ -6269,6 +6444,7 @@ class MapView {
     this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
     this._paFieldValidViewKey = viewKey;
     this._paFieldValidFixed = fixed;
+    this._paFieldValidPollutant = pollutantTab;
     // Store view state for gesture-time translate offset
     this._paFieldComputedView = { centerLat: clat, centerLon: clon, zoom: z };
   }
@@ -6710,12 +6886,41 @@ class MapView {
         p._u = u; p._v = v;
       }
 
-      // 3. Color last
-      let base = p._cachedColor;
-      if (base === undefined) {
-        const pr = primaryReadingFromPoint(p);
-        base = safeHex(pr?.ci != null ? pr.ci : pr?.color);
-        try { p._cachedColor = base; } catch {}
+      // 3. Color last — pollutant-aware: use selected pollutant when explicitly chosen
+      const pollTab = this._paFieldPollutant;
+      const usePollutantColor = pollTab != null;
+      let base;
+      if (usePollutantColor) {
+        // Per-pollutant color cache: _cachedColorByTab = { pm10: "#hex", o3: "#hex", ... }
+        const cbt = p._cachedColorByTab;
+        base = cbt && cbt[pollTab];
+        if (base === undefined) {
+          const rKeys = _LEGEND_TAB_READING_KEYS[pollTab];
+          let found = null;
+          if (rKeys && p.readings) {
+            for (const rk of rKeys) {
+              const r = p.readings[rk];
+              if (r && r.value != null) { found = r; break; }
+            }
+          }
+          if (found) {
+            // Use server's precomputed discrete band color for trails
+            base = safeHex(found.ci != null ? found.ci : found.color);
+          } else {
+            base = "#333333";
+          }
+          try {
+            if (!p._cachedColorByTab) p._cachedColorByTab = {};
+            p._cachedColorByTab[pollTab] = base;
+          } catch {}
+        }
+      } else {
+        base = p._cachedColor;
+        if (base === undefined) {
+          const pr = primaryReadingFromPoint(p);
+          base = safeHex(pr?.ci != null ? pr.ci : pr?.color);
+          try { p._cachedColor = base; } catch {}
+        }
       }
       
       // Calculate screen position
@@ -6833,6 +7038,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
+          // Fade PurpleAir dots when a non-PM2.5 pollutant is explicitly selected
+          const paFadedForPollutant = !isSel && this._paFieldPollutant != null && this._paFieldPollutant !== "pm25";
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
@@ -6847,8 +7054,9 @@ class MapView {
               staleAlpha = (1 - u) * (1 - u);
             }
           }
+          if (paFadedForPollutant) staleAlpha *= 0.3;
           const dotR = isSel ? 8 : 6;
-          const dotColor = safeHex((pr && pr.color) || color);
+          const dotColor = paFadedForPollutant ? dimHex(safeHex((pr && pr.color) || color), 0.65) : safeHex((pr && pr.color) || color);
           if (isSel) {
             ctx.beginPath();
             ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
@@ -7255,7 +7463,7 @@ class MapView {
     // Playback-mode trail caching:
     // Cache trails to offscreen canvas; only redraw when view or time changes significantly.
     const pbTimeMs = _framePbTimeMs;
-    const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}`;
+    const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}|${this._paFieldPollutant || 'default'}`;
     const viewChanged = this._trailCacheViewKey !== trailViewKey;
     const timeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? (pbTimeMs - this._trailCacheTimeMs) : 0;
     // Trail fading uses 45-min window; 2-second threshold keeps fading visually smooth while allowing fast scrubbing
@@ -7487,7 +7695,7 @@ class MapView {
       const needsFullRedraw = viewChanged || timeChanged;
       // During gestures, skip full trail redraw for pan-only view changes;
       // translate the cached canvas instead (saves ~5ms/frame on iPad).
-      const skipTrailsForGesture = this._isAnimating() && viewChanged && !timeChanged
+      const skipTrailsForGesture = this._isTransientAnimating() && viewChanged && !timeChanged
         && this._trailCacheCanvas && this._trailCacheCenterW;
       const needsIncrementalUpdate = false; // Disabled: incremental breaks fade animation
 
@@ -8276,9 +8484,27 @@ class MapView {
         // Expose the selected sensor's displayed pollutant key for legend sync
         if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
+        // Legend pollutant override: show the selected pollutant on ALL non-PurpleAir markers
+        if (this._paFieldPollutant != null && !f.purpleair) {
+          const src = isSel
+            ? (interpolateFixedReadingsAtTime(f, fixedPbTimeMs) || f.readings)
+            : f.readings;
+          const legendPr = _readingForLegendTab(src, this._paFieldPollutant);
+          if (legendPr) {
+            pr = legendPr;
+            if (isSel) this._selectedPollutantKey = legendPr.key;
+          } else {
+            const lbl = _LEGEND_TAB_LABEL[this._paFieldPollutant] || this._paFieldPollutant.toUpperCase();
+            pr = { key: lbl, value: "\u2014", color: "#666666" };
+            if (isSel) this._selectedPollutantKey = null;
+          }
+        }
+
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
+          // Fade PurpleAir dots when a non-PM2.5 pollutant is explicitly selected
+          const paFadedForPollutant = !isSel && this._paFieldPollutant != null && this._paFieldPollutant !== "pm25";
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
@@ -8293,8 +8519,9 @@ class MapView {
               staleAlpha = (1 - u) * (1 - u);
             }
           }
+          if (paFadedForPollutant) staleAlpha *= 0.3;
           const dotR = isSel ? 8 : 6;
-          const dotColor = safeHex((pr && pr.color) || color);
+          const dotColor = paFadedForPollutant ? dimHex(safeHex((pr && pr.color) || color), 0.65) : safeHex((pr && pr.color) || color);
           if (isSel) {
             ctx.beginPath();
             ctx.fillStyle = "rgba(56, 140, 220, 0.38)";
@@ -8426,7 +8653,8 @@ class MapView {
       // In live mode, hide ghosted sensors unless Debug/Selected.
       const hasPlaybackData = this.playbackMode && this._playbackPtsById.has(String(m.id));
       if (!!m.ghosted && !debug && !isSel && !hasPlaybackData) return;
-      const isParked = !!m.parked;
+      // In playback mode, ignore live parked state — vehicle was active at the playback time
+      const isParked = hasPlaybackData ? false : !!m.parked;
       const dimmed = (!debug && !isSel && isParked);
       if (!isFinite(lat) || !isFinite(lon)) return;
       const wpt = latLonToWorld(lat, lon, this.zoom);
@@ -8473,12 +8701,27 @@ class MapView {
         // Sensor has no playback trail data (e.g. parked at depot) — show "--" instead of frozen live value
         pr = { key: "", value: "--", color: "#666666" };
       }
+      // Expose the selected sensor's displayed pollutant key for legend sync
+      if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
+
+      // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers
+      // In playback mode, prefer trail-point readings (historical) over live m.readings
+      if (this._paFieldPollutant != null) {
+        const src = (this.playbackMode && pose && pose.readings) ? pose.readings : m.readings;
+        const legendPr = _readingForLegendTab(src, this._paFieldPollutant);
+        if (legendPr) {
+          pr = legendPr;
+          if (isSel) this._selectedPollutantKey = legendPr.key;
+        } else {
+          const lbl = _LEGEND_TAB_LABEL[this._paFieldPollutant] || this._paFieldPollutant.toUpperCase();
+          pr = { key: lbl, value: "\u2014", color: "#666666" };
+          if (isSel) this._selectedPollutantKey = null;
+        }
+      }
+
       const prColor = isParked ? dimHex(pr.color || "#ffffff", 0.65) : (pr.color || "#ffffff");
       const colorUse = dimmed ? desatHex(color, 0.25) : color;
       const prColorUse = dimmed ? desatHex(prColor, 0.25) : prColor;
-
-      // Expose the selected sensor's displayed pollutant key for legend sync
-      if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
       ctx.save();
       const baseAlpha = clamp(opacity, 0, 1);

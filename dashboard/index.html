@@ -32,7 +32,7 @@
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260325c" />
+  <link rel="stylesheet" href="/styles.css?v=20260327a" />
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -293,10 +293,10 @@
   <script src="format_utils.js?v=20260224a"></script>
   <script src="data_utils.js?v=20260224a"></script>
   <script src="advection_solver.js?v=20260320a"></script>
-    <script src="map_view.js?v=20260326d"></script>
+    <script src="map_view.js?v=20260327n"></script>
   <script src="sidebar_ui.js?v=20260324b"></script>
-  <script src="jog_wheel.js?v=20260227a"></script>
-  <script src="app.js?v=20260326a"></script>
+  <script src="jog_wheel.js?v=20260327j"></script>
+  <script src="app.js?v=20260327p"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">
@@ -378,7 +378,22 @@
         // Delta calculation: exact replica of playback scrub bar (app.js L4170)
         var isHoriz = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
         var isMouseWheel = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
-        var delta = isHoriz ? e.deltaX : (isMouseWheel ? e.deltaY : -e.deltaY) * 0.15;
+        var rawDy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+        var rawDx = e.deltaMode === 1 ? e.deltaX * 40 : e.deltaX;
+        var mwBoost = 1;
+        var _isWin = /Win/.test(navigator.platform || "");
+        var _isMac = /Mac/.test(navigator.platform || "");
+        if (isMouseWheel && _isWin) {
+          var now = performance.now();
+          if (!el._mwLastTs || now - el._mwLastTs > 80) el._mwAccum = 0;
+          el._mwAccum = (el._mwAccum || 0) + Math.abs(isHoriz ? rawDx : rawDy);
+          el._mwLastTs = now;
+          mwBoost = Math.max(0.55 * Math.sqrt(el._mwAccum), 1);
+          if (mwBoost > 60) mwBoost = 60;
+        } else if (isMouseWheel && _isMac) {
+          mwBoost = 1;
+        }
+        var delta = isHoriz ? rawDx * mwBoost : (isMouseWheel ? rawDy * mwBoost : -rawDy) * 0.15;
         // Nudge: scale by slider range (like playback scales by durMs)
         var lo = parseFloat(el.min), hi = parseFloat(el.max);
         var range = hi - lo;

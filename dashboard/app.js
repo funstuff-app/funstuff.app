@@ -389,9 +389,10 @@ function main() {
   let legendOpen = _isMobileWidth
     ? false
     : localStorage.getItem(LEGEND_OPEN_KEY) === "true";
-  let legendTab = localStorage.getItem(LEGEND_TAB_KEY) || "pm25";
-  let userLegendTab = legendTab; // what the user manually chose (restored on deselect)
+  let legendTab = null;
+  let userLegendTab = null; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected
+  let _wasAlreadyDeselected = true; // tracks if no sensor was selected on previous click
   let _legendAutoOpenedOnce = legendOpen; // skip auto-open if user already kept legend open
 
   /** Map a pollutant key (PM25, PM10, OZNE, O3, etc.) to a legend tab id. */
@@ -408,23 +409,27 @@ function main() {
 
   /** Switch legend tab to match a selected sensor's primary reading. */
   function syncLegendToSensor(sensor) {
-    if (!sensor) return;
+    if (!sensor || legendUserOverride || legendTab != null) return;
     const pr = primaryReadingForSensor(sensor);
     const tab = pollutantToLegendTab(pr && pr.key);
-    if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
+    if (tab && LEGEND_DATA[tab]) {
       legendTab = tab;
+      userLegendTab = tab;
       buildLegend(true);
+      _syncPaFieldDim();
     }
   }
 
   /** Sync legend tab to whatever pollutant the map is currently showing on the selected marker. */
   function syncLegendToMapSelection() {
-    if (!map || !selectedId || legendUserOverride) return;
+    if (!map || !selectedId || legendUserOverride || legendTab != null) return;
     const key = map.getSelectedPollutantKey();
     const tab = pollutantToLegendTab(key);
-    if (tab && tab !== legendTab && LEGEND_DATA[tab]) {
+    if (tab && LEGEND_DATA[tab]) {
       legendTab = tab;
+      userLegendTab = tab;
       buildLegend(true);
+      _syncPaFieldDim();
     }
   }
 
@@ -433,6 +438,7 @@ function main() {
     if (legendTab !== userLegendTab && LEGEND_DATA[userLegendTab]) {
       legendTab = userLegendTab;
       buildLegend(true);
+      _syncPaFieldDim();
     }
   }
 
@@ -668,7 +674,7 @@ function main() {
 
   function buildLegend(animate = false) {
     if (!legendBodyEl) return;
-    const data = LEGEND_DATA[legendTab] || LEGEND_DATA.pm25;
+    const data = (legendTab && LEGEND_DATA[legendTab]) || LEGEND_DATA.pm25;
     if (legendUnitEl) legendUnitEl.textContent = data.unit;
 
     const entries = data.entries;
@@ -693,6 +699,7 @@ function main() {
       _legendEntryCount = newCount;
       const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
       for (const t of tabs) t.classList.toggle("active", t.dataset.legend === legendTab);
+      _syncLegendTabVisibility();
       return;
     }
 
@@ -741,6 +748,7 @@ function main() {
     _legendEntryCount = newCount;
     const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
     for (const t of tabs) t.classList.toggle("active", t.dataset.legend === legendTab);
+    _syncLegendTabVisibility();
 
     // Re-enable transitions after instant update completes
     if (!animate) {
@@ -752,10 +760,46 @@ function main() {
     }
   }
 
+  /** Hide legend tabs for pollutants not present in any sensor's readings.
+   *  PM2.5 and O3 are always shown; others appear only when data exists. */
+  const _ALWAYS_VISIBLE_TABS = new Set(["pm25", "o3"]);
+  let _lastAvailableTabs = null;
+  function _syncLegendTabVisibility() {
+    if (!legendEl) return;
+    const st = _currentState();
+    const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
+    const found = new Set();
+    for (const s of all) {
+      const r = s && s.readings;
+      if (!r) continue;
+      for (const k of Object.keys(r)) {
+        const tab = pollutantToLegendTab(k);
+        if (tab) found.add(tab);
+      }
+    }
+    // Build a stable key to skip DOM work when nothing changed
+    const availKey = Array.from(found).sort().join(",");
+    if (availKey === _lastAvailableTabs) return;
+    _lastAvailableTabs = availKey;
+
+    for (const t of legendEl.querySelectorAll(".legendTab")) {
+      const tab = t.dataset.legend;
+      const visible = _ALWAYS_VISIBLE_TABS.has(tab) || found.has(tab);
+      t.style.display = visible ? "" : "none";
+    }
+  }
+
   function updateLegendVisibility() {
     if (legendEl) legendEl.classList.toggle("hidden", !legendOpen);
     if (legendToggleEl) legendToggleEl.classList.toggle("hidden", legendOpen);
     localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
+  }
+
+  /** Sync PA field pollutant to match legend tab selection. */
+  function _syncPaFieldDim() {
+    if (!map) return;
+    // Switch field to show the selected pollutant (null = show worst/default)
+    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(legendTab);
   }
 
   buildLegend();
@@ -765,11 +809,15 @@ function main() {
   if (legendEl) {
     for (const tab of legendEl.querySelectorAll(".legendTab")) {
       tab.addEventListener("click", () => {
-        legendTab = tab.dataset.legend || "pm25";
+        const clicked = tab.dataset.legend || "pm25";
+        // Clicking the active tab deselects back to default (null)
+        legendTab = (clicked === legendTab) ? null : clicked;
         userLegendTab = legendTab;
         legendUserOverride = !!selectedId; // override auto-sync while a marker is selected
-        localStorage.setItem(LEGEND_TAB_KEY, legendTab);
+        if (legendTab) localStorage.setItem(LEGEND_TAB_KEY, legendTab);
+        else localStorage.removeItem(LEGEND_TAB_KEY);
         buildLegend(true);
+        _syncPaFieldDim();
       });
     }
   }
@@ -777,6 +825,7 @@ function main() {
   if (legendCloseEl) {
     legendCloseEl.addEventListener("click", () => {
       legendOpen = false;
+      buildLegend();
       updateLegendVisibility();
     });
   }
@@ -784,6 +833,7 @@ function main() {
     legendToggleEl.addEventListener("click", () => {
       legendOpen = true;
       updateLegendVisibility();
+      _syncPaFieldDim();
     });
   }
 
@@ -1282,24 +1332,34 @@ function main() {
     if (id && selectedId === id) {
       selectedId = null;
       legendUserOverride = false;
+      _wasAlreadyDeselected = false;
       if (map && typeof map.cancelSelectionOrchestration === "function") map.cancelSelectionOrchestration();
       map.setSelected(null);
-      legendTab = "pm25";
-      userLegendTab = "pm25";
       buildLegend();
+      _syncPaFieldDim();
       renderLists(_currentState(), selectedId);
       renderDetails(_currentState(), selectedId);
       return;
     }
 
     selectedId = id || null;
-    legendUserOverride = false; // reset override on new selection
+    // Only reset legend override when on default (null);
+    // if user has manually selected a pollutant, keep it.
+    if (legendTab == null) legendUserOverride = false;
     if (!selectedId) {
-      legendTab = "pm25";
-      userLegendTab = "pm25";
+      if (legendTab != null && _wasAlreadyDeselected) {
+        // Second background click: clear pollutant back to default
+        legendTab = null;
+        userLegendTab = null;
+        legendUserOverride = false;
+      }
+      // Track whether we were already deselected (for next click)
+      _wasAlreadyDeselected = true;
       buildLegend();
+      _syncPaFieldDim();
     }
     map.setSelected(selectedId);
+    if (selectedId) _wasAlreadyDeselected = false;
 
     const st = _currentState();
     const sel = parseKey(selectedId);
@@ -1316,14 +1376,18 @@ function main() {
     }
 
     // Sync legend tab to selected marker's displayed pollutant
-    // Use item data directly (map render state may not be updated yet)
-    if (item) syncLegendToSensor(item);
-    // Also try map's render-resolved key as a fallback
-    syncLegendToMapSelection();
+    // Only when on the default PM2.5 tab — don't override a user's manual pollutant choice
+    if (legendTab == null) {
+      // Defer sync: the map needs to render one frame with the new selection
+      // so _selectedPollutantKey reflects the actual displayed reading
+      // (which may differ from live data during playback).
+      requestAnimationFrame(() => { syncLegendToMapSelection(); });
+    }
     
     // Center camera when selected from sidebar (any sensor type), or for mobile from map click with cmd+click for fit
     if (item && isFinite(Number(item.lat)) && isFinite(Number(item.lon))) {
-      const shouldCenter = fromPanel || (sel?.type === "mobile");
+      const isMobile = sel?.type === "mobile";
+      const shouldCenter = fromPanel || isMobile;
       if (shouldCenter) {
         // Default: center on the marker.
         // Cmd+click: fit to breadcrumb path bbox (mobile only).
@@ -1377,10 +1441,10 @@ function main() {
     if (e.key === "Escape") {
       selectedId = null;
       legendUserOverride = false;
+      _wasAlreadyDeselected = false;
       map.setSelected(null);
-      legendTab = "pm25";
-      userLegendTab = "pm25";
       buildLegend();
+      _syncPaFieldDim();
       renderLists(_currentState(), selectedId);
       renderDetails(_currentState(), selectedId);
     }
@@ -1442,7 +1506,8 @@ function main() {
           }
           const b = map.getPlaybackBounds();
           const durMs = (b.maxMs - b.minMs) || 1;
-          const nudge = (delta / 1000) * (durMs / 480);
+          const nudgeDur = Math.min(durMs, 21600000); // cap at 6h so scroll speed is consistent
+          const nudge = (delta / 1000) * (nudgeDur / 480);
           const prevDir = Math.sign(_pbVelocity);
           _pbVelocity -= nudge;
           if (prevDir !== 0 && Math.sign(_pbVelocity) !== 0 && Math.sign(_pbVelocity) !== prevDir) {
@@ -2157,6 +2222,7 @@ function main() {
   let _pbDidDrag = false;             // did the user actually drag (vs click)?
   let _pbIsWheelCoasting = false;     // is current coast from wheel scroll?
   let _pbCommitLoopStartOnCoastEnd = false;
+  let _pbMwAccum = 0, _pbMwLastTs = 0; // mouse-wheel velocity accumulator for scrub bar
 
   // ─────────────────────────────────────────────────────────────────────────────
   // PAGING: Slider maps to an 8-hour page instead of the full day.
@@ -3998,7 +4064,7 @@ function main() {
         const pct = Math.max(0, Math.min(100, Number(menuAlphaEl.value) || 0));
         window._paFieldAlpha = Math.round(pct * 2.55);
         localStorage.setItem(PA_ALPHA_STORAGE_KEY, String(pct));
-        if (map) { map._paFieldKey = null; map._redrawViewOnly(); }
+        if (map) { map._paFieldKey = null; map._paFieldValidRange = null; map._redrawViewOnly(); }
       });
     }
   }
@@ -4314,9 +4380,27 @@ function main() {
       const durMs = (b.maxMs - b.minMs) || 1;
       const isHorizontal = Math.abs(e.deltaX) >= Math.abs(e.deltaY);
       const isMouseWheel = e.deltaMode !== 0 || (!e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4);
-      // Mouse wheel: flip direction (scroll down = forward). Trackpad swipe: keep native.
-      const delta = isHorizontal ? e.deltaX : (isMouseWheel ? e.deltaY : -e.deltaY) * 0.15;
-      const nudge = (delta / 1000) * (durMs / 480);
+      // Normalize line-mode (deltaMode=1) to ~pixel equivalent (×40)
+      const rawDy = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+      const rawDx = e.deltaMode === 1 ? e.deltaX * 40 : e.deltaX;
+      // Windows mouse wheel: velocity-adaptive boost (OS provides no acceleration).
+      // Mac mouse wheel: flat 3× boost (OS acceleration handles variable speed).
+      const _isWin = /Win/.test(navigator.platform || "");
+      const _isMac = /Mac/.test(navigator.platform || "");
+      let mwBoost = 1;
+      if (isMouseWheel && _isWin) {
+        const now = performance.now();
+        if (now - _pbMwLastTs > 80) _pbMwAccum = 0;
+        _pbMwAccum += Math.abs(isHorizontal ? rawDx : rawDy);
+        _pbMwLastTs = now;
+        mwBoost = Math.max(0.55 * Math.sqrt(_pbMwAccum), 1);
+        mwBoost = Math.min(mwBoost, 60);
+      } else if (isMouseWheel && _isMac) {
+        mwBoost = 1;
+      }
+      const delta = isHorizontal ? rawDx * mwBoost : (isMouseWheel ? rawDy * mwBoost : -rawDy) * 0.15;
+      const nudgeDur = Math.min(durMs, 21600000); // cap at 6h so scroll speed is consistent
+      const nudge = (delta / 1000) * (nudgeDur / 480);
       const prevDir = Math.sign(_pbVelocity);
       _pbVelocity -= nudge;
       // On direction reversal, snap window so playhead stays just outside the jog zone
@@ -4892,6 +4976,9 @@ function main() {
 
       // Sync legend tab to selected marker's current pollutant
       syncLegendToMapSelection();
+
+      // Update legend tab visibility based on available pollutants
+      _syncLegendTabVisibility();
 
       // Keep DVR UI in sync even when the RAF loop is idle.
       if (map.playbackMode) {
