@@ -2778,28 +2778,28 @@ def purpleair_fetch_loop(
       Cluster fetch  up to ~792 pts if ALL cells trigger (worst case)
       Metadata       ~1,568 pts per refresh (392 sensors × 4 fields)
 
-      Day  (19h, 3 min):   380 cycles × 81  =  30,780 pts (sentinel only)
-                           380 cycles × 792 = 300,960 pts (worst-case clusters)
+      Day  (19h, 5 min):   228 cycles × 81  =  18,468 pts (sentinel only)
+                           228 cycles × 792 = 180,576 pts (worst-case clusters)
       Night (5h, 30 min):   10 cycles × 81  =    810 pts
       Metadata (4×/day):     4       × 1568 =  6,272 pts
       ──────────────────────────────────────────────────────
-      Quiet day  (no clusters): ~37,862 pts/day  →  ~1.15M/month
-      Worst-case day (all clusters): ~339K pts/day → over budget
-      Typical day (~10% cluster rate): ~65K pts/day → ~1.98M/month
-      Budget: 2,000,000 pts/month ✓ for typical usage
+      Quiet day  (no clusters): ~25,550 pts/day  →  ~777K/month
+      Worst-case day (all clusters): ~207K pts/day → over budget
+      Typical day (~10% cluster rate): ~43K pts/day → ~1.32M/month
+      Budget: 2,000,000 pts/month ✓ comfortable margin
     """
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
     META_INTERVAL       = 10800.0  # 3 hours
-    DATA_INTERVAL_DAY   = 180.0    # 3 min during day
-    DATA_INTERVAL_NIGHT = 1800.0   # 30 min during night (1 AM – 6 AM MST)
+    DATA_INTERVAL_DAY   = 300.0    # 5 min during day
+    DATA_INTERVAL_NIGHT = 1800.0   # 30 min during night (12 AM – 5 AM MST)
     NEIGHBOR_RADIUS_DEG = 0.018    # ~2 km grid cell side length
 
     debug_log_path = data_dir / "purpleair_debug.json"
 
     def _is_night() -> bool:
         mst_hour = (datetime.now(timezone.utc).hour - 7) % 24
-        return 1 <= mst_hour < 6
+        return 0 <= mst_hour < 5
 
     def _current_interval() -> float:
         return DATA_INTERVAL_NIGHT if _is_night() else DATA_INTERVAL_DAY
@@ -2904,7 +2904,7 @@ def purpleair_fetch_loop(
             "interval_day_s": DATA_INTERVAL_DAY,
             "interval_night_s": DATA_INTERVAL_NIGHT,
             "neighbor_radius_deg": NEIGHBOR_RADIUS_DEG,
-            "budget": "2M pts/month — worst-case ~1.83M, typical ~307K",
+            "budget": "2M pts/month — worst-case ~207K/day, typical ~43K/day",
         }, indent=2), encoding="utf-8")
     except Exception as e:
         _log(f"[PurpleAir] Debug log init error: {e}")
