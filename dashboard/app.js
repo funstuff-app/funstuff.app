@@ -697,6 +697,7 @@ function main() {
       _legendEntryCount = newCount;
       const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
       for (const t of tabs) t.classList.toggle("active", t.dataset.legend === legendTab);
+      _syncLegendTabVisibility();
       return;
     }
 
@@ -745,6 +746,7 @@ function main() {
     _legendEntryCount = newCount;
     const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
     for (const t of tabs) t.classList.toggle("active", t.dataset.legend === legendTab);
+    _syncLegendTabVisibility();
 
     // Re-enable transitions after instant update completes
     if (!animate) {
@@ -753,6 +755,35 @@ function main() {
       requestAnimationFrame(() => {
         legendBodyEl.classList.remove("legend-no-transition");
       });
+    }
+  }
+
+  /** Hide legend tabs for pollutants not present in any sensor's readings.
+   *  PM2.5 and O3 are always shown; others appear only when data exists. */
+  const _ALWAYS_VISIBLE_TABS = new Set(["pm25", "o3"]);
+  let _lastAvailableTabs = null;
+  function _syncLegendTabVisibility() {
+    if (!legendEl) return;
+    const st = _currentState();
+    const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
+    const found = new Set();
+    for (const s of all) {
+      const r = s && s.readings;
+      if (!r) continue;
+      for (const k of Object.keys(r)) {
+        const tab = pollutantToLegendTab(k);
+        if (tab) found.add(tab);
+      }
+    }
+    // Build a stable key to skip DOM work when nothing changed
+    const availKey = Array.from(found).sort().join(",");
+    if (availKey === _lastAvailableTabs) return;
+    _lastAvailableTabs = availKey;
+
+    for (const t of legendEl.querySelectorAll(".legendTab")) {
+      const tab = t.dataset.legend;
+      const visible = _ALWAYS_VISIBLE_TABS.has(tab) || found.has(tab);
+      t.style.display = visible ? "" : "none";
     }
   }
 
@@ -4915,6 +4946,9 @@ function main() {
 
       // Sync legend tab to selected marker's current pollutant
       syncLegendToMapSelection();
+
+      // Update legend tab visibility based on available pollutants
+      _syncLegendTabVisibility();
 
       // Keep DVR UI in sync even when the RAF loop is idle.
       if (map.playbackMode) {
