@@ -398,62 +398,6 @@ def fetch_wind_field(analysis_time: datetime,
 # ─── Pre-interpolation to advection grid ─────────────────────────────────────
 
 # Must match pa_advection_worker.js GEO_BOUNDS / DEFAULT_GW / DEFAULT_GH
-<<<<<<< Updated upstream
-_GRID_BOUNDS = {"latMin": 39.5, "latMax": 41.5, "lonMin": -113.0, "lonMax": -111.0}
-_DEFAULT_GW = 80
-_DEFAULT_GH = 60
-
-
-def wind_to_grid(points: list[dict[str, float]],
-                 gw: int = _DEFAULT_GW,
-                 gh: int = _DEFAULT_GH,
-                 bounds: dict | None = None) -> dict:
-    """IDW-interpolate raw wind points onto a fixed advection grid.
-
-    Returns ``{"gw": int, "gh": int, "bounds": {...},
-               "uGrid": [float, ...], "vGrid": [float, ...]}``
-    where uGrid/vGrid are flat row-major arrays of length gw*gh
-    (m/s, NOT grid-cell-scaled — the worker applies its own scaling).
-
-    The algorithm mirrors ``interpolateWindField()`` in
-    ``pa_advection_worker.js`` but outputs in m/s so the worker can
-    apply its own per-cell scaling without double-division.
-    """
-    b = bounds or _GRID_BOUNDS
-    n = gw * gh
-    u_grid = [0.0] * n
-    v_grid = [0.0] * n
-
-    if not points:
-        return {"gw": gw, "gh": gh, "bounds": b,
-                "uGrid": u_grid, "vGrid": v_grid}
-
-    d_lon = (b["lonMax"] - b["lonMin"]) / gw
-    d_lat = (b["latMax"] - b["latMin"]) / gh
-    cutoff_sq = 1.0  # 1°² — matches JS cutoff
-
-    for iy in range(gh):
-        lat = b["latMin"] + (iy + 0.5) * d_lat
-        for ix in range(gw):
-            lon = b["lonMin"] + (ix + 0.5) * d_lon
-            w_sum = 0.0
-            u_sum = 0.0
-            v_sum = 0.0
-            for wp in points:
-                dlat = lat - wp["lat"]
-                dlon = lon - wp["lon"]
-                d2 = dlat * dlat + dlon * dlon
-                if d2 > cutoff_sq:
-                    continue
-                w = 1.0 / (d2 + 0.001)
-                w_sum += w
-                u_sum += w * wp["u"]
-                v_sum += w * wp["v"]
-            idx = iy * gw + ix
-            if w_sum > 1e-12:
-                u_grid[idx] = round(u_sum / w_sum, 3)
-                v_grid[idx] = round(v_sum / w_sum, 3)
-=======
 GRID_BOUNDS = {"latMin": 39.5, "latMax": 41.5, "lonMin": -113.0, "lonMax": -111.0}
 GRID_GW = 80
 GRID_GH = 60
@@ -522,7 +466,6 @@ def wind_to_grid(points: list[dict[str, float]],
                         v_grid[ni] = v_grid[i]
                         count[ni] = -1  # mark visited
                         q.append(ni)
->>>>>>> Stashed changes
 
     return {"gw": gw, "gh": gh, "bounds": b,
             "uGrid": u_grid, "vGrid": v_grid}
@@ -540,18 +483,8 @@ def _wind_snapshots_dir(data_dir: Path) -> Path:
 
 def save_wind_field(data: list | dict, data_dir: Path,
                     analysis_time: datetime | None = None) -> None:
-<<<<<<< Updated upstream
-    """Write wind field JSON with metadata to data_dir/wind_field.json.
-
-    *data* may be either the legacy point list or a grid dict from
-    ``wind_to_grid()``.
-    """
-    if isinstance(data, dict) and "gw" in data:
-        # Grid format — store as-is with metadata
-=======
     """Write wind field JSON with metadata to data_dir/wind_field.json."""
     if isinstance(data, dict) and "gw" in data:
->>>>>>> Stashed changes
         payload = {
             "ts": time.time(),
             "analysis_time": analysis_time.isoformat() if analysis_time else None,
@@ -604,14 +537,7 @@ def save_wind_snapshot(data: list | dict, data_dir: Path,
 
 
 def load_wind_snapshots(data_dir: Path) -> dict[str, list | dict]:
-<<<<<<< Updated upstream
-    """Load all wind snapshots from disk.
-
-    Returns ``{HHMM: grid_dict_or_points_list}``.
-    """
-=======
     """Load all wind snapshots from disk.  Returns {HHMM: grid_or_points}."""
->>>>>>> Stashed changes
     snap_dir = _wind_snapshots_dir(data_dir)
     if not snap_dir.is_dir():
         return {}
@@ -622,18 +548,10 @@ def load_wind_snapshots(data_dir: Path) -> dict[str, list | dict]:
             continue
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-<<<<<<< Updated upstream
-            # New grid format
-=======
->>>>>>> Stashed changes
             grid = data.get("grid")
             if isinstance(grid, dict) and "uGrid" in grid:
                 result[key] = grid
                 continue
-<<<<<<< Updated upstream
-            # Legacy point-list format
-=======
->>>>>>> Stashed changes
             pts = data.get("points", [])
             if isinstance(pts, list) and pts:
                 result[key] = pts

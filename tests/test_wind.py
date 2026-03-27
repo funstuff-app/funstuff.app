@@ -187,11 +187,7 @@ class TestParseGrib2(unittest.TestCase):
 
 
 class TestWindToGrid(unittest.TestCase):
-<<<<<<< Updated upstream
-    """Test the wind_to_grid pre-interpolation function."""
-=======
     """Test the wind_to_grid bin-average function."""
->>>>>>> Stashed changes
 
     def test_empty_points(self):
         from mobileair.wind import wind_to_grid
@@ -199,85 +195,6 @@ class TestWindToGrid(unittest.TestCase):
         self.assertEqual(grid["gw"], 80)
         self.assertEqual(grid["gh"], 60)
         self.assertEqual(len(grid["uGrid"]), 80 * 60)
-<<<<<<< Updated upstream
-        self.assertEqual(len(grid["vGrid"]), 80 * 60)
-        self.assertTrue(all(v == 0.0 for v in grid["uGrid"]))
-
-    def test_uniform_wind(self):
-        from mobileair.wind import wind_to_grid
-        # Single point in the center of the grid with uniform wind
-        points = [{"lat": 40.5, "lon": -112.0, "u": 3.0, "v": -1.0}]
-        grid = wind_to_grid(points, gw=4, gh=3)
-        self.assertEqual(grid["gw"], 4)
-        self.assertEqual(grid["gh"], 3)
-        self.assertEqual(len(grid["uGrid"]), 12)
-        # All cells should have some wind influence
-        # The center cell should be close to (3.0, -1.0)
-        center_idx = 1 * 4 + 2  # iy=1, ix=2
-        self.assertAlmostEqual(grid["uGrid"][center_idx], 3.0, places=1)
-        self.assertAlmostEqual(grid["vGrid"][center_idx], -1.0, places=1)
-
-    def test_grid_has_bounds(self):
-        from mobileair.wind import wind_to_grid
-        grid = wind_to_grid([], gw=10, gh=8)
-        b = grid["bounds"]
-        self.assertAlmostEqual(b["latMin"], 39.5)
-        self.assertAlmostEqual(b["latMax"], 41.5)
-        self.assertAlmostEqual(b["lonMin"], -113.0)
-        self.assertAlmostEqual(b["lonMax"], -111.0)
-
-    def test_custom_bounds(self):
-        from mobileair.wind import wind_to_grid
-        custom = {"latMin": 40.0, "latMax": 41.0, "lonMin": -112.0, "lonMax": -111.0}
-        grid = wind_to_grid([], gw=5, gh=5, bounds=custom)
-        self.assertEqual(grid["bounds"], custom)
-
-
-class TestGridSaveLoad(unittest.TestCase):
-    """Test save/load roundtrip with grid format."""
-
-    def test_save_load_grid_roundtrip(self):
-        from mobileair.wind import wind_to_grid, save_wind_field, load_wind_field
-        points = [{"lat": 40.5, "lon": -112.0, "u": 2.0, "v": -0.5}]
-        grid = wind_to_grid(points, gw=4, gh=3)
-        with tempfile.TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            save_wind_field(grid, data_dir)
-            loaded = load_wind_field(data_dir)
-            self.assertIsNotNone(loaded)
-            self.assertIn("grid", loaded)
-            self.assertEqual(loaded["grid"]["gw"], 4)
-            self.assertEqual(loaded["grid"]["gh"], 3)
-            self.assertEqual(len(loaded["grid"]["uGrid"]), 12)
-
-    def test_save_load_grid_snapshot_roundtrip(self):
-        from mobileair.wind import wind_to_grid, save_wind_snapshot, load_wind_snapshots
-        points = [{"lat": 40.5, "lon": -112.0, "u": 1.0, "v": 0.5}]
-        grid = wind_to_grid(points, gw=4, gh=3)
-        with tempfile.TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            at = datetime(2026, 3, 27, 14, 30, 0, tzinfo=timezone.utc)
-            save_wind_snapshot(grid, data_dir, at)
-            snaps = load_wind_snapshots(data_dir)
-            self.assertIn("1430", snaps)
-            self.assertIn("uGrid", snaps["1430"])
-            self.assertEqual(snaps["1430"]["gw"], 4)
-
-    def test_legacy_points_still_load(self):
-        """Ensure existing point-format snapshots on disk are still readable."""
-        from mobileair.wind import save_wind_field, load_wind_field
-        points = [{"lat": 40.7, "lon": -111.9, "u": 1.5, "v": -0.3}]
-        with tempfile.TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            # Write old-format payload manually
-            payload = {"ts": 0, "analysis_time": None, "count": 1, "points": points}
-            (data_dir / "wind_field.json").write_text(json.dumps(payload))
-            loaded = load_wind_field(data_dir)
-            self.assertIsNotNone(loaded)
-            self.assertIn("points", loaded)
-            self.assertEqual(len(loaded["points"]), 1)
-
-=======
         self.assertTrue(all(v == 0.0 for v in grid["uGrid"]))
 
     def test_single_point_populates_grid(self):
@@ -286,7 +203,6 @@ class TestGridSaveLoad(unittest.TestCase):
         grid = wind_to_grid(points, gw=4, gh=3)
         self.assertEqual(grid["gw"], 4)
         self.assertEqual(len(grid["uGrid"]), 12)
-        # At least the host cell should have wind values
         has_u = any(v != 0.0 for v in grid["uGrid"])
         self.assertTrue(has_u)
 
@@ -294,7 +210,6 @@ class TestGridSaveLoad(unittest.TestCase):
         from mobileair.wind import wind_to_grid
         points = [{"lat": 40.5, "lon": -112.0, "u": 2.0, "v": 1.0}]
         grid = wind_to_grid(points, gw=4, gh=3)
-        # After flood fill, all cells should be nonzero
         self.assertTrue(all(v != 0.0 for v in grid["uGrid"]))
 
     def test_fast_enough(self):
@@ -328,7 +243,6 @@ class TestGridSaveLoad(unittest.TestCase):
             self.assertIn("1430", snaps)
             self.assertEqual(snaps["1430"]["gw"], 4)
 
->>>>>>> Stashed changes
 
 if __name__ == "__main__":
     unittest.main()

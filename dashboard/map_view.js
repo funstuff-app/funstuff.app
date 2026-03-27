@@ -2449,7 +2449,9 @@ class MapView {
     // macOS mouse wheel: deltaMode is always 0, no ctrlKey. Detect via vertical-only
     // + significant delta. Same heuristic as isSmoothScrollZoom but Mac-specific flag
     // so it gets its own code path and isn't suppressed by the pan→zoom debounce.
-    const isMacMouseWheel = this._isMac && !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
+    // Exclude if we're already in a trackpad pan stream (_wheelPanning) — a vertical
+    // portion of a two-finger swipe must not be hijacked as zoom.
+    const isMacMouseWheel = this._isMac && !this._wheelPanning && !e.ctrlKey && Math.abs(e.deltaX) < 1 && Math.abs(e.deltaY) >= 4;
 
     // Determine if this should be a zoom event:
     // 1. True mouse wheel (deltaMode !== 0) → zoom
@@ -2471,6 +2473,7 @@ class MapView {
     if (shouldZoom) {
       if (this._gesture) return;
       if (this._mouseDragging) return; // Don't zoom while user is panning
+      if (this._wheelPanning) return;  // Don't zoom while user is trackpad-panning
 
       if (this._wheelPinchEndTimer) window.clearTimeout(this._wheelPinchEndTimer);
       this._pinchZooming = true;
@@ -5864,10 +5867,7 @@ class MapView {
    */
   mergeWindSnapshot(key, points) {
     if (!key || !points) return;
-<<<<<<< Updated upstream
     // Accept both grid objects and legacy point arrays
-=======
->>>>>>> Stashed changes
     if (Array.isArray(points) && !points.length) return;
     if (typeof points === "object" && !Array.isArray(points) && !points.uGrid) return;
     if (!this._windSnapshots) this._windSnapshots = {};
@@ -5915,11 +5915,7 @@ class MapView {
             this._windField = data;
           }
         } else if (data.gw != null && data.uGrid != null) {
-<<<<<<< Updated upstream
           // Single grid object (legacy fallback from wind_field_json)
-=======
-          // Single grid object (fallback from wind_field_json)
->>>>>>> Stashed changes
           this._windSnapshots = { "0000": data };
           this._windSnapshotKeys = ["0000"];
           this._windField = data;
@@ -5945,13 +5941,9 @@ class MapView {
   }
 
   /** Interpolate u,v components between two wind field snapshots.
-<<<<<<< Updated upstream
    *  Supports both grid objects {gw, gh, uGrid, vGrid, bounds} and
    *  legacy point arrays [{lat, lon, u, v}, ...].
    *  Returns an interpolated snapshot in the same format as the inputs. */
-=======
-   *  Supports grid objects and legacy point arrays. */
->>>>>>> Stashed changes
   _interpolateWindFields(fieldA, fieldB, alpha) {
     if (!fieldA || !fieldB) return fieldA;
     // Grid object path
@@ -8902,13 +8894,18 @@ class MapView {
           const speed = Math.sqrt(u * u + v * v);
           if (speed < 0.3) return;
           const len = Math.min(speed * arrowScale, 30);
-          const dx = (u / speed) * len, dy = -(v / speed) * len;
-          ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx + dx, sy + dy); ctx.stroke();
-          const headLen = Math.min(4, len * 0.35), angle = Math.atan2(dy, dx);
-          ctx.beginPath(); ctx.moveTo(sx + dx, sy + dy);
+          const dx = (u / speed) * len;
+          const dy = -(v / speed) * len;
+          ctx.beginPath();
+          ctx.moveTo(sx, sy);
+          ctx.lineTo(sx + dx, sy + dy);
+          ctx.stroke();
+          const headLen = Math.min(4, len * 0.35);
+          const angle = Math.atan2(dy, dx);
+          ctx.beginPath();
+          ctx.moveTo(sx + dx, sy + dy);
           ctx.lineTo(sx + dx - headLen * Math.cos(angle - 0.5), sy + dy - headLen * Math.sin(angle - 0.5));
           ctx.lineTo(sx + dx - headLen * Math.cos(angle + 0.5), sy + dy - headLen * Math.sin(angle + 0.5));
-<<<<<<< Updated upstream
           ctx.closePath();
           ctx.fill();
         };
@@ -8918,31 +8915,18 @@ class MapView {
           const gw2 = wfData.gw, gh2 = wfData.gh, b = wfData.bounds;
           const dLon = (b.lonMax - b.lonMin) / gw2;
           const dLat = (b.latMax - b.latMin) / gh2;
-=======
-          ctx.closePath(); ctx.fill();
-        };
-
-        if (wfData.gw != null && wfData.uGrid) {
-          const gw2 = wfData.gw, gh2 = wfData.gh, b = wfData.bounds;
-          const dLon = (b.lonMax - b.lonMin) / gw2, dLat = (b.latMax - b.latMin) / gh2;
->>>>>>> Stashed changes
           for (let iy = 0; iy < gh2; iy++) {
             const lat = b.latMin + (iy + 0.5) * dLat;
             for (let ix = 0; ix < gw2; ix++) {
               const lon = b.lonMin + (ix + 0.5) * dLon;
               const idx = iy * gw2 + ix;
               const wpt = latLonToWorld(lat, lon, this.zoom);
-<<<<<<< Updated upstream
               const sx = wpt.x - _wCenter.x + w / 2;
               const sy = wpt.y - _wCenter.y + h / 2;
-=======
-              const sx = wpt.x - _wCenter.x + w / 2, sy = wpt.y - _wCenter.y + h / 2;
->>>>>>> Stashed changes
               if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
               _drawArrow(sx, sy, wfData.uGrid[idx] || 0, wfData.vGrid[idx] || 0);
             }
           }
-<<<<<<< Updated upstream
         } else if (Array.isArray(wfData) && wfData.length > 0) {
           // Legacy point array
           for (let i = 0; i < wfData.length; i++) {
@@ -8950,13 +8934,6 @@ class MapView {
             const wpt = latLonToWorld(wp.lat, wp.lon, this.zoom);
             const sx = wpt.x - _wCenter.x + w / 2;
             const sy = wpt.y - _wCenter.y + h / 2;
-=======
-        } else if (Array.isArray(wfData)) {
-          for (let i = 0; i < wfData.length; i++) {
-            const wp = wfData[i];
-            const wpt = latLonToWorld(wp.lat, wp.lon, this.zoom);
-            const sx = wpt.x - _wCenter.x + w / 2, sy = wpt.y - _wCenter.y + h / 2;
->>>>>>> Stashed changes
             if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
             _drawArrow(sx, sy, wp.u || 0, wp.v || 0);
           }

@@ -4044,23 +4044,12 @@ def wind_field_fetch_loop(
     try:
         cached = load_wind_field(data_dir)
         if cached:
-<<<<<<< Updated upstream
-            # New grid format or legacy points
-            wind_data = cached.get("grid") or cached.get("points")
-            if wind_data:
-                # Legacy point lists → convert to grid on the fly
-                if isinstance(wind_data, list):
-                    wind_data = wind_to_grid(wind_data)
-                json_bytes = json.dumps(wind_data).encode("utf-8")
-                # Extract HHMM key from analysis_time if available
-=======
             # Accept grid (new) or points (legacy→convert)
             grid = cached.get("grid")
             if not grid and cached.get("points"):
                 grid = wind_to_grid(cached["points"])
             if grid:
                 json_bytes = json.dumps(grid).encode("utf-8")
->>>>>>> Stashed changes
                 snap_key = None
                 at_str = cached.get("analysis_time")
                 if at_str:
@@ -4072,19 +4061,12 @@ def wind_field_fetch_loop(
                 with app_state.lock:
                     app_state.wind_field_json = json_bytes
                     app_state.wind_field_seq += 1
-<<<<<<< Updated upstream
-                    # Also seed the snapshots dict so the endpoint serves data
-=======
->>>>>>> Stashed changes
+
                     if snap_key:
                         app_state.wind_snapshots[snap_key] = json_bytes
                         app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
                         app_state.wind_snapshot_date = _today_str()
-<<<<<<< Updated upstream
-                _log(f"[Wind] Loaded cached wind field ({cached['count']} cells, key={snap_key})")
-=======
                 _log(f"[Wind] Loaded cached wind field (grid {grid['gw']}×{grid['gh']}, key={snap_key})")
->>>>>>> Stashed changes
     except Exception as e:
         _log(f"[Wind] Error loading cache: {e}")
 
@@ -4097,15 +4079,7 @@ def wind_field_fetch_loop(
                     data = wind_to_grid(data)
                 converted[k] = json.dumps(data).encode("utf-8")
             with app_state.lock:
-<<<<<<< Updated upstream
-                for k, data in snaps.items():
-                    # Legacy point lists → convert to grid
-                    if isinstance(data, list):
-                        data = wind_to_grid(data)
-                    app_state.wind_snapshots[k] = json.dumps(data).encode("utf-8")
-=======
                 app_state.wind_snapshots.update(converted)
->>>>>>> Stashed changes
                 app_state.wind_snapshots_keys = sorted(app_state.wind_snapshots.keys())
                 app_state.wind_snapshot_date = _today_str()
             _log(f"[Wind] Loaded {len(snaps)} cached snapshots from disk")
@@ -4149,10 +4123,7 @@ def wind_field_fetch_loop(
                 if not points:
                     continue
 
-<<<<<<< Updated upstream
-                # Pre-interpolate to advection grid (80×60) — saves ~90% bandwidth
-=======
->>>>>>> Stashed changes
+
                 grid = wind_to_grid(points)
 
                 # Notify poller so it learns the cadence
