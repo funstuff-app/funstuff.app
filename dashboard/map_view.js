@@ -43,6 +43,10 @@ const _LEGEND_TAB_READING_KEYS = {
 const _LEGEND_TAB_AQI_KEY = {
   pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co",
 };
+/** Map legend tab id → display label for marker. */
+const _LEGEND_TAB_LABEL = {
+  pm25: "PM25", pm10: "PM10", o3: "O\u2083", no2: "NO\u2082", co: "CO",
+};
 /** Map legend tab id → mobile trail reading keys. */
 const _LEGEND_TAB_TRAIL_KEYS = {
   pm25: ["PM25", "PM2.5", "pm25"],
@@ -8394,13 +8398,18 @@ class MapView {
         if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
         // Legend pollutant override: show the legend's chosen pollutant on the selected marker
-        if (isSel && this._paFieldPollutant) {
+        if (isSel && this._paFieldPollutant && this._paFieldPollutant !== "pm25") {
           const interp2 = interpCacheKey ? this._fixedInterpCache.map.get(f.id) : interpolateFixedReadingsAtTime(f, fixedPbTimeMs);
           const legendPr = _readingForLegendTab(
             interp2 || (f && f.readings),
             this._paFieldPollutant
           );
           if (legendPr) { pr = legendPr; this._selectedPollutantKey = legendPr.key; }
+          else {
+            const lbl = _LEGEND_TAB_LABEL[this._paFieldPollutant] || this._paFieldPollutant.toUpperCase();
+            pr = { key: lbl, value: "\u2014", color: "#666666" };
+            this._selectedPollutantKey = null;
+          }
         }
 
         ctx.save();
@@ -8604,9 +8613,14 @@ class MapView {
       if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
 
       // Legend pollutant override: show the legend's chosen pollutant on the selected marker
-      if (isSel && this._paFieldPollutant) {
+      if (isSel && this._paFieldPollutant && this._paFieldPollutant !== "pm25") {
         const legendPr = _readingForLegendTab(m.readings, this._paFieldPollutant);
         if (legendPr) { pr = legendPr; this._selectedPollutantKey = legendPr.key; }
+        else {
+          const lbl = _LEGEND_TAB_LABEL[this._paFieldPollutant] || this._paFieldPollutant.toUpperCase();
+          pr = { key: lbl, value: "\u2014", color: "#666666" };
+          this._selectedPollutantKey = null;
+        }
       }
 
       const prColor = isParked ? dimHex(pr.color || "#ffffff", 0.65) : (pr.color || "#ffffff");
