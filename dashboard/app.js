@@ -392,6 +392,7 @@ function main() {
   let legendTab = localStorage.getItem(LEGEND_TAB_KEY) || "pm25";
   let userLegendTab = legendTab; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected
+  let _legendAutoOpenedOnce = legendOpen; // skip auto-open if user already kept legend open
 
   /** Map a pollutant key (PM25, PM10, OZNE, O3, etc.) to a legend tab id. */
   function pollutantToLegendTab(key) {
@@ -1305,6 +1306,14 @@ function main() {
     let item = null;
     if (sel && sel.type === "mobile") item = (Array.isArray(st.mobile) ? st.mobile : []).find(x => x.id === sel.id) || null;
     if (sel && sel.type === "fixed") item = (Array.isArray(st.fixed) ? st.fixed : []).find(x => x.id === sel.id) || null;
+
+    // Auto-open legend on first mobile/fixed selection this session (not PurpleAir)
+    const isPurpleAir = item && item.purpleair;
+    if (selectedId && !_legendAutoOpenedOnce && !legendOpen && !isPurpleAir) {
+      _legendAutoOpenedOnce = true;
+      legendOpen = true;
+      updateLegendVisibility();
+    }
 
     // Sync legend tab to selected marker's displayed pollutant
     // Use item data directly (map render state may not be updated yet)

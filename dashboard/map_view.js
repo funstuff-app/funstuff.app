@@ -331,6 +331,10 @@ class MapView {
     this._autoFitInFlightSig = "";
     this._pendingForcedFit = null; // { bounds, durationMs }
     this.selectedId = null;
+    // Hover state: show label on mouseover with debounce
+    this._hoveredId = null;       // key currently showing hover label
+    this._hoverShowTimer = null;  // setTimeout id for show debounce
+    this._hoverHideTimer = null;  // setTimeout id for hide debounce
     // Marker visibility toggles
     this.showFixed = true;
     this.showMobile = true;
@@ -1178,7 +1182,11 @@ class MapView {
       }
       return;
     }
-    if (!this._mouseDragging || !this._mouseDragStart || !this._mouseDragCenterStart) return;
+    if (!this._mouseDragging || !this._mouseDragStart || !this._mouseDragCenterStart) {
+      // Hover hit-test for mobile/fixed (non-PurpleAir) marker labels
+      this._updateHoverAtClientXY(e.clientX, e.clientY);
+      return;
+    }
     this._noteUserInteraction();
     const dx = e.clientX - this._mouseDragStart.x;
     const dy = e.clientY - this._mouseDragStart.y;
@@ -2424,6 +2432,101 @@ class MapView {
     const ll = worldToLatLon(nx, ny, this.zoom);
     this.center = { lat: ll.lat, lon: ll.lon };
     if (!this._pinchInertiaRAF) this._requestPanRedraw();
+  }
+
+  _updateHoverAtClientXY(clientX, clientY) {
+    const st = this.lastState;
+    if (!st) return;
+    const rect = this.overlayCanvas.getBoundingClientRect();
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
+    // Only test if cursor is within the canvas bounds
+    if (sx < 0 || sy < 0 || sx > rect.width || sy > rect.height) {
+      this._scheduleHoverHide();
+      return;
+    }
+    // Suppress hover labels while a marker is selected
+    if (this.selectedId) {
+      this._clearHover();
+      return;
+    }
+
+    const mobiles = Array.isArray(st.mobile) ? st.mobile : [];
+    const fixed = Array.isArray(st.fixed) ? st.fixed : [];
+
+    // Hit-test in reverse render order (same as onClick), but exclude PurpleAir
+    let hit = null;
+    const selParsed = parseKey(this.selectedId);
+    const selMobileId = (selParsed && selParsed.type === "mobile") ? String(selParsed.id) : null;
+    const allMobileCands = mobiles.map(m => ({ type: "mobile", ...m }));
+    const topMobileCand = selMobileId ? allMobileCands.find(m => String(m.id) === selMobileId) : null;
+    const otherMobileCands = selMobileId ? allMobileCands.filter(m => String(m.id) !== selMobileId) : [...allMobileCands];
+    const candidates = [
+      ...(topMobileCand ? [topMobileCand] : []),
+      ...[...otherMobileCands].reverse(),
+      ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
+    ];
+    for (const m of candidates) {
+      let lat = Number(m.lat), lon = Number(m.lon);
+      if (m.type === "mobile") {
+        const pose = this._mobilePoseForRender(m, performance.now());
+        lat = pose.lat;
+        lon = pose.lon;
+      }
+      if (m.type === "fixed" && this._fixedGeoOffsets) {
+        const fKey = m._key || keyFor("fixed", m.id);
+        const geo = this._fixedGeoOffsets.get(fKey);
+        if (geo) { lat += geo.dlat; lon += geo.dlon; }
+      }
+      if (!isFinite(lat) || !isFinite(lon)) continue;
+      const wpt = latLonToWorld(lat, lon, this.zoom);
+      const sp = this.worldToScreen(wpt.x, wpt.y);
+      const dx = sp.x - sx;
+      const dy = sp.y - sy;
+      if ((dx*dx + dy*dy) <= (20*20)) {
+        hit = keyFor(m.type, m.id);
+        break;
+      }
+    }
+
+    if (hit) {
+      // Clear hide timer if re-entering same or new marker
+      if (this._hoverHideTimer) { clearTimeout(this._hoverHideTimer); this._hoverHideTimer = null; }
+      if (this._hoveredId === hit) return; // already showing this one
+      // Clear previous show timer
+      if (this._hoverShowTimer) { clearTimeout(this._hoverShowTimer); this._hoverShowTimer = null; }
+      this._hoverShowTimer = setTimeout(() => {
+        this._hoverShowTimer = null;
+        this._hoveredId = hit;
+        this._invalidateOverlayStatic();
+        this.drawOverlay(this.lastState);
+      }, 333);
+    } else {
+      // Cursor not over any marker — schedule hide
+      if (this._hoverShowTimer) { clearTimeout(this._hoverShowTimer); this._hoverShowTimer = null; }
+      this._scheduleHoverHide();
+    }
+  }
+
+  _scheduleHoverHide() {
+    if (!this._hoveredId) return;
+    if (this._hoverHideTimer) return; // already scheduled
+    this._hoverHideTimer = setTimeout(() => {
+      this._hoverHideTimer = null;
+      this._hoveredId = null;
+      this._invalidateOverlayStatic();
+      this.drawOverlay(this.lastState);
+    }, 333);
+  }
+
+  _clearHover() {
+    if (this._hoverShowTimer) { clearTimeout(this._hoverShowTimer); this._hoverShowTimer = null; }
+    if (this._hoverHideTimer) { clearTimeout(this._hoverHideTimer); this._hoverHideTimer = null; }
+    if (this._hoveredId) {
+      this._hoveredId = null;
+      this._invalidateOverlayStatic();
+      this.drawOverlay(this.lastState);
+    }
   }
 
   onClick(e) {
@@ -6790,7 +6893,8 @@ class MapView {
           ctx.fillText(emoji, sp.x, sp.y);
         }
 
-        if ((this.showFixedLabels && !isPurpleAir) || isSel || String(f.id) === "Home") {
+        const isHov = (this._hoveredId === keyF);
+        if ((this.showFixedLabels && !isPurpleAir) || isSel || isHov || String(f.id) === "Home") {
           ctx.font = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
           const line1 = label;
           const line2Key = pr.key ? String(pr.key) : "";
@@ -8233,7 +8337,8 @@ class MapView {
         }
 
         const showLabel = isPurpleAir ? this.showPublicLabels : this.showFixedLabels;
-        if (showLabel || isSel || String(f.id) === "Home") {
+        const isHov = !isPurpleAir && (this._hoveredId === key);
+        if (showLabel || isSel || isHov || String(f.id) === "Home") {
           const labelFont = "600 12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
           const line1 = label;
           const line2Key = pr.key ? String(pr.key) : "";
@@ -8456,8 +8561,9 @@ class MapView {
         }
       }
 
-      // tiny label pill (show for selected or when labels toggle is on)
-      const shouldShowLabel = this.showMobileLabels || isSel;
+      // tiny label pill (show for selected, hovered, or when labels toggle is on)
+      const isHov = (this._hoveredId === key);
+      const shouldShowLabel = this.showMobileLabels || isSel || isHov;
       if (shouldShowLabel) {
         ctx.save();
         // Reset transform and alpha for label drawing
