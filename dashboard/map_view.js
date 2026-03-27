@@ -66,15 +66,10 @@ function _readingForLegendTab(readings, legendTab) {
     const r = readings[rk];
     if (r && r.value != null) {
       const aqi = valueToAqi(_LEGEND_TAB_AQI_KEY[legendTab] || "pm2.5", r.value);
-      // Derive color from AQI via the same continuous ramp the field uses,
-      // so marker ring colors match the interpolated heatmap.
-      let color;
-      if (aqi != null && isFinite(aqi)) {
-        const rgb = _aqiToRgb(aqi);
-        color = `#${((1 << 24) + (rgb[0] << 16) + (rgb[1] << 8) + rgb[2]).toString(16).slice(1)}`;
-      } else {
-        color = safeHex(r.ci);
-      }
+      // Use the server's precomputed discrete band color (r.ci) for markers.
+      // _aqiToRgb is a continuous ramp for the heatmap field; its intermediate
+      // colors don't align with pollutant-specific band boundaries.
+      const color = safeHex(r.ci);
       return { key: rk, value: r.value, color, aqi };
     }
   }
@@ -6862,15 +6857,8 @@ class MapView {
             }
           }
           if (found) {
-            // Derive color from AQI via continuous ramp (matches field + marker labels)
-            const aqiKey = _LEGEND_TAB_AQI_KEY[pollTab] || "pm2.5";
-            const aqi = valueToAqi(aqiKey, found.value);
-            if (aqi != null && isFinite(aqi)) {
-              const rgb = _aqiToRgb(aqi);
-              base = `#${((1 << 24) + (rgb[0] << 16) + (rgb[1] << 8) + rgb[2]).toString(16).slice(1)}`;
-            } else {
-              base = safeHex(found.ci != null ? found.ci : found.color);
-            }
+            // Use server's precomputed discrete band color for trails
+            base = safeHex(found.ci != null ? found.ci : found.color);
           } else {
             base = "#333333";
           }
