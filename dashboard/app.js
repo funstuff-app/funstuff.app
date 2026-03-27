@@ -825,11 +825,7 @@ function main() {
   if (legendCloseEl) {
     legendCloseEl.addEventListener("click", () => {
       legendOpen = false;
-      // Reset to default on close
-      legendTab = null;
-      userLegendTab = null;
       buildLegend();
-      _syncPaFieldDim();
       updateLegendVisibility();
     });
   }
