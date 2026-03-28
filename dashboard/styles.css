@@ -1913,27 +1913,30 @@ html.lite .pbMenuBtn {
   display: none !important;
 }
 
-/* ── Screensaver mode: hide static chrome after inactivity (OLED burn-in protection) ── */
+/* ── Screensaver mode: hide all chrome when mouse parks in bottom-left corner ── */
 #topbar,
-/* #playbackBar transition is handled by .playbackBar auto-hide rules */
 #sidebar,
 #menuBtn,
 .controls,
 #legend,
 #legendToggle,
 #camReplayBtn,
-.pbMenuBtn {
-  transition: opacity 2s ease;
+.pbMenuBtn,
+#appFooter {
+  transition: opacity 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+}
+body.screensaver {
+  cursor: none;
 }
 body.screensaver #topbar,
-body.screensaver #playbackBar,
 body.screensaver #sidebar,
 body.screensaver #menuBtn,
 body.screensaver .controls,
 body.screensaver #legend,
 body.screensaver #legendToggle,
 body.screensaver #camReplayBtn,
-body.screensaver .pbMenuBtn {
+body.screensaver .pbMenuBtn,
+body.screensaver #appFooter {
   opacity: 0 !important;
   pointer-events: none !important;
 }

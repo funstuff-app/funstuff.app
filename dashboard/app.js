@@ -260,6 +260,9 @@ function main() {
   const map = new MapView(tiles, paField, overlay);
   window.__map = map;  // Expose for updateSidebarPlaybackValues
 
+  // Screensaver mode flag (set by hot-corner code below, read by camera follow)
+  let _screensaverActive = false;
+
   // Lite mode: hide all chrome (sidebar, controls, legend, menu button)
   const _liteParam = new URLSearchParams(window.location.search).get('lite') === '1';
   if (_liteParam) {
@@ -2595,8 +2598,8 @@ function main() {
     // a distant long-route vehicle doesn't drag the camera to city scale.
     // ─────────────────────────────────────────────────────────────────────────
     {
-      if (_autoCameraEnabled && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && _slcInView()) {
-        _performCameraFit();
+      if ((_autoCameraEnabled || _screensaverActive) && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && (_screensaverActive || _slcInView())) {
+        _performCameraFit({ force: _screensaverActive });
       }
     }
 
@@ -5078,6 +5081,65 @@ function main() {
         }
       }, { passive: true });
     }
+  }
+
+  // ── Screensaver mode (bottom-left hot corner → hide all UI) ──
+  // Park the mouse in the bottom-left ~40px corner for 3 s to activate.
+  // Uses a generous inset (not pixel 0,0) to avoid conflicting with OS hot corners.
+  // Activating adds body.screensaver which fades all chrome, and triggers pb-hidden
+  // on the playback bar so everything disappears together.
+  {
+    const SS_DELAY_MS = 3000;
+    const SS_CORNER_PX = 40; // px from left edge and bottom edge
+    let _ssTimer = null;
+    let _ssActive = false;
+
+    const _ssEnter = () => {
+      if (_ssActive) return;
+      _ssActive = true;
+      _screensaverActive = true;
+      document.body.classList.add("screensaver");
+      var pb = document.getElementById("playbackBar");
+      if (pb) pb.classList.add("pb-hidden");
+      // Force camera follow on enter
+      _performCameraFit({ force: true });
+    };
+
+    const _ssExit = () => {
+      clearTimeout(_ssTimer);
+      _ssTimer = null;
+      if (!_ssActive) return;
+      _ssActive = false;
+      _screensaverActive = false;
+      document.body.classList.remove("screensaver");
+      var pb = document.getElementById("playbackBar");
+      if (pb) pb.classList.remove("pb-hidden");
+    };
+
+    const _ssCheck = (x, y) => {
+      const inCorner = x <= SS_CORNER_PX &&
+        y >= window.innerHeight - SS_CORNER_PX;
+      if (inCorner && !_ssActive && !_ssTimer) {
+        _ssTimer = setTimeout(_ssEnter, SS_DELAY_MS);
+      } else if (!inCorner) {
+        if (_ssTimer) { clearTimeout(_ssTimer); _ssTimer = null; }
+        if (_ssActive) _ssExit();
+      }
+    };
+
+    document.addEventListener("mousemove", (e) => {
+      _ssCheck(e.clientX, e.clientY);
+    });
+
+    document.addEventListener("touchstart", (e) => {
+      var t = e.touches[0];
+      if (t) _ssCheck(t.clientX, t.clientY);
+    }, { passive: true });
+
+    // Any key press exits screensaver
+    document.addEventListener("keydown", () => {
+      if (_ssActive) _ssExit();
+    });
   }
 
   // Load server config before starting data polling
