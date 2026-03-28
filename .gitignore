@@ -46,3 +46,4 @@ landing/mp3s/
 DOCS/
 workers/
 tools/
+.wrangler/
