@@ -986,12 +986,13 @@ function main() {
   }
 
   // ── Camera center button (all users) ────────────────────────────────────────
-  const camCenterBtn = document.getElementById("camCenterBtn");
-  if (camCenterBtn) {
-    camCenterBtn.addEventListener("click", () => {
-      _performCameraFit({ force: true });
-    });
-  }
+  // Camera center button disabled — keepCenter feature removed.
+  // const camCenterBtn = document.getElementById("camCenterBtn");
+  // if (camCenterBtn) {
+  //   camCenterBtn.addEventListener("click", () => {
+  //     _performCameraFit({ force: true });
+  //   });
+  // }
 
   // Tab click behavior:
   // - Click inactive tab: switch to that list, make markers visible if hidden
@@ -2606,8 +2607,8 @@ function main() {
     // a distant long-route vehicle doesn't drag the camera to city scale.
     // ─────────────────────────────────────────────────────────────────────────
     {
-      if ((_autoCameraEnabled || _screensaverActive) && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && (_screensaverActive || _slcInView())) {
-        _performCameraFit({ force: _screensaverActive });
+      if (_screensaverActive && (newDataArrived || forceCameraFit) && map._playbackLiveFollow) {
+        _performCameraFit({ force: true });
       }
     }
 
