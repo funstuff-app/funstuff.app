@@ -985,6 +985,14 @@ function main() {
     });
   }
 
+  // ── Camera center button (all users) ────────────────────────────────────────
+  const camCenterBtn = document.getElementById("camCenterBtn");
+  if (camCenterBtn) {
+    camCenterBtn.addEventListener("click", () => {
+      _performCameraFit({ force: true });
+    });
+  }
+
   // Tab click behavior:
   // - Click inactive tab: switch to that list, make markers visible if hidden
   // - Click active tab: toggle marker visibility on/off
