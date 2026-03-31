@@ -3989,9 +3989,12 @@ function main() {
       closeBtn.removeEventListener("click", onClose);
     };
     closeBtn.addEventListener("click", onClose);
-    modal.addEventListener("click", (e) => {
-      if (e.target === modal) onClose();
-    }, { once: true });
+    modal.addEventListener("click", function handler(e) {
+      if (e.target === modal || e.target.classList.contains("aboutModalX")) {
+        onClose();
+        modal.removeEventListener("click", handler);
+      }
+    });
   }
 
   function handleMenuAction(action) {

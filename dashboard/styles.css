@@ -1333,6 +1333,20 @@ button#pbPlay.isLive {
   font-size: 13px;
 }
 .aboutModalClose:hover { background: rgba(24,32,48,0.90); }
+.aboutModalWrap {
+  position: relative;
+}
+.aboutModalX {
+  position: absolute;
+  top: -32px;
+  right: -8px;
+  font-size: 28px;
+  color: rgba(147,164,186,0.7);
+  cursor: pointer;
+  line-height: 1;
+  z-index: 201;
+}
+.aboutModalX:hover { color: var(--text); }
 
 /* Owner token (hidden behind version tap) */
 .ownerTokenSection { border-top: 1px solid rgba(255,255,255,0.06); padding-top: 12px; }

@@ -32,7 +32,7 @@
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260328a" />
+  <link rel="stylesheet" href="/styles.css?v=20260330a" />
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -233,7 +233,9 @@
     </main>
     <!-- About modal -->
     <div id="aboutModal" class="aboutModal hidden">
-      <div class="aboutModalContent">
+      <div class="aboutModalWrap">
+        <span class="aboutModalX">&times;</span>
+        <div class="aboutModalContent">
         <h3>About DustyTrails</h3>
         <p class="aboutVersion">Version 1.3</p>
         <p class="aboutDesc">Real-time air quality monitoring dashboard for Utah mobile and fixed sensors.</p>
@@ -275,6 +277,7 @@
           <p id="ownerTokenStatus" class="ownerTokenStatus"></p>
         </div>
         <button class="aboutModalClose" type="button">Close</button>
+        </div>
       </div>
     </div>
 
