@@ -1433,15 +1433,18 @@ button#pbPlay.isLive {
   border-radius: 5px;
   padding: 3px 7px;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  filter: brightness(0.45) saturate(0.4);
+  transition: background 0.15s, color 0.15s, border-color 0.15s, filter 0.2s ease-out;
 }
 .legendTab:hover {
   background: rgba(255,255,255,0.06);
+  filter: brightness(0.7) saturate(0.6);
 }
 .legendTab.active {
   color: var(--text);
   background: rgba(255,255,255,0.08);
   border-color: rgba(255,255,255,0.12);
+  filter: none;
 }
 .legendNameRow {
   font-size: 10px;
@@ -1488,6 +1491,7 @@ button#pbPlay.isLive {
   flex-shrink: 0;
   height: 18px;
   overflow: visible;
+  transition: filter 0.22s ease-out;
 }
 /* Pill-shaped bar: absolutely positioned, overflows leftZone */
 .legendPill {
@@ -1500,7 +1504,7 @@ button#pbPlay.isLive {
   border: 1px solid rgba(0,0,0,0.3);
   box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset;
   /* Smooth tweening on pollutant switch — back-in overshoot curve on width */
-  transition: width 0.35s cubic-bezier(0.34, 1.56, 0.64, 1), background-color 0.3s ease-out, border-color 0.3s ease-out;
+  transition: width 0.35s cubic-bezier(0.34, 1.56, 0.64, 1), background-color 0.3s ease-out, border-color 0.3s ease-out, box-shadow 0.3s ease-out;
 }
 /* Legend row: transition max-height + opacity for add/remove */
 .legendRow {
@@ -1510,12 +1514,20 @@ button#pbPlay.isLive {
 }
 .legendRow.entering { max-height: 0; opacity: 0; }
 .legendRow.leaving  { max-height: 0; opacity: 0; pointer-events: none; }
+/* Unlit: only the pill zone dims — brackets and range text stay fully lit.
+   Scoping the filter to .legendLeftZone means the right-side labels are unaffected.
+   brightness(0.18) saturate(0.5) drops luminance dramatically while keeping
+   contrast intact — like an LED with the power cut. */
+.legendRow--dim .legendLeftZone {
+  filter: brightness(0.18) saturate(0.5);
+}
 /* Range text crossfade */
 .legendRange { transition: opacity 0.15s ease-out; }
 .legendBracket { transition: opacity 0.15s ease-out; }
 .legendCatLabel { transition: opacity 0.15s ease-out; }
 /* Suppress all legend transitions for instant (non-animated) updates */
 .legend-no-transition .legendPill,
+.legend-no-transition .legendLeftZone,
 .legend-no-transition .legendRow,
 .legend-no-transition .legendRange,
 .legend-no-transition .legendBracket,

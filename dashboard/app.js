@@ -398,6 +398,7 @@ function main() {
   let _wasAlreadyDeselected = true; // tracks if no sensor was selected on previous click
   let _lastBuiltDisplayTab = undefined; // cache key for buildLegend fast-skip
   let _lastSyncedPaTab = undefined; // cache key for _syncPaFieldDim fast-skip
+  let _lastDimKey = undefined; // cache key for _applyLegendDimming
   let _legendAutoOpenedOnce = legendOpen; // skip auto-open if user already kept legend open
 
   /** Map a pollutant key (PM25, PM10, OZNE, O3, etc.) to a legend tab id. */
@@ -569,6 +570,15 @@ function main() {
     return `<div class="${cls}">${lbl}</div>`;
   }
 
+  // Subtle inner edge glow, colour-matched to the pill.
+  // Pill is 16 px tall (8 px radius). Spread ≤1 px keeps the glow confined
+  // to the perimeter; blur 3 px bleeds it gently inward without flooding the centre.
+  function _pillInnerShadow(color) {
+    const glow = hexToRgba(color, 0.30);  // ambient halo from all edges in pill hue
+    const rim  = hexToRgba(color, 0.18);  // softer top-rim in same hue
+    return `inset 0 0 3px 1px ${glow}, inset 0 1px 2px ${rim}`;
+  }
+
   function _createLegendRow(entry, idx, dimGroups, useDecimal) {
     const fmt = (v) => (useDecimal && v != null) ? Number(v).toFixed(1) : `${v}`;
     const e = entry;
@@ -576,7 +586,7 @@ function main() {
     const hiText = e.hi != null ? fmt(e.hi) : "";
     const row = document.createElement("div");
     row.className = "legendRow";
-    const pillHtml = `<div class="legendPill" style="width:${e.w}px;background:${e.color};border-color:${darkenHex(e.color,0.55)}"></div>`;
+    const pillHtml = `<div class="legendPill" style="width:${e.w}px;background:${e.color};border-color:${darkenHex(e.color,0.55)};box-shadow:${_pillInnerShadow(e.color)}"></div>`;
     const rangeInner = `<span class="legendLo">${loText}</span>` +
       (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
     const leftZone = `<div class="legendLeftZone">${pillHtml}</div><div class="legendRange"><div class="legendRangeBg">${rangeInner}</div></div>`;
@@ -593,6 +603,7 @@ function main() {
       pill.style.width = `${e.w}px`;
       pill.style.background = e.color;
       pill.style.borderColor = darkenHex(e.color, 0.55);
+      pill.style.boxShadow = _pillInnerShadow(e.color);
     }
     // True crossfade for range text: clone old, stack it, fade old out + new in simultaneously
     const rangeEl = row.querySelector(".legendRange");
@@ -656,6 +667,7 @@ function main() {
       pill.style.width = `${e.w}px`;
       pill.style.background = e.color;
       pill.style.borderColor = darkenHex(e.color, 0.55);
+      pill.style.boxShadow = _pillInnerShadow(e.color);
     }
     const rangeEl = row.querySelector(".legendRange");
     if (rangeEl) {
@@ -677,6 +689,52 @@ function main() {
     }
   }
 
+  /** Dim legend rows whose lo-bound exceeds the active sensor (or max-sensor) reading value. */
+  const _DIM_READING_KEYS = {
+    pm25: ["PM25", "PM2.5", "pm25", "pm2.5"],
+    pm10: ["PM10", "pm10"],
+    o3:   ["OZNE", "O3", "OZONE", "ozone", "o3"],
+    no2:  ["NO2", "no2"],
+    co:   ["CO", "co"],
+  };
+  function _applyLegendDimming() {
+    if (!_legendRows || _legendRows.length === 0) return;
+    let displayTab = legendTab;
+    if (!displayTab && selectedId) displayTab = _selectedSensorPollutantTab();
+    const tabKey = displayTab || "pm25";
+    const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
+    const entries = data.entries;
+    // Determine the active value: selected sensor's reading, or max across all sensors
+    let activeValue = null;
+    if (map && selectedId) {
+      const v = map.getSelectedPollutantValue();
+      if (v != null && isFinite(v)) activeValue = v;
+    } else {
+      const keys = _DIM_READING_KEYS[tabKey] || [];
+      const st = _currentState();
+      const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
+      let max = -Infinity;
+      for (const s of all) {
+        if (s && s.outlier) continue;
+        const r = s && s.readings;
+        if (!r) continue;
+        for (const k of keys) {
+          const rv = r[k] && r[k].value;
+          if (rv != null) { const n = parseFloat(rv); if (isFinite(n) && n > max) max = n; }
+        }
+      }
+      if (max > -Infinity) activeValue = max;
+    }
+    const dimKey = `${tabKey}|${activeValue}`;
+    if (dimKey === _lastDimKey) return;
+    _lastDimKey = dimKey;
+    for (let i = 0; i < _legendRows.length; i++) {
+      if (!entries[i]) continue;
+      const shouldDim = activeValue != null && entries[i].lo > activeValue;
+      _legendRows[i].classList.toggle("legendRow--dim", shouldDim);
+    }
+  }
+
   function buildLegend(animate = false) {
     if (!legendBodyEl) return;
     // Derive display pollutant: explicit tab wins, otherwise follow selected sensor
@@ -686,7 +744,7 @@ function main() {
     }
     // Fast-skip: nothing changed since last build
     const buildKey = `${legendTab}|${displayTab}`;
-    if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) return;
+    if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) { _applyLegendDimming(); return; }
     _lastBuiltDisplayTab = buildKey;
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const legendNameEl = document.getElementById("legendName");
@@ -714,8 +772,10 @@ function main() {
       }
       _legendEntryCount = newCount;
       const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
-      for (const t of tabs) t.classList.toggle("active", t.dataset.legend === legendTab);
+      const activeTabKey = legendTab || (selectedId ? displayTab : null);
+      for (const t of tabs) t.classList.toggle("active", t.dataset.legend === activeTabKey);
       _syncLegendTabVisibility();
+      _applyLegendDimming();
       return;
     }
 
@@ -763,8 +823,10 @@ function main() {
 
     _legendEntryCount = newCount;
     const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
-    for (const t of tabs) t.classList.toggle("active", t.dataset.legend === legendTab);
+    const activeTabKey = legendTab || (selectedId ? displayTab : null);
+    for (const t of tabs) t.classList.toggle("active", t.dataset.legend === activeTabKey);
     _syncLegendTabVisibility();
+    _applyLegendDimming();
 
     // Re-enable transitions after instant update completes
     if (!animate) {

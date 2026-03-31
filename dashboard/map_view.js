@@ -1686,6 +1686,7 @@ class MapView {
     this.selectedId = next;
     if (!next) this._selectedPollutantKey = null;
     if (!next) this._selectedNaturalPollutantKey = null;
+    if (!next) this._selectedPollutantValue = null;
     this._followSuppressUntilMs = 0;
     this._invalidateOverlayStatic();
     this.drawOverlay(this.lastState);
@@ -1698,6 +1699,10 @@ class MapView {
 
   getSelectedNaturalPollutantKey() {
     return this._selectedNaturalPollutantKey || null;
+  }
+
+  getSelectedPollutantValue() {
+    return this._selectedPollutantValue ?? null;
   }
 
   setShowFixed(v) {
@@ -7404,6 +7409,7 @@ class MapView {
     // Reset per-frame: will be set by whichever marker is selected
     this._selectedPollutantKey = null;
     this._selectedNaturalPollutantKey = null;
+    this._selectedPollutantValue = null;
     const w = this._cssW || 1;
     const h = this._cssH || 1;
     const dpr = this._dpr || (window.devicePixelRatio || 1);
@@ -8525,6 +8531,7 @@ class MapView {
         // Expose the selected sensor's displayed pollutant key for legend sync
         if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
         if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
+        if (isSel && pr && pr.key) this._selectedPollutantValue = parseFloat(pr.value);
 
         // Legend pollutant override: show the selected pollutant on ALL non-PurpleAir markers
         if (this._markerPollutantOverride != null && !f.purpleair) {
@@ -8535,10 +8542,12 @@ class MapView {
           if (legendPr) {
             pr = legendPr;
             if (isSel) this._selectedPollutantKey = legendPr.key;
+            if (isSel) this._selectedPollutantValue = parseFloat(legendPr.value);
           } else {
             const lbl = _LEGEND_TAB_LABEL[this._markerPollutantOverride] || this._markerPollutantOverride.toUpperCase();
             pr = { key: lbl, value: "\u2014", color: "#666666" };
             if (isSel) this._selectedPollutantKey = null;
+            if (isSel) this._selectedPollutantValue = null;
           }
         }
 
@@ -8746,6 +8755,7 @@ class MapView {
       // Expose the selected sensor's displayed pollutant key for legend sync
       if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
       if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
+      if (isSel && pr && pr.key) this._selectedPollutantValue = parseFloat(pr.value);
 
       // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers
       // In playback mode, prefer trail-point readings (historical) over live m.readings
@@ -8755,10 +8765,12 @@ class MapView {
         if (legendPr) {
           pr = legendPr;
           if (isSel) this._selectedPollutantKey = legendPr.key;
+          if (isSel) this._selectedPollutantValue = parseFloat(legendPr.value);
         } else {
           const lbl = _LEGEND_TAB_LABEL[this._markerPollutantOverride] || this._markerPollutantOverride.toUpperCase();
           pr = { key: lbl, value: "\u2014", color: "#666666" };
           if (isSel) this._selectedPollutantKey = null;
+          if (isSel) this._selectedPollutantValue = null;
         }
       }
 
