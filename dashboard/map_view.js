@@ -31,6 +31,12 @@ const _BAND_MIDS = [1.0, 3.5, 7.0, 22.2, 45.4, 90.4, 175.4, 250.0];
 const _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG = 0.55;
 const _PA_FIELD_FIXED_WEIGHT_MULTIPLIER = 10;
 
+// ── Overfetch constants: render PA field & trails on a buffer larger than the
+// viewport so gesture panning reveals pre-rendered content instead of blank edges.
+const _OVERFETCH = 1.5;              // buffer = viewport × this factor
+const _OVERFETCH_MAX_DEVICE_PX = 4096; // hard cap to avoid GPU OOM
+const _OVERFETCH_MARGIN_EXHAUST = 0.65; // re-render when pan consumes this fraction of margin
+
 /** Map legend tab id → array of reading keys to search for in fixed sensor data. */
 const _LEGEND_TAB_READING_KEYS = {
   pm25: ["PM25", "PM2.5", "pm25", "pm2.5"],
@@ -76,9 +82,12 @@ function _readingForLegendTab(readings, legendTab) {
   return null;
 }
 
-function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab) {
+function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab, bufW, bufH) {
   const isPm25 = !pollutantTab || pollutantTab === "pm25";
   const readingKeys = _LEGEND_TAB_READING_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_READING_KEYS.pm25;
+  // Project to buffer center when overfetch dimensions supplied
+  const projW = bufW || cssW;
+  const projH = bufH || cssH;
 
   const paLatLons = [];
   for (const f of fixed) {
@@ -126,8 +135,8 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
 
     const wp = latLonToWorld(lat, lon, zoom);
     sensors.push({
-      sx: wp.x - centerW.x + cssW / 2,
-      sy: wp.y - centerW.y + cssH / 2,
+      sx: wp.x - centerW.x + projW / 2,
+      sy: wp.y - centerW.y + projH / 2,
       value,
       weightMultiplier: f.purpleair ? 1 : _PA_FIELD_FIXED_WEIGHT_MULTIPLIER,
     });
@@ -142,8 +151,11 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
  * Each trail point with a reading for the selected pollutant becomes a transient sensor
  * that decays over the same time window as the trail fade.
  */
-function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs, pollutantTab) {
+function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs, pollutantTab, bufW, bufH) {
   const trailKeys = _LEGEND_TAB_TRAIL_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_TRAIL_KEYS.pm25;
+  // Project to buffer center when overfetch dimensions supplied
+  const projW = bufW || cssW;
+  const projH = bufH || cssH;
   // Map keyed by quantized lat/lon — at most 1 virtual sensor per spatial slot.
   // Iterating newest-first means the freshest reading at each location wins.
   const sensorMap = new Map();
@@ -215,8 +227,8 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
         try { p._u = u; p._v = v; } catch {}
       }
       const wx = u * ws, wy = v * ws;
-      const sx = wx - centerW.x + cssW / 2;
-      const sy = wy - centerW.y + cssH / 2;
+      const sx = wx - centerW.x + projW / 2;
+      const sy = wy - centerW.y + projH / 2;
 
       sensorMap.set(slotKey, { sx, sy, value: pollVal, weightMultiplier: decayWeight });
     }
@@ -6273,34 +6285,46 @@ class MapView {
       const cssW = this._cssW || 1;
       const cssH = this._cssH || 1;
       const prev = this._paFieldComputedView;
-      ctx.save();
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, pw, ph);
-      const sZoom = Math.pow(2, this.zoom - prev.zoom);
-      if (Math.abs(sZoom - 1) > 0.001) {
-        // Scale + translate around viewport center (mirrors drawTiles pinch path)
-        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
-        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
-        const txPan = (prevC.x - currC.x) * sZoom;
-        const tyPan = (prevC.y - currC.y) * sZoom;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.translate(cssW / 2, cssH / 2);
-        ctx.scale(sZoom, sZoom);
-        ctx.translate((-cssW / 2) + (txPan / sZoom), (-cssH / 2) + (tyPan / sZoom));
+      const bufW = this._paFieldBufW || cssW;
+      const bufH = this._paFieldBufH || cssH;
+      const offX = (bufW - cssW) / 2;
+      const offY = (bufH - cssH) / 2;
+
+      // Margin exhaustion: if pan delta exceeds the overfetch margin, fall through
+      // to the static path which will recompute the field centered on current view.
+      const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
+      const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
+      const absTx = Math.abs(prevC.x - currC.x);
+      const absTy = Math.abs(prevC.y - currC.y);
+      if (absTx >= offX * _OVERFETCH_MARGIN_EXHAUST || absTy >= offY * _OVERFETCH_MARGIN_EXHAUST) {
+        // Force _ensurePaField to recompute despite animating
+        this._paFieldMarginExhausted = true;
       } else {
-        // Pan only: translate (mirrors drawTiles pan path)
-        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
-        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
-        const tx = prevC.x - currC.x;
-        const ty = prevC.y - currC.y;
-        ctx.setTransform(dpr, 0, 0, dpr, dpr * tx, dpr * ty);
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, pw, ph);
+        const sZoom = Math.pow(2, this.zoom - prev.zoom);
+        if (Math.abs(sZoom - 1) > 0.001) {
+          // Scale + translate around viewport center (mirrors drawTiles pinch path)
+          const txPan = (prevC.x - currC.x) * sZoom;
+          const tyPan = (prevC.y - currC.y) * sZoom;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.translate(cssW / 2, cssH / 2);
+          ctx.scale(sZoom, sZoom);
+          ctx.translate((-cssW / 2) + (txPan / sZoom), (-cssH / 2) + (tyPan / sZoom));
+        } else {
+          // Pan only: translate
+          const tx = prevC.x - currC.x;
+          const ty = prevC.y - currC.y;
+          ctx.setTransform(dpr, 0, 0, dpr, dpr * tx, dpr * ty);
+        }
+        ctx.globalAlpha = this._paFieldDimCurrent;
+        ctx.drawImage(this._paFieldCanvas, -offX, -offY, bufW, bufH);
+        ctx.restore();
+        // Drop in-progress cross-fade to avoid stale fades during gesture
+        this._paFieldPrevCanvas = null;
+        return;
       }
-      ctx.globalAlpha = this._paFieldDimCurrent;
-      ctx.drawImage(this._paFieldCanvas, 0, 0, cssW, cssH);
-      ctx.restore();
-      // Drop in-progress cross-fade to avoid stale fades during gesture
-      this._paFieldPrevCanvas = null;
-      return;
     }
 
     // ── Static Nadaraya-Watson interpolation path ──
@@ -6316,6 +6340,16 @@ class MapView {
     ctx.clearRect(0, 0, pw, ph);
     if (!this._paFieldCanvas) { ctx.restore(); return; }
 
+    // Overfetch offset: the field canvas is larger than the viewport.
+    // Draw it shifted so the viewport windows over the center portion.
+    const _dpr = this._dpr || (window.devicePixelRatio || 1);
+    const _cssW = this._cssW || 1;
+    const _cssH = this._cssH || 1;
+    const _bw = this._paFieldBufW || _cssW;
+    const _bh = this._paFieldBufH || _cssH;
+    const _offPx = (_bw - _cssW) / 2 * _dpr;
+    const _offPy = (_bh - _cssH) / 2 * _dpr;
+
     // Cross-fade from previous field canvas to current one
     const dimAlpha = this._paFieldDimCurrent;
     const fadeT = this._paFieldPrevCanvas
@@ -6323,9 +6357,9 @@ class MapView {
       : 1;
     if (this._paFieldPrevCanvas && fadeT < 1) {
       ctx.globalAlpha = (1 - fadeT) * dimAlpha;
-      ctx.drawImage(this._paFieldPrevCanvas, 0, 0);
+      ctx.drawImage(this._paFieldPrevCanvas, -_offPx, -_offPy);
       ctx.globalAlpha = fadeT * dimAlpha;
-      ctx.drawImage(this._paFieldCanvas, 0, 0);
+      ctx.drawImage(this._paFieldCanvas, -_offPx, -_offPy);
       ctx.globalAlpha = 1;
       // Schedule another frame to complete the fade (no-op if playback loop is running)
       if (!this._paFieldFadeRAF) {
@@ -6338,7 +6372,7 @@ class MapView {
     } else {
       if (this._paFieldPrevCanvas) this._paFieldPrevCanvas = null;
       ctx.globalAlpha = dimAlpha;
-      ctx.drawImage(this._paFieldCanvas, 0, 0);
+      ctx.drawImage(this._paFieldCanvas, -_offPx, -_offPy);
     }
     ctx.restore();
   }
@@ -6364,8 +6398,9 @@ class MapView {
 
     // During transient animations (gestures, easing), reuse cached PA field.
     // The composite step translates the cached canvas to match the current view.
-    // Excludes the persistent follow loop so the field recomputes after user pans.
-    if (this._isTransientAnimating() && this._paFieldCanvas) return;
+    // Exception: if margin is exhausted, fall through to recompute centered on new view.
+    if (this._isTransientAnimating() && this._paFieldCanvas && !this._paFieldMarginExhausted) return;
+    this._paFieldMarginExhausted = false;
 
     const dpr = this._dpr || (window.devicePixelRatio || 1);
     const z = Number(this.zoom);
@@ -6390,7 +6425,14 @@ class MapView {
 
     // ── Collect sensors, project to screen coords + build color fingerprint ──
     const centerW = latLonToWorld(clat, clon, z);
-    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab);
+
+    // Overfetch: collect sensors and compute the field on a buffer larger than
+    // the viewport so gesture pans reveal pre-rendered content at the edges.
+    const maxDevPx = _OVERFETCH_MAX_DEVICE_PX;
+    const bufW = Math.min(Math.ceil(cssW * _OVERFETCH), Math.floor(maxDevPx / dpr));
+    const bufH = Math.min(Math.ceil(cssH * _OVERFETCH), Math.floor(maxDevPx / dpr));
+
+    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH);
     const paSensors = paField.sensors;
 
     // ── Inject virtual sensors from mobile trail GPS points ──
@@ -6400,7 +6442,7 @@ class MapView {
     const _boundsMaxMs = (_pbBounds?.maxMs != null && isFinite(_pbBounds.maxMs)) ? _pbBounds.maxMs : null;
     const virtualRefNowMs = (_pbTimeMs != null && isFinite(_pbTimeMs)) ? Number(_pbTimeMs) : (_boundsMaxMs ?? this._dataNowMs());
     const virtualField = _collectVirtualMobileSensors(
-      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab
+      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab, bufW, bufH
     );
     this._virtualMobileSensors = virtualField.sensors;
 
@@ -6440,12 +6482,11 @@ class MapView {
     this._paFieldKey = key;
     this._paFieldFingerprint = fingerprint;
 
-    // ── Grid dimensions ──
-    // Scale cell size with viewport to keep grid cell count roughly constant (~1400 cells).
-    // iPhone (393×852) → 16px cells, iPad (1024×1366) → ~32px cells.
+    // ── Grid dimensions (based on overfetch buffer, not viewport) ──
+    // Scale cell size with viewport area to keep per-cell density constant.
     const cellSize = Math.max(16, Math.ceil(Math.sqrt(cssW * cssH / 1400)));
-    const gw = Math.ceil(cssW / cellSize);
-    const gh = Math.ceil(cssH / cellSize);
+    const gw = Math.ceil(bufW / cellSize);
+    const gh = Math.ceil(bufH / cellSize);
 
     // ── Cutoff in screen pixels ──
     const _fd = window._fieldDebug;
@@ -6483,7 +6524,11 @@ class MapView {
     const effectiveCutoffSq = wind ? cutoffSq * wind.stretch * wind.stretch : cutoffSq;
 
     // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind);
+    this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind);
+
+    // ── Store overfetch buffer dimensions for composite offset ──
+    this._paFieldBufW = bufW;
+    this._paFieldBufH = bufH;
 
     // ── Update fingerprint validity window for fast-path skipping ──
     this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
@@ -6780,7 +6825,10 @@ class MapView {
     for (const tMs of sorted) {
       // Build sensor array and fingerprint at this time
       const centerW = latLonToWorld(clat, clon, z);
-      const paField = _collectPaFieldSensors(fixed, tMs, centerW, z, cssW, cssH);
+      const dpr = this._dpr || (window.devicePixelRatio || 1);
+      const bufW = Math.min(Math.ceil(cssW * _OVERFETCH), Math.floor(_OVERFETCH_MAX_DEVICE_PX / dpr));
+      const bufH = Math.min(Math.ceil(cssH * _OVERFETCH), Math.floor(_OVERFETCH_MAX_DEVICE_PX / dpr));
+      const paField = _collectPaFieldSensors(fixed, tMs, centerW, z, cssW, cssH, undefined, bufW, bufH);
       const paSensors = paField.sensors;
       const fp = paField.fingerprint;
       if (paSensors.length === 0) continue;
@@ -6788,8 +6836,8 @@ class MapView {
 
       // Dispatch this one to the worker
       const cellSize = Math.max(16, Math.ceil(Math.sqrt(cssW * cssH / 1400)));
-      const gw = Math.ceil(cssW / cellSize);
-      const gh = Math.ceil(cssH / cellSize);
+      const gw = Math.ceil(bufW / cellSize);
+      const gh = Math.ceil(bufH / cellSize);
       const refW = latLonToWorld(clat, clon + 0.15, z);
       const cutoffPx = Math.abs(refW.x - centerW.x);
       const cutoffSq = cutoffPx * cutoffPx;
@@ -7406,10 +7454,14 @@ class MapView {
   drawOverlay(state, opts = {}) {
     const ctx = this.octx;
     if (!ctx) return;
-    // Reset per-frame: will be set by whichever marker is selected
-    this._selectedPollutantKey = null;
-    this._selectedNaturalPollutantKey = null;
-    this._selectedPollutantValue = null;
+    // Only reset per-frame when nothing is selected.
+    // When a sensor is selected but off-screen (user panned away),
+    // keep the last-known values so the legend doesn't jump back to PM2.5.
+    if (!this.selectedId) {
+      this._selectedPollutantKey = null;
+      this._selectedNaturalPollutantKey = null;
+      this._selectedPollutantValue = null;
+    }
     const w = this._cssW || 1;
     const h = this._cssH || 1;
     const dpr = this._dpr || (window.devicePixelRatio || 1);
@@ -7519,6 +7571,11 @@ class MapView {
     // Precompute center world once per frame; avoids repeated center projection in worldToScreen().
     const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
     const worldToScreenFast = (wx, wy) => ({ x: wx - centerW.x + w / 2, y: wy - centerW.y + h / 2 });
+
+    // Overfetch: trail cache buffer is larger than viewport
+    const trailBufW = Math.min(Math.ceil(w * _OVERFETCH), Math.floor(_OVERFETCH_MAX_DEVICE_PX / dpr));
+    const trailBufH = Math.min(Math.ceil(h * _OVERFETCH), Math.floor(_OVERFETCH_MAX_DEVICE_PX / dpr));
+    const worldToScreenBuf = (wx, wy) => ({ x: wx - centerW.x + trailBufW / 2, y: wy - centerW.y + trailBufH / 2 });
 
     // Fixed markers are drawn AFTER trails (below)
 
@@ -7742,13 +7799,25 @@ class MapView {
       const needsFullRedraw = viewChanged || timeChanged;
       // During gestures, skip full trail redraw for pan-only view changes;
       // translate the cached canvas instead (saves ~5ms/frame on iPad).
-      const skipTrailsForGesture = this._isTransientAnimating() && viewChanged && !timeChanged
+      // If pan exceeds overfetch margin, force full redraw.
+      let skipTrailsForGesture = this._isTransientAnimating() && viewChanged && !timeChanged
         && this._trailCacheCanvas && this._trailCacheCenterW;
+      if (skipTrailsForGesture) {
+        const cachedCW = this._trailCacheCenterW;
+        const cachedZ = this._trailCacheZoom || this.zoom;
+        const currCW = latLonToWorld(this.center.lat, this.center.lon, cachedZ);
+        const tMarginX = (trailBufW - w) / 2;
+        const tMarginY = (trailBufH - h) / 2;
+        if (Math.abs(cachedCW.x - currCW.x) >= tMarginX * _OVERFETCH_MARGIN_EXHAUST
+            || Math.abs(cachedCW.y - currCW.y) >= tMarginY * _OVERFETCH_MARGIN_EXHAUST) {
+          skipTrailsForGesture = false; // margin exhausted — force redraw
+        }
+      }
       const needsIncrementalUpdate = false; // Disabled: incremental breaks fade animation
 
-      // Ensure trail cache canvas exists and is correctly sized (only resize when dimensions change)
-      const targetW = Math.floor(w * dpr);
-      const targetH = Math.floor(h * dpr);
+      // Ensure trail cache canvas exists and is correctly sized (overfetch buffer)
+      const targetW = Math.floor(trailBufW * dpr);
+      const targetH = Math.floor(trailBufH * dpr);
       if (!this._trailCacheCanvas) {
         this._trailCacheCanvas = document.createElement("canvas");
         this._trailCacheCanvas.width = targetW;
@@ -7764,7 +7833,7 @@ class MapView {
           tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           // Only clear on full redraw; incremental mode draws on top of existing cache
           if (needsFullRedraw) {
-            tctx.clearRect(0, 0, w, h);
+            tctx.clearRect(0, 0, trailBufW, trailBufH);
           }
 
           // Draw order: oldest trails first, newest trails last.
@@ -7929,23 +7998,29 @@ class MapView {
 
           const timeFilter = null;
           for (const m of candidates) {
-            drawTrailForCached(m, alphaOther, worldToScreenFast, timeFilter);
+            drawTrailForCached(m, alphaOther, worldToScreenBuf, timeFilter);
           }
 
           if (selectedId) {
             const m = mobiles.find(x => x.id === selectedId);
-            if (m) drawTrailForCached(m, 1.0, worldToScreenFast, timeFilter);
+            if (m) drawTrailForCached(m, 1.0, worldToScreenBuf, timeFilter);
           }
         }
         this._trailCacheViewKey = trailViewKey;
         this._trailCacheTimeMs = pbTimeMs;
         this._trailCacheCenterW = { x: centerW.x, y: centerW.y };
         this._trailCacheZoom = this.zoom;
+        this._trailCacheBufW = trailBufW;
+        this._trailCacheBufH = trailBufH;
         this._lastTrailRedrawPerf = performance.now();
       }
 
       // Blit cached trails to main canvas
       if (this._trailCacheCanvas) {
+        const tBufW = this._trailCacheBufW || w;
+        const tBufH = this._trailCacheBufH || h;
+        const tOffX = (tBufW - w) / 2;
+        const tOffY = (tBufH - h) / 2;
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         if (skipTrailsForGesture && this._trailCacheCenterW) {
@@ -7961,15 +8036,16 @@ class MapView {
             ctx.translate(w / 2, h / 2);
             ctx.scale(sZoom, sZoom);
             ctx.translate(-w / 2 + txPan / sZoom, -h / 2 + tyPan / sZoom);
-            ctx.drawImage(this._trailCacheCanvas, 0, 0, w, h);
+            ctx.drawImage(this._trailCacheCanvas, -tOffX, -tOffY, tBufW, tBufH);
           } else {
-            // Pan only: simple translate in physical pixel space
-            const dx = (cachedCW.x - currCW.x) * dpr;
-            const dy = (cachedCW.y - currCW.y) * dpr;
+            // Pan only: simple translate in physical pixel space with overfetch offset
+            const dx = (cachedCW.x - currCW.x - tOffX) * dpr;
+            const dy = (cachedCW.y - currCW.y - tOffY) * dpr;
             ctx.drawImage(this._trailCacheCanvas, dx, dy);
           }
         } else {
-          ctx.drawImage(this._trailCacheCanvas, 0, 0);
+          // Static: draw the overfetch buffer offset so viewport sees center
+          ctx.drawImage(this._trailCacheCanvas, -tOffX * dpr, -tOffY * dpr);
         }
         ctx.restore();
       }
