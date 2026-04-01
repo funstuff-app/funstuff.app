@@ -281,21 +281,16 @@
       </div>
     </div>
 
-    <!-- Install toast: visual-only hint pointing to Safari share button -->
-    <div id="installToast" class="installToast hidden" aria-hidden="true">
-      <div class="installToastContent">
-        <!-- Safari share icon -->
-        <svg class="installToastShare" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 7l4-4 4 4"/><path d="M5 11v9a2 2 0 002 2h10a2 2 0 002-2v-9"/></svg>
-        <!-- Arrow -->
-        <svg class="installToastArrow" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4l-1.4 1.4L16.2 11H4v2h12.2l-5.6 5.6L12 20l8-8z"/></svg>
-        <!-- App icon dropping into open box -->
-        <div class="installToastDock">
-          <img class="installToastAppIcon" src="/icon-192.png" width="20" height="20" alt="" />
-          <svg class="installToastBox" width="24" height="18" viewBox="0 0 24 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h20v12a2 2 0 01-2 2H4a2 2 0 01-2-2V4z"/><path d="M2 4l3-3h14l3 3" opacity="0.5"/></svg>
-        </div>
+    <!-- PWA install banner (Safari only, non-standalone) -->
+    <div id="pwaInstallBanner" class="pwaInstallBanner hidden" role="complementary" aria-label="Install app">
+      <button id="pwaInstallDismiss" type="button" class="pwaInstallDismiss" aria-label="Dismiss">&times;</button>
+      <img class="pwaInstallAppIcon" src="/icon-192.png" width="40" height="40" alt="DustyTrails" />
+      <div class="pwaInstallBody">
+        <span class="pwaInstallTitle">Install DustyTrails</span>
+        <span class="pwaInstallSteps">
+          Tap <svg class="pwaInstallShareIcon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 7l4-4 4 4"/><path d="M5 11v9a2 2 0 002 2h10a2 2 0 002-2v-9"/></svg> then <strong class="pwaInstallAction">Add to Dock</strong>
+        </span>
       </div>
-      <!-- Pointer triangle (CSS rotated per platform) -->
-      <div class="installToastPointer"></div>
     </div>
 
     <footer id="appFooter">

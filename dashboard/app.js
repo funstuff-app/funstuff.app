@@ -4092,12 +4092,13 @@ function main() {
   
   // Share button - opens native share dialog.
   // Hidden on desktop (browser already has a share/URL bar).
-  // Only shown in standalone PWA mode on mobile/tablet.
+  // Share button: Web Share API in standalone PWA mode, or keep visible on Safari for install hint.
   {
     const isStandalone = window.matchMedia('(display-mode: standalone)').matches
       || window.navigator.standalone === true;
     const isMobileUA = /iPad|iPhone|iPod|Android/i.test(navigator.userAgent)
       || (navigator.maxTouchPoints > 1);
+    const isSafari = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
     if (shareBtn && navigator.share && isStandalone && isMobileUA) {
       shareBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
@@ -4112,32 +4113,32 @@ function main() {
     }
   }
 
-  // ── Install toast: visual-only Safari share hint ──────────────────────
-  // Shows once per device on Safari (not in standalone) to nudge users
-  // toward Add to Dock (macOS) or Add to Home Screen (iOS).
+  // ── PWA install banner: bottom sheet on Safari (non-standalone) ────────
+  // Teaches user to tap Share → Add to Dock (macOS) or Add to Home Screen (iOS).
   {
-    const INSTALL_TOAST_KEY = "dusty_install_toast_dismissed";
-    const toast = document.getElementById("installToast");
-    if (toast && !localStorage.getItem(INSTALL_TOAST_KEY)) {
+    const INSTALL_KEY = "dusty_install_toast_dismissed";
+    const banner = document.getElementById("pwaInstallBanner");
+    if (banner && !localStorage.getItem(INSTALL_KEY)) {
       const isSafari = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
       const isStandaloneNow = window.matchMedia("(display-mode: standalone)").matches
         || window.navigator.standalone === true;
       if (isSafari && !isStandaloneNow) {
         const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
           || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
-        toast.classList.add(isIOS ? "ios-hint" : "mac-hint");
-        toast.classList.remove("hidden");
+        const actionEl = banner.querySelector(".pwaInstallAction");
+        if (actionEl) actionEl.textContent = isIOS ? "Add to Home Screen" : "Add to Dock";
+        banner.classList.remove("hidden");
         requestAnimationFrame(() => {
-          requestAnimationFrame(() => toast.classList.add("visible"));
+          requestAnimationFrame(() => banner.classList.add("visible"));
         });
         const dismiss = () => {
-          toast.classList.remove("visible");
-          localStorage.setItem(INSTALL_TOAST_KEY, "1");
-          setTimeout(() => toast.classList.add("hidden"), 450);
+          banner.classList.remove("visible");
+          localStorage.setItem(INSTALL_KEY, "1");
+          setTimeout(() => banner.classList.add("hidden"), 400);
         };
-        setTimeout(dismiss, 6000);
-        toast.addEventListener("click", dismiss);
-        document.addEventListener("scroll", dismiss, { once: true, passive: true });
+        const dismissBtn = document.getElementById("pwaInstallDismiss");
+        if (dismissBtn) dismissBtn.addEventListener("click", dismiss);
+        setTimeout(dismiss, 8000);
       }
     }
   }
