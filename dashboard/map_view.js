@@ -7454,10 +7454,14 @@ class MapView {
   drawOverlay(state, opts = {}) {
     const ctx = this.octx;
     if (!ctx) return;
-    // Reset per-frame: will be set by whichever marker is selected
-    this._selectedPollutantKey = null;
-    this._selectedNaturalPollutantKey = null;
-    this._selectedPollutantValue = null;
+    // Only reset per-frame when nothing is selected.
+    // When a sensor is selected but off-screen (user panned away),
+    // keep the last-known values so the legend doesn't jump back to PM2.5.
+    if (!this.selectedId) {
+      this._selectedPollutantKey = null;
+      this._selectedNaturalPollutantKey = null;
+      this._selectedPollutantValue = null;
+    }
     const w = this._cssW || 1;
     const h = this._cssH || 1;
     const dpr = this._dpr || (window.devicePixelRatio || 1);
