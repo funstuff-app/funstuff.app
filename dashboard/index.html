@@ -32,7 +32,7 @@
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260331a" />
+  <link rel="stylesheet" href="/styles.css?v=20260331b" />
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -281,6 +281,20 @@
       </div>
     </div>
 
+    <!-- Install toast: visual-only hint pointing to Safari share button -->
+    <div id="installToast" class="installToast hidden" aria-hidden="true">
+      <div class="installToastContent">
+        <!-- Safari share icon -->
+        <svg class="installToastShare" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 7l4-4 4 4"/><path d="M5 11v9a2 2 0 002 2h10a2 2 0 002-2v-9"/></svg>
+        <!-- Arrow -->
+        <svg class="installToastArrow" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4l-1.4 1.4L16.2 11H4v2h12.2l-5.6 5.6L12 20l8-8z"/></svg>
+        <!-- Plus icon (add) -->
+        <svg class="installToastPlus" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="4"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+      </div>
+      <!-- Pointer triangle (CSS rotated per platform) -->
+      <div class="installToastPointer"></div>
+    </div>
+
     <footer id="appFooter">
       <div class="footerRow1"><span class="footerContent">©2026 Funstuff.wtf</span> <a href="mailto:matt@funstuff.app" class="contactLink">Contact Me</a> <span class="footerDisclaimer">For visualization only.</span></div>
       <div class="footerRow2"><span class="footerDisclaimer"><span class="footerSentence">Not for medical, regulatory, or emergency response use.</span> <span class="footerSentence">Data courtesy of Utah DAQ &amp; <a href="https://www.airnow.gov" target="_blank" class="contactLink">EPA AirNow</a>.</span> <span class="footerSentence">Community sensors powered by <a href="https://www.purpleair.com" target="_blank" class="contactLink">PurpleAir</a>.</span></span></div>
@@ -301,7 +315,7 @@
     <script src="map_view.js?v=20260331c"></script>
   <script src="sidebar_ui.js?v=20260324b"></script>
   <script src="jog_wheel.js?v=20260327j"></script>
-  <script src="app.js?v=20260331a"></script>
+  <script src="app.js?v=20260331b"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">

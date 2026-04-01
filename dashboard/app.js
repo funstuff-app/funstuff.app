@@ -4111,6 +4111,36 @@ function main() {
       shareBtn.style.display = "none";
     }
   }
+
+  // ── Install toast: visual-only Safari share hint ──────────────────────
+  // Shows once per device on Safari (not in standalone) to nudge users
+  // toward Add to Dock (macOS) or Add to Home Screen (iOS).
+  {
+    const INSTALL_TOAST_KEY = "dusty_install_toast_dismissed";
+    const toast = document.getElementById("installToast");
+    if (toast && !localStorage.getItem(INSTALL_TOAST_KEY)) {
+      const isSafari = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
+      const isStandaloneNow = window.matchMedia("(display-mode: standalone)").matches
+        || window.navigator.standalone === true;
+      if (isSafari && !isStandaloneNow) {
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+          || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+        toast.classList.add(isIOS ? "ios-hint" : "mac-hint");
+        toast.classList.remove("hidden");
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => toast.classList.add("visible"));
+        });
+        const dismiss = () => {
+          toast.classList.remove("visible");
+          localStorage.setItem(INSTALL_TOAST_KEY, "1");
+          setTimeout(() => toast.classList.add("hidden"), 450);
+        };
+        setTimeout(dismiss, 6000);
+        toast.addEventListener("click", dismiss);
+        document.addEventListener("scroll", dismiss, { once: true, passive: true });
+      }
+    }
+  }
   
   // Display submenu (dim/sat sliders in three-dot menu)
   const pbDisplaySubmenu = document.getElementById("pbDisplaySubmenu");

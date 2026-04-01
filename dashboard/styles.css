@@ -1900,6 +1900,93 @@ button#pbPlay.isLive {
   }
 }
 
+/* ── Install toast: visual-only Safari share hint ── */
+.installToast {
+  position: fixed;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+.installToast.hidden { display: none; }
+.installToast.visible {
+  opacity: 1;
+}
+.installToastContent {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 14px;
+  background: rgba(17, 24, 38, 0.88);
+  border: 1px solid rgba(108, 195, 255, 0.3);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 12px rgba(108, 195, 255, 0.12);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: rgba(232, 238, 247, 0.92);
+}
+.installToastShare {
+  opacity: 0.9;
+  color: var(--accent, #6cc3ff);
+}
+.installToastArrow {
+  opacity: 0.5;
+  color: rgba(232, 238, 247, 0.7);
+}
+.installToastPlus {
+  opacity: 0.85;
+  color: rgba(232, 238, 247, 0.85);
+}
+.installToastPointer {
+  width: 12px;
+  height: 12px;
+  background: rgba(17, 24, 38, 0.88);
+  border-right: 1px solid rgba(108, 195, 255, 0.3);
+  border-bottom: 1px solid rgba(108, 195, 255, 0.3);
+  transform: rotate(45deg);
+  margin-top: -7px;
+}
+/* iOS: toast at bottom center, pointer below pointing down */
+.installToast.ios-hint {
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(10px);
+  flex-direction: column;
+}
+.installToast.ios-hint.visible {
+  transform: translateX(-50%) translateY(0);
+}
+.installToast.ios-hint .installToastPointer {
+  margin-top: -7px;
+  transform: rotate(45deg);
+}
+/* macOS: toast at top-right, pointer above pointing up */
+.installToast.mac-hint {
+  top: 12px;
+  right: 60px;
+  transform: translateY(-10px);
+  flex-direction: column-reverse;
+}
+.installToast.mac-hint.visible {
+  transform: translateY(0);
+}
+.installToast.mac-hint .installToastPointer {
+  margin-bottom: -7px;
+  margin-top: 0;
+  transform: rotate(-135deg);
+}
+/* Pulse animation to draw attention */
+@keyframes installToastPulse {
+  0%, 100% { box-shadow: 0 4px 20px rgba(0,0,0,0.4), 0 0 12px rgba(108,195,255,0.12); }
+  50% { box-shadow: 0 4px 20px rgba(0,0,0,0.4), 0 0 20px rgba(108,195,255,0.25); }
+}
+.installToast.visible .installToastContent {
+  animation: installToastPulse 2.5s ease-in-out 2;
+}
+
 .detailsBody { display: flex; flex-direction: column; gap: 10px; }
 .muted { color: var(--muted); }
 .kv { display: flex; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: rgba(255,255,255,0.03); }
