@@ -705,25 +705,12 @@ function main() {
     const tabKey = displayTab || "pm25";
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const entries = data.entries;
-    // "Show All" mode (no explicit tab, no selected sensor): all bars lit.
-    if (!legendTab && !selectedId) {
-      const dimKey = `${tabKey}|showall|null`;
-      if (dimKey === _lastDimKey) return;
-      _lastDimKey = dimKey;
-      for (let i = 0; i < _legendRows.length; i++) {
-        _legendRows[i].classList.toggle("legendRow--dim", false);
-      }
-      return;
-    }
-    // Use whatever value the marker is currently displaying.
+    // Determine the active value: selected sensor's reading, or max across all sensors
     let activeValue = null;
     if (map && selectedId) {
       const v = map.getSelectedPollutantValue();
       if (v != null && isFinite(v)) activeValue = v;
-    }
-    // Fall through: no selected sensor, or sensor lacks the requested pollutant.
-    // Scan all non-outlier sensors for the highest reading.
-    if (activeValue == null) {
+    } else {
       const keys = _DIM_READING_KEYS[tabKey] || [];
       const st = _currentState();
       const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
@@ -739,32 +726,21 @@ function main() {
       }
       if (max > -Infinity) activeValue = max;
     }
-    // Fall through: no selected sensor, or sensor lacks the requested pollutant.
-    // Scan all non-outlier sensors for the highest reading.
-    if (activeValue == null) {
-      const keys = _DIM_READING_KEYS[tabKey] || [];
-      const st = _currentState();
-      const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
-      let max = -Infinity;
-      for (const s of all) {
-        if (s && s.outlier) continue;
-        const r = s && s.readings;
-        if (!r) continue;
-        for (const k of keys) {
-          const rv = r[k] && r[k].value;
-          if (rv != null) { const n = parseFloat(rv); if (isFinite(n) && n > max) max = n; }
-        }
+    // Only touch DOM when the value crosses a bracket boundary.
+    // Find the first row that would dim (lo > activeValue) — that index IS the bracket.
+    let bracket = -1;
+    if (activeValue != null) {
+      for (let i = 0; i < entries.length; i++) {
+        if (entries[i].lo > activeValue) { bracket = i; break; }
       }
-      if (max > -Infinity) activeValue = max;
+      if (bracket === -1) bracket = entries.length; // above all brackets
     }
-    const overrideTab = (map && typeof map._markerPollutantOverride !== 'undefined') ? map._markerPollutantOverride : null;
-    const dimKey = `${tabKey}|${overrideTab}|${activeValue}`;
+    const dimKey = `${tabKey}|${bracket}`;
     if (dimKey === _lastDimKey) return;
     _lastDimKey = dimKey;
     for (let i = 0; i < _legendRows.length; i++) {
       if (!entries[i]) continue;
-      const shouldDim = activeValue != null && entries[i].lo > activeValue;
-      _legendRows[i].classList.toggle("legendRow--dim", shouldDim);
+      _legendRows[i].classList.toggle("legendRow--dim", bracket >= 0 && i >= bracket);
     }
   }
 
@@ -4737,14 +4713,7 @@ function main() {
   let _sseLastSeq = null;
   let _sseSource = null;
 
-  // ── Client ID (persistent across sessions) ──
-  var _clientId = localStorage.getItem("dusty_client_id");
-  if (!_clientId) {
-    _clientId = (typeof crypto !== "undefined" && crypto.randomUUID)
-      ? crypto.randomUUID()
-      : "c_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-    localStorage.setItem("dusty_client_id", _clientId);
-  }
+  // ── Client ID: reuse the one declared at file scope (line ~88) ──
 
   // ── Analytics batching ──
   var _analyticsQueue = [];

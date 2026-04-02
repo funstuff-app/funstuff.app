@@ -6275,7 +6275,7 @@ class MapView {
     this._markerPollutantOverride = tab || null;
     if (prev !== this._markerPollutantOverride) {
       this._invalidateOverlayStatic();
-      this.drawOverlay(this.lastState);
+      if (this.lastState) this.drawOverlay(this.lastState);
     }
   }
 
