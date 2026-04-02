@@ -698,7 +698,7 @@ function main() {
     no2:  ["NO2", "no2"],
     co:   ["CO", "co"],
   };
-  function _applyLegendDimming(fromTabClick) {
+  function _applyLegendDimming() {
     if (!_legendRows || _legendRows.length === 0) return;
     let displayTab = legendTab;
     if (!displayTab && selectedId) displayTab = _selectedSensorPollutantTab();
@@ -715,15 +715,29 @@ function main() {
       }
       return;
     }
-    // Determine the active value: selected sensor's reading, or max across all sensors
+    // Use whatever value the marker is currently displaying.
     let activeValue = null;
     if (map && selectedId) {
-      // Tab click: use synchronous lookup (override not rendered yet).
-      // Playback/poll: use post-render value (has correct playback-time reading).
-      const v = (fromTabClick && legendTab)
-        ? map.getReadingForPollutant(legendTab)
-        : map.getSelectedPollutantValue();
+      const v = map.getSelectedPollutantValue();
       if (v != null && isFinite(v)) activeValue = v;
+    }
+    // Fall through: no selected sensor, or sensor lacks the requested pollutant.
+    // Scan all non-outlier sensors for the highest reading.
+    if (activeValue == null) {
+      const keys = _DIM_READING_KEYS[tabKey] || [];
+      const st = _currentState();
+      const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
+      let max = -Infinity;
+      for (const s of all) {
+        if (s && s.outlier) continue;
+        const r = s && s.readings;
+        if (!r) continue;
+        for (const k of keys) {
+          const rv = r[k] && r[k].value;
+          if (rv != null) { const n = parseFloat(rv); if (isFinite(n) && n > max) max = n; }
+        }
+      }
+      if (max > -Infinity) activeValue = max;
     }
     // Fall through: no selected sensor, or sensor lacks the requested pollutant.
     // Scan all non-outlier sensors for the highest reading.
@@ -766,7 +780,7 @@ function main() {
     }
     // Fast-skip: nothing changed since last build
     const buildKey = `${legendTab}|${displayTab}`;
-    if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) { _applyLegendDimming(animate); return; }
+    if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) { _applyLegendDimming(); return; }
     _lastBuiltDisplayTab = buildKey;
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const legendNameEl = document.getElementById("legendName");
@@ -797,7 +811,7 @@ function main() {
       const activeTabKey = legendTab || (selectedId ? displayTab : null);
       for (const t of tabs) t.classList.toggle("active", t.dataset.legend === activeTabKey);
       _syncLegendTabVisibility();
-      _applyLegendDimming(animate);
+      _applyLegendDimming();
       return;
     }
 
@@ -848,7 +862,7 @@ function main() {
     const activeTabKey = legendTab || (selectedId ? displayTab : null);
     for (const t of tabs) t.classList.toggle("active", t.dataset.legend === activeTabKey);
     _syncLegendTabVisibility();
-    _applyLegendDimming(animate);
+    _applyLegendDimming();
 
     // Re-enable transitions after instant update completes
     if (!animate) {

@@ -6271,7 +6271,12 @@ class MapView {
 
   /** Set marker pollutant override (only from explicit legend tab clicks). */
   setMarkerPollutantOverride(tab) {
+    const prev = this._markerPollutantOverride;
     this._markerPollutantOverride = tab || null;
+    if (prev !== this._markerPollutantOverride) {
+      this._invalidateOverlayStatic();
+      this.drawOverlay(this.lastState);
+    }
   }
 
   /**
