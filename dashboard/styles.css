@@ -1446,6 +1446,14 @@ button#pbPlay.isLive {
   border-color: rgba(255,255,255,0.12);
   filter: none;
 }
+/* Auto-displaying: legend shows this pollutant's content but user never clicked it */
+.legendTab.auto-active {
+  filter: brightness(0.75) saturate(0.65);
+}
+/* Extra-dim tabs when another tab is auto-displaying or user-selected */
+.legendTab.tab-dim {
+  filter: brightness(0.28) saturate(0.25);
+}
 .legendNameRow {
   font-size: 10px;
   font-weight: 700;

@@ -784,8 +784,13 @@ function main() {
       }
       _legendEntryCount = newCount;
       const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
-      const activeTabKey = legendTab || (selectedId ? displayTab : null);
-      for (const t of tabs) t.classList.toggle("active", t.dataset.legend === activeTabKey);
+      const autoTabKey = legendTab == null ? (selectedId ? displayTab : null) : null;
+      for (const t of tabs) {
+        const k = t.dataset.legend;
+        t.classList.toggle("active", k === legendTab);
+        t.classList.toggle("auto-active", legendTab == null && k === autoTabKey);
+        t.classList.toggle("tab-dim", (legendTab != null ? k !== legendTab : autoTabKey != null && k !== autoTabKey));
+      }
       _syncLegendTabVisibility();
       _applyLegendDimming();
       return;
@@ -835,8 +840,13 @@ function main() {
 
     _legendEntryCount = newCount;
     const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
-    const activeTabKey = legendTab || (selectedId ? displayTab : null);
-    for (const t of tabs) t.classList.toggle("active", t.dataset.legend === activeTabKey);
+    const autoTabKey = legendTab == null ? (selectedId ? displayTab : null) : null;
+    for (const t of tabs) {
+      const k = t.dataset.legend;
+      t.classList.toggle("active", k === legendTab);
+      t.classList.toggle("auto-active", legendTab == null && k === autoTabKey);
+      t.classList.toggle("tab-dim", (legendTab != null ? k !== legendTab : autoTabKey != null && k !== autoTabKey));
+    }
     _syncLegendTabVisibility();
     _applyLegendDimming();
 
