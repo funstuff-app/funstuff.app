@@ -429,7 +429,8 @@ function main() {
 
   /** Sync legend content to whatever pollutant the map is currently showing on the selected marker. */
   function syncLegendToMapSelection() {
-    if (!map || !selectedId || legendTab != null) return;
+    if (!map || !selectedId) return;
+    if (legendTab != null) { _applyLegendDimming(); return; }
     buildLegend(true);
     _syncPaFieldDim();
   }
@@ -697,19 +698,36 @@ function main() {
     no2:  ["NO2", "no2"],
     co:   ["CO", "co"],
   };
-  function _applyLegendDimming() {
+  function _applyLegendDimming(fromTabClick) {
     if (!_legendRows || _legendRows.length === 0) return;
     let displayTab = legendTab;
     if (!displayTab && selectedId) displayTab = _selectedSensorPollutantTab();
     const tabKey = displayTab || "pm25";
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const entries = data.entries;
+    // "Show All" mode (no explicit tab, no selected sensor): all bars lit.
+    if (!legendTab && !selectedId) {
+      const dimKey = `${tabKey}|showall|null`;
+      if (dimKey === _lastDimKey) return;
+      _lastDimKey = dimKey;
+      for (let i = 0; i < _legendRows.length; i++) {
+        _legendRows[i].classList.toggle("legendRow--dim", false);
+      }
+      return;
+    }
     // Determine the active value: selected sensor's reading, or max across all sensors
     let activeValue = null;
     if (map && selectedId) {
-      const v = map.getSelectedPollutantValue();
+      // Tab click: use synchronous lookup (override not rendered yet).
+      // Playback/poll: use post-render value (has correct playback-time reading).
+      const v = (fromTabClick && legendTab)
+        ? map.getReadingForPollutant(legendTab)
+        : map.getSelectedPollutantValue();
       if (v != null && isFinite(v)) activeValue = v;
-    } else {
+    }
+    // Fall through: no selected sensor, or sensor lacks the requested pollutant.
+    // Scan all non-outlier sensors for the highest reading.
+    if (activeValue == null) {
       const keys = _DIM_READING_KEYS[tabKey] || [];
       const st = _currentState();
       const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
@@ -725,7 +743,8 @@ function main() {
       }
       if (max > -Infinity) activeValue = max;
     }
-    const dimKey = `${tabKey}|${activeValue}`;
+    const overrideTab = (map && typeof map._markerPollutantOverride !== 'undefined') ? map._markerPollutantOverride : null;
+    const dimKey = `${tabKey}|${overrideTab}|${activeValue}`;
     if (dimKey === _lastDimKey) return;
     _lastDimKey = dimKey;
     for (let i = 0; i < _legendRows.length; i++) {
@@ -737,6 +756,9 @@ function main() {
 
   function buildLegend(animate = false) {
     if (!legendBodyEl) return;
+    // Explicit user action (tab click): always invalidate the dim cache so
+    // stale values from the previous pollutant never persist.
+    if (animate) _lastDimKey = undefined;
     // Derive display pollutant: explicit tab wins, otherwise follow selected sensor
     let displayTab = legendTab;
     if (!displayTab && selectedId) {
@@ -744,7 +766,7 @@ function main() {
     }
     // Fast-skip: nothing changed since last build
     const buildKey = `${legendTab}|${displayTab}`;
-    if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) { _applyLegendDimming(); return; }
+    if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) { _applyLegendDimming(animate); return; }
     _lastBuiltDisplayTab = buildKey;
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const legendNameEl = document.getElementById("legendName");
@@ -775,7 +797,7 @@ function main() {
       const activeTabKey = legendTab || (selectedId ? displayTab : null);
       for (const t of tabs) t.classList.toggle("active", t.dataset.legend === activeTabKey);
       _syncLegendTabVisibility();
-      _applyLegendDimming();
+      _applyLegendDimming(animate);
       return;
     }
 
@@ -826,7 +848,7 @@ function main() {
     const activeTabKey = legendTab || (selectedId ? displayTab : null);
     for (const t of tabs) t.classList.toggle("active", t.dataset.legend === activeTabKey);
     _syncLegendTabVisibility();
-    _applyLegendDimming();
+    _applyLegendDimming(animate);
 
     // Re-enable transitions after instant update completes
     if (!animate) {
@@ -903,8 +925,8 @@ function main() {
         legendUserOverride = !!selectedId; // override auto-sync while a marker is selected
         if (legendTab) localStorage.setItem(LEGEND_TAB_KEY, legendTab);
         else localStorage.removeItem(LEGEND_TAB_KEY);
-        buildLegend(true);
         _syncPaFieldDim();
+        buildLegend(true);
       });
     }
   }
@@ -4113,36 +4135,8 @@ function main() {
     }
   }
 
-  // ── PWA install banner: bottom sheet on Safari (non-standalone) ────────
-  // Teaches user to tap Share → Add to Dock (macOS) or Add to Home Screen (iOS).
-  {
-    const INSTALL_KEY = "dusty_install_toast_dismissed";
-    const banner = document.getElementById("pwaInstallBanner");
-    if (banner && !localStorage.getItem(INSTALL_KEY)) {
-      const isSafari = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
-      const isStandaloneNow = window.matchMedia("(display-mode: standalone)").matches
-        || window.navigator.standalone === true;
-      if (isSafari && !isStandaloneNow) {
-        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
-          || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
-        const actionEl = banner.querySelector(".pwaInstallAction");
-        if (actionEl) actionEl.textContent = isIOS ? "Add to Home Screen" : "Add to Dock";
-        banner.classList.remove("hidden");
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => banner.classList.add("visible"));
-        });
-        const dismiss = () => {
-          banner.classList.remove("visible");
-          localStorage.setItem(INSTALL_KEY, "1");
-          setTimeout(() => banner.classList.add("hidden"), 400);
-        };
-        const dismissBtn = document.getElementById("pwaInstallDismiss");
-        if (dismissBtn) dismissBtn.addEventListener("click", dismiss);
-        setTimeout(dismiss, 8000);
-      }
-    }
-  }
-  
+  // (PWA install banner is initialized below, outside main(), so it can't be blocked by errors)
+
   // Display submenu (dim/sat sliders in three-dot menu)
   const pbDisplaySubmenu = document.getElementById("pbDisplaySubmenu");
   const menuDimEl = document.getElementById("menuDim");
@@ -5311,3 +5305,56 @@ function main() {
 }
 
 main();
+
+// ── PWA install banner ──────────────────────────────────────────────────────
+// Runs independently of main() so a JS error elsewhere can't suppress it.
+(function initPWAInstallBanner() {
+  const INSTALL_KEY = "dusty_install_toast_dismissed";
+  const banner = document.getElementById("pwaInstallBanner");
+  if (!banner) return;
+  const pwaDebug = new URLSearchParams(window.location.search).has("pwa_debug");
+  const isStandaloneNow = window.matchMedia("(display-mode: standalone)").matches
+    || window.navigator.standalone === true;
+  if (isStandaloneNow) return; // already installed
+  // Safari detection: has 'Safari' in UA but not Chrome/CriOS/Firefox/Android browser
+  const ua = navigator.userAgent;
+  const isSafari = /Safari/i.test(ua) && !/Chrome|CriOS|FxiOS|EdgA|OPR|SamsungBrowser/i.test(ua);
+  if (!pwaDebug && !isSafari) return;
+  if (!pwaDebug && localStorage.getItem(INSTALL_KEY)) return;
+
+  const isIOS = /iPad|iPhone|iPod/.test(ua)
+    || (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua));
+  const actionEl = banner.querySelector(".pwaInstallAction");
+  if (actionEl) actionEl.textContent = isIOS ? "Add to Home Screen" : "Add to Dock";
+
+  banner.classList.remove("hidden");
+  requestAnimationFrame(() => requestAnimationFrame(() => banner.classList.add("visible")));
+
+  let dismissed = false;
+  const dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
+    banner.classList.remove("visible");
+    if (!pwaDebug) localStorage.setItem(INSTALL_KEY, "1");
+    setTimeout(() => banner.classList.add("hidden"), 400);
+  };
+  const dismissBtn = document.getElementById("pwaInstallDismiss");
+  if (dismissBtn) dismissBtn.addEventListener("click", dismiss);
+
+  // Dismiss 500ms after the user starts interacting with the map (pan/zoom)
+  const mapRoot = document.getElementById("mapRoot");
+  if (mapRoot) {
+    const dismissOnInteract = () => setTimeout(dismiss, 500);
+    mapRoot.addEventListener("wheel", dismissOnInteract, { once: true, passive: true });
+    mapRoot.addEventListener("touchmove", dismissOnInteract, { once: true, passive: true });
+    // pointerdown with movement = drag/pan
+    let dragging = false;
+    mapRoot.addEventListener("pointerdown", () => { dragging = true; }, { passive: true });
+    mapRoot.addEventListener("pointermove", () => {
+      if (dragging && !dismissed) { dragging = false; dismissOnInteract(); }
+    }, { passive: true });
+    mapRoot.addEventListener("pointerup", () => { dragging = false; }, { passive: true });
+  }
+
+  setTimeout(dismiss, 8000);
+}());

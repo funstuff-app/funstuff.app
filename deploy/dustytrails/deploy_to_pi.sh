@@ -141,6 +141,44 @@ minify_javascript() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Obfuscate JavaScript files for production
+# ─────────────────────────────────────────────────────────────────────────────
+obfuscate_javascript() {
+    if ! command -v javascript-obfuscator &> /dev/null; then
+        log_info "javascript-obfuscator not found, skipping obfuscation"
+        return 0
+    fi
+
+    log_info "Obfuscating JavaScript files..."
+    local dashboard_dir="$STAGING_DIR/dashboard"
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+
+    for jsfile in "$dashboard_dir"/*.js; do
+        if [[ -f "$jsfile" ]]; then
+            local basename
+            basename=$(basename "$jsfile")
+            local outfile="$tmpdir/$basename"
+            if javascript-obfuscator "$jsfile" \
+                --output "$outfile" \
+                --string-array true \
+                --string-array-encoding rc4 \
+                --identifier-names-generator hexadecimal \
+                --rename-globals false \
+                --self-defending false 2>/dev/null; then
+                mv "$outfile" "$jsfile"
+                log_info "  Obfuscated $basename"
+            else
+                log_info "  Skipped $basename (obfuscation failed)"
+                rm -f "$outfile"
+            fi
+        fi
+    done
+
+    rm -rf "$tmpdir"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Parse arguments
 # ─────────────────────────────────────────────────────────────────────────────
 FILES_ONLY=0
@@ -257,6 +295,9 @@ build_staging() {
     
     # Minify JavaScript for production
     minify_javascript
+    
+    # Obfuscate JavaScript for production
+    obfuscate_javascript
     
     # Copy icons if they exist
     for icon in icon-180.png icon-192.png icon-512.png icon-maskable-512.png icon.svg; do

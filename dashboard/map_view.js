@@ -433,8 +433,11 @@ class MapView {
     this._traceRAF = null;
     this._traceLastFrameTs = 0;
     this._traceTargetFPS = 30; // reduce CPU while staying smooth
+    this._backgroundedFPS = 15; // throttle when tab is hidden
+    this._backgrounded = document.visibilityState === "hidden";
 
     this._followRAF = null;
+    this._followLastFrameTs = 0;
     this._followSuppressUntilMs = 0;
     this._followTargetLat = null;
     this._followTargetLon = null;
@@ -672,6 +675,9 @@ class MapView {
     window.addEventListener("resize", () => this._forceResize());
     document.addEventListener("fullscreenchange", () => this._forceResize());
     document.addEventListener("webkitfullscreenchange", () => this._forceResize());
+    document.addEventListener("visibilitychange", () => {
+      this._backgrounded = document.visibilityState === "hidden";
+    });
     if (window.visualViewport) {
       window.visualViewport.addEventListener("resize", () => this._forceResize());
     }
@@ -1998,7 +2004,8 @@ class MapView {
     // Basemap is static; only redraw overlays.
     // Throttle to reduce CPU while remaining smooth.
     const now = performance.now();
-    const minDt = 1000 / (this._traceTargetFPS || 30);
+    const fps = this._backgrounded ? (this._backgroundedFPS || 15) : (this._traceTargetFPS || 30);
+    const minDt = 1000 / fps;
     if (this._traceLastFrameTs > 0 && (now - this._traceLastFrameTs) < (minDt - 0.5)) {
       this._traceRAF = requestAnimationFrame(() => this._traceTick());
       return;
@@ -2011,10 +2018,20 @@ class MapView {
   _followTick() {
     this._followRAF = null;
     if (!this.selectedId || this._followTargetLat === null) return;
+    const now = performance.now();
     if (this._touchActive || this._mouseDragging || this._pinchZooming ||
-        performance.now() < this._followSuppressUntilMs) {
+        now < this._followSuppressUntilMs) {
       this._followRAF = requestAnimationFrame(() => this._followTick());
       return;
+    }
+    // Throttle follow updates when tab is backgrounded
+    if (this._backgrounded) {
+      const minDt = 1000 / (this._backgroundedFPS || 15);
+      if (this._followLastFrameTs > 0 && (now - this._followLastFrameTs) < (minDt - 0.5)) {
+        this._followRAF = requestAnimationFrame(() => this._followTick());
+        return;
+      }
+      this._followLastFrameTs = now;
     }
     // Always use the rendered marker position (interpolated), not raw GPS.
     let tLat = this._followTargetLat;
@@ -6235,6 +6252,21 @@ class MapView {
       this._trailCacheCanvas = null;
       this._redrawViewOnly();
     }
+  }
+
+  /** Synchronously look up the selected sensor's reading for a specific pollutant tab.
+   *  Returns the numeric value or null. Does NOT require a render cycle. */
+  getReadingForPollutant(tab) {
+    if (!this.selectedId || !this.lastState || !tab) return null;
+    const parsed = parseKey(this.selectedId);
+    if (!parsed) return null;
+    const list = (parsed.type === "mobile")
+      ? (this.lastState.mobile || [])
+      : (this.lastState.fixed || []);
+    const sensor = list.find(s => s && String(s.id) === String(parsed.id));
+    if (!sensor) return null;
+    const pr = _readingForLegendTab(sensor.readings, tab);
+    return (pr && pr.value != null) ? parseFloat(pr.value) : null;
   }
 
   /** Set marker pollutant override (only from explicit legend tab clicks). */
