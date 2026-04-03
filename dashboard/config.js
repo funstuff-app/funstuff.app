@@ -63,6 +63,12 @@ var TILE_THEMES = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// App Token — casual bot deterrent sent with every /api/* request.
+// Not secret; matched server-side to reject bare curl/scraper traffic.
+// ─────────────────────────────────────────────────────────────────────────────
+const APP_TOKEN = "42c86460b903df7b764887b6278a17a7";
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Server Configuration (loaded from /api/config for CDN/scaling support)
 // ─────────────────────────────────────────────────────────────────────────────
 let appConfig = {
@@ -78,7 +84,7 @@ let appConfig = {
  */
 async function loadConfig() {
   try {
-    const res = await fetch("/api/config", { cache: "no-store" });
+    const res = await fetch("/api/config", { cache: "no-store", headers: { "X-App-Token": APP_TOKEN } });
     if (res.ok) {
       const cfg = await res.json();
       // Merge with defaults (server may not provide all fields)

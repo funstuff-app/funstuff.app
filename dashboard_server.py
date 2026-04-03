@@ -4185,6 +4185,9 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             "version": "1.0.0",
         }
     
+    # Casual bot deterrent — must match the value in dashboard/config.js.
+    APP_TOKEN = "42c86460b903df7b764887b6278a17a7"
+
     class Handler(BaseHTTPRequestHandler):
         # Disable keep-alive to avoid Safari/iOS hanging on connections
         protocol_version = "HTTP/1.1"
@@ -4290,6 +4293,13 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return False
             return self._get_owner_tok() == OWNER_TOKEN
 
+        def _check_app_token(self) -> bool:
+            """Return True if X-App-Token matches.  Sends 403 and returns False if not."""
+            if self.headers.get("X-App-Token") == APP_TOKEN:
+                return True
+            self._send(403, b'{"error": "forbidden"}', "application/json")
+            return False
+
         def _require_owner(self) -> bool:
             """Return True if auth passes.  Sends 403 and returns False if not."""
             if not OWNER_TOKEN:
@@ -4355,7 +4365,11 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
         def do_GET(self):
             # Strip query string for path matching (cache-busting params like ?v=123)
             path_no_query = self.path.split('?')[0]
-            
+
+            # Reject bare API requests missing the app token (bot deterrent).
+            if path_no_query.startswith("/api/") and not self._check_app_token():
+                return
+
             # Static HTML - short cache, may change frequently during development
             if path_no_query in ("/", "/index.html"):
                 if not self._is_owner():
@@ -4596,6 +4610,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
+            if not self._check_app_token():
+                return
             if self.path.startswith("/api/auth"):
                 return self._handle_auth()
             if self.path.startswith("/api/prefs/sync"):
@@ -4609,6 +4625,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             return self._send(404, b"not found", "text/plain")
 
         def do_DELETE(self):
+            if not self._check_app_token():
+                return
             if self.path.startswith("/api/auth"):
                 return self._handle_auth_delete()
             return self._send(404, b"not found", "text/plain")

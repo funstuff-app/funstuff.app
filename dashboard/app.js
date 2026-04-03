@@ -21,7 +21,7 @@ const _authReady = (async () => {
   try {
     await fetch("/api/auth", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-App-Token": APP_TOKEN },
       body: JSON.stringify({ token: _ownerTok }),
       credentials: "same-origin",
     });
@@ -69,7 +69,7 @@ function _syncPrefsToServer() {
   fetch("/api/prefs/sync", {
     method: "POST",
     body: payload,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-App-Token": APP_TOKEN },
     credentials: "same-origin",
     keepalive: true,
   }).catch(() => {});
@@ -107,7 +107,7 @@ function _syncViewToServer() {
   fetch("/api/view/sync", {
     method: "POST",
     body: payload,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-App-Token": APP_TOKEN },
     keepalive: true,
   }).catch(() => {});
 }
@@ -203,7 +203,7 @@ async function fetchState() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15000); // 15s timeout
   try {
-    const headers = {};
+    const headers = { "X-App-Token": APP_TOKEN };
     if (_stateEtag) headers["If-None-Match"] = _stateEtag;
     const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers, credentials: "same-origin" });
     if (res.status === 304 && _accumulatedState) return _accumulatedState;
@@ -974,7 +974,7 @@ function main() {
       _closePicker();
       let entries;
       try {
-        const resp = await fetch(`/api/view/log?client=${encodeURIComponent(clientId)}&n=500`);
+        const resp = await fetch(`/api/view/log?client=${encodeURIComponent(clientId)}&n=500`, { headers: { "X-App-Token": APP_TOKEN } });
         if (!resp.ok) throw new Error("HTTP " + resp.status);
         entries = await resp.json();
       } catch (e) {
@@ -1022,7 +1022,7 @@ function main() {
       camClientPicker.classList.remove("hidden");
       _pickerOpen = true;
       try {
-        const resp = await fetch("/api/view/clients");
+        const resp = await fetch("/api/view/clients", { headers: { "X-App-Token": APP_TOKEN } });
         if (!resp.ok) throw new Error("HTTP " + resp.status);
         const clients = await resp.json();
         if (!clients.length) {
@@ -4050,7 +4050,7 @@ function main() {
           try {
             const res = await fetch("/api/auth", {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { "Content-Type": "application/json", "X-App-Token": APP_TOKEN },
               body: JSON.stringify({ token: val }),
               credentials: "same-origin",
             });
@@ -4061,7 +4061,7 @@ function main() {
         } else {
           localStorage.removeItem("dusty_owner_tok");
           // Clear the auth cookie
-          try { await fetch("/api/auth", { method: "DELETE", credentials: "same-origin" }); } catch (_) {}
+          try { await fetch("/api/auth", { method: "DELETE", headers: { "X-App-Token": APP_TOKEN }, credentials: "same-origin" }); } catch (_) {}
           if (tokenStatus) tokenStatus.textContent = "Cleared.";
         }
       };

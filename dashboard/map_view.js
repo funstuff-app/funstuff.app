@@ -5936,7 +5936,7 @@ class MapView {
     if (now - this._windFieldLastFetch < this._windFieldFetchInterval && this._windSnapshots) return;
     this._windFieldFetchInFlight = true;
     this._windFieldLastFetch = now;
-    const headers = {};
+    const headers = { "X-App-Token": APP_TOKEN };
     if (this._windFieldEtag) headers["If-None-Match"] = this._windFieldEtag;
     fetch("/api/wind-field", { headers })
       .then(res => {
