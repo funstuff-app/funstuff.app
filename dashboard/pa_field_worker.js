@@ -10,19 +10,21 @@
 
 // AQI → [r,g,b] with continuous interpolation — must match main-thread _aqiToRgb
 // Input sensor values are already converted to AQI by the main thread.
+const _AQI_RGB_STOPS = [
+  [0,     0x00,0xFF,0xFF],
+  [6,     0x00,0xFF,0xFF],  // cyan    – AQI ~6
+  [19,    0x00,0xCC,0xFF],  // lt-blue – AQI ~19
+  [39,    0x00,0xE4,0x00],  // green   – AQI ~39
+  [75,    0xFF,0xFF,0x00],  // yellow  – AQI ~75
+  [125,   0xFF,0x7E,0x00],  // orange  – AQI ~125
+  [176,   0xFF,0x00,0x00],  // red     – AQI ~176
+  [250,   0x8F,0x3F,0x97],  // purple  – AQI ~250
+  [350,   0x7E,0x00,0x23],  // maroon  – AQI ~350
+  [500,   0x7E,0x00,0x23]
+];
+
 function aqiToRgb(aqi) {
-  const stops = [
-    [0,     0x00,0xFF,0xFF],
-    [6,     0x00,0xFF,0xFF],  // cyan    – AQI ~6
-    [19,    0x00,0xCC,0xFF],  // lt-blue – AQI ~19
-    [39,    0x00,0xE4,0x00],  // green   – AQI ~39
-    [75,    0xFF,0xFF,0x00],  // yellow  – AQI ~75
-    [125,   0xFF,0x7E,0x00],  // orange  – AQI ~125
-    [176,   0xFF,0x00,0x00],  // red     – AQI ~176
-    [250,   0x8F,0x3F,0x97],  // purple  – AQI ~250
-    [350,   0x7E,0x00,0x23],  // maroon  – AQI ~350
-    [500,   0x7E,0x00,0x23]
-  ];
+  const stops = _AQI_RGB_STOPS;
   if (aqi <= stops[0][0]) return [stops[0][1], stops[0][2], stops[0][3]];
   for (let i = 1; i < stops.length; i++) {
     if (aqi <= stops[i][0]) {

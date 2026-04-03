@@ -1,4 +1,7 @@
 const _isLite = new URLSearchParams(window.location.search).get('lite') === '1';
+const _isWindows = /Win/.test(navigator.platform || navigator.userAgent);
+const _isMac = /Mac/.test(navigator.platform || navigator.userAgent);
+const _isMobileDevice = /iPad|iPhone|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1);
 
 /**
  * PM2.5 concentration → [r, g, b], matching Python color_for_value("pm2.5", v).
@@ -295,22 +298,24 @@ function _findFingerprintValidRange(fixed, playbackTimeMs) {
   return { fromMs: prevChangeMs, toMs: nextChangeMs };
 }
 
+const _PM25_SMOOTH_STOPS = [
+  [0,     0x00,0xFF,0xFF],
+  [1.0,   0x00,0xFF,0xFF],  // cyan   – mid of 0–2
+  [3.5,   0x00,0xCC,0xFF],  // lt-blue– mid of 2–5
+  [7.0,   0x00,0xE4,0x00],  // green  – mid of 5–9
+  [22.2,  0xFF,0xFF,0x00],  // yellow – mid of 9–35.4
+  [45.4,  0xFF,0x7E,0x00],  // orange – mid of 35.4–55.4
+  [90.4,  0xFF,0x00,0x00],  // red    – mid of 55.4–125.4
+  [175.4, 0x8F,0x3F,0x97],  // purple – mid of 125.4–225.4
+  [250.0, 0x7E,0x00,0x23],  // maroon – mid of 225.4+
+  [500,   0x7E,0x00,0x23]
+];
+
 /** PM2.5 → [r,g,b] with continuous linear interpolation between AQI color stops.
  *  Stops placed at band midpoints (_BAND_MIDS) so colors match dot palette at
  *  typical readings; transitions occur near band boundaries. */
 function _pm25ToRgbSmooth(v) {
-  const stops = [
-    [0,     0x00,0xFF,0xFF],
-    [1.0,   0x00,0xFF,0xFF],  // cyan   – mid of 0–2
-    [3.5,   0x00,0xCC,0xFF],  // lt-blue– mid of 2–5
-    [7.0,   0x00,0xE4,0x00],  // green  – mid of 5–9
-    [22.2,  0xFF,0xFF,0x00],  // yellow – mid of 9–35.4
-    [45.4,  0xFF,0x7E,0x00],  // orange – mid of 35.4–55.4
-    [90.4,  0xFF,0x00,0x00],  // red    – mid of 55.4–125.4
-    [175.4, 0x8F,0x3F,0x97],  // purple – mid of 125.4–225.4
-    [250.0, 0x7E,0x00,0x23],  // maroon – mid of 225.4+
-    [500,   0x7E,0x00,0x23]
-  ];
+  const stops = _PM25_SMOOTH_STOPS;
   if (v <= stops[0][0]) return [stops[0][1], stops[0][2], stops[0][3]];
   for (let i = 1; i < stops.length; i++) {
     if (v <= stops[i][0]) {
@@ -326,16 +331,18 @@ function _pm25ToRgbSmooth(v) {
   return [last[1], last[2], last[3]];
 }
 
+const _PM25_AQI_BP = [
+  [0.0,   9.0,   0,   50],
+  [9.1,   35.4,  51,  100],
+  [35.5,  55.4,  101, 150],
+  [55.5,  125.4, 151, 200],
+  [125.5, 225.4, 201, 300],
+  [225.5, 325.4, 301, 500],
+];
+
 /** PM2.5 concentration → AQI index (EPA piecewise-linear, PM2.5 24-hr breakpoints). */
 function _pm25ToAqi(v) {
-  const bp = [
-    [0.0,   9.0,   0,   50],
-    [9.1,   35.4,  51,  100],
-    [35.5,  55.4,  101, 150],
-    [55.5,  125.4, 151, 200],
-    [125.5, 225.4, 201, 300],
-    [225.5, 325.4, 301, 500],
-  ];
+  const bp = _PM25_AQI_BP;
   if (v < 0) return 0;
   for (let i = 0; i < bp.length; i++) {
     if (v <= bp[i][1]) {
@@ -346,20 +353,22 @@ function _pm25ToAqi(v) {
   return 500;
 }
 
+const _AQI_RGB_STOPS = [
+  [0,     0x00,0xFF,0xFF],
+  [6,     0x00,0xFF,0xFF],  // cyan    – AQI ~6
+  [19,    0x00,0xCC,0xFF],  // lt-blue – AQI ~19
+  [39,    0x00,0xE4,0x00],  // green   – AQI ~39
+  [75,    0xFF,0xFF,0x00],  // yellow  – AQI ~75
+  [125,   0xFF,0x7E,0x00],  // orange  – AQI ~125
+  [176,   0xFF,0x00,0x00],  // red     – AQI ~176
+  [250,   0x8F,0x3F,0x97],  // purple  – AQI ~250
+  [350,   0x7E,0x00,0x23],  // maroon  – AQI ~350
+  [500,   0x7E,0x00,0x23]
+];
+
 /** AQI index → RGB color.  Same colors as _pm25ToRgbSmooth, stops at AQI equivalents. */
 function _aqiToRgb(aqi) {
-  const stops = [
-    [0,     0x00,0xFF,0xFF],
-    [6,     0x00,0xFF,0xFF],  // cyan    – AQI ~6
-    [19,    0x00,0xCC,0xFF],  // lt-blue – AQI ~19
-    [39,    0x00,0xE4,0x00],  // green   – AQI ~39
-    [75,    0xFF,0xFF,0x00],  // yellow  – AQI ~75
-    [125,   0xFF,0x7E,0x00],  // orange  – AQI ~125
-    [176,   0xFF,0x00,0x00],  // red     – AQI ~176
-    [250,   0x8F,0x3F,0x97],  // purple  – AQI ~250
-    [350,   0x7E,0x00,0x23],  // maroon  – AQI ~350
-    [500,   0x7E,0x00,0x23]
-  ];
+  const stops = _AQI_RGB_STOPS;
   if (aqi <= stops[0][0]) return [stops[0][1], stops[0][2], stops[0][3]];
   for (let i = 1; i < stops.length; i++) {
     if (aqi <= stops[i][0]) {
@@ -447,11 +456,9 @@ class MapView {
     this._cssW = 1;
     this._cssH = 1;
 
-    // OS detection for platform-specific input handling
-    // macOS: scroll = pan, pinch (ctrlKey) = zoom, mouse wheel (deltaMode≠0) = zoom
-    // Windows/Linux: smooth-scroll mice also zoom (primary pointing device)
-    this._isWindows = /Win/.test(navigator.platform || navigator.userAgent);
-    this._isMac = /Mac/.test(navigator.platform || navigator.userAgent);
+    // OS detection for platform-specific input handling (module-level constants)
+    this._isWindows = _isWindows;
+    this._isMac = _isMac;
 
     // Trace-mode optimization: cache static overlay (trails + fixed markers).
     this._overlayStaticCanvas = null; // offscreen canvas in device pixels
@@ -597,8 +604,7 @@ class MapView {
     // Basemap tile cache (LRU bounded). Without eviction this grows unbounded as you pan/zoom.
     // Lower limit on mobile/tablet for memory constraints; detect via coarse heuristic.
     this.tileCache = new Map(); // key -> {img, ok}
-    const isMobileDevice = /iPad|iPhone|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1);
-    this._tileCacheMax = isMobileDevice ? 180 : 420;
+    this._tileCacheMax = _isMobileDevice ? 180 : 420;
 
     // Touch pan/pinch state (iPad, iOS, Android)
     this._touchState = null; // null or { startTouches, startCenter, startZoom, startCenterLatLon, lastPinchDist, lastMidpoint }
@@ -2822,6 +2828,13 @@ class MapView {
 
   draw(state) {
     this.lastState = state;
+
+    // Fast path: skip overlay/composite work when no data has arrived yet.
+    // Tile prefetch is preserved so it overlaps with the config/data fetch.
+    if (!state && !this.lastState) {
+      this.drawTiles();
+      return;
+    }
 
     // Soft-follow: keep target fresh and ensure the loop is running.
     {
