@@ -4616,8 +4616,8 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 return self._handle_auth()
             if self.path.startswith("/api/prefs/sync"):
                 return self._handle_prefs_sync()
-            if self.path.startswith("/api/view/sync"):
-                return self._handle_view_sync()
+            # if self.path.startswith("/api/view/sync"):
+            #     return self._handle_view_sync()
             if self.path.startswith("/api/snapshot/save"):
                 return self._handle_save_snapshot()
             if self.path.startswith("/api/analytics"):
