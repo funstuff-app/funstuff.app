@@ -5608,7 +5608,7 @@ def main() -> int:
 
         # Always fetch live PA data and start the live loop
         # (demo day is served from fixed_history via the snapshot endpoint)
-        data_sensors = _fetch_purpleair_sensors(fields="pm2.5")
+        data_sensors = _fetch_purpleair_sensors(fields="pm2.5,last_seen")
         if data_sensors:
             data_by_id = {s["sensor_index"]: s for s in data_sensors if s.get("sensor_index")}
             with app_state.lock:
@@ -5616,6 +5616,8 @@ def main() -> int:
                     sid = s.get("sensor_index")
                     if sid and sid in data_by_id:
                         s["pm2.5"] = data_by_id[sid].get("pm2.5")
+                        if data_by_id[sid].get("last_seen") is not None:
+                            s["last_seen"] = data_by_id[sid]["last_seen"]
                 app_state.purpleair_last_fetch = time.time()
                 if isinstance(app_state.state, dict):
                     _merge_purpleair_into_fixed(app_state.state, app_state)
