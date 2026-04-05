@@ -5035,15 +5035,17 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 cache_key = None
 
             try:
-                # Try DB first, then fall back to filesystem
+                # Load snapshot from DB only — filesystem fallback removed.
+                # All daily snapshots were migrated to SQLite; if it's not in
+                # the DB, it doesn't exist.
                 state = None
                 if app_state.db_worker is not None:
                     try:
                         state = app_state.db_worker.get_daily_snapshot(date_str)
                     except Exception:
                         pass
-                if state is None:
-                    state = load_snapshot(data_dir, date_str)
+                # if state is None:
+                #     state = load_snapshot(data_dir, date_str)
                 if state is None:
                     return self._send(404, b'{"error": "snapshot not found"}', "application/json")
 
