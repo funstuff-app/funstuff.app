@@ -3523,7 +3523,7 @@ function main() {
     try {
       const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
         method: "POST",
-        headers: { "Content-Length": "0" },
+        headers: { "Content-Length": "0", "X-App-Token": APP_TOKEN },
         credentials: "same-origin",
       });
       if (!resp.ok) {
@@ -3557,7 +3557,7 @@ function main() {
     // Fetch available snapshots
     let snapshots = [];
     try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`);
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`, { headers: { "X-App-Token": APP_TOKEN } });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       snapshots = data.snapshots || [];
