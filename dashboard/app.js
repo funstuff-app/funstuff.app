@@ -3523,7 +3523,7 @@ function main() {
     try {
       const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
         method: "POST",
-        headers: { "Content-Length": "0" },
+        headers: { "Content-Length": "0", "X-App-Token": APP_TOKEN },
         credentials: "same-origin",
       });
       if (!resp.ok) {

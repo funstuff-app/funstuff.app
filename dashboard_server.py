@@ -5006,36 +5006,6 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 if state is None:
                     return self._send(404, b'{"error": "snapshot not found"}', "application/json")
 
-                # Strip PA sensors from the snapshot unless fixed_history confirms
-                # PA data actually existed on this date.  Old snapshot files may have
-                # PA entries baked in from a time when the sensor list was different or
-                # data was injected incorrectly.
-                existing_pa = [f for f in (state.get("fixed") or []) if f.get("purpleair")]
-                if existing_pa:
-                    # Check fixed_history for any PA entry timestamped on this date.
-                    # date_str is a Mountain-time date but timestamps are UTC, so
-                    # we check both UTC dates that cover this MT day.
-                    try:
-                        _day_mt = datetime.strptime(date_str, "%Y-%m-%d").replace(
-                            hour=0, minute=0, second=0, microsecond=0, tzinfo=_MOUNTAIN_TZ)
-                        _pa_prefixes = _utc_date_prefixes_for_mt_day(_day_mt)
-                    except (ValueError, TypeError):
-                        _pa_prefixes = (date_str,)
-                    pa_confirmed = False
-                    with app_state.lock:
-                        for sensor_id, pollutants in app_state.fixed_history.items():
-                            if not sensor_id.startswith("PA_"):
-                                continue
-                            for entries in pollutants.values():
-                                if any(e.get("time", "")[:10] in _pa_prefixes for e in entries):
-                                    pa_confirmed = True
-                                    break
-                            if pa_confirmed:
-                                break
-                    if not pa_confirmed:
-                        _log(f"[Snapshot] Stripping {len(existing_pa)} stale PA sensors from {date_str} (no fixed_history data for that date)")
-                        state["fixed"] = [f for f in state["fixed"] if not f.get("purpleair")]
-
                 # Trim to the requested day's 5 AM–5 AM MST window.
                 # Current saves are pre-trimmed, but older snapshots may not be.
                 _trim_trails_to_day(state, date_str)
