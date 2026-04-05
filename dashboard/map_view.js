@@ -7186,10 +7186,12 @@ class MapView {
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
-          if (!isSel && f.last_seen) {
+          const _refMs = this.getPlaybackTimeMs() || this._dataNowMs();
+          const _sensorMs = (pr && pr.timeMs) || (f.last_seen ? f.last_seen * 1000 : null);
+          if (!isSel && _sensorMs) {
             const PA_FADE_MS = 45 * 60 * 1000;
             const PA_FADE_TAIL = 0.20;
-            const ageMs = this._dataNowMs() - f.last_seen * 1000;
+            const ageMs = _refMs - _sensorMs;
             if (ageMs >= PA_FADE_MS) { ctx.restore(); return; }
             const fadeStart = PA_FADE_MS * (1.0 - PA_FADE_TAIL);
             if (ageMs > fadeStart) {
@@ -8688,10 +8690,12 @@ class MapView {
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
-          if (!isSel && f.last_seen) {
+          const _refMs = this.getPlaybackTimeMs() || this._dataNowMs();
+          const _sensorMs = (pr && pr.timeMs) || (f.last_seen ? f.last_seen * 1000 : null);
+          if (!isSel && _sensorMs) {
             const PA_FADE_MS = 45 * 60 * 1000;
             const PA_FADE_TAIL = 0.20;
-            const ageMs = this._dataNowMs() - f.last_seen * 1000;
+            const ageMs = _refMs - _sensorMs;
             if (ageMs >= PA_FADE_MS) { ctx.restore(); return; }
             const fadeStart = PA_FADE_MS * (1.0 - PA_FADE_TAIL);
             if (ageMs > fadeStart) {

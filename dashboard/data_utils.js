@@ -156,6 +156,7 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
     result[key] = {
       value: valuesF[idx],
       color: colorsF[idx] ?? r.ci ?? 0,
+      timeMs: timesMs[idx],
       // Keep original arrays for sparklines
       history: values,
       history_times: times,
@@ -183,7 +184,7 @@ function primaryReadingForFixedAtTime(f, playbackTimeMs) {
   const interpolated = interpolateFixedReadingsAtTime(f, playbackTimeMs);
   const w = pickWorstReadingKey(interpolated);
   if (w && w.key && interpolated[w.key] && interpolated[w.key].value != null) {
-    return { key: w.key, value: interpolated[w.key].value, color: safeHex(interpolated[w.key].color), aqi: w.aqi };
+    return { key: w.key, value: interpolated[w.key].value, color: safeHex(interpolated[w.key].color), aqi: w.aqi, timeMs: interpolated[w.key].timeMs };
   }
   // No data for this scrub time — return null so the renderer skips this sensor.
   // Do NOT fall back to primaryReadingForSensor: that returns the live value,

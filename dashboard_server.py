@@ -2756,6 +2756,7 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
             "pci": color_to_idx(color),
             "primary_aqi": None,
             "outlier": is_outlier,
+            "last_seen": s.get("last_seen"),
         })
 
     # ── Spatial thinning: keep one PurpleAir sensor per ~500 m grid cell ──
