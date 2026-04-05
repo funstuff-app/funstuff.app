@@ -8646,7 +8646,7 @@ class MapView {
             this._fixedInterpCache.map.clear();
           }
           pr = this._fixedInterpCache.map.get(f.id);
-          if (!pr) {
+          if (pr === undefined) {
             pr = primaryReadingForFixedAtTime(f, fixedPbTimeMs);
             this._fixedInterpCache.map.set(f.id, pr);
           }
@@ -8676,6 +8676,9 @@ class MapView {
             if (isSel) this._selectedPollutantValue = null;
           }
         }
+
+        // No data for this sensor at the current scrub time — skip drawing
+        if (!pr) { return; }
 
         ctx.save();
         const isPurpleAir = !!f.purpleair;

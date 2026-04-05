@@ -131,10 +131,15 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
     const tMin = timesMs[0];
     const tMax = timesMs[timesMs.length - 1];
     
+    // If scrub time is before the sensor's first reading, hide it —
+    // the sensor had no data at this point in time.
+    if (playbackTimeMs < tMin) {
+      result[key] = { value: null, ci: 0, history: values, history_times: times, hci: colors, scrubbed: r.scrubbed || 0 };
+      continue;
+    }
+
     let idx;
-    if (playbackTimeMs <= tMin) {
-      idx = 0;
-    } else if (playbackTimeMs >= tMax) {
+    if (playbackTimeMs >= tMax) {
       idx = valuesF.length - 1;
     } else {
       // Binary search for the right interval
@@ -177,8 +182,11 @@ function primaryReadingForFixedAtTime(f, playbackTimeMs) {
   
   const interpolated = interpolateFixedReadingsAtTime(f, playbackTimeMs);
   const w = pickWorstReadingKey(interpolated);
-  if (w && w.key && interpolated[w.key]) {
+  if (w && w.key && interpolated[w.key] && interpolated[w.key].value != null) {
     return { key: w.key, value: interpolated[w.key].value, color: safeHex(interpolated[w.key].color), aqi: w.aqi };
   }
-  return primaryReadingForSensor(f);
+  // No data for this scrub time — return null so the renderer skips this sensor.
+  // Do NOT fall back to primaryReadingForSensor: that returns the live value,
+  // which would show current data at every scrub position.
+  return null;
 }
