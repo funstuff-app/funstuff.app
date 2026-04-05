@@ -725,7 +725,7 @@ class AirQualityApp(App):
         if _REMOTE_CONFIG["url"]:
             # Remote mode: fetch from server's /api/raw endpoint
             try:
-                resp = stdlib_get(f"{_REMOTE_CONFIG['url']}/api/raw", timeout=10)
+                resp = stdlib_get(f"{_REMOTE_CONFIG['url']}/api/raw", headers=_APP_TOKEN_HEADERS, timeout=10)
                 if resp.status_code == 200:
                     raw = resp.json()
                     mobile_data = raw.get("mobile", {})
@@ -739,7 +739,7 @@ class AirQualityApp(App):
             # Fetch enriched fixed sensors (AirNow, Home) from lightweight /api/fixed
             # Falls back to /api/state if the server hasn't been updated yet
             try:
-                resp2 = stdlib_get(f"{_REMOTE_CONFIG['url']}/api/fixed", timeout=10)
+                resp2 = stdlib_get(f"{_REMOTE_CONFIG['url']}/api/fixed", headers=_APP_TOKEN_HEADERS, timeout=10)
                 if resp2.status_code == 200:
                     dashboard_fixed = resp2.json()
                     if not isinstance(dashboard_fixed, list):
@@ -747,7 +747,7 @@ class AirQualityApp(App):
             except Exception:
                 # /api/fixed not available (404 or network error) — fall back to /api/state
                 try:
-                    resp2 = stdlib_get(f"{_REMOTE_CONFIG['url']}/api/state", timeout=15)
+                    resp2 = stdlib_get(f"{_REMOTE_CONFIG['url']}/api/state", headers=_APP_TOKEN_HEADERS, timeout=15)
                     if resp2.status_code == 200:
                         state = resp2.json()
                         dashboard_fixed = state.get("fixed", [])
@@ -800,7 +800,8 @@ class AirQualityApp(App):
             port = int(os.environ.get("MOBILEAIR_DASHBOARD_PORT", "8766"))
             server_url = f"http://127.0.0.1:{port}/api/state"
         try:
-            resp = stdlib_get(server_url, timeout=2)
+            _hdrs = _APP_TOKEN_HEADERS if _REMOTE_CONFIG["url"] else None
+            resp = stdlib_get(server_url, headers=_hdrs, timeout=2)
             if resp.status_code == 200:
                 state = resp.json()
                 wind_data = state.get("wind", {})
@@ -2102,6 +2103,9 @@ def _run_headless_server(host: str, port: int, demo_pa: bool = False):
 
 
 _REMOTE_CONFIG = {"url": None}  # Set by --remote flag
+
+# Must match APP_TOKEN in dashboard/config.js and dashboard_server.py
+_APP_TOKEN_HEADERS = {"X-App-Token": "42c86460b903df7b764887b6278a17a7"}
 
 
 if __name__ == "__main__":

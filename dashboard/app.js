@@ -3886,7 +3886,7 @@ function main() {
     // Fetch available snapshots to know which days have data
     const snapshotDates = new Map(); // dateStr -> {size_bytes, demo}
     try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`);
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`, { headers: { "X-App-Token": APP_TOKEN } });
       if (resp.ok) {
         const data = await resp.json();
         for (const snap of (data.snapshots || [])) {
