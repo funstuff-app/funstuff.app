@@ -3373,7 +3373,7 @@ function main() {
     try {
       // Load from local snapshots — we already store all data (mobile, fixed,
       // purpleair, etc.) so there's no need to fetch from upstream history servers.
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`);
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`, { headers: { "X-App-Token": APP_TOKEN } });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `No snapshot for ${dateStr}`);
@@ -3642,7 +3642,7 @@ function main() {
     updateSaveButtonState();
     
     try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}`);
+      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}`, { headers: { "X-App-Token": APP_TOKEN } });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `HTTP ${resp.status}`);
