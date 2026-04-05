@@ -10,3 +10,8 @@ AIRNOW_API_KEY="your-airnow-api-key"
 
 # If empty or commented out, deploy will auto-generate one.
 DUSTY_OWNER_TOKEN=""
+
+# Database archival & backup
+# DUSTY_DB_RETENTION_DAYS="30"       # Keep hot data for 30 days (default)
+# DUSTY_DB_MAX_SIZE_MB="1024"        # Emergency prune if DB exceeds 1 GB
+# DUSTY_BACKUP_TARGET="user@mac.local:/backups/dustytrails/"  # rsync destination

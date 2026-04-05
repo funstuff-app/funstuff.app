@@ -25,6 +25,8 @@ from mobileair.config import (
     DB_WAL_CHECKPOINT_INTERVAL_S,
     DB_WRITE_BATCH_SIZE,
     DB_WRITE_FLUSH_INTERVAL_S,
+    DB_PRUNE_BATCH_SIZE,
+    DB_RETENTION_DAYS,
 )
 
 log = logging.getLogger("dustytrails.db")
@@ -348,15 +350,20 @@ class DbWorker:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def get_wind_snapshots(self, date: str) -> dict[str, list[dict[str, float]]]:
-        """Load all wind snapshots for a given date.  Returns {HHMM: points}."""
+    def get_wind_snapshots(self, date: str) -> dict[str, Any]:
+        """Load all wind snapshots for a given date.
+
+        Returns ``{HHMM: grid_or_points}`` where each value is either
+        a grid dict (``{gw, gh, bounds, uGrid, vGrid}``) for new data
+        or a legacy point list for older entries.
+        """
         assert self.read_pool is not None
         with self.read_pool.connection() as conn:
             rows = conn.execute(
                 "SELECT key, data FROM wind_snapshots WHERE date = ? ORDER BY key",
                 (date,),
             ).fetchall()
-        result: dict[str, list[dict[str, float]]] = {}
+        result: dict[str, Any] = {}
         for row in rows:
             try:
                 raw = gzip.decompress(bytes(row["data"]))
@@ -388,6 +395,185 @@ class DbWorker:
                 "SELECT date, ts, size_bytes FROM daily_snapshots ORDER BY date DESC"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def has_readings_for_date(
+        self, sensor_prefix: str, ts_start: float, ts_end: float
+    ) -> bool:
+        """Check whether any sensor matching *sensor_prefix* has readings in [ts_start, ts_end).
+
+        Handles both new sensor_id format (e.g. ``PA_4059``) and the legacy
+        prefixed format from ``_enqueue_state_to_db`` (e.g. ``pa:PA_4059``).
+        """
+        assert self.read_pool is not None
+        with self.read_pool.connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM readings "
+                "WHERE (sensor_id LIKE ? OR sensor_id LIKE ?) "
+                "AND ts >= ? AND ts < ? LIMIT 1",
+                (
+                    f"{sensor_prefix}%",
+                    f"pa:{sensor_prefix}%",
+                    ts_start,
+                    ts_end,
+                ),
+            ).fetchone()
+        return row is not None
+
+    # ── Archival & pruning ────────────────────────────────────────────────
+
+    def archive_month(self, year: int, month: int, archive_dir: Path) -> Path | None:
+        """Export one calendar month of data to a standalone gzip'd SQLite file.
+
+        Returns the archive path on success, None on failure.
+        """
+        import calendar
+
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_name = f"dustytrails-{year:04d}-{month:02d}.db.gz"
+        archive_path = archive_dir / archive_name
+        if archive_path.exists():
+            log.info("[DB] Archive already exists: %s", archive_path)
+            return archive_path
+
+        # Month boundaries (UTC epoch)
+        _, last_day = calendar.monthrange(year, month)
+        from datetime import datetime, timezone
+        ts_start = datetime(year, month, 1, tzinfo=timezone.utc).timestamp()
+        if month == 12:
+            ts_end = datetime(year + 1, 1, 1, tzinfo=timezone.utc).timestamp()
+        else:
+            ts_end = datetime(year, month + 1, 1, tzinfo=timezone.utc).timestamp()
+        date_prefix = f"{year:04d}-{month:02d}"
+        date_compact_prefix = f"{year:04d}{month:02d}"
+
+        tmp_path = archive_dir / f".tmp_{archive_name.replace('.gz', '')}"
+        try:
+            # Create archive DB with same schema
+            arc_conn = sqlite3.connect(str(tmp_path))
+            _configure_connection(arc_conn)
+            _apply_migrations(arc_conn)
+
+            assert self.read_pool is not None
+            with self.read_pool.connection() as src:
+                # readings
+                rows = src.execute(
+                    "SELECT sensor_id, source, ts, lat, lon, pollutant, value, aqi, color, meta "
+                    "FROM readings WHERE ts >= ? AND ts < ?",
+                    (ts_start, ts_end),
+                ).fetchall()
+                arc_conn.executemany(
+                    "INSERT INTO readings "
+                    "(sensor_id, source, ts, lat, lon, pollutant, value, aqi, color, meta) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+                readings_count = len(rows)
+
+                # trail_points
+                rows = src.execute(
+                    "SELECT sensor_id, ts, lat, lon, value, color, snapped "
+                    "FROM trail_points WHERE ts >= ? AND ts < ?",
+                    (ts_start, ts_end),
+                ).fetchall()
+                arc_conn.executemany(
+                    "INSERT INTO trail_points "
+                    "(sensor_id, ts, lat, lon, value, color, snapped) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+
+                # wind_snapshots (date column is YYYYMMDD string)
+                rows = src.execute(
+                    "SELECT key, date, ts, point_count, data "
+                    "FROM wind_snapshots WHERE date LIKE ?",
+                    (f"{date_compact_prefix}%",),
+                ).fetchall()
+                arc_conn.executemany(
+                    "INSERT INTO wind_snapshots "
+                    "(key, date, ts, point_count, data) VALUES (?, ?, ?, ?, ?)",
+                    rows,
+                )
+
+                # daily_snapshots (date column is YYYY-MM-DD)
+                rows = src.execute(
+                    "SELECT date, ts, data, size_bytes "
+                    "FROM daily_snapshots WHERE date LIKE ?",
+                    (f"{date_prefix}%",),
+                ).fetchall()
+                arc_conn.executemany(
+                    "INSERT OR REPLACE INTO daily_snapshots "
+                    "(date, ts, data, size_bytes) VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+
+            arc_conn.commit()
+            arc_conn.close()
+
+            # Gzip the archive
+            import shutil
+            with open(tmp_path, "rb") as f_in:
+                with gzip.open(str(archive_path), "wb", compresslevel=6) as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            tmp_path.unlink()
+
+            log.info(
+                "[DB] Archived %d readings for %s to %s",
+                readings_count, date_prefix, archive_path,
+            )
+            return archive_path
+        except Exception as e:
+            log.warning("[DB] Archive failed for %s: %s", date_prefix, e)
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            return None
+
+    def prune_before(self, cutoff_ts: float) -> int:
+        """Delete readings, trail_points, and analytics older than *cutoff_ts*.
+
+        Deletes in batches to avoid long write-locks on the Pi.
+        Returns the total number of rows deleted.
+        """
+        assert self._write_conn is not None
+        conn = self._write_conn
+        total = 0
+        for table in ("readings", "trail_points", "client_analytics"):
+            while True:
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE rowid IN "
+                    f"(SELECT rowid FROM {table} WHERE ts < ? LIMIT ?)",
+                    (cutoff_ts, DB_PRUNE_BATCH_SIZE),
+                )
+                deleted = cur.rowcount
+                conn.commit()
+                total += deleted
+                if deleted < DB_PRUNE_BATCH_SIZE:
+                    break
+                time.sleep(0.05)  # yield to writer thread
+
+        # wind_snapshots uses date string (YYYYMMDD), not epoch ts
+        from datetime import datetime, timezone
+        cutoff_date = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y%m%d")
+        cur = conn.execute(
+            "DELETE FROM wind_snapshots WHERE date < ?", (cutoff_date,)
+        )
+        conn.commit()
+        total += cur.rowcount
+
+        # Reclaim space gradually
+        try:
+            conn.execute("PRAGMA incremental_vacuum(100)")
+        except Exception:
+            pass
+
+        log.info("[DB] Pruned %d rows older than %s", total, cutoff_date)
+        return total
+
+    def db_size_mb(self) -> float:
+        """Return the current database file size in MB."""
+        try:
+            return self._db_path.stat().st_size / (1024 * 1024)
+        except OSError:
+            return 0.0
 
     # ── Writer loop ───────────────────────────────────────────────────────
 
