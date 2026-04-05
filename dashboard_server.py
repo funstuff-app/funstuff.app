@@ -517,14 +517,9 @@ class AppState:
     # Optional offline road graph cache for map-matching.
     road_graph: Any | None = None
     
-    # Persistent fixed sensor history (shared with TUI)
-    # Structure: { sensor_id: { pollutant: [{val, col, time, recorded_at}, ...] } }
-    # TODO: fixed_history.json is ~41 MB and growing unbounded (PurpleAir has no cap).
-    #       Merge this into the daily snapshot instead of a separate file — the snapshot
-    #       already carries today's data and gets rotated naturally.
+    # TODO: fixed_history is now a today-only in-memory cache.
+    #       The DB (readings table) is the durable store.
     fixed_history: dict[str, dict[str, list[dict[str, Any]]]] = field(default_factory=dict)
-    fixed_history_path: Path | None = None
-    fixed_history_dirty: bool = False
 
     # PA sensors detected as stuck-elevated: { sensor_id: stuck_start_recorded_at }
     # Used by _inject_fixed_history to retroactively null stuck readings.
@@ -710,56 +705,18 @@ _WEATHER_KEYS = {"BARPR", "DEWPOINT", "TEMP", "WD", "WS", "RHUM", "SOLAR", "PREC
 
 
 def load_fixed_history(app_state: AppState, data_dir: Path) -> None:
-    """Load fixed sensor history from disk."""
-    path = data_dir / "fixed_history.json"
-    app_state.fixed_history_path = path
-    app_state.fixed_history = load_json_file(path, {})
-    if not isinstance(app_state.fixed_history, dict):
-        app_state.fixed_history = {}
-    # Purge any weather/met keys that were persisted before filtering was added
-    for sensor_id in list(app_state.fixed_history):
-        pols = app_state.fixed_history[sensor_id]
-        if isinstance(pols, dict):
-            for wk in _WEATHER_KEYS:
-                pols.pop(wk, None)
-    # Deduplicate each history list by time key.  The fixed_history.json can
-    # accumulate duplicate timestamp entries when the server restarts and
-    # re-fetches already-cached hours (the previous dedup only checked the
-    # last list entry, so out-of-order re-inserts slipped through).  Scrub on
-    # load so front-ends never see the sawtooth pattern in stored data.
-    deduped_any = False
-    for sensor_id, pols in app_state.fixed_history.items():
-        if not isinstance(pols, dict):
-            continue
-        for param, entries in pols.items():
-            if not isinstance(entries, list):
-                continue
-            seen: dict[str, dict] = {}
-            for e in entries:
-                t = e.get("time")
-                if t:
-                    seen[t] = e  # later entry wins (most recent correction)
-                else:
-                    # no time key — keep via a unique fallback key
-                    seen[f"__no_time_{id(e)}"] = e
-            if len(seen) != len(entries):
-                pols[param] = list(seen.values())
-                deduped_any = True
-    if deduped_any:
-        app_state.fixed_history_dirty = True  # flush scrubbed version to disk
+    """Initialize an empty fixed_history dict.
+
+    History is now a today-only in-memory cache that fills from live data
+    on the first fetch cycle.  The DB (readings table) is the durable store.
+    Legacy ``fixed_history.json`` is left on disk but no longer read.
+    """
+    app_state.fixed_history = {}
 
 
 def save_fixed_history(app_state: AppState) -> None:
-    """Save fixed sensor history to disk if dirty."""
-    if not app_state.fixed_history_dirty or not app_state.fixed_history_path:
-        return
-    try:
-        app_state.fixed_history_path.write_text(
-            json.dumps(app_state.fixed_history), encoding="utf-8"
-        )
-        app_state.fixed_history_dirty = False
-    except Exception as e:
-        _log(f"[FixedHistory] Failed to save: {e}")
+    """No-op. History is now DB-backed; JSON file no longer written."""
+    pass
 
 
 def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
@@ -1047,13 +1004,8 @@ def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         _trim_trails_to_day(state, today_str)
         _trim_history_to_date(state, today_str)
 
-        # Include wind snapshots in the daily save
-        with app_state.lock:
-            if app_state.wind_snapshots:
-                wind_snap = {}
-                for k, v in app_state.wind_snapshots.items():
-                    wind_snap[k] = json.loads(v.decode("utf-8"))
-                state["wind_snapshots"] = wind_snap
+        # Wind snapshots are persisted separately in the DB and on disk;
+        # no longer embedded in daily saves to avoid 40+ MB snapshot bloat.
 
         result = save_snapshot(data_dir, today_str, state)
         _log(f"[Snapshot] Saved today's state: {result.get('filename')} ({result.get('size_bytes')} bytes)")
@@ -1276,16 +1228,35 @@ def accumulate_fixed_reading(
         "recorded_at": now_ts,
     })
 
-    # Keep history based on sensor type:
-    # - Home sensor: 5760 entries (~48 hours at 30-second intervals) to span today + yesterday
-    # - PurpleAir: no cap — all readings accumulate into the snapshot
-    # - Utah sensors: 2880 entries (~24 hours at 5-10 min intervals spans days anyway)
-    if not is_pa:
-        max_entries = 5760 if sensor_id == "Home" else 2880
-        if len(hist) > max_entries:
-            app_state.fixed_history[sensor_id][pollutant] = hist[-max_entries:]
-    
-    app_state.fixed_history_dirty = True
+    # Cap all sensor types to prevent unbounded memory growth.
+    max_entries = 5760 if sensor_id == "Home" else 2880
+    if len(hist) > max_entries:
+        app_state.fixed_history[sensor_id][pollutant] = hist[-max_entries:]
+
+    # Write-through to SQLite (non-blocking queue put).
+    db = app_state.db_worker
+    if db is not None:
+        _source = (
+            "purpleair" if is_pa else
+            "airnow" if sensor_id.startswith("AIRNOW_") else
+            "home" if sensor_id == "Home" else
+            "fixed"
+        )
+        try:
+            _val_f = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            _val_f = None
+        db.enqueue_reading(
+            sensor_id=sensor_id,
+            source=_source,
+            ts=now_ts,
+            lat=None,
+            lon=None,
+            pollutant=pollutant,
+            value=_val_f,
+            color=color,
+            meta={"time_utc": time_utc} if time_utc else None,
+        )
 
 
 def _accumulate_fixed_history_from_raw(app_state: AppState, fixed_raw: dict[str, Any] | None) -> None:
@@ -2088,7 +2059,7 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
         # Re-apply custom sensor names after AirNow/PurpleAir merges
         # (those merges add sensors with their upstream names, overriding any
         # custom names that normalize_state_for_dashboard applied earlier)
-        _dd = app_state.fixed_history_path.parent if app_state.fixed_history_path else default_data_dir()
+        _dd = default_data_dir()
         names = load_json_file(_dd / "sensor_names.json", {})
         if isinstance(names, dict):
             apply_sensor_names_inplace(st, names)
@@ -2212,43 +2183,9 @@ def _enqueue_state_to_db(db: DbWorker, st: dict[str, Any], now: float) -> None:
     if trail_batch:
         db.enqueue_trail_points(trail_batch)
 
-    # Fixed sensor readings
-    for f in st.get("fixed", []):
-        sid = f.get("id")
-        if not sid:
-            continue
-        is_pa = f.get("purpleair")
-        is_airnow = f.get("airnow")
-        if is_pa:
-            source = "purpleair"
-            sensor_id = f"pa:{sid}"
-        elif is_airnow:
-            source = "airnow"
-            sensor_id = f"airnow:{sid}"
-        else:
-            source = "fixed"
-            sensor_id = f"fixed:{sid}"
-        readings = f.get("readings", {})
-        if isinstance(readings, dict):
-            for pollutant, rdg in readings.items():
-                if not isinstance(rdg, dict):
-                    continue
-                val = rdg.get("value")
-                try:
-                    val = float(val) if val is not None else None
-                except (TypeError, ValueError):
-                    val = None
-                db.enqueue_reading(
-                    sensor_id=sensor_id,
-                    source=source,
-                    ts=now,
-                    lat=f.get("lat"),
-                    lon=f.get("lon"),
-                    pollutant=pollutant,
-                    value=val,
-                    aqi=rdg.get("aqi"),
-                    color=rdg.get("color"),
-                )
+    # Fixed sensor readings are now written to DB in accumulate_fixed_reading()
+    # at the point of collection, with correct sensor_id and measurement time.
+    # No duplicate writes needed here.
 
 
 def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
@@ -3998,6 +3935,110 @@ def load_snapshot(data_dir: Path, date_str: str) -> dict[str, Any] | None:
 
 # ── Wind vector field background fetch (RTMA-RU from NOMADS) ─────────────────
 
+def archive_loop(
+    *,
+    app_state: AppState,
+    data_dir: Path,
+    stop_event: threading.Event,
+) -> None:
+    """Background loop: archive closed months and prune old data.
+
+    Runs once per hour, acts at ~5:05 AM Mountain Time:
+    1. If a calendar month has closed, export it to a standalone gzip'd SQLite.
+    2. Prune hot DB rows older than DB_RETENTION_DAYS.
+    3. Rsync archives to DB_BACKUP_TARGET (if configured).
+    4. Clean up old JSON snapshot files from disk.
+    """
+    from mobileair.config import DB_RETENTION_DAYS, DB_MAX_SIZE_MB, DB_BACKUP_TARGET
+    import subprocess
+    import calendar
+
+    archive_dir = data_dir / "archives"
+    last_archive_check: str = ""  # YYYY-MM-DD of last check
+
+    while not stop_event.is_set():
+        stop_event.wait(3600)  # check hourly
+        if stop_event.is_set():
+            break
+
+        try:
+            now_mt = datetime.now(_MOUNTAIN_TZ)
+            today_str = now_mt.strftime("%Y-%m-%d")
+
+            # Only act once per day, around 5 AM MT
+            if today_str == last_archive_check:
+                continue
+            if now_mt.hour < 5 or now_mt.hour > 6:
+                continue
+            last_archive_check = today_str
+
+            db = app_state.db_worker
+            if db is None:
+                continue
+
+            # ── Archive closed months ──
+            # Check if the previous month is complete and not yet archived
+            if now_mt.month == 1:
+                prev_year, prev_month = now_mt.year - 1, 12
+            else:
+                prev_year, prev_month = now_mt.year, now_mt.month - 1
+
+            archive_path = db.archive_month(prev_year, prev_month, archive_dir)
+            if archive_path:
+                _log(f"[Archive] Archived {prev_year}-{prev_month:02d} to {archive_path}")
+
+            # ── Prune old data ──
+            retention_s = DB_RETENTION_DAYS * 86400
+            cutoff_ts = time.time() - retention_s
+            pruned = db.prune_before(cutoff_ts)
+            if pruned > 0:
+                _log(f"[Archive] Pruned {pruned} rows older than {DB_RETENTION_DAYS} days")
+
+            # Emergency prune if DB is too large
+            size_mb = db.db_size_mb()
+            if size_mb > DB_MAX_SIZE_MB:
+                _log(f"[Archive] DB size {size_mb:.0f}MB exceeds cap {DB_MAX_SIZE_MB}MB — emergency prune")
+                emergency_cutoff = time.time() - (DB_RETENTION_DAYS * 86400 // 2)
+                db.prune_before(emergency_cutoff)
+
+            # ── Clean old JSON snapshot files ──
+            snapshots_dir = data_dir / "snapshots"
+            if snapshots_dir.is_dir():
+                cutoff_date = (now_mt - timedelta(days=DB_RETENTION_DAYS)).strftime("%Y-%m-%d")
+                for p in snapshots_dir.glob("*.json"):
+                    if p.stem < cutoff_date:
+                        try:
+                            p.unlink()
+                            _log(f"[Archive] Removed old snapshot file {p.name}")
+                        except OSError:
+                            pass
+
+            # ── Offsite backup ──
+            if DB_BACKUP_TARGET:
+                try:
+                    # Rsync archives
+                    subprocess.run(
+                        ["rsync", "-az", "--timeout=60",
+                         str(archive_dir) + "/", DB_BACKUP_TARGET],
+                        timeout=120, capture_output=True, check=False,
+                    )
+                    # Warm backup of live DB
+                    subprocess.run(
+                        ["rsync", "-az", "--timeout=60",
+                         str(data_dir / "dustytrails.db"),
+                         DB_BACKUP_TARGET],
+                        timeout=120, capture_output=True, check=False,
+                    )
+                    _log(f"[Archive] Rsync to {DB_BACKUP_TARGET} complete")
+                except Exception as e:
+                    _log(f"[Archive] Rsync failed: {e}")
+
+        except Exception as e:
+            _log(f"[Archive] Error: {e}")
+
+    _log("[Archive] archive_loop thread STOPPED")
+
+
 def wind_field_fetch_loop(
     *,
     app_state: AppState,
@@ -4994,17 +5035,70 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 cache_key = None
 
             try:
-                # Try DB first, then fall back to filesystem
+                # Load snapshot from DB only — filesystem fallback removed.
+                # All daily snapshots were migrated to SQLite; if it's not in
+                # the DB, it doesn't exist.
                 state = None
                 if app_state.db_worker is not None:
                     try:
                         state = app_state.db_worker.get_daily_snapshot(date_str)
                     except Exception:
                         pass
-                if state is None:
-                    state = load_snapshot(data_dir, date_str)
+                # if state is None:
+                #     state = load_snapshot(data_dir, date_str)
                 if state is None:
                     return self._send(404, b'{"error": "snapshot not found"}', "application/json")
+
+                # Strip PA sensors from the snapshot unless the DB confirms
+                # PA data actually existed on this date.  Old snapshot files may have
+                # PA entries baked in from a time when the sensor list was different or
+                # data was injected incorrectly.
+                existing_pa = [f for f in (state.get("fixed") or []) if f.get("purpleair")]
+                if existing_pa:
+                    pa_confirmed = False
+                    if app_state.db_worker is not None:
+                        try:
+                            _day_mt = datetime.strptime(date_str, "%Y-%m-%d").replace(
+                                hour=5, minute=0, second=0, microsecond=0, tzinfo=_MOUNTAIN_TZ)
+                            _ts_start = _day_mt.timestamp()
+                            _ts_end = _ts_start + 86400  # 24 hours
+                            pa_confirmed = app_state.db_worker.has_readings_for_date(
+                                "PA_", _ts_start, _ts_end
+                            )
+                        except Exception:
+                            pa_confirmed = False
+                    else:
+                        # Fallback: check in-memory fixed_history (today only)
+                        try:
+                            _day_mt = datetime.strptime(date_str, "%Y-%m-%d").replace(
+                                hour=0, minute=0, second=0, microsecond=0, tzinfo=_MOUNTAIN_TZ)
+                            _pa_prefixes = _utc_date_prefixes_for_mt_day(_day_mt)
+                        except (ValueError, TypeError):
+                            _pa_prefixes = (date_str,)
+                        with app_state.lock:
+                            for sensor_id, pollutants in app_state.fixed_history.items():
+                                if not sensor_id.startswith("PA_"):
+                                    continue
+                                for entries in pollutants.values():
+                                    if any(e.get("time", "")[:10] in _pa_prefixes for e in entries):
+                                        pa_confirmed = True
+                                        break
+                                if pa_confirmed:
+                                    break
+                    if not pa_confirmed:
+                        _log(f"[Snapshot] Stripping {len(existing_pa)} stale PA sensors from {date_str} (no fixed_history data for that date)")
+                        state["fixed"] = [f for f in state["fixed"] if not f.get("purpleair")]
+
+                # Inject wind snapshots from DB if not already embedded
+                # (new saves omit wind; old saves may have it baked in).
+                if "wind_snapshots" not in state and app_state.db_worker is not None:
+                    try:
+                        date_compact = date_str.replace("-", "")  # YYYY-MM-DD → YYYYMMDD
+                        wind_data = app_state.db_worker.get_wind_snapshots(date_compact)
+                        if wind_data:
+                            state["wind_snapshots"] = wind_data
+                    except Exception:
+                        pass  # wind playback just won't be available
 
                 # Trim to the requested day's 5 AM–5 AM MST window.
                 # Current saves are pre-trimmed, but older snapshots may not be.
@@ -5443,6 +5537,13 @@ def main() -> int:
         daemon=True
     ).start()
 
+    # Start archive/prune loop (hourly check, acts at 5 AM MT)
+    threading.Thread(
+        target=archive_loop,
+        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+        daemon=True
+    ).start()
+
     # History prefetch disabled — Select Day now loads from local snapshots
     # threading.Thread(
     #     target=_history_prefetch_loop,
@@ -5616,6 +5717,12 @@ def start_server_in_thread(host: str = "0.0.0.0", port: int = 8766, interval: fl
     # Start wind vector field fetch loop (RTMA-RU from NOMADS, 15-min refresh)
     threading.Thread(
         target=wind_field_fetch_loop,
+        kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=archive_loop,
         kwargs=dict(app_state=app_state, data_dir=data_dir, stop_event=stop_event),
         daemon=True
     ).start()

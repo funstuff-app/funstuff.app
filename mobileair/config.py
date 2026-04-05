@@ -147,3 +147,10 @@ DB_WRITE_BATCH_SIZE = 200          # Commit after this many queued writes
 DB_WRITE_FLUSH_INTERVAL_S = 30.0   # Commit at least this often (seconds)
 DB_READ_POOL_SIZE = 3              # Concurrent read-only connections
 DB_WAL_CHECKPOINT_INTERVAL_S = 300 # Passive WAL checkpoint every 5 min
+
+# Archival & retention
+import os as _os_db
+DB_RETENTION_DAYS = int(_os_db.environ.get("DUSTY_DB_RETENTION_DAYS", "30"))
+DB_MAX_SIZE_MB = int(_os_db.environ.get("DUSTY_DB_MAX_SIZE_MB", "1024"))
+DB_BACKUP_TARGET = _os_db.environ.get("DUSTY_BACKUP_TARGET", "")  # rsync dest
+DB_PRUNE_BATCH_SIZE = 1000        # rows per DELETE batch (avoid long locks)

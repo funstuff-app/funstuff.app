@@ -399,5 +399,159 @@ class TestAnalytics(unittest.TestCase):
         self.assertEqual(rows[0]["client_id"], "client-abc")
 
 
+class TestHasReadingsForDate(unittest.TestCase):
+    """Test the has_readings_for_date query used for PA validation."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = Path(self.tmpdir) / "test.db"
+        self.worker = DbWorker(self.db_path)
+        self.worker.start()
+
+    def tearDown(self):
+        self.worker.stop()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_finds_pa_reading(self):
+        ts = 1711584000.0  # 2024-03-28 00:00:00 UTC
+        self.worker.enqueue_reading(
+            sensor_id="PA_4059", source="purpleair", ts=ts,
+            lat=40.7, lon=-111.9, pollutant="PM25", value=12.3, color="#00E400",
+        )
+        self.worker.stop()
+        self.worker.start()
+        time.sleep(0.2)
+        self.assertTrue(self.worker.has_readings_for_date(
+            "PA_", ts - 3600, ts + 3600))
+
+    def test_no_reading_outside_range(self):
+        ts = 1711584000.0
+        self.worker.enqueue_reading(
+            sensor_id="PA_4059", source="purpleair", ts=ts,
+            lat=40.7, lon=-111.9, pollutant="PM25", value=12.3, color="#00E400",
+        )
+        self.worker.stop()
+        self.worker.start()
+        time.sleep(0.2)
+        self.assertFalse(self.worker.has_readings_for_date(
+            "PA_", ts + 86400, ts + 2 * 86400))
+
+    def test_finds_legacy_prefixed_id(self):
+        """Readings with old 'pa:PA_' prefix should also match."""
+        ts = 1711584000.0
+        self.worker.enqueue_reading(
+            sensor_id="pa:PA_4059", source="purpleair", ts=ts,
+            lat=40.7, lon=-111.9, pollutant="PM25", value=12.3, color="#00E400",
+        )
+        self.worker.stop()
+        self.worker.start()
+        time.sleep(0.2)
+        self.assertTrue(self.worker.has_readings_for_date(
+            "PA_", ts - 3600, ts + 3600))
+
+
+class TestArchiveAndPrune(unittest.TestCase):
+    """Test archive_month and prune_before."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = Path(self.tmpdir) / "test.db"
+        self.archive_dir = Path(self.tmpdir) / "archives"
+        self.worker = DbWorker(self.db_path)
+        self.worker.start()
+
+    def tearDown(self):
+        self.worker.stop()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_archive_month(self):
+        # Insert readings in March 2024
+        from datetime import datetime, timezone
+        ts_mar = datetime(2024, 3, 15, tzinfo=timezone.utc).timestamp()
+        ts_apr = datetime(2024, 4, 15, tzinfo=timezone.utc).timestamp()
+        for i in range(5):
+            self.worker.enqueue_reading(
+                sensor_id=f"sensor_{i}", source="fixed", ts=ts_mar + i * 60,
+                lat=40.7, lon=-111.9, pollutant="PM25", value=float(i * 10),
+                color="#00E400",
+            )
+        # Insert one in April (should NOT be in March archive)
+        self.worker.enqueue_reading(
+            sensor_id="sensor_9", source="fixed", ts=ts_apr,
+            lat=40.7, lon=-111.9, pollutant="PM25", value=99.0,
+            color="#FF0000",
+        )
+        self.worker.stop()
+        self.worker.start()
+        time.sleep(0.3)
+
+        path = self.worker.archive_month(2024, 3, self.archive_dir)
+        self.assertIsNotNone(path)
+        self.assertTrue(path.exists())
+        self.assertTrue(path.name.endswith(".db.gz"))
+
+        # Verify archive contents
+        import shutil
+        unzipped = Path(self.tmpdir) / "verify.db"
+        with gzip.open(str(path), "rb") as f_in:
+            with open(unzipped, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        conn = sqlite3.connect(str(unzipped))
+        count = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+        self.assertEqual(count, 5)  # only March readings
+        conn.close()
+
+    def test_archive_idempotent(self):
+        """Second archive call for same month returns existing file."""
+        from datetime import datetime, timezone
+        ts = datetime(2024, 3, 15, tzinfo=timezone.utc).timestamp()
+        self.worker.enqueue_reading(
+            sensor_id="s1", source="fixed", ts=ts,
+            lat=40.7, lon=-111.9, pollutant="PM25", value=10.0, color="#00E400",
+        )
+        self.worker.stop()
+        self.worker.start()
+        time.sleep(0.2)
+
+        p1 = self.worker.archive_month(2024, 3, self.archive_dir)
+        p2 = self.worker.archive_month(2024, 3, self.archive_dir)
+        self.assertEqual(p1, p2)
+
+    def test_prune_before(self):
+        from datetime import datetime, timezone
+        ts_old = datetime(2024, 1, 15, tzinfo=timezone.utc).timestamp()
+        ts_new = datetime(2024, 6, 15, tzinfo=timezone.utc).timestamp()
+        for i in range(3):
+            self.worker.enqueue_reading(
+                sensor_id=f"old_{i}", source="fixed", ts=ts_old + i,
+                lat=40.7, lon=-111.9, pollutant="PM25", value=10.0, color="#00E400",
+            )
+        for i in range(2):
+            self.worker.enqueue_reading(
+                sensor_id=f"new_{i}", source="fixed", ts=ts_new + i,
+                lat=40.7, lon=-111.9, pollutant="PM25", value=20.0, color="#FFFF00",
+            )
+        self.worker.stop()
+        self.worker.start()
+        time.sleep(0.3)
+
+        # Prune before April 2024
+        cutoff = datetime(2024, 4, 1, tzinfo=timezone.utc).timestamp()
+        pruned = self.worker.prune_before(cutoff)
+        self.assertGreaterEqual(pruned, 3)  # at least 3 old readings
+
+        # Verify new readings survived
+        assert self.worker.read_pool is not None
+        with self.worker.read_pool.connection() as conn:
+            rows = conn.execute("SELECT COUNT(*) FROM readings").fetchone()
+        self.assertEqual(rows[0], 2)
+
+    def test_db_size_mb(self):
+        size = self.worker.db_size_mb()
+        self.assertGreater(size, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
