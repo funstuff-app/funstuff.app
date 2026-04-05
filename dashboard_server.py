@@ -2805,7 +2805,7 @@ def purpleair_fetch_loop(
     def _apply_fetched(fetched: list[dict], now: float) -> None:
         """Merge fetched pm2.5 readings into app_state and accumulate history.
         Must be called with app_state.lock held."""
-        time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fallback_time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         by_id = {s["sensor_index"]: s for s in fetched if s.get("sensor_index") is not None}
         existing_ids = {s.get("sensor_index") for s in app_state.purpleair_sensors}
         for s in app_state.purpleair_sensors:
@@ -2820,6 +2820,14 @@ def purpleair_fetch_loop(
             except (TypeError, ValueError):
                 continue
             s["pm2.5"] = pm25_val
+            last_seen_ts = by_id[sid].get("last_seen")
+            if last_seen_ts is not None:
+                try:
+                    time_utc = datetime.fromtimestamp(int(last_seen_ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except (TypeError, ValueError, OSError):
+                    time_utc = fallback_time_utc
+            else:
+                time_utc = fallback_time_utc
             color = _get_aqi_color("PM25", pm25_val)
             accumulate_fixed_reading(app_state, f"PA_{sid}", "PM25", round(pm25_val, 1), color, time_utc)
         # Brand-new sensors not yet in cache
@@ -2830,6 +2838,14 @@ def purpleair_fetch_loop(
                 if pm25_raw is not None:
                     try:
                         pm25_val = float(pm25_raw)
+                        last_seen_ts = s.get("last_seen")
+                        if last_seen_ts is not None:
+                            try:
+                                time_utc = datetime.fromtimestamp(int(last_seen_ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            except (TypeError, ValueError, OSError):
+                                time_utc = fallback_time_utc
+                        else:
+                            time_utc = fallback_time_utc
                         color = _get_aqi_color("PM25", pm25_val)
                         accumulate_fixed_reading(app_state, f"PA_{sid}", "PM25", round(pm25_val, 1), color, time_utc)
                     except (TypeError, ValueError):
@@ -2872,8 +2888,8 @@ def purpleair_fetch_loop(
             # Also fetches all pm2.5 values so the full picture stays current.
             need_meta = (now - app_state.purpleair_meta_last_fetch) >= META_INTERVAL
             if need_meta:
-                _log("[PurpleAir] Metadata refresh: fetching name,latitude,longitude,pm2.5 for all sensors")
-                meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude,pm2.5")
+                _log("[PurpleAir] Metadata refresh: fetching name,latitude,longitude,pm2.5,last_seen for all sensors")
+                meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude,pm2.5,last_seen")
                 debug_info["calls"].append({"type": "metadata_full", "count": len(meta_sensors)})
                 if meta_sensors:
                     with app_state.lock:
@@ -2901,7 +2917,7 @@ def purpleair_fetch_loop(
                 sentinels = _pick_sentinels(app_state.purpleair_sensors, grid)
             sentinel_ids = [s["sensor_index"] for s in sentinels]
 
-            sentinel_data = _fetch_purpleair_sensors(fields="pm2.5", sensor_indices=sentinel_ids)
+            sentinel_data = _fetch_purpleair_sensors(fields="pm2.5,last_seen", sensor_indices=sentinel_ids)
             debug_info["calls"].append({"type": "sentinel_poll", "count": len(sentinel_ids)})
 
             # Detect AQI color-category changes and queue full cluster fetches.
@@ -2939,7 +2955,7 @@ def purpleair_fetch_loop(
             cluster_ids_to_fetch -= set(sentinel_ids)
             if cluster_ids_to_fetch:
                 cluster_list = list(cluster_ids_to_fetch)
-                cluster_data = _fetch_purpleair_sensors(fields="pm2.5",
+                cluster_data = _fetch_purpleair_sensors(fields="pm2.5,last_seen",
                                                         sensor_indices=cluster_list)
                 debug_info["calls"].append({"type": "cluster_fetch", "count": len(cluster_list)})
                 with app_state.lock:
