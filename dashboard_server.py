@@ -705,13 +705,67 @@ _WEATHER_KEYS = {"BARPR", "DEWPOINT", "TEMP", "WD", "WS", "RHUM", "SOLAR", "PREC
 
 
 def load_fixed_history(app_state: AppState, data_dir: Path) -> None:
-    """Initialize an empty fixed_history dict.
+    """Hydrate today's fixed_history from the DB readings table.
 
-    History is now a today-only in-memory cache that fills from live data
-    on the first fetch cycle.  The DB (readings table) is the durable store.
-    Legacy ``fixed_history.json`` is left on disk but no longer read.
+    On startup, query all non-mobile readings since today's 5 AM MT boundary
+    and reconstruct the in-memory cache that ``_inject_fixed_history`` uses.
+    Falls back to an empty dict if the DB is unavailable.
     """
     app_state.fixed_history = {}
+
+    db = app_state.db_worker
+    if db is None or db.read_pool is None:
+        return
+
+    # Today's 5 AM Mountain Time boundary (day starts at 5 AM MT)
+    now_mt = datetime.now(_MOUNTAIN_TZ)
+    today_5am = now_mt.replace(hour=5, minute=0, second=0, microsecond=0)
+    if now_mt.hour < 5:
+        today_5am -= timedelta(days=1)
+    since_ts = today_5am.timestamp()
+
+    try:
+        rows = db.query_fixed_readings_since(since_ts)
+    except Exception as e:
+        _log(f"[FixedHistory] DB hydration failed: {e}")
+        return
+
+    from mobileair.aqi import color_to_idx as _c2i
+
+    count = 0
+    for row in rows:
+        sid = row["sensor_id"]
+        pol = row["pollutant"]
+
+        if sid not in app_state.fixed_history:
+            app_state.fixed_history[sid] = {}
+        if pol not in app_state.fixed_history[sid]:
+            app_state.fixed_history[sid][pol] = []
+
+        time_utc = None
+        meta_raw = row.get("meta")
+        if meta_raw:
+            try:
+                meta = json.loads(meta_raw)
+                time_utc = meta.get("time_utc")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        val = row["value"]
+        app_state.fixed_history[sid][pol].append({
+            "val": str(val) if val is not None else None,
+            "ci": _c2i(row.get("color")),
+            "time": time_utc,
+            "recorded_at": row["ts"],
+        })
+        count += 1
+
+    # Apply per-sensor caps (same as accumulate_fixed_reading)
+    for sid, pols in app_state.fixed_history.items():
+        max_entries = 5760 if sid == "Home" else 2880
+        for pol in pols:
+            if len(pols[pol]) > max_entries:
+                pols[pol] = pols[pol][-max_entries:]
 
 
 def save_fixed_history(app_state: AppState) -> None:
@@ -821,6 +875,46 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
                         pa_seeded += 1
                 if pa_seeded:
                     _log(f"[Snapshot] Seeded {pa_seeded} PurpleAir sensors from snapshot")
+
+        # Backfill fixed_history from snapshot when DB hydration found nothing
+        # (covers first boot, empty DB, or DB corruption)
+        if not app_state.fixed_history:
+            fixed = snapshot.get("fixed", [])
+            if isinstance(fixed, list):
+                from mobileair.aqi import color_to_idx as _c2i
+                hist_seeded = 0
+                with app_state.lock:
+                    for f in fixed:
+                        sid_str = f.get("id", "")
+                        if not sid_str:
+                            continue
+                        readings = f.get("readings", {})
+                        if not isinstance(readings, dict):
+                            continue
+                        for pol, rdg in readings.items():
+                            if not isinstance(rdg, dict):
+                                continue
+                            hist_vals = rdg.get("history")
+                            hist_times = rdg.get("history_times")
+                            hist_colors = rdg.get("history_colors")
+                            if not isinstance(hist_vals, list) or not hist_vals:
+                                continue
+                            if sid_str not in app_state.fixed_history:
+                                app_state.fixed_history[sid_str] = {}
+                            entries = []
+                            for i, v in enumerate(hist_vals):
+                                t = hist_times[i] if isinstance(hist_times, list) and i < len(hist_times) else None
+                                c = hist_colors[i] if isinstance(hist_colors, list) and i < len(hist_colors) else None
+                                entries.append({
+                                    "val": str(v) if v is not None else None,
+                                    "ci": _c2i(c) if isinstance(c, str) else (c if isinstance(c, int) else 0),
+                                    "time": t,
+                                    "recorded_at": None,
+                                })
+                            app_state.fixed_history[sid_str][pol] = entries
+                            hist_seeded += len(entries)
+                if hist_seeded:
+                    _log(f"[Snapshot] Backfilled {hist_seeded} history entries from snapshot")
 
         return loaded_count > 0
         

@@ -339,6 +339,20 @@ class DbWorker:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
 
+    def query_fixed_readings_since(
+        self, since_ts: float
+    ) -> list[dict[str, Any]]:
+        """Return all non-mobile readings since *since_ts*, ordered by ts ascending."""
+        assert self.read_pool is not None
+        with self.read_pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT sensor_id, pollutant, value, color, ts, meta "
+                "FROM readings WHERE source != 'mobile' AND ts >= ? "
+                "ORDER BY ts",
+                (since_ts,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def query_trail_since(
         self, sensor_id: str, since_ts: float
     ) -> list[dict[str, Any]]:
