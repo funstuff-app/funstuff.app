@@ -868,8 +868,8 @@ class MapView {
       // Apply velocity, then decay it quickly (feels like native trackpad momentum).
       const z2 = clamp(this.zoom + this._pinchVz * dt, this._zoomMin, this._zoomMax);
       this._setZoomAroundScreenPoint(z2, this._pinchAnchorSX, this._pinchAnchorSY);
-      this._tilesSnapshotCanvas = null;
-      this._tilesSnapshotMeta = null;
+      // Keep tile snapshot alive so drawTiles fast-path (scale + return) fires.
+      // The snapshot is recaptured with real tiles once inertia ends.
       this._requestZoomRedraw();
       this._notifyViewChanged();
 
@@ -7702,8 +7702,11 @@ class MapView {
     const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}|${this._paFieldPollutant || 'default'}`;
     const viewChanged = this._trailCacheViewKey !== trailViewKey;
     const timeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? (pbTimeMs - this._trailCacheTimeMs) : 0;
-    // Trail fading uses 45-min window; 2-second threshold keeps fading visually smooth while allowing fast scrubbing
-    const timeChanged = Math.abs(timeDelta) > 2000;
+    // Trail fading uses 45-min window. During active scrubbing, widen the threshold
+    // so trails aren't fully redrawn every frame (the expensive O(vehicles*points) path).
+    // 30s during scrub still gives smooth visual feedback; 2s during playback keeps fading smooth.
+    const timeThreshold = this._scrubbing ? 30000 : 2000;
+    const timeChanged = Math.abs(timeDelta) > timeThreshold;
 
     // Precompute center world once per frame; avoids repeated center projection in worldToScreen().
     const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
