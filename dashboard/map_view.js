@@ -782,6 +782,9 @@ class MapView {
 
   _invalidateOverlayStatic() {
     this._overlayStaticDirty = true;
+  }
+
+  _invalidatePaField() {
     this._paFieldKey = "";
     this._paFieldValidRange = null;
     this._preWarmScanValidUntilMs = null;
@@ -2469,6 +2472,7 @@ class MapView {
     this._paFieldCtx = null;
     this._paGrid = null;
     this._invalidateOverlayStatic();
+    this._invalidatePaField();
     // Invalidate trail cache on resize
     this._trailCacheCanvas = null;
     this._trailCacheViewKey = "";
@@ -6276,6 +6280,7 @@ class MapView {
     this._paFieldPollutant = tab || null;
     if (prev !== this._paFieldPollutant) {
       this._invalidateOverlayStatic();
+      this._invalidatePaField();
       // Invalidate trail canvas cache so trails redraw with new pollutant colors
       this._trailCacheViewKey = "";
       this._trailCacheCanvas = null;
