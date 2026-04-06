@@ -2737,7 +2737,14 @@ class MapView {
       ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
       ...(this._paFieldPollutant == null ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
     ];
+    const _clickRefMs = this.getPlaybackTimeMs() || this._dataNowMs();
+    const _PA_FADE_MS = 45 * 60 * 1000;
     for (const m of candidates) {
+      // Skip fully-faded PurpleAir sensors
+      if (m.purpleair) {
+        const sMs = m.last_seen ? m.last_seen * 1000 : null;
+        if (sMs && (_clickRefMs - sMs) >= _PA_FADE_MS) continue;
+      }
       let lat = Number(m.lat), lon = Number(m.lon);
       if (m.type === "mobile") {
         const pose = this._mobilePoseForRender(m, performance.now());
@@ -2788,7 +2795,14 @@ class MapView {
       ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
       ...(this._paFieldPollutant == null ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
     ];
+    const _tapRefMs = this.getPlaybackTimeMs() || this._dataNowMs();
+    const _TAP_PA_FADE_MS = 45 * 60 * 1000;
     for (const m of candidates) {
+      // Skip fully-faded PurpleAir sensors
+      if (m.purpleair) {
+        const sMs = m.last_seen ? m.last_seen * 1000 : null;
+        if (sMs && (_tapRefMs - sMs) >= _TAP_PA_FADE_MS) continue;
+      }
       let lat = Number(m.lat), lon = Number(m.lon);
       if (m.type === "mobile") {
         const pose = this._mobilePoseForRender(m, performance.now());
