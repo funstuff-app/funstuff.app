@@ -85,12 +85,17 @@ function _readingForLegendTab(readings, legendTab) {
   return null;
 }
 
-function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab, bufW, bufH) {
+function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab, bufW, bufH, refNowMs) {
   const isPm25 = !pollutantTab || pollutantTab === "pm25";
   const readingKeys = _LEGEND_TAB_READING_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_READING_KEYS.pm25;
   // Project to buffer center when overfetch dimensions supplied
   const projW = bufW || cssW;
   const projH = bufH || cssH;
+
+  // Staleness fade for PurpleAir sensors (matches dot rendering in drawOverlay)
+  const PA_FADE_MS = 45 * 60 * 1000;
+  const PA_FADE_TAIL = 0.20;
+  const paFadeStart = PA_FADE_MS * (1.0 - PA_FADE_TAIL);
 
   const paLatLons = [];
   for (const f of fixed) {
@@ -128,6 +133,21 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
       if (f.purpleair) continue;
     }
 
+    // PurpleAir staleness: skip fully stale, decay weight in tail
+    let staleWeight = 1.0;
+    if (f.purpleair && refNowMs) {
+      const sMs = f.last_seen ? f.last_seen * 1000 : null;
+      if (sMs) {
+        const ageMs = refNowMs - sMs;
+        if (ageMs >= PA_FADE_MS) continue;
+        if (ageMs > paFadeStart) {
+          const u = (ageMs - paFadeStart) / (PA_FADE_MS - paFadeStart);
+          staleWeight = (1 - u) * (1 - u);
+          if (staleWeight <= 0.01) continue;
+        }
+      }
+    }
+
     const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
     let value = NaN;
     for (const rk of readingKeys) {
@@ -141,7 +161,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
       sx: wp.x - centerW.x + projW / 2,
       sy: wp.y - centerW.y + projH / 2,
       value,
-      weightMultiplier: f.purpleair ? 1 : _PA_FIELD_FIXED_WEIGHT_MULTIPLIER,
+      weightMultiplier: (f.purpleair ? 1 : _PA_FIELD_FIXED_WEIGHT_MULTIPLIER) * staleWeight,
     });
     fingerprint += _pm25ColorCat(value);
   }
@@ -217,9 +237,10 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       }
 
       // Spatial dedup: 1 sensor per ~220m cell. Newest-first → skip if slot taken.
+      // Reduced to half for performance diagnostics
       const lat = Number(p.lat), lon = Number(p.lon);
       if (!isFinite(lat) || !isFinite(lon)) continue;
-      const slotKey = `${(lat * 500) | 0},${(lon * 500) | 0}`;
+      const slotKey = `${(lat * 250) | 0},${(lon * 250) | 0}`;
       if (sensorMap.has(slotKey)) continue;
 
       // Project GPS to screen coords (use cached norm when available)
@@ -6515,15 +6536,17 @@ class MapView {
     const bufW = Math.min(Math.ceil(cssW * _OVERFETCH), Math.floor(maxDevPx / dpr));
     const bufH = Math.min(Math.ceil(cssH * _OVERFETCH), Math.floor(maxDevPx / dpr));
 
-    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH);
-    const paSensors = paField.sensors;
-
-    // ── Inject virtual sensors from mobile trail GPS points ──
-    const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
+    // Reference time for staleness fade (playback time or live clock)
     const _pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
     const _pbBounds = this.playbackMode ? this.getPlaybackBounds() : null;
     const _boundsMaxMs = (_pbBounds?.maxMs != null && isFinite(_pbBounds.maxMs)) ? _pbBounds.maxMs : null;
     const virtualRefNowMs = (_pbTimeMs != null && isFinite(_pbTimeMs)) ? Number(_pbTimeMs) : (_boundsMaxMs ?? this._dataNowMs());
+
+    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH, virtualRefNowMs);
+    const paSensors = paField.sensors;
+
+    // ── Inject virtual sensors from mobile trail GPS points ──
+    const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
     const virtualField = _collectVirtualMobileSensors(
       mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab, bufW, bufH
     );
@@ -6938,7 +6961,7 @@ class MapView {
       const dpr = this._dpr || (window.devicePixelRatio || 1);
       const bufW = Math.min(Math.ceil(cssW * _OVERFETCH), Math.floor(_OVERFETCH_MAX_DEVICE_PX / dpr));
       const bufH = Math.min(Math.ceil(cssH * _OVERFETCH), Math.floor(_OVERFETCH_MAX_DEVICE_PX / dpr));
-      const paField = _collectPaFieldSensors(fixed, tMs, centerW, z, cssW, cssH, undefined, bufW, bufH);
+      const paField = _collectPaFieldSensors(fixed, tMs, centerW, z, cssW, cssH, undefined, bufW, bufH, tMs);
       const paSensors = paField.sensors;
       const fp = paField.fingerprint;
       if (paSensors.length === 0) continue;
@@ -9182,6 +9205,13 @@ class MapView {
 
     // Debug: render virtual mobile sensors as ghost dots
     if (window._fieldDebug?.showVirtual && this._virtualMobileSensors?.length > 0) {
+      // vs.sx/sy are in overfetch buffer space; shift to viewport space.
+      const _bufW = this._paFieldBufW || (this._cssW || 1);
+      const _bufH = this._paFieldBufH || (this._cssH || 1);
+      const _vw = this._cssW || 1;
+      const _vh = this._cssH || 1;
+      const _offX = (_bufW - _vw) / 2;
+      const _offY = (_bufH - _vh) / 2;
       ctx.save();
       for (const vs of this._virtualMobileSensors) {
         const rgb = _pm25ToRgb(vs.value);
@@ -9192,7 +9222,7 @@ class MapView {
         ctx.globalAlpha = 0.5 * (vs.weightMultiplier || 0.01);
         ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
         ctx.beginPath();
-        ctx.arc(vs.sx, vs.sy, 4, 0, Math.PI * 2);
+        ctx.arc(vs.sx - _offX, vs.sy - _offY, 4, 0, Math.PI * 2);
         ctx.fill();
       }
       ctx.restore();
