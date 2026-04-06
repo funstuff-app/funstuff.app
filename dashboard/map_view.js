@@ -467,6 +467,7 @@ class MapView {
 
     // PurpleAir scalar field underlay: cached offscreen canvas of radial gradient discs.
     this._paFieldCanvas = null;
+    this._paFieldCtx = null;
     this._paFieldKey = "";
     // Cross-fade: previous field canvas + transition timing
     this._paFieldPrevCanvas = null;
@@ -2465,6 +2466,7 @@ class MapView {
     this._tilesSnapshotCanvas = null;
     this._tilesSnapshotMeta = null;
     this._paFieldCanvas = null;
+    this._paFieldCtx = null;
     this._paGrid = null;
     this._invalidateOverlayStatic();
     // Invalidate trail cache on resize
@@ -6383,6 +6385,9 @@ class MapView {
           ctx.setTransform(dpr, 0, 0, dpr, dpr * tx, dpr * ty);
         }
         ctx.globalAlpha = this._paFieldDimCurrent;
+        const _uq = (window._fieldDebug && window._fieldDebug.upscaleQuality) || "high";
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = (_uq === "2pass") ? "medium" : _uq;
         ctx.drawImage(this._paFieldCanvas, -offX, -offY, bufW, bufH);
         ctx.restore();
         // Drop in-progress cross-fade to avoid stale fades during gesture
@@ -6406,6 +6411,7 @@ class MapView {
 
     // Overfetch offset: the field canvas is larger than the viewport.
     // Draw it shifted so the viewport windows over the center portion.
+    // Use 9-param drawImage so source canvas can be any resolution (2pass = small).
     const _dpr = this._dpr || (window.devicePixelRatio || 1);
     const _cssW = this._cssW || 1;
     const _cssH = this._cssH || 1;
@@ -6413,6 +6419,17 @@ class MapView {
     const _bh = this._paFieldBufH || _cssH;
     const _offPx = (_bw - _cssW) / 2 * _dpr;
     const _offPy = (_bh - _cssH) / 2 * _dpr;
+    const _uq = (window._fieldDebug && window._fieldDebug.upscaleQuality) || "high";
+    const _iq = (_uq === "2pass") ? "medium" : _uq;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = _iq;
+
+    // Helper: draw a PA field canvas (any resolution) into the viewport.
+    const _drawPaCanvas = (src, alpha) => {
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(src, 0, 0, src.width, src.height,
+                    -_offPx, -_offPy, _bw * _dpr, _bh * _dpr);
+    };
 
     // Cross-fade from previous field canvas to current one
     const dimAlpha = this._paFieldDimCurrent;
@@ -6420,10 +6437,8 @@ class MapView {
       ? Math.min(1, (performance.now() - this._paFieldFadeStart) / this._paFieldFadeMs)
       : 1;
     if (this._paFieldPrevCanvas && fadeT < 1) {
-      ctx.globalAlpha = (1 - fadeT) * dimAlpha;
-      ctx.drawImage(this._paFieldPrevCanvas, -_offPx, -_offPy);
-      ctx.globalAlpha = fadeT * dimAlpha;
-      ctx.drawImage(this._paFieldCanvas, -_offPx, -_offPy);
+      _drawPaCanvas(this._paFieldPrevCanvas, (1 - fadeT) * dimAlpha);
+      _drawPaCanvas(this._paFieldCanvas, fadeT * dimAlpha);
       ctx.globalAlpha = 1;
       // Schedule another frame to complete the fade (no-op if playback loop is running)
       if (!this._paFieldFadeRAF) {
@@ -6435,8 +6450,7 @@ class MapView {
       }
     } else {
       if (this._paFieldPrevCanvas) this._paFieldPrevCanvas = null;
-      ctx.globalAlpha = dimAlpha;
-      ctx.drawImage(this._paFieldCanvas, -_offPx, -_offPy);
+      _drawPaCanvas(this._paFieldCanvas, dimAlpha);
     }
     ctx.restore();
   }
@@ -6513,7 +6527,7 @@ class MapView {
     const allSensors = paSensors.concat(virtualField.sensors);
     const fingerprint = paField.fingerprint + (virtualField.fingerprint ? "|v:" + virtualField.fingerprint : "");
     const nSensors = allSensors.length;
-    if (nSensors === 0) { this._paFieldCanvas = null; return; }
+    if (nSensors === 0) { this._paFieldCanvas = null; this._paFieldCtx = null; return; }
 
     // Disable validity-range fast-skip when virtual sensors are present (they age continuously)
     if (virtualField.sensors.length > 0) this._paFieldValidRange = null;
@@ -6538,6 +6552,7 @@ class MapView {
     if (this._paFieldCanvas && fingerprintChanged) {
       this._paFieldPrevCanvas = this._paFieldCanvas;
       this._paFieldCanvas = null;
+      this._paFieldCtx = null;
       this._paFieldFadeStart = performance.now();
     } else {
       // View-only change — drop the previous canvas to avoid stale fades
@@ -6780,42 +6795,45 @@ class MapView {
 
   /** Upscale the coarse interpolation grid to viewport size with bilinear smoothing. */
   _upscalePaField(tc, cssW, cssH, dpr) {
-    if (!this._paFieldCanvas) this._paFieldCanvas = document.createElement("canvas");
+    const _fd = window._fieldDebug;
+    const mode = (_fd && _fd.upscaleQuality) || "high";
+
+    if (mode === "2pass") {
+      // Store grid-x4 intermediate as _paFieldCanvas (~272x172 instead of ~4320x2700).
+      // The composite path does the final upscale to viewport via pfctx.drawImage,
+      // so the fast-path blit during zoom operates on a tiny texture.
+      const iw = tc.width * 4, ih = tc.height * 4;
+      if (!this._paFieldCanvas || this._paFieldCanvas.width !== iw || this._paFieldCanvas.height !== ih) {
+        this._paFieldCanvas = document.createElement("canvas");
+        this._paFieldCanvas.width = iw;
+        this._paFieldCanvas.height = ih;
+        this._paFieldCtx = this._paFieldCanvas.getContext("2d");
+      }
+      const ctx = this._paFieldCtx;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "medium";
+      ctx.clearRect(0, 0, iw, ih);
+      ctx.drawImage(tc, 0, 0, iw, ih);
+      return;
+    }
+
+    // Single-pass modes: full device-pixel resolution
+    if (!this._paFieldCanvas) {
+      this._paFieldCanvas = document.createElement("canvas");
+      this._paFieldCtx = this._paFieldCanvas.getContext("2d");
+    }
     const pw = Math.floor(cssW * dpr), ph = Math.floor(cssH * dpr);
     if (this._paFieldCanvas.width !== pw || this._paFieldCanvas.height !== ph) {
       this._paFieldCanvas.width = pw;
       this._paFieldCanvas.height = ph;
     }
-    const ctx = this._paFieldCanvas.getContext("2d");
+    const ctx = this._paFieldCtx;
     if (!ctx) return;
-
-    const _fd = window._fieldDebug;
-    const mode = (_fd && _fd.upscaleQuality) || "high";
-
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
-
-    if (mode === "2pass") {
-      // Two-pass bilinear: grid -> 4x intermediate -> full viewport.
-      // Approximates bicubic quality, much cheaper in Chrome.
-      const iw = tc.width * 4, ih = tc.height * 4;
-      if (!this._paUpscaleIntermediate) this._paUpscaleIntermediate = document.createElement("canvas");
-      const ic = this._paUpscaleIntermediate;
-      if (ic.width !== iw || ic.height !== ih) { ic.width = iw; ic.height = ih; }
-      const ictx = ic.getContext("2d");
-      ictx.imageSmoothingEnabled = true;
-      ictx.imageSmoothingQuality = "medium";
-      ictx.clearRect(0, 0, iw, ih);
-      ictx.drawImage(tc, 0, 0, iw, ih);
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "medium";
-      ctx.drawImage(ic, 0, 0, cssW, cssH);
-    } else {
-      // Single-pass: low / medium / high
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = mode;
-      ctx.drawImage(tc, 0, 0, cssW, cssH);
-    }
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = mode;
+    ctx.drawImage(tc, 0, 0, cssW, cssH);
   }
 
   /** Handle worker result — cache pre-warmed pixel data for future scrub hits. */
