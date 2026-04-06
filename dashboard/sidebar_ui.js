@@ -131,6 +131,11 @@ function updateSidebarPlaybackValues() {
   const map = window.__map;
   if (!map || !map.playbackMode) return;
 
+  // Fast path: skip DOM work when sidebar is not visible or during gestures.
+  const sbEl = document.getElementById("sidebar");
+  if (sbEl && sbEl.classList.contains("hidden")) return;
+  if (map._isTransientAnimating && map._isTransientAnimating()) return;
+
   const state = map._historicalMode ? window._historicalState : window.__lastState;
   if (!state || !Array.isArray(state.mobile)) return;
 

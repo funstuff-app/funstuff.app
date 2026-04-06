@@ -7520,10 +7520,12 @@ class MapView {
   drawOverlay(state, opts = {}) {
     const ctx = this.octx;
     if (!ctx) return;
+    // During gestures/easing, skip legend-export work (no one reads these values).
+    const _skipLegendExport = this._isTransientAnimating();
     // Only reset per-frame when nothing is selected.
     // When a sensor is selected but off-screen (user panned away),
     // keep the last-known values so the legend doesn't jump back to PM2.5.
-    if (!this.selectedId) {
+    if (!this.selectedId && !_skipLegendExport) {
       this._selectedPollutantKey = null;
       this._selectedNaturalPollutantKey = null;
       this._selectedPollutantValue = null;
@@ -8671,12 +8673,14 @@ class MapView {
         }
 
         // Expose the selected sensor's displayed pollutant key for legend sync
-        if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
-        if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
-        if (isSel && pr && pr.key) this._selectedPollutantValue = parseFloat(pr.value);
+        if (!_skipLegendExport) {
+          if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
+          if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
+          if (isSel && pr && pr.key) this._selectedPollutantValue = parseFloat(pr.value);
+        }
 
         // Legend pollutant override: show the selected pollutant on ALL non-PurpleAir markers
-        if (this._markerPollutantOverride != null && !f.purpleair) {
+        if (!_skipLegendExport && this._markerPollutantOverride != null && !f.purpleair) {
           const src = isSel
             ? (interpolateFixedReadingsAtTime(f, fixedPbTimeMs) || f.readings)
             : f.readings;
@@ -8900,13 +8904,15 @@ class MapView {
         pr = { key: "", value: "--", color: "#666666" };
       }
       // Expose the selected sensor's displayed pollutant key for legend sync
-      if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
-      if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
-      if (isSel && pr && pr.key) this._selectedPollutantValue = parseFloat(pr.value);
+      if (!_skipLegendExport) {
+        if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
+        if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
+        if (isSel && pr && pr.key) this._selectedPollutantValue = parseFloat(pr.value);
+      }
 
       // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers
       // In playback mode, prefer trail-point readings (historical) over live m.readings
-      if (this._markerPollutantOverride != null) {
+      if (!_skipLegendExport && this._markerPollutantOverride != null) {
         const src = (this.playbackMode && pose && pose.readings) ? pose.readings : m.readings;
         const legendPr = _readingForLegendTab(src, this._markerPollutantOverride);
         if (legendPr) {

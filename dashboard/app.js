@@ -434,6 +434,9 @@ function main() {
   /** Sync legend content to whatever pollutant the map is currently showing on the selected marker. */
   function syncLegendToMapSelection() {
     if (!map || !selectedId) return;
+    // Fast path: skip when legend panel is closed or during gestures.
+    if (!legendOpen) return;
+    if (map._isTransientAnimating && map._isTransientAnimating()) return;
     if (legendTab != null) { _applyLegendDimming(); return; }
     buildLegend(true);
     _syncPaFieldDim();
@@ -2972,7 +2975,7 @@ function main() {
     const uiMinDt = isActive ? 16 : 250;
     if ((didAdvanceTime || isActive) && (now - _pbLastUiPerf) >= uiMinDt) {
       updatePlaybackUi();
-      updateSidebarPlaybackValues();
+      if (sidebarOpen) updateSidebarPlaybackValues();
       _pbLastUiPerf = now;
     }
 
