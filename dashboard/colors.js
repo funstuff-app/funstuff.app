@@ -17,11 +17,11 @@ const AQI_PALETTE = [
 
 function safeHex(c) {
   if (typeof c === "number") return AQI_PALETTE[c] || "#cccccc";
-  if (!c) return "#3388ff";
+  if (!c) return "#cccccc";
   let s = String(c).trim();
   if (s.startsWith("dim ")) s = s.slice(4).trim();
   if (s.startsWith("#") && (s.length === 7 || s.length === 4)) return s;
-  return "#3388ff";
+  return "#cccccc";
 }
 
 function dimHex(hex, amt = 0.6) {
@@ -86,7 +86,7 @@ function darkenHex(hex, factor = 0.75) {
   // Darken a hex color by multiplying RGB by factor (0 = black, 1 = original).
   const h = safeHex(hex);
   const m = /^#([0-9a-f]{6})$/i.exec(h);
-  if (!m) return "#3388ff";
+  if (!m) return "#cccccc";
   const n = parseInt(m[1], 16);
   const r = Math.round(((n >> 16) & 255) * factor);
   const g = Math.round(((n >> 8) & 255) * factor);
@@ -98,7 +98,7 @@ function hexToRgba(hex, alpha = 1) {
   // Convert a hex color to rgba format with specified alpha (0-1).
   const h = safeHex(hex);
   const m = /^#([0-9a-f]{6})$/i.exec(h);
-  if (!m) return `rgba(51, 136, 255, ${alpha})`;
+  if (!m) return `rgba(204, 204, 204, ${alpha})`;
   const n = parseInt(m[1], 16);
   const r = (n >> 16) & 255;
   const g = (n >> 8) & 255;
