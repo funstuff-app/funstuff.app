@@ -771,7 +771,7 @@ class MapView {
   }
 
   _isGesturing() {
-    return this._touchActive || this._mouseDragging || this._pinchZooming || this._wheelPanning;
+    return this._touchActive || this._mouseDragging || this._pinchZooming || this._wheelPanning || this._scrubbing;
   }
 
   /** True during any camera movement: user gestures, inertia, easing, follow, orchestration. */
@@ -835,6 +835,7 @@ class MapView {
     if (this._pinchInertiaRAF) cancelAnimationFrame(this._pinchInertiaRAF);
     this._pinchInertiaRAF = null;
     this._wheelPinchEndTimer = null;
+    if (this._pinchZoomEndTimer) { window.clearTimeout(this._pinchZoomEndTimer); this._pinchZoomEndTimer = null; }
     this._pinchVz = 0;
     this._pinchVelTs = 0;
   }
@@ -853,9 +854,16 @@ class MapView {
   _startPinchInertia() {
     // Only continue if we have meaningful velocity and an anchor.
     if (!isFinite(this._pinchVz) || Math.abs(this._pinchVz) < 0.00005 || !isFinite(this._pinchAnchorSX) || !isFinite(this._pinchAnchorSY)) {
-      // No coast; end pinch mode and force a "real tiles" redraw.
-      this._pinchZooming = false;
-      this._requestZoomRedraw();
+      // No coast. Keep _pinchZooming alive briefly so the expensive PA field
+      // path doesn't fire in the gap before the next wheel event arrives.
+      // If no event arrives within 80ms, then truly end pinch mode.
+      if (!this._pinchZoomEndTimer) {
+        this._pinchZoomEndTimer = window.setTimeout(() => {
+          this._pinchZoomEndTimer = null;
+          this._pinchZooming = false;
+          this._requestZoomRedraw();
+        }, 80);
+      }
       return;
     }
 
@@ -2051,6 +2059,7 @@ class MapView {
     if (!this.selectedId || this._followTargetLat === null) return;
     const now = performance.now();
     if (this._touchActive || this._mouseDragging || this._pinchZooming ||
+        this._scrubbing ||
         now < this._followSuppressUntilMs) {
       this._followRAF = requestAnimationFrame(() => this._followTick());
       return;
@@ -2550,6 +2559,7 @@ class MapView {
       if (this._wheelPanning) return;  // Don't zoom while user is trackpad-panning
 
       if (this._wheelPinchEndTimer) window.clearTimeout(this._wheelPinchEndTimer);
+      if (this._pinchZoomEndTimer) { window.clearTimeout(this._pinchZoomEndTimer); this._pinchZoomEndTimer = null; }
       this._pinchZooming = true;
 
       const rect = this.overlayCanvas.getBoundingClientRect();
@@ -6362,6 +6372,12 @@ class MapView {
    * Restores tiles from snapshot first to avoid opacity accumulation on repeated calls.
    */
   _compositePaFieldOnTiles(state, tilesJustRedrawn = false) {
+    // Per-frame deduplication: skip if already composited this frame.
+    {
+      const _now = performance.now();
+      if (!tilesJustRedrawn && this._compositeLastDrawMs && (_now - this._compositeLastDrawMs) < 4) return;
+      this._compositeLastDrawMs = _now;
+    }
     const pbMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
 
     // Fetch wind field in background for debug vector overlay (does not affect PA field rendering)
@@ -7589,6 +7605,15 @@ class MapView {
   drawOverlay(state, opts = {}) {
     const ctx = this.octx;
     if (!ctx) return;
+    // ── Per-frame deduplication ──
+    // Multiple RAF chains (playbackLoop, _followTick, _paFieldFadeRAF, _requestZoomRedraw)
+    // can all call drawOverlay in the same animation frame. The work is identical for a
+    // given (view + playbackTime) so skip redundant calls within the same frame.
+    {
+      const _now = performance.now();
+      if (this._overlayLastDrawMs && (_now - this._overlayLastDrawMs) < 4) return;
+      this._overlayLastDrawMs = _now;
+    }
     // During gestures/easing, skip legend-export work (no one reads these values).
     const _skipLegendExport = this._isTransientAnimating();
     // Only reset per-frame when nothing is selected.
