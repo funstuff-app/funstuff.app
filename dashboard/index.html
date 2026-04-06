@@ -310,7 +310,7 @@
   <script defer src="format_utils.js?v=20260224a"></script>
   <script defer src="data_utils.js?v=20260405c"></script>
   <script defer src="advection_solver.js?v=20260320a"></script>
-  <script defer src="map_view.js?v=20260406b"></script>
+  <script defer src="map_view.js?v=20260406c"></script>
   <script defer src="sidebar_ui.js?v=20260406a"></script>
   <script defer src="jog_wheel.js?v=20260327j"></script>
   <script defer src="app.js?v=20260406a"></script>
@@ -327,11 +327,20 @@
       <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowWind" type="checkbox" style="margin:0;"> wind vectors</label>
       <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowVirtual" type="checkbox" style="margin:0;"> ghost sensors</label>
     </div>
+    <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
+      <span>upscale</span>
+      <select id="fdUpscale" style="font-size:10px; background:#222; color:#ccc; border:1px solid #555; border-radius:3px; padding:1px 2px;">
+        <option value="high">high</option>
+        <option value="medium">medium</option>
+        <option value="low">low</option>
+        <option value="2pass">2-pass</option>
+      </select>
+    </div>
   </div>
   <script>
   (function(){
     var ids=['fdSigma','fdCutoff','fdBlur'];
-    var _fdState={sigmaDivisor:8,cutoffDeg:0.14,blur:2,showWind:false,showVirtual:false};
+    var _fdState={sigmaDivisor:8,cutoffDeg:0.14,blur:2,showWind:false,showVirtual:false,upscaleQuality:'high'};
     window._fieldDebug=_fdState;
     function _fdEnable() {
       document.getElementById('fieldDebugPanel').classList.remove('fdHidden');
@@ -354,6 +363,10 @@
     });
     document.getElementById('fdShowVirtual').addEventListener('change',function(){
       _fdState.showVirtual=this.checked;
+      if(window.__map){window.__map._paFieldKey=null;window.__map._paFieldValidRange=null;window.__map._redrawViewOnly();}
+    });
+    document.getElementById('fdUpscale').addEventListener('change',function(){
+      _fdState.upscaleQuality=this.value;
       if(window.__map){window.__map._paFieldKey=null;window.__map._paFieldValidRange=null;window.__map._redrawViewOnly();}
     });
 

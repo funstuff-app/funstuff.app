@@ -6788,11 +6788,34 @@ class MapView {
     }
     const ctx = this._paFieldCanvas.getContext("2d");
     if (!ctx) return;
+
+    const _fd = window._fieldDebug;
+    const mode = (_fd && _fd.upscaleQuality) || "high";
+
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(tc, 0, 0, cssW, cssH);
+
+    if (mode === "2pass") {
+      // Two-pass bilinear: grid -> 4x intermediate -> full viewport.
+      // Approximates bicubic quality, much cheaper in Chrome.
+      const iw = tc.width * 4, ih = tc.height * 4;
+      if (!this._paUpscaleIntermediate) this._paUpscaleIntermediate = document.createElement("canvas");
+      const ic = this._paUpscaleIntermediate;
+      if (ic.width !== iw || ic.height !== ih) { ic.width = iw; ic.height = ih; }
+      const ictx = ic.getContext("2d");
+      ictx.imageSmoothingEnabled = true;
+      ictx.imageSmoothingQuality = "medium";
+      ictx.clearRect(0, 0, iw, ih);
+      ictx.drawImage(tc, 0, 0, iw, ih);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "medium";
+      ctx.drawImage(ic, 0, 0, cssW, cssH);
+    } else {
+      // Single-pass: low / medium / high
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = mode;
+      ctx.drawImage(tc, 0, 0, cssW, cssH);
+    }
   }
 
   /** Handle worker result — cache pre-warmed pixel data for future scrub hits. */
