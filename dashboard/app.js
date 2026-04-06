@@ -262,6 +262,10 @@ function main() {
 
   // Screensaver mode flag (set by hot-corner code below, read by camera follow)
   let _screensaverActive = false;
+  let _ssSnapshot = null;       // state snapshot taken on screensaver enter
+  let _ssLoopInterval = null;   // poll interval that detects end-of-playback
+  let _ssLoopTimer = null;      // 10s pause timer between loops
+  let _ssEndMaxMs = null;       // maxMs when we started the 10s pause
 
   // Lite mode: hide all chrome (sidebar, controls, legend, menu button)
   const _liteParam = new URLSearchParams(window.location.search).get('lite') === '1';
@@ -2945,6 +2949,7 @@ function main() {
       var _crossedIntoLiveWindow = _inLiveWindow2 && isFinite(tMsBefore) && tMsBefore < bufferEdge;
     }
     if (!_pbIsRewinding &&
+        !_screensaverActive &&
         map.getPlaybackPlaying() &&
         !map._playbackLiveFollow &&
         !_pbIsWheelCoasting &&
@@ -5193,6 +5198,55 @@ function main() {
       document.body.classList.add("screensaver");
       var pb = document.getElementById("playbackBar");
       if (pb) pb.classList.add("pb-hidden");
+
+      // Snapshot current state for restoration on exit
+      var sb = map.getPlaybackBounds();
+      _ssSnapshot = {
+        centerLat: map.center.lat, centerLon: map.center.lon, zoom: map.zoom,
+        timeMs: map.getPlaybackTimeMs(), speed: map.getPlaybackSpeed(),
+        playing: map.getPlaybackPlaying(), liveFollow: map._playbackLiveFollow,
+      };
+
+      // Configure: 60x from start
+      map._playbackLiveFollow = false;
+      map.setPlaybackSpeed(60);
+      if (pbSpeedEl) pbSpeedEl.value = "60";
+      if (isFinite(sb.minMs)) map.setPlaybackTimeMs(sb.minMs);
+      _pbVelocity = _pbPlaybackSpeed * 60;
+      map.setPlaybackPlaying(true);
+      _pbLastPerf = 0;
+      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+
+      // Poll for end-of-playback to trigger 10s pause then loop
+      _ssLoopInterval = setInterval(() => {
+        if (!_screensaverActive) return;
+        // While waiting in the 10s pause, check if new data arrived
+        if (_ssLoopTimer != null) {
+          var sb2 = map.getPlaybackBounds();
+          if (isFinite(sb2.maxMs) && _ssEndMaxMs != null && sb2.maxMs > _ssEndMaxMs + 100) {
+            clearTimeout(_ssLoopTimer); _ssLoopTimer = null;
+            // Jump to where the new data begins and resume playing
+            map.setPlaybackTimeMs(_ssEndMaxMs);
+            _ssEndMaxMs = null;
+            _pbVelocity = _pbPlaybackSpeed * 60;
+            map.setPlaybackPlaying(true);
+            _pbLastPerf = 0;
+            if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          }
+          return;
+        }
+        // Detect playback stalled at end (velocity zeroed by physics loop)
+        if (map.isPlaybackAtEnd(200) && Math.abs(_pbVelocity) < 0.1) {
+          var sb3 = map.getPlaybackBounds();
+          _ssEndMaxMs = isFinite(sb3.maxMs) ? sb3.maxMs : null;
+          _ssLoopTimer = setTimeout(() => {
+            _ssLoopTimer = null; _ssEndMaxMs = null;
+            if (!_screensaverActive) return;
+            if (pbPlayEl) pbPlayEl.click();
+          }, 10000);
+        }
+      }, 500);
+
       // Force camera follow on enter
       _performCameraFit({ force: true });
     };
@@ -5203,9 +5257,30 @@ function main() {
       if (!_ssActive) return;
       _ssActive = false;
       _screensaverActive = false;
+      if (_ssLoopInterval) { clearInterval(_ssLoopInterval); _ssLoopInterval = null; }
+      if (_ssLoopTimer) { clearTimeout(_ssLoopTimer); _ssLoopTimer = null; }
+      _ssEndMaxMs = null;
       document.body.classList.remove("screensaver");
       var pb = document.getElementById("playbackBar");
       if (pb) pb.classList.remove("pb-hidden");
+
+      // Restore pre-screensaver state
+      if (_ssSnapshot) {
+        map.center.lat = _ssSnapshot.centerLat;
+        map.center.lon = _ssSnapshot.centerLon;
+        map.zoom = _ssSnapshot.zoom;
+        map.setPlaybackSpeed(_ssSnapshot.speed);
+        if (pbSpeedEl) pbSpeedEl.value = String(_ssSnapshot.speed);
+        map.setPlaybackTimeMs(_ssSnapshot.timeMs);
+        map.setPlaybackPlaying(_ssSnapshot.playing);
+        map._playbackLiveFollow = _ssSnapshot.liveFollow;
+        _pbVelocity = _ssSnapshot.playing ? _pbPlaybackSpeed * (_ssSnapshot.speed || 1) : 0;
+        _pbLastPerf = 0;
+        if (_ssSnapshot.playing && !_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        _ssSnapshot = null;
+        updatePlaybackUi();
+        map.drawOverlay(map.lastState, { cacheUnderlay: false });
+      }
     };
 
     const _ssCheck = (x, y) => {
