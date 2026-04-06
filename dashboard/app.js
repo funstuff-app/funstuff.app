@@ -4368,6 +4368,7 @@ function main() {
       _pbEaseStartPerf = null;
       _pbIsWheelCoasting = false;
       _pbScrubbing = true;
+      map._scrubbing = true;
       _pbDidDrag = false; // track if user actually dragged
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
@@ -4419,6 +4420,7 @@ function main() {
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
       _pbScrubbing = false;
+      map._scrubbing = false;
       _pbVelocity = 0;
       _pbPageAutoFollow = true; // resume auto-following after manual scrub
 
@@ -4484,6 +4486,7 @@ function main() {
       }
       // For clicks on the track (not drags), just resume playing
       _pbScrubbing = false;
+      map._scrubbing = false;
       _pbVelocity = 0; // no inertia for clicks
       map.setPlaybackPlaying(true);
       _pbLastPerf = 0;
@@ -4581,6 +4584,7 @@ function main() {
       _pbEaseStartPerf = null;
       _pbIsWheelCoasting = false;
       _pbScrubbing = true;
+      map._scrubbing = true;
       _pbDidDrag = false;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
@@ -4629,6 +4633,7 @@ function main() {
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
       _pbScrubbing = false;
+      map._scrubbing = false;
       _pbVelocity = 0;
       _pbPageAutoFollow = true;
 

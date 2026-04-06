@@ -663,6 +663,7 @@ class MapView {
     this._lastWheelPanTime = 0; // debounce pan→zoom from trackpad finger-lift artifacts
     this._wheelPanning = false; // true during trackpad/keyboard-trackpad wheel-pan streams
     this._wheelPanEndTimer = null; // debounce timer to exit wheel-pan mode
+    this._scrubbing = false; // true during timeline scrub (slider/jog wheel drag)
 
     // Windows scroll-velocity accumulator for adaptive zoom
     this._winScrollAccum = 0;      // accumulated deltaY in current burst
@@ -6383,8 +6384,22 @@ class MapView {
     // Fetch wind field in background for debug vector overlay (does not affect PA field rendering)
     if (!_isLite) this._fetchWindField();
 
+    // ── PERF PROBE ──
+    {
+      if (!this._perfProbe) this._perfProbe = { fastPath: 0, slowPath: 0, lastReport: 0, ensureMs: 0, ensureCalls: 0 };
+      const _pp = this._perfProbe;
+      const _now2 = performance.now();
+      if (_now2 - _pp.lastReport > 2000) {
+        if (_pp.fastPath + _pp.slowPath > 0) {
+          console.log(`[PA-PROBE] fast:${_pp.fastPath} slow:${_pp.slowPath} ensureAvg:${_pp.ensureCalls ? (_pp.ensureMs/_pp.ensureCalls).toFixed(1) : '-'}ms gesturing:${this._isGesturing()} transient:${this._isTransientAnimating()} scrub:${!!this._scrubbing} pinch:${this._pinchZooming} drag:${this._mouseDragging}`);
+        }
+        _pp.fastPath = 0; _pp.slowPath = 0; _pp.ensureMs = 0; _pp.ensureCalls = 0; _pp.lastReport = _now2;
+      }
+    }
+
     // ── Animation fast-path: transform existing PA field canvas instead of recomputing ──
     if (this._isTransientAnimating() && this._paFieldCanvas && this._paFieldComputedView) {
+      if (this._perfProbe) this._perfProbe.fastPath++;
       const ctx = this.pfctx;
       if (!ctx) return;
       const pw = this.paFieldCanvasEl.width;
@@ -6439,7 +6454,13 @@ class MapView {
     }
 
     // ── Static Nadaraya-Watson interpolation path ──
-    this._ensurePaField(state, pbMs);
+    if (this._perfProbe) this._perfProbe.slowPath++;
+    {
+      const _t0 = performance.now();
+      this._ensurePaField(state, pbMs);
+      const _dur = performance.now() - _t0;
+      if (this._perfProbe) { this._perfProbe.ensureMs += _dur; this._perfProbe.ensureCalls++; }
+    }
     if (pbMs != null && isFinite(pbMs)) this._preWarmPaFields(state, pbMs);
     const ctx = this.pfctx;
     if (!ctx) return;
