@@ -4568,7 +4568,7 @@ class MapView {
   // ─────────────────────────────────────────────────────────────────────────────
   
   // Physics constants (matching unit tests in vehicle_physics.test.cjs)
-  static CRUISE_SPEED = 12;           // m/s on straights (~25 mph)
+  static CRUISE_SPEED = 20;           // m/s on straights (~25 mph)
   static CURVE_SPEED = 8;             // m/s in tight curves (~18 mph)
   static ACCEL_RATE = 4;              // m/s² acceleration
   static BRAKE_RATE = 6;              // m/s² braking (stronger than accel)
