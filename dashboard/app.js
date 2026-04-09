@@ -5033,7 +5033,9 @@ function main() {
       // Initialize playhead on first data load: offset based on time until next server update
       // Use timeSinceChangeS here since we don't know how stale the initial data is
       // Account for playback speed: at 5x, we consume data 5x faster, so need 5x runway
-      if (!map._playbackInitialized && Array.isArray(st.mobile) && st.mobile.length > 0) {
+      const hasAnyData = (Array.isArray(st.mobile) && st.mobile.length > 0) ||
+                          (Array.isArray(st.fixed) && st.fixed.length > 0);
+      if (!map._playbackInitialized && hasAnyData) {
         const b = map.getPlaybackBounds();
         if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
           const meta = st?.meta || {};

@@ -3945,10 +3945,15 @@ class MapView {
 
     // In live mode, if fixed sensors exist but mobile data is stale,
     // extend the timeline to now so playback doesn't freeze.
-    if (!this._historicalMode && isFinite(minMs)) {
+    if (!this._historicalMode) {
       const fixed = Array.isArray(state?.fixed) ? state.fixed : [];
       if (fixed.length > 0) {
         const nowMs = Date.now();
+        if (!isFinite(minMs)) {
+          // No mobile trail data at all -- anchor to server start or 1h ago
+          minMs = (typeof serverStartMs === "number" && isFinite(serverStartMs))
+            ? serverStartMs : (nowMs - 3600000);
+        }
         if (!isFinite(maxMs) || nowMs > maxMs) {
           maxMs = nowMs;
         }
