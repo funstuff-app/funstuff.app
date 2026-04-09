@@ -4988,7 +4988,7 @@ function main() {
       const meta = st.meta || {};
       const mobileCount = Array.isArray(st.mobile) ? st.mobile.length : 0;
       const fixedCount = Array.isArray(st.fixed) ? st.fixed.length : 0;
-      const hasData = mobileCount > 0;
+      const hasData = mobileCount > 0 || fixedCount > 0;
       
       if (!hasData) {
         // No data yet - still loading
@@ -4996,7 +4996,7 @@ function main() {
         statusEl.classList.remove("live");
         statusEl.classList.remove("offline");
       } else if (meta.data_stale) {
-        // Data is stale - show age from actual data timestamps
+        // ALL sources are stale
         const ageS = meta.data_age_s || 0;
         const ageMin = Math.floor(ageS / 60);
         const ageHr = Math.floor(ageMin / 60);

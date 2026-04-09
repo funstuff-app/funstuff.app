@@ -3942,6 +3942,18 @@ class MapView {
     if (isFinite(maxMs) && typeof serverEndMs === "number" && isFinite(serverEndMs) && serverEndMs > maxMs) {
       maxMs = serverEndMs;
     }
+
+    // In live mode, if fixed sensors exist but mobile data is stale,
+    // extend the timeline to now so playback doesn't freeze.
+    if (!this._historicalMode && isFinite(minMs)) {
+      const fixed = Array.isArray(state?.fixed) ? state.fixed : [];
+      if (fixed.length > 0) {
+        const nowMs = Date.now();
+        if (!isFinite(maxMs) || nowMs > maxMs) {
+          maxMs = nowMs;
+        }
+      }
+    }
     
     this._playbackMinMs = isFinite(minMs) ? minMs : null;
     this._playbackMaxMs = isFinite(maxMs) ? maxMs : null;

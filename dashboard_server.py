@@ -3581,9 +3581,15 @@ def _do_one_fetch(app_state: AppState, data_dir: Path) -> tuple:
 
     mobile_data_age = _get_data_age_s(mobile)
     fixed_data_age = _get_data_age_s(fixed_raw)
-    data_stale = (mobile_data_age is not None and mobile_data_age > 1800) or \
-                 (fixed_data_age is not None and fixed_data_age > 1800)
-    data_age_s = max(mobile_data_age or 0, fixed_data_age or 0) if data_stale else None
+    # Only mark globally stale when ALL sources with data are stale.
+    # A single fresh source (fixed, PurpleAir, etc.) keeps the dashboard live.
+    mobile_stale = mobile_data_age is not None and mobile_data_age > 1800
+    fixed_stale = fixed_data_age is not None and fixed_data_age > 1800
+    sources_with_age = [a for a in (mobile_data_age, fixed_data_age) if a is not None]
+    data_stale = bool(sources_with_age) and all(
+        a > 1800 for a in sources_with_age
+    )
+    data_age_s = min(sources_with_age) if sources_with_age else None
 
     # --- accumulate history & raw storage ------------------------------------
     _accumulate_fixed_history_from_raw(app_state, fixed_raw)
@@ -3608,8 +3614,10 @@ def _do_one_fetch(app_state: AppState, data_dir: Path) -> tuple:
         meta["data_age_s"] = data_age_s
     if mobile_data_age is not None:
         meta["mobile_data_age_s"] = mobile_data_age
+        meta["mobile_stale"] = mobile_stale
     if fixed_data_age is not None:
         meta["fixed_data_age_s"] = fixed_data_age
+        meta["fixed_stale"] = fixed_stale
     meta["force_refresh_seq"] = int(getattr(app_state, "force_refresh_seq", 0) or 0)
 
     return mobile, fixed_raw, st
