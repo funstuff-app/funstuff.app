@@ -376,7 +376,8 @@ aside, section { min-height: 0; }
   transition: transform 0.45s cubic-bezier(0.4, 0, 0.2, 1),
               opacity  0.45s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.playbackBar.pb-hidden {
+.playbackBar.pb-hidden,
+.playbackBar.pb-ss-hidden {
   transform: translateX(-50%) translateY(40px);
   opacity: 0;
   pointer-events: none;
@@ -2081,8 +2082,7 @@ body.screensaver #legend,
 body.screensaver #legendToggle,
 body.screensaver #camReplayBtn,
 body.screensaver #camCenterBtn,
-body.screensaver .pbMenuBtn,
-body.screensaver #appFooter {
+body.screensaver .pbMenuBtn {
   opacity: 0 !important;
   pointer-events: none !important;
 }

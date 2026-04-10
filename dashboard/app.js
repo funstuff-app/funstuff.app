@@ -5227,7 +5227,7 @@ function main() {
       _screensaverActive = true;
       document.body.classList.add("screensaver");
       var pb = document.getElementById("playbackBar");
-      if (pb) pb.classList.add("pb-hidden");
+      if (pb) pb.classList.add("pb-ss-hidden");
 
       // Snapshot current state for restoration on exit
       var sb = map.getPlaybackBounds();
@@ -5292,7 +5292,7 @@ function main() {
       _ssEndMaxMs = null;
       document.body.classList.remove("screensaver");
       var pb = document.getElementById("playbackBar");
-      if (pb) pb.classList.remove("pb-hidden");
+      if (pb) pb.classList.remove("pb-ss-hidden");
 
       // Restore pre-screensaver state
       if (_ssSnapshot) {
