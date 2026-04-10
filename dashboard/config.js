@@ -23,8 +23,8 @@ var TILE_THEMES = {
     template: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 1.45, brightness: 0.80, contrast: 1.08 },
-    defaultDim: 101,
-    defaultSat: 118,
+    defaultDim: 150,
+    defaultSat: 67,
     bgColor: "#282828", // CARTO Dark Matter background
   },
   carto_dark_nolabels: {
@@ -32,8 +32,8 @@ var TILE_THEMES = {
     template: "https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png",
     subdomains: ["a", "b", "c", "d"],
     filter: { saturate: 0.90, brightness: 0.95, contrast: 1.06 },
-    defaultDim: 101,
-    defaultSat: 118,
+    defaultDim: 150,
+    defaultSat: 67,
     bgColor: "#282828",
   },
   // carto_positron_all: {

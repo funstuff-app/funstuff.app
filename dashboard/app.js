@@ -4174,8 +4174,8 @@ function main() {
   // PA field alpha: restore from localStorage (0-100%)
   {
     const raw = localStorage.getItem(PA_ALPHA_STORAGE_KEY);
-    const v = raw != null ? Number(raw) : 18;
-    const pct = Math.max(0, Math.min(100, isFinite(v) ? v : 18));
+    const v = raw != null ? Number(raw) : 27;
+    const pct = Math.max(0, Math.min(100, isFinite(v) ? v : 27));
     window._paFieldAlpha = Math.round(pct * 2.55);
     if (menuAlphaEl) menuAlphaEl.value = pct;
   }
@@ -4188,8 +4188,8 @@ function main() {
       if (menuSatEl && satEl) menuSatEl.value = satEl.value;
       if (menuAlphaEl) {
         const raw = localStorage.getItem(PA_ALPHA_STORAGE_KEY);
-        const v = raw != null ? Number(raw) : 18;
-        menuAlphaEl.value = Math.max(0, Math.min(100, isFinite(v) ? v : 18));
+        const v = raw != null ? Number(raw) : 27;
+        menuAlphaEl.value = Math.max(0, Math.min(100, isFinite(v) ? v : 27));
       }
     }
     
