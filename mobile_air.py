@@ -18,6 +18,7 @@ from mobileair import (
     # Configuration
     IMMOBILITY_LOOKBACK_MINUTES,
     IMMOBILITY_MIN_COVERAGE_MINUTES,
+    STALE_DATA_THRESHOLD_MINUTES,
     IMMOBILITY_MIN_SAMPLES,
     IMMOBILITY_TOTAL_DISTANCE_THRESHOLD,
     IMMOBILITY_MAX_STEP_THRESHOLD,
@@ -435,6 +436,7 @@ class AirQualityApp(App):
     pinned_sensors = set()
     fixed_history = {}
     _refresh_token = 0
+    _last_known_mobile_ts: "datetime | None" = None
     _max_readings_count = 3  # minimum pad for details table
 
     def __init__(self, *, dashboard_handle=None, **kwargs):
@@ -760,6 +762,12 @@ class AirQualityApp(App):
         # Also fetch wind data
         self.fetch_wind_data()
 
+        # Detect stale-data recovery: if mobile data just came back after being
+        # absent for longer than STALE_DATA_THRESHOLD_MINUTES, ring the bell and
+        # post a macOS notification to bounce the dock.
+        if mobile_data is not None:
+            self._check_mobile_stale_recovery(mobile_data)
+
         # Always drive the same "data refreshed" UI update routine.
         # If we couldn't fetch anything, reuse the existing state (don't mutate history).
         fetched_any = mobile_data is not None or fixed_data is not None
@@ -788,6 +796,72 @@ class AirQualityApp(App):
         self.call_from_thread(self.update_data_state, combined_data, update_history=update_history)
         self.call_from_thread(self.update_status, status_msg)
         self.call_from_thread(self.update_last_updated, now.strftime('%H:%M:%S'))
+
+    def _check_mobile_stale_recovery(self, mobile_data: dict) -> None:
+        """Called from worker thread. If the mobile API timestamp just advanced
+        after being stale for > STALE_DATA_THRESHOLD_MINUTES, alert the user."""
+        new_ts: "datetime | None" = None
+        try:
+            for p_details in mobile_data.values():
+                if isinstance(p_details, dict):
+                    raw_ts = p_details.get("LastUpdateUTC")
+                    if raw_ts:
+                        parsed = parse_utc_timestamp(raw_ts)
+                        if parsed and (new_ts is None or parsed > new_ts):
+                            new_ts = parsed
+        except Exception:
+            return
+
+        if new_ts is None:
+            return
+
+        prev_ts = self._last_known_mobile_ts
+        self._last_known_mobile_ts = new_ts
+
+        if prev_ts is None:
+            # First run - just record the timestamp, don't alert
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        prev_utc = prev_ts.astimezone(timezone.utc)
+        new_utc = new_ts.astimezone(timezone.utc)
+        stale_cutoff = timedelta(minutes=STALE_DATA_THRESHOLD_MINUTES)
+
+        data_was_stale = (now_utc - prev_utc) > stale_cutoff
+        ts_advanced = new_utc > prev_utc
+
+        if data_was_stale and ts_advanced:
+            self._notify_stale_recovery(new_ts)
+
+    def _notify_stale_recovery(self, new_ts: "datetime") -> None:
+        """Ring the terminal bell and post a macOS notification."""
+        # Terminal bell
+        try:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        # macOS notification (bounces the dock icon)
+        try:
+            ts_local = new_ts.astimezone().strftime("%H:%M")
+            subprocess.Popen(
+                [
+                    "osascript", "-e",
+                    f'display notification "Mobile data updated at {ts_local}" '
+                    f'with title "DustyTrails" subtitle "Stale data recovered"',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+        # In-app notification
+        self.call_from_thread(
+            self.notify,
+            f"Mobile data recovered (updated at {new_ts.astimezone().strftime('%H:%M')})",
+            severity="information",
+            timeout=10,
+        )
 
     def fetch_wind_data(self) -> None:
         """Fetch wind data from dashboard server or directly from AirNow."""

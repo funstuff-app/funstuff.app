@@ -44,7 +44,7 @@ SPARSE_ASSUME_IDLE_ROBUST_RADIUS_M = 120
 # ============================================================================
 # A sensor is considered "stale" if its last data point is this many minutes
 # older than the API's last update timestamp. Stale sensors should be dimmed/ghosted.
-STALE_DATA_THRESHOLD_MINUTES = 30
+STALE_DATA_THRESHOLD_MINUTES = 45
 
 # ============================================================================
 # AQI Levels (EPA-based)
