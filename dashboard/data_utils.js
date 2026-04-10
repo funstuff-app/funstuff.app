@@ -108,6 +108,8 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
       const timesMs = [];
       const valuesF = [];
       const colorsF = [];
+      const outliersF = [];
+      const histOutlier = Array.isArray(r.history_outlier) ? r.history_outlier : null;
       const n = Math.min(times.length, values.length);
       for (let i = 0; i < n; i++) {
         const tMs = parseUtcMs(times[i]);
@@ -117,11 +119,12 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
         timesMs.push(tMs);
         valuesF.push(v);
         colorsF.push(colors[i] != null ? colors[i] : (r.ci ?? 0));
+        outliersF.push(histOutlier ? !!histOutlier[i] : false);
       }
-      r._parsedTimeline = { timesMs, valuesF, colorsF, _srcLen: times.length };
+      r._parsedTimeline = { timesMs, valuesF, colorsF, outliersF, _srcLen: times.length };
     }
 
-    const { timesMs, valuesF, colorsF } = r._parsedTimeline;
+    const { timesMs, valuesF, colorsF, outliersF } = r._parsedTimeline;
     if (timesMs.length < 1) {
       result[key] = r;
       continue;
@@ -157,6 +160,7 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
       value: valuesF[idx],
       color: colorsF[idx] ?? r.ci ?? 0,
       timeMs: timesMs[idx],
+      outlier: outliersF[idx] || false,
       // Keep original arrays for sparklines
       history: values,
       history_times: times,
@@ -184,7 +188,7 @@ function primaryReadingForFixedAtTime(f, playbackTimeMs) {
   const interpolated = interpolateFixedReadingsAtTime(f, playbackTimeMs);
   const w = pickWorstReadingKey(interpolated);
   if (w && w.key && interpolated[w.key] && interpolated[w.key].value != null) {
-    return { key: w.key, value: interpolated[w.key].value, color: safeHex(interpolated[w.key].color), aqi: w.aqi, timeMs: interpolated[w.key].timeMs };
+    return { key: w.key, value: interpolated[w.key].value, color: safeHex(interpolated[w.key].color), aqi: w.aqi, timeMs: interpolated[w.key].timeMs, outlier: interpolated[w.key].outlier || false };
   }
   // No data for this scrub time — return null so the renderer skips this sensor.
   // Do NOT fall back to primaryReadingForSensor: that returns the live value,

@@ -194,10 +194,14 @@ def filter_history_outliers(
     values: list[Any] | None,
     colors: list[Any] | None = None,
 ) -> tuple[list[Any], list[Any] | None, list[float]]:
-    """Remove obvious single-sample glitches from history.
+    """Remove obvious single-sample glitches and cliff-jump plateaus from history.
 
-    This is intentionally conservative: it targets clearly impossible/implausible spikes
-    (like OZNE=778) that otherwise dominate sparklines and trend indicators.
+    Two detection modes:
+    1. Hard plausibility bounds (e.g. PM2.5 > 999 from a single glitch).
+    2. Cliff detection: when consecutive readings show an impossible rate of
+       change (one value dwarfs its neighbor), everything on the high side of
+       the cliff is flagged until values drop back down.  Real atmospheric
+       events ramp gradually; instant jumps indicate sensor malfunction.
 
     Returns (filtered_values, filtered_colors, removed_values) and preserves alignment when colors provided.
     """
@@ -207,36 +211,71 @@ def filter_history_outliers(
     key = normalize_pollutant_key(pollutant_key)
 
     # Hard plausibility bounds in *feed units*.
-    # These are not health breakpoints; they're "sanity" limits to drop obvious glitches.
     bounds = {
-        # ug/m3
         "pm2.5": (0.0, 999.0),
         "pm10": (0.0, 2000.0),
-        # ozone is typically ppb in our feeds; allow up to 600ppb (extreme) before dropping
         "ozone": (0.0, 600.0),
-        # NO2 ppb; allow up to 2100 ppb (beyond max AQI bracket)
         "no2": (0.0, 2100.0),
-        # CO ppm; allow up to 60 ppm (beyond max AQI bracket)
         "co": (0.0, 60.0),
     }.get(key)
 
+    # ── Cliff detection pass ────────────────────────────────────────
+    # Walk the series and flag readings on the high plateau of an
+    # impossible jump.  A cliff edge is detected when consecutive
+    # numeric values have an extreme ratio.  Once on a plateau,
+    # readings stay flagged until a cliff edge drops back down.
+    n = len(values)
+    cliff_flagged = [False] * n
+    prev_idx: int | None = None
+    in_cliff = False
+    for i in range(n):
+        try:
+            fv = float(values[i])
+            if not math.isfinite(fv):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if prev_idx is not None:
+            try:
+                pv = float(values[prev_idx])
+            except (TypeError, ValueError):
+                pv = None
+            if pv is not None and math.isfinite(pv):
+                hi, lo = max(fv, pv), min(fv, pv)
+                lo_safe = max(lo, 0.1)
+                is_cliff = hi / lo_safe >= 8.0 and hi >= 50.0
+                if is_cliff:
+                    if fv > pv:
+                        # jumped up
+                        in_cliff = True
+                        cliff_flagged[i] = True
+                    else:
+                        # dropped back down
+                        in_cliff = False
+                elif in_cliff:
+                    cliff_flagged[i] = True
+        prev_idx = i
+
+    # ── Filter pass ─────────────────────────────────────────────────
     out_vals: list[Any] = []
     out_cols: list[Any] | None = [] if isinstance(colors, list) else None
     removed: list[float] = []
 
     for i, v in enumerate(values):
         keep = True
-        try:
-            fv = float(v)
-            if not math.isfinite(fv):
-                keep = False
-            elif bounds is not None:
-                lo, hi = bounds
-                if fv < lo or fv > hi:
-                    keep = False
-        except (TypeError, ValueError):
-            # Non-numeric history is ignored by spark/trend; keep it out.
+        if cliff_flagged[i]:
             keep = False
+        else:
+            try:
+                fv = float(v)
+                if not math.isfinite(fv):
+                    keep = False
+                elif bounds is not None:
+                    blo, bhi = bounds
+                    if fv < blo or fv > bhi:
+                        keep = False
+            except (TypeError, ValueError):
+                keep = False
 
         if keep:
             out_vals.append(v)

@@ -525,6 +525,11 @@ class AppState:
     # Used by _inject_fixed_history to retroactively null stuck readings.
     stuck_pa_sensors: dict[str, float] = field(default_factory=dict)
 
+    # PA sensors on a cliff plateau: { sensor_id: (cliff_start_ts, cliff_end_ts|None) }
+    # Used by _inject_fixed_history to retroactively null cliff readings.
+    # end_ts is None while the cliff is ongoing; set when the sensor recovers.
+    cliff_pa_sensors: dict[str, tuple[float, float | None]] = field(default_factory=dict)
+
     # Cached fixed sensor locations so offline sensors can still be rendered.
     # Structure: { sensor_id: { "lat": float, "lon": float, "name": str } }
     fixed_sensor_locations: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -1482,10 +1487,12 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
             history_values = []
             hci = []
             history_times = []
+            history_outlier = []
 
-            # If this PA sensor is stuck-elevated, null readings in the
-            # stuck window so playback doesn't show the frozen value.
+            # If this PA sensor is stuck-elevated or on a cliff plateau,
+            # mark those readings as outlier so playback renders them correctly.
             stuck_since = app_state.stuck_pa_sensors.get(sensor_id) if sensor_id.startswith("PA_") else None
+            cliff_window = app_state.cliff_pa_sensors.get(sensor_id) if sensor_id.startswith("PA_") else None
 
             for entry in hist_entries:
                 t = entry.get("time") or ""
@@ -1498,18 +1505,26 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
                         fval = int(fval)
                 except (ValueError, TypeError):
                     fval = None
-                # Retroactively null readings during the stuck period
-                if stuck_since is not None and fval is not None:
+                # Check if this reading falls in an outlier window
+                is_outlier = False
+                if fval is not None:
                     rec = entry.get("recorded_at", 0)
-                    if rec >= stuck_since:
-                        fval = None
+                    if stuck_since is not None and rec >= stuck_since:
+                        is_outlier = True
+                    if cliff_window is not None:
+                        c_start, c_end = cliff_window
+                        if rec >= c_start and (c_end is None or rec < c_end):
+                            is_outlier = True
                 history_values.append(fval)
                 hci.append(color_to_idx(_get_aqi_color(pollutant, fval)) if fval is not None else 0)
                 history_times.append(t)
+                history_outlier.append(is_outlier)
 
             reading["history"] = history_values
             reading["hci"] = hci
             reading["history_times"] = history_times
+            if any(history_outlier):
+                reading["history_outlier"] = history_outlier
 
 
 def _reinject_offline_fixed_sensors(app_state: AppState, st: dict[str, Any]) -> None:
@@ -2601,11 +2616,54 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
         if i in outlier_indices:
             continue
         pm25_val = s["_pm25"]
-        if pm25_val < 500:
-            continue  # only inspect high readings
         sid = f"PA_{s.get('sensor_index', '')}"
         hist_entries = (history.get(sid, {}).get("PM25") or
                         history.get(sid, {}).get("PM2.5") or [])
+
+        # ── Cliff detection: impossible rate-of-change between readings ──
+        # Walk history and detect cliff jumps (8x ratio, high side >= 50).
+        # Record the cliff window so _inject_fixed_history can null those
+        # readings during playback rewind, even after the sensor recovers.
+        if len(hist_entries) >= 2:
+            # Scan full history to find cliff edges -- sustained malfunctions
+            # can push the cliff edge far back in the timeline.
+            in_cliff = False
+            cliff_start_ts: float | None = None
+            cliff_end_ts: float | None = None
+            prev_cv: float | None = None
+            for h in hist_entries:
+                try:
+                    cv = float(h.get("val", h.get("value", float("nan"))))
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(cv):
+                    continue
+                if prev_cv is not None:
+                    hi_v, lo_v = max(cv, prev_cv), min(cv, prev_cv)
+                    lo_safe = max(lo_v, 0.1)
+                    if hi_v / lo_safe >= 8.0 and hi_v >= 50.0:
+                        if cv > prev_cv:
+                            in_cliff = True
+                            cliff_start_ts = h.get("recorded_at", 0)
+                            cliff_end_ts = None
+                        else:
+                            in_cliff = False
+                            cliff_end_ts = h.get("recorded_at", 0)
+                    # if not a cliff edge, in_cliff state persists
+                prev_cv = cv
+
+            if cliff_start_ts is not None:
+                # Record the cliff window for playback nulling
+                app_state.cliff_pa_sensors[sid] = (cliff_start_ts, cliff_end_ts)
+                if in_cliff:
+                    # Still on the plateau -- flag as outlier on live map
+                    outlier_indices.add(i)
+                continue
+            else:
+                app_state.cliff_pa_sensors.pop(sid, None)
+
+        if pm25_val < 500:
+            continue  # only inspect high readings for overflow/stuck patterns
         if not hist_entries:
             continue
         recent = hist_entries[-10:]  # last ~10 data points

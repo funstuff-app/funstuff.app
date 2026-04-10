@@ -150,11 +150,13 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
 
     const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
     let value = NaN;
+    let readingOutlier = false;
     for (const rk of readingKeys) {
       const r = interp && interp[rk];
-      if (r && r.value != null) { value = Number(r.value); break; }
+      if (r && r.value != null) { value = Number(r.value); readingOutlier = !!r.outlier; break; }
     }
     if (!isFinite(value) || value < 0) continue;
+    if (readingOutlier) continue;
 
     const wp = latLonToWorld(lat, lon, zoom);
     sensors.push({
@@ -5967,6 +5969,7 @@ class MapView {
       }
       const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
       const pm = interp && (interp["PM25"] || interp["PM2.5"] || interp["pm25"] || interp["pm2.5"]);
+      if (pm && pm.outlier) continue;
       const value = pm && pm.value != null ? Number(pm.value) : NaN;
       if (!isFinite(value) || value < 0) continue;
       sensors.push({ lat, lon, value });
@@ -7311,9 +7314,10 @@ class MapView {
         const keyF = f._key;
         const isSel = (this.selectedId === keyF);
         const emoji = f.purpleair ? "" : (f.emoji || "📍");
-        const label = ((f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id) + (f.outlier ? " (Outlier)" : "");
         const color = safeHex(f.ci);
         const pr = primaryReadingForFixedAtTime(f, this.getPlaybackTimeMs());
+        const isOutlier = f.outlier || (pr && pr.outlier);
+        const label = ((f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id) + (isOutlier ? " (Outlier)" : "");
 
         ctx.save();
         const isPurpleAir = !!f.purpleair;
@@ -7401,8 +7405,8 @@ class MapView {
           const bx = sp.x - bw / 2;
           const by = sp.y + 18;
           const _markerColor = safeHex((pr && pr.color) || color);
-          const markerColor = f.outlier ? outlierHex(_markerColor) : _markerColor;
-          if (f.outlier) ctx.globalAlpha = 0.5;
+          const markerColor = isOutlier ? outlierHex(_markerColor) : _markerColor;
+          if (isOutlier) ctx.globalAlpha = 0.5;
           ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
           ctx.strokeStyle = markerColor;
           ctx.lineWidth = 1.8;
@@ -7421,7 +7425,7 @@ class MapView {
             const x0 = sp.x - (m2aw + m2bw) / 2;
             ctx.fillStyle = "rgba(232,238,247,0.70)";
             ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
-            ctx.fillStyle = f.outlier ? markerColor : (pr.color || "#ffffff");
+            ctx.fillStyle = isOutlier ? markerColor : (pr.color || "#ffffff");
             ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
           }
         }
@@ -8786,7 +8790,6 @@ class MapView {
         const key = f._key;
         const isSel = (this.selectedId === key);
         const emoji = f.purpleair ? "" : (f.emoji || "📍");
-        const label = ((f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id) + (f.outlier ? " (Outlier)" : "");
         const color = safeHex(f.ci);
         let pr;
         const interpCacheKey = (fixedPbTimeMs != null && isFinite(fixedPbTimeMs))
@@ -8834,6 +8837,9 @@ class MapView {
 
         // No data for this sensor at the current scrub time — skip drawing
         if (!pr) { return; }
+
+        const isOutlier = f.outlier || (pr && pr.outlier);
+        const label = ((f.name && f.name.length && String(f.name) !== String(f.id)) ? f.name : f.id) + (isOutlier ? " (Outlier)" : "");
 
         ctx.save();
         const isPurpleAir = !!f.purpleair;
@@ -8916,8 +8922,8 @@ class MapView {
           const bx = sp.x - bw/2;
           const by = sp.y + 18;
           const _markerColor = safeHex((pr && pr.color) || color);
-          const markerColor = f.outlier ? outlierHex(_markerColor) : _markerColor;
-          if (f.outlier) ctx.globalAlpha = 0.5;
+          const markerColor = isOutlier ? outlierHex(_markerColor) : _markerColor;
+          if (isOutlier) ctx.globalAlpha = 0.5;
           ctx.fillStyle = "rgba(16, 20, 28, 0.82)";
           ctx.strokeStyle = markerColor;
           ctx.lineWidth = 1.8;
@@ -8937,7 +8943,7 @@ class MapView {
             const x0 = sp.x - (m2aw + m2bw) / 2;
             ctx.fillStyle = "rgba(232,238,247,0.70)";
             ctx.fillText(line2Key ? `${line2Key} ` : "", x0 + m2aw / 2, y2);
-            ctx.fillStyle = f.outlier ? markerColor : (pr.color || "#ffffff");
+            ctx.fillStyle = isOutlier ? markerColor : (pr.color || "#ffffff");
             ctx.fillText(line2Val, x0 + m2aw + m2bw / 2, y2);
           }
         }
