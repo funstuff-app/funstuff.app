@@ -921,9 +921,10 @@ function main() {
   buildLegend();
   updateLegendVisibility();
 
-  // Legend tab clicks
+  // Legend tab clicks + hover highlight
   if (legendEl) {
-    for (const tab of legendEl.querySelectorAll(".legendTab")) {
+    const allTabs = legendEl.querySelectorAll(".legendTab");
+    for (const tab of allTabs) {
       tab.addEventListener("click", () => {
         const clicked = tab.dataset.legend || "pm25";
         // Clicking the active tab deselects back to default (null)
@@ -934,6 +935,25 @@ function main() {
         else localStorage.removeItem(LEGEND_TAB_KEY);
         _syncPaFieldDim();
         buildLegend(true);
+      });
+      tab.addEventListener("mouseenter", () => {
+        if (legendTab != null) return; // user has a tab selected, don't interfere
+        const hovered = tab.dataset.legend || "pm25";
+        for (const t of allTabs) {
+          const k = t.dataset.legend;
+          t.classList.toggle("auto-active", k === hovered);
+          t.classList.toggle("tab-dim", k !== hovered);
+        }
+      });
+      tab.addEventListener("mouseleave", () => {
+        if (legendTab != null) return;
+        // Restore: re-derive from current state (selected sensor or none)
+        const autoTabKey = selectedId ? _selectedSensorPollutantTab() : null;
+        for (const t of allTabs) {
+          const k = t.dataset.legend;
+          t.classList.toggle("auto-active", k === autoTabKey);
+          t.classList.toggle("tab-dim", autoTabKey != null && k !== autoTabKey);
+        }
       });
     }
   }
@@ -5296,11 +5316,13 @@ function main() {
     const _ssCheck = (x, y) => {
       const inCorner = x <= SS_CORNER_PX &&
         y >= window.innerHeight - SS_CORNER_PX;
+      const inBottomStrip = y >= window.innerHeight - SS_CORNER_PX;
       if (inCorner && !_ssActive && !_ssTimer) {
         _ssTimer = setTimeout(_ssEnter, SS_DELAY_MS);
-      } else if (!inCorner) {
+      } else if (!inCorner && !_ssActive) {
         if (_ssTimer) { clearTimeout(_ssTimer); _ssTimer = null; }
-        if (_ssActive) _ssExit();
+      } else if (_ssActive && !inBottomStrip) {
+        _ssExit();
       }
     };
 
