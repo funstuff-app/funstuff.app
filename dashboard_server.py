@@ -2975,6 +2975,7 @@ def purpleair_fetch_loop(
             s["pm2.5"] = pm25_val
             last_seen_ts = by_id[sid].get("last_seen")
             if last_seen_ts is not None:
+                s["last_seen"] = last_seen_ts
                 try:
                     time_utc = datetime.fromtimestamp(int(last_seen_ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 except (TypeError, ValueError, OSError):
@@ -3054,6 +3055,8 @@ def purpleair_fetch_loop(
                                 s["name"]      = m.get("name",      s.get("name"))
                                 s["latitude"]  = m.get("latitude",  s.get("latitude"))
                                 s["longitude"] = m.get("longitude", s.get("longitude"))
+                                if m.get("last_seen") is not None:
+                                    s["last_seen"] = m["last_seen"]
                                 if m.get("pm2.5") is not None:
                                     s["pm2.5"] = m["pm2.5"]
                         for sid, m in meta_by_id.items():
