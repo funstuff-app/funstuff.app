@@ -6411,7 +6411,7 @@ class MapView {
       const _now2 = performance.now();
       if (_now2 - _pp.lastReport > 2000) {
         if (_pp.fastPath + _pp.slowPath > 0) {
-          console.log(`[PA-PROBE] fast:${_pp.fastPath} slow:${_pp.slowPath} ensureAvg:${_pp.ensureCalls ? (_pp.ensureMs/_pp.ensureCalls).toFixed(1) : '-'}ms gesturing:${this._isGesturing()} transient:${this._isTransientAnimating()} scrub:${!!this._scrubbing} pinch:${this._pinchZooming} drag:${this._mouseDragging}`);
+          // console.log(`[PA-PROBE] fast:${_pp.fastPath} slow:${_pp.slowPath} ensureAvg:${_pp.ensureCalls ? (_pp.ensureMs/_pp.ensureCalls).toFixed(1) : '-'}ms gesturing:${this._isGesturing()} transient:${this._isTransientAnimating()} scrub:${!!this._scrubbing} pinch:${this._pinchZooming} drag:${this._mouseDragging}`);
         }
         _pp.fastPath = 0; _pp.slowPath = 0; _pp.ensureMs = 0; _pp.ensureCalls = 0; _pp.lastReport = _now2;
       }
