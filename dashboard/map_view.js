@@ -159,11 +159,10 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
     if (readingOutlier) continue;
 
     const wp = latLonToWorld(lat, lon, zoom);
-    const sx = wp.x - centerW.x + projW / 2;
-    const sy = wp.y - centerW.y + projH / 2;
-    if (sx < 0 || sx > projW || sy < 0 || sy > projH) continue;
     sensors.push({
-      sx, sy, value,
+      sx: wp.x - centerW.x + projW / 2,
+      sy: wp.y - centerW.y + projH / 2,
+      value,
       weightMultiplier: (f.purpleair ? 1 : _PA_FIELD_FIXED_WEIGHT_MULTIPLIER) * staleWeight,
     });
     fingerprint += _pm25ColorCat(value);
@@ -256,7 +255,6 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       const wx = u * ws, wy = v * ws;
       const sx = wx - centerW.x + projW / 2;
       const sy = wy - centerW.y + projH / 2;
-      if (sx < 0 || sx > projW || sy < 0 || sy > projH) continue;
 
       sensorMap.set(slotKey, { sx, sy, value: pollVal, weightMultiplier: decayWeight });
     }
