@@ -6593,11 +6593,13 @@ class MapView {
     const bufW = Math.min(Math.ceil(cssW * _OVERFETCH), Math.floor(maxDevPx / dpr));
     const bufH = Math.min(Math.ceil(cssH * _OVERFETCH), Math.floor(maxDevPx / dpr));
 
-    // Reference time for staleness fade (playback time or live clock)
-    const _pbTimeMs = this.playbackMode ? this.getPlaybackTimeMs() : null;
+    // Reference time for staleness fade: use data "now", NOT the playback scrub
+    // position.  last_seen is a live snapshot (not historical), so comparing it
+    // against the scrub position causes all PA sensors to vanish once the bar
+    // advances 45 min past last_seen.
     const _pbBounds = this.playbackMode ? this.getPlaybackBounds() : null;
     const _boundsMaxMs = (_pbBounds?.maxMs != null && isFinite(_pbBounds.maxMs)) ? _pbBounds.maxMs : null;
-    const virtualRefNowMs = (_pbTimeMs != null && isFinite(_pbTimeMs)) ? Number(_pbTimeMs) : (_boundsMaxMs ?? this._dataNowMs());
+    const virtualRefNowMs = _boundsMaxMs ?? this._dataNowMs();
 
     const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH, virtualRefNowMs);
     const paSensors = paField.sensors;
