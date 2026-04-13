@@ -401,7 +401,7 @@ function main() {
   let legendUserOverride = false; // true when user manually changed tab while marker selected
   let _wasAlreadyDeselected = true; // tracks if no sensor was selected on previous click
   let _lastBuiltDisplayTab = undefined; // cache key for buildLegend fast-skip
-  let _lastSyncedPaTab = undefined; // cache key for _syncPaFieldDim fast-skip
+  let _lastSyncedPaTab = undefined; // cache key for _syncMapPollutant fast-skip
   let _lastDimKey = undefined; // cache key for _applyLegendDimming
   let _legendAutoOpenedOnce = legendOpen; // skip auto-open if user already kept legend open
 
@@ -424,11 +424,18 @@ function main() {
     return pollutantToLegendTab(key);
   }
 
+  /** The effective pollutant tab: explicit user choice wins, else auto-derived from selected sensor. */
+  function _displayTab() {
+    if (legendTab) return legendTab;
+    if (selectedId) return _selectedSensorPollutantTab();
+    return null;
+  }
+
   /** Switch legend content to match a selected sensor's primary reading (without selecting the tab). */
   function syncLegendToSensor(sensor) {
     if (!sensor || legendTab != null) return;
     buildLegend(true);
-    _syncPaFieldDim();
+    _syncMapPollutant();
   }
 
   /** Sync legend content to whatever pollutant the map is currently showing on the selected marker. */
@@ -439,7 +446,7 @@ function main() {
     if (map._isTransientAnimating && map._isTransientAnimating()) return;
     if (legendTab != null) { _applyLegendDimming(); return; }
     buildLegend(true);
-    _syncPaFieldDim();
+    _syncMapPollutant();
   }
 
   /** Revert legend tab to the user's manual choice. */
@@ -447,7 +454,7 @@ function main() {
     if (legendTab !== userLegendTab && LEGEND_DATA[userLegendTab]) {
       legendTab = userLegendTab;
       buildLegend(true);
-      _syncPaFieldDim();
+      _syncMapPollutant();
     }
   }
 
@@ -707,8 +714,7 @@ function main() {
   };
   function _applyLegendDimming() {
     if (!_legendRows || _legendRows.length === 0) return;
-    let displayTab = legendTab;
-    if (!displayTab && selectedId) displayTab = _selectedSensorPollutantTab();
+    const displayTab = _displayTab();
     const tabKey = displayTab || "pm25";
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const entries = data.entries;
@@ -756,11 +762,7 @@ function main() {
     // Explicit user action (tab click): always invalidate the dim cache so
     // stale values from the previous pollutant never persist.
     if (animate) _lastDimKey = undefined;
-    // Derive display pollutant: explicit tab wins, otherwise follow selected sensor
-    let displayTab = legendTab;
-    if (!displayTab && selectedId) {
-      displayTab = _selectedSensorPollutantTab();
-    }
+    const displayTab = _displayTab();
     // Fast-skip: nothing changed since last build
     const buildKey = `${legendTab}|${displayTab}`;
     if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) { _applyLegendDimming(); return; }
@@ -903,19 +905,14 @@ function main() {
   }
 
   /** Sync PA field pollutant to match legend display (explicit tab or sensor-derived). */
-  function _syncPaFieldDim() {
+  /** Sync map-layer pollutant state (PA field + marker override) to match legend. */
+  function _syncMapPollutant() {
     if (!map) return;
-    let displayTab = legendTab;
-    if (!displayTab && selectedId) {
-      displayTab = _selectedSensorPollutantTab();
-    }
-    // Fast-skip: nothing changed since last sync
+    const displayTab = _displayTab();
     const syncKey = `${legendTab}|${displayTab}`;
     if (syncKey === _lastSyncedPaTab) return;
     _lastSyncedPaTab = syncKey;
     if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(displayTab);
-    // Marker override only from explicit legend tab clicks -- auto-display from
-    // selected sensor should NOT force all other markers to switch pollutant.
     if (typeof map.setMarkerPollutantOverride === "function") map.setMarkerPollutantOverride(legendTab);
   }
 
@@ -934,7 +931,7 @@ function main() {
         legendUserOverride = !!selectedId; // override auto-sync while a marker is selected
         if (legendTab) localStorage.setItem(LEGEND_TAB_KEY, legendTab);
         else localStorage.removeItem(LEGEND_TAB_KEY);
-        _syncPaFieldDim();
+        _syncMapPollutant();
         buildLegend(true);
       });
       tab.addEventListener("mouseenter", () => {
@@ -970,7 +967,7 @@ function main() {
     legendToggleEl.addEventListener("click", () => {
       legendOpen = true;
       updateLegendVisibility();
-      _syncPaFieldDim();
+      _syncMapPollutant();
     });
   }
 
@@ -1482,7 +1479,7 @@ function main() {
       if (map && typeof map.cancelSelectionOrchestration === "function") map.cancelSelectionOrchestration();
       map.setSelected(null);
       buildLegend();
-      _syncPaFieldDim();
+      _syncMapPollutant();
       renderLists(_currentState(), selectedId);
       renderDetails(_currentState(), selectedId);
       return;
@@ -1502,7 +1499,7 @@ function main() {
       // Track whether we were already deselected (for next click)
       _wasAlreadyDeselected = true;
       buildLegend();
-      _syncPaFieldDim();
+      _syncMapPollutant();
     }
     map.setSelected(selectedId);
     if (selectedId) _wasAlreadyDeselected = false;
@@ -1590,7 +1587,7 @@ function main() {
       _wasAlreadyDeselected = false;
       map.setSelected(null);
       buildLegend();
-      _syncPaFieldDim();
+      _syncMapPollutant();
       renderLists(_currentState(), selectedId);
       renderDetails(_currentState(), selectedId);
     }
@@ -3003,7 +3000,7 @@ function main() {
     // Sync legend + field only when not scrubbing with a sensor selected.
     // Legend title/bars and PA field update when scrubbing stops or vehicle resumes.
     if (!(_pbScrubbing || _pbIsWheelCoasting) || !selectedId) {
-      _syncPaFieldDim();
+      _syncMapPollutant();
       syncLegendToMapSelection();
     }
 

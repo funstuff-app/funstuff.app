@@ -8821,7 +8821,7 @@ class MapView {
 
         // Legend pollutant override: show the selected pollutant on ALL non-PurpleAir markers
         if (this._markerPollutantOverride != null && !f.purpleair) {
-          const src = isSel
+          const src = (fixedPbTimeMs != null)
             ? (interpolateFixedReadingsAtTime(f, fixedPbTimeMs) || f.readings)
             : f.readings;
           const legendPr = _readingForLegendTab(src, this._markerPollutantOverride);
