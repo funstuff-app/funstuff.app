@@ -3881,25 +3881,42 @@ class MapView {
     let minMs = Infinity;
     let maxMs = -Infinity;
 
-    // Live playback is "today only"; clamp the window start to 5:00 AM local time.
-    // Use the newest reading timestamp to determine what "today" means.
+    // Live playback is "today only"; clamp the window start to 5:00 AM Mountain Time.
+    // Use wall-clock time (not data timestamps) to determine what "today" means,
+    // so the scrub range stays anchored even when buses aren't running.
     const liveDayStartMs = (!this._historicalMode)
       ? (() => {
-          const bestMs = newestReadingMsFromState(state);
-          if (bestMs == null || !isFinite(bestMs)) return null;
-          const d = new Date(bestMs);
+          // Get current date/time in Mountain Time via toLocaleString.
+          // This survives JS obfuscation (no property-name lookups on Intl objects).
+          const mtStr = new Date().toLocaleString("en-US", { timeZone: "America/Denver", hour12: false });
+          // Format: "M/D/YYYY, HH:MM:SS"
+          const parts = mtStr.split(/[/,: ]+/);
+          const mtMonth = Number(parts[0]) - 1;
+          const mtDay = Number(parts[1]);
+          const mtYear = Number(parts[2]);
+          const mtHour = Number(parts[3]);
 
-          // If it's after midnight but before 5AM local time, "today's 5AM" is in the
-          // future relative to bestMs; in that case the live window should start at
-          // the previous day's 5AM.
-          const localHour = d.getHours();
-          if (localHour < 5) {
-            d.setDate(d.getDate() - 1);
+          // Build 5:00 AM Mountain Time as an epoch-ms value.
+          // Create a local Date for the MT calendar date at noon, then use
+          // toLocaleString round-trip to derive the UTC offset for that day.
+          const noonLocal = new Date(mtYear, mtMonth, mtDay, 12, 0, 0, 0);
+          const noonUtcStr = noonLocal.toLocaleString("en-US", { timeZone: "UTC", hour12: false });
+          const utcParts = noonUtcStr.split(/[/,: ]+/);
+          const noonUtcRecon = new Date(Date.UTC(
+            Number(utcParts[2]), Number(utcParts[0]) - 1, Number(utcParts[1]),
+            Number(utcParts[3]), Number(utcParts[4]), Number(utcParts[5])
+          ));
+          const offsetMs = noonUtcRecon.getTime() - noonLocal.getTime();
+
+          // 5 AM MT = local-constructed 5 AM + offset
+          let fiveAmMs = new Date(mtYear, mtMonth, mtDay, 5, 0, 0, 0).getTime() + offsetMs;
+
+          // If it's currently before 5 AM MT, the window started at yesterday's 5 AM.
+          if (mtHour < 5) {
+            fiveAmMs -= 86400000;
           }
 
-          d.setHours(5, 0, 0, 0);
-          const ms = d.getTime();
-          return isFinite(ms) ? ms : null;
+          return isFinite(fiveAmMs) ? fiveAmMs : null;
         })()
       : null;
 
