@@ -2700,12 +2700,6 @@ class MapView {
       this._scheduleHoverHide();
       return;
     }
-    // Suppress hover labels while a marker is selected
-    if (this.selectedId) {
-      this._clearHover();
-      return;
-    }
-
     const mobiles = Array.isArray(st.mobile) ? st.mobile : [];
     const fixed = Array.isArray(st.fixed) ? st.fixed : [];
 
@@ -2744,6 +2738,15 @@ class MapView {
       }
     }
 
+    // Update pointer cursor for marker hover
+    this.overlayCanvas.style.cursor = hit ? "pointer" : "";
+
+    // Suppress hover labels while a marker is selected
+    if (this.selectedId) {
+      this._clearHover();
+      return;
+    }
+
     if (hit) {
       // Clear hide timer if re-entering same or new marker
       if (this._hoverHideTimer) { clearTimeout(this._hoverHideTimer); this._hoverHideTimer = null; }
@@ -2757,7 +2760,7 @@ class MapView {
         this.drawOverlay(this.lastState);
       }, 333);
     } else {
-      // Cursor not over any marker — schedule hide
+      // Not over any marker — schedule hide
       if (this._hoverShowTimer) { clearTimeout(this._hoverShowTimer); this._hoverShowTimer = null; }
       this._scheduleHoverHide();
     }
