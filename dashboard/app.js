@@ -914,7 +914,8 @@ function main() {
     if (syncKey === _lastSyncedPaTab) return;
     _lastSyncedPaTab = syncKey;
     if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(displayTab);
-    // Marker override only from explicit tab clicks
+    // Marker override only from explicit legend tab clicks -- auto-display from
+    // selected sensor should NOT force all other markers to switch pollutant.
     if (typeof map.setMarkerPollutantOverride === "function") map.setMarkerPollutantOverride(legendTab);
   }
 

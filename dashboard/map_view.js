@@ -8820,20 +8820,20 @@ class MapView {
         }
 
         // Legend pollutant override: show the selected pollutant on ALL non-PurpleAir markers
-        if (!_skipLegendExport && this._markerPollutantOverride != null && !f.purpleair) {
+        if (this._markerPollutantOverride != null && !f.purpleair) {
           const src = isSel
             ? (interpolateFixedReadingsAtTime(f, fixedPbTimeMs) || f.readings)
             : f.readings;
           const legendPr = _readingForLegendTab(src, this._markerPollutantOverride);
           if (legendPr) {
             pr = legendPr;
-            if (isSel) this._selectedPollutantKey = legendPr.key;
-            if (isSel) this._selectedPollutantValue = parseFloat(legendPr.value);
+            if (!_skipLegendExport && isSel) this._selectedPollutantKey = legendPr.key;
+            if (!_skipLegendExport && isSel) this._selectedPollutantValue = parseFloat(legendPr.value);
           } else {
             const lbl = _LEGEND_TAB_LABEL[this._markerPollutantOverride] || this._markerPollutantOverride.toUpperCase();
             pr = { key: lbl, value: "\u2014", color: "#666666" };
-            if (isSel) this._selectedPollutantKey = null;
-            if (isSel) this._selectedPollutantValue = null;
+            if (!_skipLegendExport && isSel) this._selectedPollutantKey = null;
+            if (!_skipLegendExport && isSel) this._selectedPollutantValue = null;
           }
         }
 
@@ -9055,18 +9055,18 @@ class MapView {
 
       // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers
       // In playback mode, prefer trail-point readings (historical) over live m.readings
-      if (!_skipLegendExport && this._markerPollutantOverride != null) {
+      if (this._markerPollutantOverride != null) {
         const src = (this.playbackMode && pose && pose.readings) ? pose.readings : m.readings;
         const legendPr = _readingForLegendTab(src, this._markerPollutantOverride);
         if (legendPr) {
           pr = legendPr;
-          if (isSel) this._selectedPollutantKey = legendPr.key;
-          if (isSel) this._selectedPollutantValue = parseFloat(legendPr.value);
+          if (!_skipLegendExport && isSel) this._selectedPollutantKey = legendPr.key;
+          if (!_skipLegendExport && isSel) this._selectedPollutantValue = parseFloat(legendPr.value);
         } else {
           const lbl = _LEGEND_TAB_LABEL[this._markerPollutantOverride] || this._markerPollutantOverride.toUpperCase();
           pr = { key: lbl, value: "\u2014", color: "#666666" };
-          if (isSel) this._selectedPollutantKey = null;
-          if (isSel) this._selectedPollutantValue = null;
+          if (!_skipLegendExport && isSel) this._selectedPollutantKey = null;
+          if (!_skipLegendExport && isSel) this._selectedPollutantValue = null;
         }
       }
 
