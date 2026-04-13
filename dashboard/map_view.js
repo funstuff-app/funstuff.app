@@ -1765,6 +1765,25 @@ class MapView {
     return this._selectedPollutantValue ?? null;
   }
 
+  /** Return lat/lon bounds of the viewport with _OVERFETCH buffer.
+   *  Returns { minLat, maxLat, minLon, maxLon } or null if not sized. */
+  getBufferedBounds() {
+    const w = this._cssW || 0;
+    const h = this._cssH || 0;
+    if (w < 2 || h < 2) return null;
+    const cw = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
+    const bw = w * _OVERFETCH / 2;
+    const bh = h * _OVERFETCH / 2;
+    const tl = worldToLatLon(cw.x - bw, cw.y - bh, this.zoom);
+    const br = worldToLatLon(cw.x + bw, cw.y + bh, this.zoom);
+    return {
+      minLat: Math.min(tl.lat, br.lat),
+      maxLat: Math.max(tl.lat, br.lat),
+      minLon: Math.min(tl.lon, br.lon),
+      maxLon: Math.max(tl.lon, br.lon),
+    };
+  }
+
   setShowFixed(v) {
     const next = !!v;
     if (this.showFixed === next) return;

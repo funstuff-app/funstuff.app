@@ -440,11 +440,13 @@ function main() {
 
   /** Sync legend content to whatever pollutant the map is currently showing on the selected marker. */
   function syncLegendToMapSelection() {
-    if (!map || !selectedId) return;
+    if (!map) return;
     // Fast path: skip when legend panel is closed or during gestures.
     if (!legendOpen) return;
     if (map._isTransientAnimating && map._isTransientAnimating()) return;
-    if (legendTab != null) { _applyLegendDimming(); return; }
+    // Always re-run dimming when a tab is active (viewport may have changed)
+    if (legendTab != null) { _applyLegendDimming(); if (!selectedId) return; }
+    if (!selectedId) return;
     buildLegend(true);
     _syncMapPollutant();
   }
@@ -727,14 +729,21 @@ function main() {
       const keys = _DIM_READING_KEYS[tabKey] || [];
       const st = _currentState();
       const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
+      const bounds = map ? map.getBufferedBounds() : null;
       let max = -Infinity;
       for (const s of all) {
         if (s && s.outlier) continue;
+        if (bounds && isFinite(s.lat) && isFinite(s.lon)) {
+          if (s.lat < bounds.minLat || s.lat > bounds.maxLat
+              || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
+        }
         const r = s && s.readings;
         if (!r) continue;
         for (const k of keys) {
-          const rv = r[k] && r[k].value;
-          if (rv != null) { const n = parseFloat(rv); if (isFinite(n) && n > max) max = n; }
+          const rd = r[k];
+          if (!rd || rd.value == null || rd.outlier) continue;
+          const n = parseFloat(rd.value);
+          if (isFinite(n) && n > max) max = n;
         }
       }
       if (max > -Infinity) activeValue = max;
