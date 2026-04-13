@@ -443,6 +443,7 @@ function main() {
     const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
     const bounds = map.getViewportBounds();
     if (!bounds) return;
+    const pbTimeMs = map.playbackMode ? map.getPlaybackTimeMs() : null;
     const cLat = (bounds.minLat + bounds.maxLat) / 2;
     const cLon = (bounds.minLon + bounds.maxLon) / 2;
     const rLat = (bounds.maxLat - bounds.minLat) / 2;
@@ -454,13 +455,14 @@ function main() {
       if (!isFinite(s.lat) || !isFinite(s.lon)) continue;
       if (s.lat < bounds.minLat || s.lat > bounds.maxLat
           || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
-      const r = s && s.readings;
+      // Use interpolated readings during playback, live readings otherwise
+      const r = (pbTimeMs != null && fixedSensorHasHistoryTimes(s))
+        ? interpolateFixedReadingsAtTime(s, pbTimeMs)
+        : (s && s.readings);
       if (!r) continue;
-      // Normalized distance from center: 0 at center, 1 at edge
       const dLat = rLat > 0 ? Math.abs(s.lat - cLat) / rLat : 0;
       const dLon = rLon > 0 ? Math.abs(s.lon - cLon) / rLon : 0;
       const dist = Math.min(1, Math.sqrt(dLat * dLat + dLon * dLon));
-      // Weight: 1.0 at center, 0.5 at edge
       const weight = 1.0 - 0.5 * dist;
       for (const k of Object.keys(r)) {
         const rd = r[k];
@@ -785,6 +787,7 @@ function main() {
       const st = _currentState();
       const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
       const bounds = map ? map.getViewportBounds() : null;
+      const pbTimeMs = map && map.playbackMode ? map.getPlaybackTimeMs() : null;
       let max = -Infinity;
       for (const s of all) {
         if (s && s.outlier) continue;
@@ -792,7 +795,9 @@ function main() {
           if (s.lat < bounds.minLat || s.lat > bounds.maxLat
               || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
         }
-        const r = s && s.readings;
+        const r = (pbTimeMs != null && fixedSensorHasHistoryTimes(s))
+          ? interpolateFixedReadingsAtTime(s, pbTimeMs)
+          : (s && s.readings);
         if (!r) continue;
         for (const k of keys) {
           const rd = r[k];
