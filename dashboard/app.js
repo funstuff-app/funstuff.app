@@ -424,11 +424,65 @@ function main() {
     return pollutantToLegendTab(key);
   }
 
-  /** The effective pollutant tab: explicit user choice wins, else auto-derived from selected sensor. */
+  /** The effective pollutant tab: explicit user choice wins, else auto-derived from selected sensor,
+   *  else auto-derived from highest-AQI pollutant visible in the viewport. */
   function _displayTab() {
     if (legendTab) return legendTab;
     if (selectedId) return _selectedSensorPollutantTab();
-    return null;
+    return _viewportAutoTab;
+  }
+
+  let _viewportAutoTab = null; // auto-derived from highest-AQI pollutant in viewport
+  let _lastViewportAutoKey = undefined; // cache key to avoid redundant rebuilds
+
+  /** Scan visible sensors and pick the pollutant with the highest center-weighted AQI. */
+  function _updateViewportAutoTab() {
+    if (!map || !legendOpen) return;
+    if (legendTab || selectedId) return;
+    const st = _currentState();
+    const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
+    const bounds = map.getViewportBounds();
+    if (!bounds) return;
+    const cLat = (bounds.minLat + bounds.maxLat) / 2;
+    const cLon = (bounds.minLon + bounds.maxLon) / 2;
+    const rLat = (bounds.maxLat - bounds.minLat) / 2;
+    const rLon = (bounds.maxLon - bounds.minLon) / 2;
+    let bestScore = -1;
+    let bestKey = null;
+    for (const s of all) {
+      if (s && s.outlier) continue;
+      if (!isFinite(s.lat) || !isFinite(s.lon)) continue;
+      if (s.lat < bounds.minLat || s.lat > bounds.maxLat
+          || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
+      const r = s && s.readings;
+      if (!r) continue;
+      // Normalized distance from center: 0 at center, 1 at edge
+      const dLat = rLat > 0 ? Math.abs(s.lat - cLat) / rLat : 0;
+      const dLon = rLon > 0 ? Math.abs(s.lon - cLon) / rLon : 0;
+      const dist = Math.min(1, Math.sqrt(dLat * dLat + dLon * dLon));
+      // Weight: 1.0 at center, 0.5 at edge
+      const weight = 1.0 - 0.5 * dist;
+      for (const k of Object.keys(r)) {
+        const rd = r[k];
+        if (!rd || rd.value == null || rd.outlier) continue;
+        const aqi = valueToAqi(k, rd.value);
+        if (aqi != null) {
+          const score = aqi * weight;
+          if (score > bestScore) {
+            bestScore = score;
+            bestKey = k;
+          }
+        }
+      }
+    }
+    const newTab = pollutantToLegendTab(bestKey);
+    const cacheKey = `${newTab}|${Math.round(bestScore)}`;
+    if (cacheKey === _lastViewportAutoKey) return;
+    _lastViewportAutoKey = cacheKey;
+    _viewportAutoTab = newTab;
+    _lastBuiltDisplayTab = undefined;
+    _lastDimKey = undefined;
+    buildLegend(true);
   }
 
   /** Switch legend content to match a selected sensor's primary reading (without selecting the tab). */
@@ -441,10 +495,11 @@ function main() {
   /** Sync legend content to whatever pollutant the map is currently showing on the selected marker. */
   function syncLegendToMapSelection() {
     if (!map) return;
-    // Fast path: skip when legend panel is closed or during gestures.
     if (!legendOpen) return;
     if (map._isTransientAnimating && map._isTransientAnimating()) return;
-    // Always re-run dimming when a tab is active (viewport may have changed)
+    // Auto-detect highest-AQI pollutant in viewport when no explicit tab or sensor
+    if (!legendTab && !selectedId) { _updateViewportAutoTab(); return; }
+    // Re-run dimming when a tab is active (viewport may have changed)
     if (legendTab != null) { _applyLegendDimming(); if (!selectedId) return; }
     if (!selectedId) return;
     buildLegend(true);
@@ -729,7 +784,7 @@ function main() {
       const keys = _DIM_READING_KEYS[tabKey] || [];
       const st = _currentState();
       const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
-      const bounds = map ? map.getBufferedBounds() : null;
+      const bounds = map ? map.getViewportBounds() : null;
       let max = -Infinity;
       for (const s of all) {
         if (s && s.outlier) continue;
@@ -772,8 +827,9 @@ function main() {
     // stale values from the previous pollutant never persist.
     if (animate) _lastDimKey = undefined;
     const displayTab = _displayTab();
-    // Fast-skip: nothing changed since last build
-    const buildKey = `${legendTab}|${displayTab}`;
+    // Fast-skip: nothing changed since last build.
+    // Include selectedId so sensor selection always refreshes tab highlighting.
+    const buildKey = `${legendTab}|${displayTab}|${selectedId || ""}`;
     if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) { _applyLegendDimming(); return; }
     _lastBuiltDisplayTab = buildKey;
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
@@ -802,7 +858,7 @@ function main() {
       }
       _legendEntryCount = newCount;
       const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
-      const autoTabKey = legendTab == null ? (selectedId ? displayTab : null) : null;
+      const autoTabKey = legendTab == null ? displayTab : null;
       for (const t of tabs) {
         const k = t.dataset.legend;
         t.classList.toggle("active", k === legendTab);
@@ -858,7 +914,7 @@ function main() {
 
     _legendEntryCount = newCount;
     const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
-    const autoTabKey = legendTab == null ? (selectedId ? displayTab : null) : null;
+    const autoTabKey = legendTab == null ? displayTab : null;
     for (const t of tabs) {
       const k = t.dataset.legend;
       t.classList.toggle("active", k === legendTab);
@@ -914,14 +970,16 @@ function main() {
   }
 
   /** Sync PA field pollutant to match legend display (explicit tab or sensor-derived). */
-  /** Sync map-layer pollutant state (PA field + marker override) to match legend. */
+  /** Sync map-layer pollutant state (PA field + marker override) to match legend.
+   *  Only explicit tab clicks and sensor-derived tabs affect the map layers.
+   *  Viewport auto-tab only drives the legend panel UI. */
   function _syncMapPollutant() {
     if (!map) return;
-    const displayTab = _displayTab();
-    const syncKey = `${legendTab}|${displayTab}`;
+    const mapTab = legendTab || (selectedId ? _selectedSensorPollutantTab() : null);
+    const syncKey = `${legendTab}|${mapTab}`;
     if (syncKey === _lastSyncedPaTab) return;
     _lastSyncedPaTab = syncKey;
-    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(displayTab);
+    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(mapTab);
     if (typeof map.setMarkerPollutantOverride === "function") map.setMarkerPollutantOverride(legendTab);
   }
 
@@ -937,9 +995,11 @@ function main() {
         // Clicking the active tab deselects back to default (null)
         legendTab = (clicked === legendTab) ? null : clicked;
         userLegendTab = legendTab;
-        legendUserOverride = !!selectedId; // override auto-sync while a marker is selected
+        legendUserOverride = !!selectedId;
         if (legendTab) localStorage.setItem(LEGEND_TAB_KEY, legendTab);
         else localStorage.removeItem(LEGEND_TAB_KEY);
+        _lastViewportAutoKey = undefined;
+        if (!legendTab && !selectedId) _updateViewportAutoTab();
         _syncMapPollutant();
         buildLegend(true);
       });
@@ -976,7 +1036,10 @@ function main() {
     legendToggleEl.addEventListener("click", () => {
       legendOpen = true;
       updateLegendVisibility();
+      _lastViewportAutoKey = undefined;
+      _updateViewportAutoTab();
       _syncMapPollutant();
+      buildLegend(true);
     });
   }
 

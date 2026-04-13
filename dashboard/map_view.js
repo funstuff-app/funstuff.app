@@ -1784,6 +1784,22 @@ class MapView {
     };
   }
 
+  /** Return lat/lon bounds of the visible viewport (no buffer). */
+  getViewportBounds() {
+    const w = this._cssW || 0;
+    const h = this._cssH || 0;
+    if (w < 2 || h < 2) return null;
+    const cw = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
+    const tl = worldToLatLon(cw.x - w / 2, cw.y - h / 2, this.zoom);
+    const br = worldToLatLon(cw.x + w / 2, cw.y + h / 2, this.zoom);
+    return {
+      minLat: Math.min(tl.lat, br.lat),
+      maxLat: Math.max(tl.lat, br.lat),
+      minLon: Math.min(tl.lon, br.lon),
+      maxLon: Math.max(tl.lon, br.lon),
+    };
+  }
+
   setShowFixed(v) {
     const next = !!v;
     if (this.showFixed === next) return;
@@ -2794,7 +2810,7 @@ class MapView {
       ...(topMobileCand ? [topMobileCand] : []),
       ...[...otherMobileCands].reverse(),
       ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
-      ...(this._paFieldPollutant == null ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
+      ...(this._paFieldPollutant == null || this._paFieldPollutant === "pm25" ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
     ];
     const _clickRefMs = this.getPlaybackTimeMs() || this._dataNowMs();
     const _PA_FADE_MS = 45 * 60 * 1000;
@@ -2852,7 +2868,7 @@ class MapView {
       ...(tapTopMobileCand ? [tapTopMobileCand] : []),
       ...[...tapOtherMobileCands].reverse(),
       ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
-      ...(this._paFieldPollutant == null ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
+      ...(this._paFieldPollutant == null || this._paFieldPollutant === "pm25" ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
     ];
     const _tapRefMs = this.getPlaybackTimeMs() || this._dataNowMs();
     const _TAP_PA_FADE_MS = 45 * 60 * 1000;
@@ -7343,8 +7359,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
-          // Fade PurpleAir dots when any pollutant is active
-          const paFadedForPollutant = !isSel && this._paFieldPollutant != null;
+          // Fade PurpleAir dots when a non-PM2.5 pollutant is active (PA sensors report PM2.5)
+          const paFadedForPollutant = !isSel && this._paFieldPollutant != null && this._paFieldPollutant !== "pm25";
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
@@ -8865,8 +8881,8 @@ class MapView {
         ctx.save();
         const isPurpleAir = !!f.purpleair;
         if (isPurpleAir) {
-          // Fade PurpleAir dots when any pollutant is active
-          const paFadedForPollutant = !isSel && this._paFieldPollutant != null;
+          // Fade PurpleAir dots when a non-PM2.5 pollutant is active (PA sensors report PM2.5)
+          const paFadedForPollutant = !isSel && this._paFieldPollutant != null && this._paFieldPollutant !== "pm25";
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
