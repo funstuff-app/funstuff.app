@@ -2087,6 +2087,32 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                 # to the last ~1200 points so this is cheap.
                 pm["trail"] = clean_trail(pm["trail"])
 
+                # Trim trail to today's 5 AM MT window so the client
+                # can't scrub past the current day boundary.
+                _mt_now = datetime.now(_MOUNTAIN_TZ)
+                _mt_day = _mt_now.date()
+                if _mt_now.hour < 5:
+                    _mt_day -= timedelta(days=1)
+                _day_start_utc = datetime(
+                    _mt_day.year, _mt_day.month, _mt_day.day,
+                    5, 0, 0, 0, tzinfo=_MOUNTAIN_TZ
+                ).astimezone(timezone.utc)
+                _day_start_epoch = _day_start_utc.timestamp()
+                _old_len = len(pm["trail"])
+                if _old_len > 0:
+                    # Binary search: trail is chronological after clean_trail
+                    _lo, _hi = 0, _old_len
+                    while _lo < _hi:
+                        _mid = (_lo + _hi) >> 1
+                        _pt = pm["trail"][_mid]
+                        _dt = parse_utc_timestamp(_pt.get("t")) if isinstance(_pt, dict) else None
+                        if _dt is not None and _dt.timestamp() < _day_start_epoch:
+                            _lo = _mid + 1
+                        else:
+                            _hi = _mid
+                    if _lo > 0:
+                        pm["trail"] = pm["trail"][_lo:]
+
                 if len(pm["trail"]) > 5000:
                     pm["trail"] = pm["trail"][-5000:]
 
