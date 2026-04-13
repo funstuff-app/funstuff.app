@@ -88,6 +88,8 @@ function _readingForLegendTab(readings, legendTab) {
 function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab, bufW, bufH, refNowMs) {
   const isPm25 = !pollutantTab || pollutantTab === "pm25";
   const readingKeys = _LEGEND_TAB_READING_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_READING_KEYS.pm25;
+  // Utah bounding box: skip sensors outside the Wasatch Front / Utah region
+  const _UT_MIN_LAT = 36.9, _UT_MAX_LAT = 42.1, _UT_MIN_LON = -114.1, _UT_MAX_LON = -109.0;
   // Project to buffer center when overfetch dimensions supplied
   const projW = bufW || cssW;
   const projH = bufH || cssH;
@@ -113,6 +115,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
     const lat = Number(f.lat);
     const lon = Number(f.lon);
     if (!isFinite(lat) || !isFinite(lon)) continue;
+    if (lat < _UT_MIN_LAT || lat > _UT_MAX_LAT || lon < _UT_MIN_LON || lon > _UT_MAX_LON) continue;
 
     if (isPm25) {
       // PM2.5 mode: PurpleAir + nearby non-PA fixed (original behavior)
