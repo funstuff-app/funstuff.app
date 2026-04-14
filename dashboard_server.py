@@ -2639,8 +2639,6 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
     # flip-flopping between max-positive and 0 (unsigned overflow).
     history = app_state.fixed_history
     for i, s in enumerate(valid_sensors):
-        if i in outlier_indices:
-            continue
         pm25_val = s["_pm25"]
         sid = f"PA_{s.get('sensor_index', '')}"
         hist_entries = (history.get(sid, {}).get("PM25") or
@@ -2650,6 +2648,8 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
         # Walk history and detect cliff jumps (8x ratio, high side >= 50).
         # Record the cliff window so _inject_fixed_history can null those
         # readings during playback rewind, even after the sensor recovers.
+        # Runs for ALL sensors (including spatial outliers) so cliff windows
+        # are always recorded for playback nulling.
         if len(hist_entries) >= 2:
             # Scan full history to find cliff edges -- sustained malfunctions
             # can push the cliff edge far back in the timeline.
@@ -2684,9 +2684,13 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
                 if in_cliff:
                     # Still on the plateau -- flag as outlier on live map
                     outlier_indices.add(i)
-                continue
+                    continue
             else:
                 app_state.cliff_pa_sensors.pop(sid, None)
+
+        # Skip overflow/stuck checks for sensors already flagged
+        if i in outlier_indices:
+            continue
 
         if pm25_val < 500:
             continue  # only inspect high readings for overflow/stuck patterns
