@@ -193,7 +193,15 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
   const FADE_TAIL_FRAC = 0.20;
   const fadeStartAgeMs = FADE_TIME_MS * (1.0 - FADE_TAIL_FRAC);
 
-  if (!refNowMs || !isFinite(refNowMs)) return { sensors: [], fingerprint: "" };
+  // In playback, age trail points relative to the scrub position so virtual
+  // sensors follow the playhead and decay as the user scrubs. In live mode,
+  // fall back to refNowMs (data-max). Without this, virtuals never decay in
+  // playback and trail points older than the fade window relative to data-max
+  // never contribute — even when the playhead is scrubbed back to when they
+  // were fresh.
+  const ageRefMs = (isPlayback && playbackTimeMs != null && isFinite(playbackTimeMs))
+    ? playbackTimeMs : refNowMs;
+  if (!ageRefMs || !isFinite(ageRefMs)) return { sensors: [], fingerprint: "" };
 
   const ws = worldSizeForZoom(zoom);
 
@@ -215,7 +223,7 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       }
       if (tMs == null || !isFinite(tMs)) continue;
 
-      const ageMs = refNowMs - tMs;
+      const ageMs = ageRefMs - tMs;
       if (ageMs < 0) continue;           // future point in playback
       if (ageMs >= FADE_TIME_MS) break;   // past fade window (older points only get older)
 
@@ -6674,14 +6682,19 @@ class MapView {
     const nSensors = allSensors.length;
     if (nSensors === 0) { this._paFieldCanvas = null; this._paFieldCtx = null; return; }
 
-    // Disable validity-range fast-skip when virtual sensors are present (they age continuously)
-    if (virtualField.sensors.length > 0) this._paFieldValidRange = null;
+    // Disable validity-range fast-skip when virtual sensors are present — they
+    // age continuously with the playhead, so the fingerprint validity window
+    // (computed only from fixed sensors) would let us skip recomputation that's
+    // actually needed. hasVirtuals gates BOTH the cache-hit assignment below
+    // AND the post-compute assignment at the end of this function.
+    const hasVirtuals = virtualField.sensors.length > 0;
+    if (hasVirtuals) this._paFieldValidRange = null;
 
     // ── Cache key: view geometry + color fingerprint + pollutant ──
     const key = `pa:${viewKey}|p:${pollutantTab}|f:${fingerprint}`;
     if (this._paFieldCanvas && this._paFieldKey === key) {
       // Cache hit — update validity window so future frames skip _collectPaFieldSensors.
-      if (!this._paFieldValidRange) {
+      if (!this._paFieldValidRange && !hasVirtuals) {
         this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
         this._paFieldValidViewKey = viewKey;
         this._paFieldValidFixed = fixed;
@@ -6755,10 +6768,17 @@ class MapView {
     this._paFieldBufH = bufH;
 
     // ── Update fingerprint validity window for fast-path skipping ──
-    this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
-    this._paFieldValidViewKey = viewKey;
-    this._paFieldValidFixed = fixed;
-    this._paFieldValidPollutant = pollutantTab;
+    // Skip when virtuals are present — the range is derived only from fixed
+    // sensor color transitions and would incorrectly allow skipping frames
+    // where virtual sensors age/decay relative to the playhead.
+    if (!hasVirtuals) {
+      this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
+      this._paFieldValidViewKey = viewKey;
+      this._paFieldValidFixed = fixed;
+      this._paFieldValidPollutant = pollutantTab;
+    } else {
+      this._paFieldValidRange = null;
+    }
     // Store view state for gesture-time translate offset
     this._paFieldComputedView = { centerLat: clat, centerLon: clon, zoom: z };
   }
