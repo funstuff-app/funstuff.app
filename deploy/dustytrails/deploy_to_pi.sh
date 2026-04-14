@@ -532,9 +532,9 @@ main() {
     echo "  Dashboard:  http://$PI_HOST:$DASHBOARD_PORT/"
     echo ""
     echo "  Commands:"
-    echo "    Logs:    ssh $PI_TARGET 'journalctl -u $SERVICE_NAME -f'"
-    echo "    Status:  ssh $PI_TARGET 'systemctl status $SERVICE_NAME'"
-    echo "    Restart: ssh $PI_TARGET 'systemctl restart $SERVICE_NAME'"
+    echo "    Logs:    ssh -t $PI_TARGET 'journalctl -u $SERVICE_NAME -f'"
+    echo "    Status:  ssh -t $PI_TARGET 'systemctl status $SERVICE_NAME'"
+    echo "    Restart: ssh -t $PI_TARGET 'systemctl restart $SERVICE_NAME'"
     echo ""
 }
 

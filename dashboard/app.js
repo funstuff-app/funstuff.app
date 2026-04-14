@@ -1039,8 +1039,8 @@ function main() {
       });
       tab.addEventListener("mouseleave", () => {
         if (legendTab != null) return;
-        // Restore: re-derive from current state (selected sensor or none)
-        const autoTabKey = selectedId ? _selectedSensorPollutantTab() : null;
+        // Restore: re-derive from current state (selected sensor, or viewport auto)
+        const autoTabKey = selectedId ? _selectedSensorPollutantTab() : _viewportAutoTab;
         for (const t of allTabs) {
           const k = t.dataset.legend;
           t.classList.toggle("auto-active", k === autoTabKey);
