@@ -259,7 +259,7 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       const sx = wx - centerW.x + projW / 2;
       const sy = wy - centerW.y + projH / 2;
 
-      sensorMap.set(slotKey, { sx, sy, value: pollVal, weightMultiplier: decayWeight });
+      sensorMap.set(slotKey, { sx, sy, value: pollVal, weightMultiplier: _PA_FIELD_FIXED_WEIGHT_MULTIPLIER * decayWeight });
     }
   }
 
