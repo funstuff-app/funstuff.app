@@ -310,7 +310,7 @@
   <script defer src="format_utils.js?v=20260224a"></script>
   <script defer src="data_utils.js?v=20260412a"></script>
   <script defer src="advection_solver.js?v=20260320a"></script>
-  <script defer src="map_view.js?v=20260413b"></script>
+  <script defer src="map_view.js?v=20260414a"></script>
   <script defer src="sidebar_ui.js?v=20260406a"></script>
   <script defer src="jog_wheel.js?v=20260327j"></script>
   <script defer src="app.js?v=20260413c"></script>
@@ -323,9 +323,10 @@
       <span>cut°</span><span id="fdCutoffVal" style="text-align:right">0.14</span><input id="fdCutoff" type="range" min="0.02" max="1.0" step="0.01" value="0.14" style="height:14px;width:100%;">
       <span>blur</span><span id="fdBlurVal" style="text-align:right">2</span><input id="fdBlur" type="range" min="0" max="6" step="1" value="2" style="height:14px;width:100%;">
     </div>
-    <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
+    <div style="margin-top:4px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
       <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowWind" type="checkbox" style="margin:0;"> wind vectors</label>
       <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowVirtual" type="checkbox" style="margin:0;"> ghost sensors</label>
+      <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="pbDebugPath" type="checkbox" style="margin:0;"> road debug</label>
     </div>
     <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
       <span>upscale</span>
