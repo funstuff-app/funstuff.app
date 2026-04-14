@@ -481,10 +481,16 @@ function main() {
     const cacheKey = `${newTab}|${Math.round(bestScore)}`;
     if (cacheKey === _lastViewportAutoKey) return;
     _lastViewportAutoKey = cacheKey;
+    const tabChanged = _viewportAutoTab !== newTab;
     _viewportAutoTab = newTab;
-    _lastBuiltDisplayTab = undefined;
-    _lastDimKey = undefined;
-    buildLegend(true);
+    if (tabChanged) {
+      _lastBuiltDisplayTab = undefined;
+      _lastDimKey = undefined;
+      buildLegend(true);
+    } else {
+      _lastDimKey = undefined;
+      _applyLegendDimming();
+    }
   }
 
   /** Switch legend content to match a selected sensor's primary reading (without selecting the tab). */
@@ -679,7 +685,7 @@ function main() {
       pill.style.borderColor = darkenHex(e.color, 0.55);
       pill.style.boxShadow = _pillInnerShadow(e.color);
     }
-    // True crossfade for range text: clone old, stack it, fade old out + new in simultaneously
+    // True crossfade for range text: ghost overlay inside oldBg fades out to reveal new content
     const rangeEl = row.querySelector(".legendRange");
     if (rangeEl) {
       const oldBg = rangeEl.querySelector(".legendRangeBg");
@@ -690,44 +696,53 @@ function main() {
           (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
         // Skip if text unchanged
         if (oldBg.innerHTML !== newInner) {
-          // Clone old text as a fading-out ghost
-          const ghost = oldBg.cloneNode(true);
-          ghost.style.cssText = "position:absolute;top:0;left:0;right:0;opacity:1;transition:opacity 0.2s ease-out;pointer-events:none;";
-          rangeEl.style.position = "relative";
-          rangeEl.appendChild(ghost);
-          // Set new text immediately, start invisible
+          // Clone old content as ghost inside oldBg (which gets position:relative)
+          const ghost = document.createElement("span");
+          ghost.innerHTML = oldBg.innerHTML;
+          ghost.style.cssText = "position:absolute;inset:0;display:inline-flex;align-items:center;opacity:1;transition:opacity 0.2s ease-out;pointer-events:none;";
+          oldBg.style.position = "relative";
           oldBg.innerHTML = newInner;
-          oldBg.style.opacity = "0";
-          oldBg.style.transition = "opacity 0.2s ease-out";
-          // Crossfade: old ghost fades out, new fades in
-          requestAnimationFrame(() => {
+          oldBg.appendChild(ghost);
+          // Double-rAF: ghost fades out, new content is already visible underneath
+          requestAnimationFrame(() => { requestAnimationFrame(() => {
             ghost.style.opacity = "0";
-            oldBg.style.opacity = "1";
-          });
+          }); });
           // Clean up ghost after transition
-          setTimeout(() => { if (ghost.parentNode) ghost.parentNode.removeChild(ghost); }, 220);
+          setTimeout(() => {
+            if (ghost.parentNode) ghost.parentNode.removeChild(ghost);
+            oldBg.removeAttribute("style");
+          }, 250);
         }
       }
     }
-    // Crossfade bracket labels the same way
+    // Crossfade bracket labels
     const oldBracket = row.querySelector(".legendBracket");
     if (oldBracket) {
       const newHtml = _makeBracketHtml(idx, dimGroups);
-      if (oldBracket.outerHTML !== newHtml) {
-        const ghost = oldBracket.cloneNode(true);
-        ghost.style.cssText += ";position:absolute;right:0;top:0;bottom:0;opacity:1;transition:opacity 0.2s ease-out;pointer-events:none;";
-        oldBracket.parentNode.insertBefore(ghost, oldBracket.nextSibling);
-        oldBracket.outerHTML = newHtml;
-        const newBracket = row.querySelector(".legendBracket");
-        if (newBracket) {
-          newBracket.style.opacity = "0";
-          newBracket.style.transition = "opacity 0.2s ease-out";
-          requestAnimationFrame(() => {
-            ghost.style.opacity = "0";
-            newBracket.style.opacity = "1";
-          });
-        }
-        setTimeout(() => { if (ghost.parentNode) ghost.parentNode.removeChild(ghost); }, 220);
+      const _tmp = document.createElement("div");
+      _tmp.innerHTML = newHtml;
+      const _ref = _tmp.firstChild;
+      if (oldBracket.className !== _ref.className || oldBracket.innerHTML !== _ref.innerHTML) {
+        // Clone old content as ghost inside the bracket (which has position:relative)
+        const ghost = document.createElement("span");
+        ghost.innerHTML = oldBracket.innerHTML;
+        ghost.style.cssText = "position:absolute;inset:0;display:flex;align-items:center;justify-content:flex-end;opacity:1;transition:opacity 0.2s ease-out;pointer-events:none;";
+        oldBracket.appendChild(ghost);
+        // Replace bracket content in-place
+        oldBracket.className = _ref.className;
+        // Set new label content (ghost covers it during crossfade)
+        const newLabel = _ref.innerHTML;
+        oldBracket.innerHTML = newLabel;
+        oldBracket.appendChild(ghost);
+        oldBracket.style.opacity = "1";
+        // Double-rAF crossfade
+        requestAnimationFrame(() => { requestAnimationFrame(() => {
+          ghost.style.opacity = "0";
+        }); });
+        setTimeout(() => {
+          if (ghost.parentNode) ghost.parentNode.removeChild(ghost);
+          oldBracket.removeAttribute("style");
+        }, 250);
       }
     }
   }
@@ -751,14 +766,19 @@ function main() {
         const hiText = e.hi != null ? fmt(e.hi) : "";
         bg.innerHTML = `<span class="legendLo">${loText}</span>` +
           (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
-        bg.style.opacity = "1";
+        bg.removeAttribute("style");
       }
     }
     const oldBracket = row.querySelector(".legendBracket");
     if (oldBracket) {
       const newHtml = _makeBracketHtml(idx, dimGroups);
-      if (oldBracket.outerHTML !== newHtml) {
+      const _tmp = document.createElement("div");
+      _tmp.innerHTML = newHtml;
+      const _ref = _tmp.firstChild;
+      if (oldBracket.className !== _ref.className || oldBracket.innerHTML !== _ref.innerHTML) {
         oldBracket.outerHTML = newHtml;
+      } else {
+        oldBracket.removeAttribute("style");
       }
     }
   }
