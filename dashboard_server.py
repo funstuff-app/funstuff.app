@@ -364,6 +364,55 @@ def default_data_dir() -> Path:
     return Path(os.path.expanduser("~/.mobileair"))
 
 
+def _fetch_remote_db(remote_spec: str, local_db: Path) -> None:
+    """scp ``{remote_spec}/dustytrails.db`` into ``local_db``.
+
+    ``remote_spec`` is in the form ``USER@HOST:PATH`` (e.g.
+    ``jpark@192.168.10.149:~/.mobileair/``). The remote shell expands ``~``
+    so tilde paths work fine.
+
+    Any existing local .db / -wal / -shm are removed first so SQLite starts
+    from the fetched snapshot with a clean WAL. On any failure we raise
+    SystemExit — silently starting with an empty DB would mask a
+    network/auth problem and produce an empty dashboard.
+
+    Note: this is a plain scp of a live file. If the remote is actively
+    writing to the DB at fetch time, the copy can be torn. Stopping the
+    remote writer (or using ``sqlite3 .backup`` out-of-band) before running
+    this is the safe play.
+    """
+    import subprocess
+
+    if ":" not in remote_spec:
+        raise SystemExit(
+            f"--remote-data-dir must be USER@HOST:PATH, got: {remote_spec!r}"
+        )
+    spec = remote_spec.rstrip("/")
+    remote_db = f"{spec}/dustytrails.db"
+
+    # Clean local artifacts so sqlite starts with an empty WAL against the
+    # freshly-fetched file (leftover -wal from a prior run refers to a
+    # different .db and will be rejected).
+    for suffix in ("", "-wal", "-shm"):
+        p = local_db.parent / f"{local_db.name}{suffix}"
+        if p.exists():
+            p.unlink()
+
+    _log(f"[DB] Fetching remote DB from {remote_db} → {local_db}")
+    result = subprocess.run(
+        ["scp", "-q", remote_db, str(local_db)],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"[DB] scp failed (exit {result.returncode}) fetching {remote_db}"
+        )
+    if not local_db.exists():
+        raise SystemExit(f"[DB] scp reported success but {local_db} does not exist")
+    mb = local_db.stat().st_size / (1024 * 1024)
+    _log(f"[DB] Fetched remote DB ({mb:.1f} MB)")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Geo-IP visitor logging
 # Logs city/region/country to ~/.mobileair/visitors.log on each unique page load.
@@ -5641,6 +5690,14 @@ def main() -> int:
         action="store_true",
         help="Demo mode: fetch real PA sensor coordinates once, then generate synthetic PM2.5 time-series with choreographed effects for field testing"
     )
+    parser.add_argument(
+        "--remote-data-dir",
+        default="",
+        help="Remote SSH data dir (e.g. 'jpark@192.168.10.149:~/.mobileair/'). "
+             "If set, scp's dustytrails.db from there into the local data dir "
+             "before startup, overwriting any local copy. Useful for pointing "
+             "a dev dashboard at the Pi's live DB."
+    )
     args = parser.parse_args()
     
     # Build server config for /api/config endpoint
@@ -5672,6 +5729,8 @@ def main() -> int:
 
     # ── Initialize SQLite database ──
     db_path = data_dir / "dustytrails.db"
+    if args.remote_data_dir:
+        _fetch_remote_db(args.remote_data_dir, db_path)
     _log(f"[DB] Initializing SQLite at {db_path}")
     db_worker = DbWorker(db_path)
     db_worker.start()
