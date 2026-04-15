@@ -864,20 +864,11 @@ function main() {
     if (map && selectedId) {
       const v = map.getSelectedPollutantValue();
       if (v != null && isFinite(v)) activeValue = v;
-    } else {
-      // Sample the PA field's max AQI within the viewport. The field is
-      // IDW-smoothed across all sensors (PurpleAir + mobile trails) so it
-      // reflects what the user actually sees, not raw individual readings.
+    } else if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
       const aqiKey = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" }[tabKey] || "pm2.5";
-      if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
-        for (let i = entries.length - 1; i >= 0; i--) {
-          const loAqi = valueToAqi(aqiKey, entries[i].lo);
-          if (loAqi != null && map._paFieldMaxAqi >= loAqi) {
-            activeValue = entries[i].lo;
-            break;
-          }
-        }
-      }
+      activeValue = aqiToValue(aqiKey, map._paFieldMaxAqi);
+      // Ozone AQI breakpoints are in ppm but legend entries are in ppb
+      if (tabKey === "o3" && activeValue != null) activeValue *= 1000;
     }
     // Only touch DOM when the value crosses a bracket boundary.
     // Find the first row that would dim (lo > activeValue) — that index IS the bracket.

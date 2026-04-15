@@ -6856,6 +6856,7 @@ class MapView {
     const vpH = vpCssH || cssH;
     const vpMarginX = (cssW - vpW) / 2;
     const vpMarginY = (cssH - vpH) / 2;
+    // Sample only the viewport region (exclude overfetch margins)
     const vpGxMin = Math.floor(vpMarginX / cellSize);
     const vpGyMin = Math.floor(vpMarginY / cellSize);
     const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + vpW) / cellSize));
@@ -6863,7 +6864,7 @@ class MapView {
 
     for (let gy = 0; gy < gh; gy++) {
       const py = (gy + 0.5) * cellSize;
-      const inVpY = gy >= vpGyMin && gy < vpGyMax;
+      const inVpY = gy >= vpGyMin && gy <= vpGyMax;
       for (let gx = 0; gx < gw; gx++) {
         const pxx = (gx + 0.5) * cellSize;
 

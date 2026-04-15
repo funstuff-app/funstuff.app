@@ -100,6 +100,23 @@ function valueToAqi(pollutantKey, value) {
   return null;
 }
 
+function aqiToValue(pollutantKey, aqi) {
+  const k = _normalizePollutantKeyForAqi(pollutantKey);
+  const a = Number(aqi);
+  if (!isFinite(a)) return null;
+  const bps = AQI_BREAKPOINTS[k];
+  if (!bps || !bps.length) return null;
+  for (const bp of bps) {
+    if (a >= bp.aqi_low && a <= bp.aqi_high) {
+      if (bp.aqi_high === bp.aqi_low) return bp.c_high;
+      return ((bp.c_high - bp.c_low) / (bp.aqi_high - bp.aqi_low)) * (a - bp.aqi_low) + bp.c_low;
+    }
+  }
+  if (a < bps[0].aqi_low) return bps[0].c_low;
+  if (a > bps[bps.length - 1].aqi_high) return bps[bps.length - 1].c_high;
+  return null;
+}
+
 function aqiLevel(aqi) {
   const a = Number(aqi);
   if (!isFinite(a)) return { label: "Unknown", color: "#AAAAAA", aqi_hi: null };
