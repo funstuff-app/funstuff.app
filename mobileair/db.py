@@ -598,15 +598,35 @@ class DbWorker:
         last_checkpoint = time.time()
         pending = 0
 
+        def _safe_commit() -> None:
+            """Commit, swallowing corruption errors so the thread survives.
+
+            If the DB file is corrupt (``database disk image is malformed``),
+            re-raising kills the writer thread and every subsequent .put()
+            piles up silently in the queue. Logging and resetting ``pending``
+            keeps the thread alive so the rest of the server still works —
+            the corrupt rows are dropped, which is already the only sane
+            outcome for a malformed DB.
+            """
+            nonlocal pending, last_flush
+            try:
+                conn.commit()
+            except sqlite3.DatabaseError as e:
+                log.warning("[DB] Commit error (dropping %d pending): %s", pending, e)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            pending = 0
+            last_flush = time.time()
+
         while True:
             try:
                 item = self._queue.get(timeout=1.0)
             except queue.Empty:
                 # Flush on idle if anything is pending
                 if pending > 0:
-                    conn.commit()
-                    pending = 0
-                    last_flush = time.time()
+                    _safe_commit()
                 # Periodic WAL checkpoint
                 if time.time() - last_checkpoint > DB_WAL_CHECKPOINT_INTERVAL_S:
                     try:
@@ -618,7 +638,7 @@ class DbWorker:
 
             if item is _STOP:
                 if pending > 0:
-                    conn.commit()
+                    _safe_commit()
                 log.info("[DB] Writer flushed final %d items", pending)
                 break
 
@@ -632,9 +652,7 @@ class DbWorker:
             # Batch commit policy
             now = time.time()
             if pending >= DB_WRITE_BATCH_SIZE or (now - last_flush) >= DB_WRITE_FLUSH_INTERVAL_S:
-                conn.commit()
-                pending = 0
-                last_flush = now
+                _safe_commit()
 
             # Periodic WAL checkpoint
             if now - last_checkpoint > DB_WAL_CHECKPOINT_INTERVAL_S:
