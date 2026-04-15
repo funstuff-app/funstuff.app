@@ -453,26 +453,85 @@ function main() {
     for (const s of all) {
       if (s && s.outlier) continue;
       if (!isFinite(s.lat) || !isFinite(s.lon)) continue;
-      if (s.lat < bounds.minLat || s.lat > bounds.maxLat
-          || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
+      // For mobile sensors in playback, skip the head-position viewport check
+      // because trail points have their own lat/lon checked individually below.
+      const isMobilePlayback = pbTimeMs != null && map && map._playbackPtsById
+                               && map._playbackPtsById.has(String(s.id));
+      if (!isMobilePlayback) {
+        if (s.lat < bounds.minLat || s.lat > bounds.maxLat
+            || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
+      }
       // Use interpolated readings during playback, live readings otherwise
-      const r = (pbTimeMs != null && fixedSensorHasHistoryTimes(s))
-        ? interpolateFixedReadingsAtTime(s, pbTimeMs)
-        : (s && s.readings);
-      if (!r) continue;
-      const dLat = rLat > 0 ? Math.abs(s.lat - cLat) / rLat : 0;
-      const dLon = rLon > 0 ? Math.abs(s.lon - cLon) / rLon : 0;
-      const dist = Math.min(1, Math.sqrt(dLat * dLat + dLon * dLon));
-      const weight = 1.0 - 0.5 * dist;
-      for (const k of Object.keys(r)) {
-        const rd = r[k];
-        if (!rd || rd.value == null || rd.outlier) continue;
-        const aqi = valueToAqi(k, rd.value);
-        if (aqi != null) {
-          const score = aqi * weight;
-          if (score > bestScore) {
-            bestScore = score;
-            bestKey = k;
+      if (pbTimeMs != null && fixedSensorHasHistoryTimes(s)) {
+        const dLat = rLat > 0 ? Math.abs(s.lat - cLat) / rLat : 0;
+        const dLon = rLon > 0 ? Math.abs(s.lon - cLon) / rLon : 0;
+        const dist = Math.min(1, Math.sqrt(dLat * dLat + dLon * dLon));
+        const weight = 1.0 - 0.5 * dist;
+        const r = interpolateFixedReadingsAtTime(s, pbTimeMs);
+        if (r) {
+          for (const k of Object.keys(r)) {
+            const rd = r[k];
+            if (!rd || rd.value == null || rd.outlier) continue;
+            const aqi = valueToAqi(k, rd.value);
+            if (aqi != null) {
+              const score = aqi * weight;
+              if (score > bestScore) { bestScore = score; bestKey = k; }
+            }
+          }
+        }
+      } else if (pbTimeMs != null && map && map._playbackPtsById
+                 && map._playbackPtsById.has(String(s.id))) {
+        // Mobile sensor in playback: use per-point lat/lon for viewport check
+        // and center-distance weighting, with decay gating.
+        const pts = map._playbackPtsById.get(String(s.id));
+        const windowMs = 45 * 60 * 1000;
+        const fadeStartMs = windowMs * 0.80;
+        const minT = pbTimeMs - windowMs;
+        for (let pi = pts.length - 1; pi >= 0; pi--) {
+          const pt = pts[pi];
+          if (pt.tMs > pbTimeMs) continue;
+          if (pt.tMs < minT) break;
+          const ageMs = pbTimeMs - pt.tMs;
+          let decay = 1.0;
+          if (ageMs > fadeStartMs) {
+            const u = (ageMs - fadeStartMs) / (windowMs - fadeStartMs);
+            decay = (1 - u) * (1 - u);
+            if (decay < 0.25) continue;
+          }
+          if (!isFinite(pt.lat) || !isFinite(pt.lon)) continue;
+          if (pt.lat < bounds.minLat || pt.lat > bounds.maxLat
+              || pt.lon < bounds.minLon || pt.lon > bounds.maxLon) continue;
+          const dLat = rLat > 0 ? Math.abs(pt.lat - cLat) / rLat : 0;
+          const dLon = rLon > 0 ? Math.abs(pt.lon - cLon) / rLon : 0;
+          const dist = Math.min(1, Math.sqrt(dLat * dLat + dLon * dLon));
+          const weight = (1.0 - 0.5 * dist) * decay;
+          const pr = pt.readings;
+          if (!pr) continue;
+          for (const k of Object.keys(pr)) {
+            const rd = pr[k];
+            if (!rd || rd.value == null || rd.outlier) continue;
+            const aqi = valueToAqi(k, rd.value);
+            if (aqi != null) {
+              const score = aqi * weight;
+              if (score > bestScore) { bestScore = score; bestKey = k; }
+            }
+          }
+        }
+      } else {
+        const dLat = rLat > 0 ? Math.abs(s.lat - cLat) / rLat : 0;
+        const dLon = rLon > 0 ? Math.abs(s.lon - cLon) / rLon : 0;
+        const dist = Math.min(1, Math.sqrt(dLat * dLat + dLon * dLon));
+        const weight = 1.0 - 0.5 * dist;
+        const r = s && s.readings;
+        if (r) {
+          for (const k of Object.keys(r)) {
+            const rd = r[k];
+            if (!rd || rd.value == null || rd.outlier) continue;
+            const aqi = valueToAqi(k, rd.value);
+            if (aqi != null) {
+              const score = aqi * weight;
+              if (score > bestScore) { bestScore = score; bestKey = k; }
+            }
           }
         }
       }
@@ -803,30 +862,19 @@ function main() {
       const v = map.getSelectedPollutantValue();
       if (v != null && isFinite(v)) activeValue = v;
     } else {
-      const keys = _DIM_READING_KEYS[tabKey] || [];
-      const st = _currentState();
-      const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
-      const bounds = map ? map.getViewportBounds() : null;
-      const pbTimeMs = map && map.playbackMode ? map.getPlaybackTimeMs() : null;
-      let max = -Infinity;
-      for (const s of all) {
-        if (s && s.outlier) continue;
-        if (bounds && isFinite(s.lat) && isFinite(s.lon)) {
-          if (s.lat < bounds.minLat || s.lat > bounds.maxLat
-              || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
-        }
-        const r = (pbTimeMs != null && fixedSensorHasHistoryTimes(s))
-          ? interpolateFixedReadingsAtTime(s, pbTimeMs)
-          : (s && s.readings);
-        if (!r) continue;
-        for (const k of keys) {
-          const rd = r[k];
-          if (!rd || rd.value == null || rd.outlier) continue;
-          const n = parseFloat(rd.value);
-          if (isFinite(n) && n > max) max = n;
+      // Sample the PA field's max AQI within the viewport. The field is
+      // IDW-smoothed across all sensors (PurpleAir + mobile trails) so it
+      // reflects what the user actually sees, not raw individual readings.
+      const aqiKey = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" }[tabKey] || "pm2.5";
+      if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const loAqi = valueToAqi(aqiKey, entries[i].lo);
+          if (loAqi != null && map._paFieldMaxAqi >= loAqi) {
+            activeValue = entries[i].lo;
+            break;
+          }
         }
       }
-      if (max > -Infinity) activeValue = max;
     }
     // Only touch DOM when the value crosses a bracket boundary.
     // Find the first row that would dim (lo > activeValue) — that index IS the bracket.

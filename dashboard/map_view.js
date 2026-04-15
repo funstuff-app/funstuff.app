@@ -6753,7 +6753,7 @@ class MapView {
     const effectiveCutoffSq = wind ? cutoffSq * wind.stretch * wind.stretch : cutoffSq;
 
     // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind);
+    this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
 
     // ── Store overfetch buffer dimensions for composite offset ──
     this._paFieldBufW = bufW;
@@ -6831,7 +6831,7 @@ class MapView {
    *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
    *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
    *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
-  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind) {
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
     // ── Reuse tiny canvas + ImageData if grid size unchanged ──
     if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
       const tc = document.createElement("canvas");
@@ -6850,8 +6850,20 @@ class MapView {
     const wUpwind  = isAniso ? wind.upwindShrink : 1;
 
     // ── Nadaraya-Watson kernel regression with optional wind-anisotropic Gaussian weights ──
+    // Track max interpolated AQI within the actual viewport (not overfetch margin)
+    let fieldMaxAqi = -Infinity;
+    const vpW = vpCssW || cssW;
+    const vpH = vpCssH || cssH;
+    const vpMarginX = (cssW - vpW) / 2;
+    const vpMarginY = (cssH - vpH) / 2;
+    const vpGxMin = Math.floor(vpMarginX / cellSize);
+    const vpGyMin = Math.floor(vpMarginY / cellSize);
+    const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + vpW) / cellSize));
+    const vpGyMax = Math.min(gh, Math.ceil((vpMarginY + vpH) / cellSize));
+
     for (let gy = 0; gy < gh; gy++) {
       const py = (gy + 0.5) * cellSize;
+      const inVpY = gy >= vpGyMin && gy < vpGyMax;
       for (let gx = 0; gx < gw; gx++) {
         const pxx = (gx + 0.5) * cellSize;
 
@@ -6891,6 +6903,9 @@ class MapView {
           const fade = Math.min(1, wSum * 2);
           const alpha = Math.round(FIELD_ALPHA * fade);
           const val = vSum / wSum;
+          if (inVpY && gx >= vpGxMin && gx < vpGxMax && val > fieldMaxAqi) {
+            fieldMaxAqi = val;
+          }
           const rgb = _aqiToRgb(val);
           px[off]   = rgb[0];
           px[off+1] = rgb[1];
@@ -6899,6 +6914,7 @@ class MapView {
         }
       }
     }
+    this._paFieldMaxAqi = fieldMaxAqi > -Infinity ? fieldMaxAqi : null;
 
     // ── Cauchy blur (1/(1+d²) kernel) to soften band-edge staircase artifacts ──
     const _fd = window._fieldDebug;
