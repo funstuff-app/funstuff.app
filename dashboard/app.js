@@ -859,18 +859,26 @@ function main() {
     const tabKey = displayTab || "pm25";
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const entries = data.entries;
-    // Determine the active value: selected sensor's reading, or max across all sensors
+    // Determine the active value: selected sensor's reading, or the
+    // per-pollutant field max for this tab.  The per-pollutant map is computed
+    // from the same sensor set (fixed + virtual mobile trail) as the rendered
+    // field, independent of which pollutant is currently being rendered — so
+    // each tab's dim bracket reflects its own pollutant data.
     let activeValue = null;
     if (map && selectedId) {
       const v = map.getSelectedPollutantValue();
       if (v != null && isFinite(v)) activeValue = v;
-    } else if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
-      const aqiKey = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" }[tabKey] || "pm2.5";
-      activeValue = aqiToValue(aqiKey, map._paFieldMaxAqi);
-      // Ozone AQI breakpoints are in ppm but legend entries are in ppb
-      if (tabKey === "o3" && activeValue != null) activeValue *= 1000;
+    } else if (map) {
+      const perPollField = map._paFieldMaxAqiPerPollutant || null;
+      if (perPollField) {
+        activeValue = _fieldAqiToLegendValue(tabKey, perPollField[tabKey]);
+      }
     }
-    // Only touch DOM when the value crosses a bracket boundary.
+    // Only touch row DOM when the value crosses a bracket boundary. Tab
+    // colors depend on the selected sensor / per-pollutant data and must
+    // refresh whenever this function runs, even if the dim bracket is
+    // unchanged, so we update them ahead of the dim-row skip.
+    if (legendCollapsed) _applyLegendTabColors();
     // Find the first row that would dim (lo > activeValue) — that index IS the bracket.
     // When activeValue is null (no field data yet), keep the last bracket — never
     // revert to showing all rows undimmed.
@@ -889,7 +897,6 @@ function main() {
       if (!entries[i]) continue;
       _legendRows[i].classList.toggle("legendRow--dim", bracket >= 0 && i >= bracket);
     }
-    if (legendCollapsed) _applyLegendTabColors();
   }
 
   function buildLegend(animate = false) {
@@ -1053,53 +1060,42 @@ function main() {
 
   let _lastTabColorKey = undefined;
   const _persistedTabColors = {}; // last-known color per tab key
+  /** aqi.js pollutant key per legend tab (for aqiToValue). */
+  const _TAB_AQI_KEY = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" };
+  /** Convert a per-pollutant field AQI to the concentration unit the legend
+   *  brackets are authored in. O3 legend bands are in ppb but aqi.js works
+   *  in ppm, so scale that one pollutant. */
+  function _fieldAqiToLegendValue(tabKey, aqi) {
+    if (aqi == null || !isFinite(aqi)) return null;
+    const aqiKey = _TAB_AQI_KEY[tabKey] || "pm2.5";
+    let v = aqiToValue(aqiKey, aqi);
+    if (v == null || !isFinite(v)) return null;
+    if (tabKey === "o3") v *= 1000;
+    return v;
+  }
   /** In collapsed mode, color each tab's text using the same AQI color logic as the bars. */
   function _applyLegendTabColors() {
     if (!legendEl) return;
     const tabs = legendEl.querySelectorAll(".legendTab");
 
-    // No-sensor path: scan visible sensors for per-pollutant max concentrations
-    let perPollutantMax = null;
-    if (!selectedId) {
-      perPollutantMax = {};
-      const st = _currentState();
-      const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
-      const bounds = map ? map.getViewportBounds() : null;
-      for (const s of all) {
-        if (!s || s.outlier) continue;
-        if (bounds && isFinite(s.lat) && isFinite(s.lon)) {
-          if (s.lat < bounds.minLat || s.lat > bounds.maxLat
-              || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
-        }
-        const r = s && s.readings;
-        if (!r) continue;
-        for (const tabKey of Object.keys(_DIM_READING_KEYS)) {
-          const keys = _DIM_READING_KEYS[tabKey];
-          for (const rk of keys) {
-            const rd = r[rk];
-            if (rd && rd.value != null && isFinite(rd.value)) {
-              if (perPollutantMax[tabKey] == null || rd.value > perPollutantMax[tabKey]) {
-                perPollutantMax[tabKey] = rd.value;
-              }
-              break;
-            }
-          }
-        }
-      }
-    }
+    // Selected sensor (if any) — its own readings take precedence over field
+    // aggregates so tab colors reflect the user's focus.
+    const selectedSensor = (map && selectedId)
+      ? (() => {
+          const st = _currentState();
+          const sel = parseKey(selectedId);
+          if (!sel) return null;
+          const list = sel.type === "mobile"
+            ? (Array.isArray(st.mobile) ? st.mobile : [])
+            : (Array.isArray(st.fixed) ? st.fixed : []);
+          return list.find(s => s && String(s.id) === String(sel.id)) || null;
+        })()
+      : null;
 
-    // For the currently displayed tab, derive value the same way _applyLegendDimming
-    // does (PA field AQI when available) so collapsed color matches the lit bars exactly.
-    const displayTab = _displayTab() || "pm25";
-    let displayTabValue = null;
-    if (map && selectedId) {
-      const v = map.getSelectedPollutantValue();
-      if (v != null && isFinite(v)) displayTabValue = v;
-    } else if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
-      const aqiKey = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" }[displayTab] || "pm2.5";
-      displayTabValue = aqiToValue(aqiKey, map._paFieldMaxAqi);
-      if (displayTab === "o3" && displayTabValue != null) displayTabValue *= 1000;
-    }
+    // Per-pollutant field maxes from the map — one AQI value per tab,
+    // computed over the same viewport + sensor set as the rendered field.
+    // Independent of which pollutant is currently being rendered.
+    const perPollField = (map && map._paFieldMaxAqiPerPollutant) || null;
 
     for (const tab of tabs) {
       const tabKey = tab.dataset.legend;
@@ -1107,26 +1103,20 @@ function main() {
       const data = LEGEND_DATA[tabKey];
       const entries = data.entries;
       let activeValue = null;
-      if (tabKey === displayTab) {
-        // Use the same value source as legend dimming for the displayed pollutant
-        activeValue = displayTabValue;
-        // Fall back to sensor scan if PA field didn't provide a value
-        if (activeValue == null && perPollutantMax) {
-          activeValue = perPollutantMax[tabKey] != null ? perPollutantMax[tabKey] : null;
-        }
-      } else if (map && selectedId) {
-        const st = _currentState();
-        const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
-        const sensor = all.find(s => String(s.id) === String(selectedId));
-        if (sensor && sensor.readings) {
-          const keys = _DIM_READING_KEYS[tabKey] || [];
-          for (const rk of keys) {
-            const rd = sensor.readings[rk];
-            if (rd && rd.value != null && isFinite(rd.value)) { activeValue = rd.value; break; }
+      // 1. Selected sensor's reading for this pollutant.
+      if (selectedSensor && selectedSensor.readings) {
+        const keys = _DIM_READING_KEYS[tabKey] || [];
+        for (const rk of keys) {
+          const rd = selectedSensor.readings[rk];
+          if (rd && rd.value != null && isFinite(rd.value)) {
+            const n = parseFloat(rd.value);
+            if (isFinite(n)) { activeValue = n; break; }
           }
         }
-      } else if (perPollutantMax) {
-        activeValue = perPollutantMax[tabKey] != null ? perPollutantMax[tabKey] : null;
+      }
+      // 2. Per-pollutant field max — this tab's own pollutant data.
+      if (activeValue == null && perPollField) {
+        activeValue = _fieldAqiToLegendValue(tabKey, perPollField[tabKey]);
       }
       // Find the matching entry color for activeValue
       let color = null;
