@@ -32,7 +32,7 @@
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260409b" />
+  <link rel="stylesheet" href="/styles.css?v=20260414a" />
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -104,7 +104,7 @@
             </div>
           </div>
           <div class="pbMenuDivider"></div>
-          <div class="pbMenuItem" data-action="debug" id="pbDebugItem" style="display:none">
+          <div class="pbMenuItem" data-action="debug" id="pbDebugItem">
             <span class="pbMenuIcon">🔧</span>
             <span class="pbMenuLabel">Debug</span>
           </div>
@@ -133,6 +133,7 @@
                 <button class="legendTab" data-legend="no2" type="button" title="Nitrogen Dioxide">NO₂</button>
                 <button class="legendTab" data-legend="co" type="button" title="Carbon Monoxide">CO</button>
               </div>
+              <button id="legendCollapse" class="legendCollapseBtn" type="button" title="Collapse legend" aria-label="Collapse legend"><svg width="10" height="6" viewBox="0 0 10 6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l4 4 4-4"/></svg></button>
               <button id="legendClose" class="sidebarClose" type="button" title="Close legend" aria-label="Close legend">✕</button>
             </div>
             <div class="legendNameRow" id="legendName">Fine Particles</div>
@@ -140,7 +141,7 @@
             <div class="legendBody" id="legendBody"></div>
             <div class="legendFooter">Bars show measured concentration, not exposure risk.</div>
           </aside>
-          <button id="legendToggle" class="legendToggleBtn" type="button" title="Show color legend" aria-label="Show color legend"><svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="1" y="10" width="4" height="7" rx="1" fill="currentColor" opacity="0.7" style="color: lightgreen;"/><rect x="7" y="5" width="4" height="12" rx="1" fill="currentColor" opacity="0.85" style="color: yellow;" /><rect x="13" y="1" width="4" height="16" rx="1" fill="currentColor" style="color: orange;"/></svg></button>
+
           <!-- Camera replay: visible to visitors (non-owner), hidden from owner -->
           <button id="camReplayBtn" type="button" title="Replay visitor camera history" aria-label="Replay visitor camera history"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></button>
           <div id="camClientPicker" class="camClientPicker hidden"></div>
@@ -209,7 +210,7 @@
                 <option value="60">60×</option>
               </select>
             </label>
-            <button id="pbDebugBtn" type="button" class="pbDebugBtn" title="Toggle field debug panel" aria-label="Toggle field debug panel">🔧</button>
+            <button id="legendToggle" class="legendToggleBtn pbLegendBtn" type="button" title="Show color legend" aria-label="Show color legend"><svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="1" y="10" width="4" height="7" rx="1" fill="currentColor" opacity="0.7" style="color: lightgreen;"/><rect x="7" y="5" width="4" height="12" rx="1" fill="currentColor" opacity="0.85" style="color: yellow;" /><rect x="13" y="1" width="4" height="16" rx="1" fill="currentColor" style="color: orange;"/></svg></button>
           </div>
           <!-- A/B toggle for jog wheel style — SHUNTED -->
           <div class="pbRow0" id="pbRow0" style="display:none">
@@ -313,7 +314,7 @@
   <script defer src="map_view.js?v=20260414c"></script>
   <script defer src="sidebar_ui.js?v=20260406a"></script>
   <script defer src="jog_wheel.js?v=20260327j"></script>
-  <script defer src="app.js?v=20260414h"></script>
+  <script defer src="app.js?v=20260414j"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">
@@ -345,13 +346,9 @@
     window._fieldDebug=_fdState;
     function _fdEnable() {
       document.getElementById('fieldDebugPanel').classList.remove('fdHidden');
-      var di=document.getElementById('pbDebugBtn');
-      if(di) di.classList.add('active');
     }
     function _fdDisable() {
       document.getElementById('fieldDebugPanel').classList.add('fdHidden');
-      var di=document.getElementById('pbDebugBtn');
-      if(di) di.classList.remove('active');
     }
     window._fdToggle=function(){
       var panel=document.getElementById('fieldDebugPanel');

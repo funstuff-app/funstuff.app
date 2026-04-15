@@ -1411,6 +1411,45 @@ button#pbPlay.isLive {
   opacity: 0;
   pointer-events: none;
 }
+/* Collapsed legend: show only the header bar */
+.legendPanel.legend--collapsed .legendNameRow,
+.legendPanel.legend--collapsed .legendUnit,
+.legendPanel.legend--collapsed .legendBody,
+.legendPanel.legend--collapsed .legendFooter {
+  display: none;
+}
+.legendPanel.legend--collapsed .legendHeader {
+  border-bottom: none;
+}
+/* In collapsed mode, tab text gets AQI colors via JS inline styles.
+   Override filter/color from active/dim states so inline styles win. */
+.legendPanel.legend--collapsed .legendTab {
+  filter: none !important;
+  transition: color 0.3s ease, text-shadow 0.3s ease;
+}
+/* Collapse/expand arrow button */
+.legendCollapseBtn {
+  width: 22px;
+  height: 28px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+  opacity: 0.5;
+  transition: opacity 0.15s, color 0.15s;
+}
+.legendCollapseBtn:hover {
+  opacity: 1;
+  color: var(--text);
+}
+.legendCollapseBtn svg {
+  transition: transform 0.2s ease;
+}
 .legendHeader {
   display: flex;
   align-items: center;
@@ -1670,12 +1709,33 @@ button#pbPlay.isLive {
   transition: background 0.15s, opacity 0.2s;
   opacity: 1;
 }
+/* When in the playback bar, override absolute positioning */
+.legendToggleBtn.pbLegendBtn {
+  position: static;
+  z-index: auto;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: none;
+  border-color: transparent;
+  width: auto;
+  height: auto;
+  padding: 4px 6px;
+  color: rgba(147,164,186,0.5);
+  transition: color 0.15s, border-color 0.15s;
+}
+.legendToggleBtn.pbLegendBtn:hover {
+  color: rgba(232,238,247,0.8);
+  border-color: rgba(255,255,255,0.12);
+}
 .legendToggleBtn:hover {
   background: rgba(30, 40, 55, 0.95);
 }
 .legendToggleBtn.hidden {
   opacity: 0;
   pointer-events: none;
+}
+.legendToggleBtn.pbLegendBtn.hidden {
+  display: none;
 }
 
 /* Camera history replay button (owner-only, top-right below legend toggle) */

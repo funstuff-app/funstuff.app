@@ -388,14 +388,17 @@ function main() {
   // ── Color legend panel ──────────────────────────────────────────
   const legendEl = document.getElementById("legend");
   const legendCloseEl = document.getElementById("legendClose");
+  const legendCollapseEl = document.getElementById("legendCollapse");
   const legendToggleEl = document.getElementById("legendToggle");
   const legendBodyEl = document.getElementById("legendBody");
   const legendUnitEl = document.getElementById("legendUnit");
   const LEGEND_OPEN_KEY = "dusty_legend_open";
   const LEGEND_TAB_KEY = "dusty_legend_tab";
+  const LEGEND_COLLAPSED_KEY = "dusty_legend_collapsed";
   let legendOpen = _isMobileWidth
     ? false
     : localStorage.getItem(LEGEND_OPEN_KEY) === "true";
+  let legendCollapsed = localStorage.getItem(LEGEND_COLLAPSED_KEY) === "true";
   let legendTab = null;
   let userLegendTab = null; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected
@@ -878,6 +881,9 @@ function main() {
     }
     // Only touch DOM when the value crosses a bracket boundary.
     // Find the first row that would dim (lo > activeValue) — that index IS the bracket.
+    // When activeValue is null (no field data yet), keep the last bracket — never
+    // revert to showing all rows undimmed.
+    if (activeValue == null && _lastDimKey != null) return;
     let bracket = -1;
     if (activeValue != null) {
       for (let i = 0; i < entries.length; i++) {
@@ -892,6 +898,7 @@ function main() {
       if (!entries[i]) continue;
       _legendRows[i].classList.toggle("legendRow--dim", bracket >= 0 && i >= bracket);
     }
+    if (legendCollapsed) _applyLegendTabColors();
   }
 
   function buildLegend(animate = false) {
@@ -1037,9 +1044,88 @@ function main() {
   }
 
   function updateLegendVisibility() {
-    if (legendEl) legendEl.classList.toggle("hidden", !legendOpen);
+    if (legendEl) {
+      legendEl.classList.toggle("hidden", !legendOpen);
+      legendEl.classList.toggle("legend--collapsed", legendOpen && legendCollapsed);
+    }
     if (legendToggleEl) legendToggleEl.classList.toggle("hidden", legendOpen);
+    if (legendCollapseEl) {
+      const svg = legendCollapseEl.querySelector("svg");
+      if (svg) svg.style.transform = legendCollapsed ? "rotate(180deg)" : "";
+      legendCollapseEl.title = legendCollapsed ? "Expand legend" : "Collapse legend";
+    }
     localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
+    localStorage.setItem(LEGEND_COLLAPSED_KEY, legendCollapsed ? "true" : "false");
+    if (legendOpen && legendCollapsed) _applyLegendTabColors();
+    else _clearLegendTabColors();
+  }
+
+  let _lastTabColorKey = undefined;
+  /** In collapsed mode, color each tab's text using the same AQI color logic as the bars. */
+  function _applyLegendTabColors() {
+    if (!legendEl) return;
+    const tabs = legendEl.querySelectorAll(".legendTab");
+    // Determine the active reading value for each pollutant
+    for (const tab of tabs) {
+      const tabKey = tab.dataset.legend;
+      if (!tabKey || !LEGEND_DATA[tabKey]) continue;
+      const data = LEGEND_DATA[tabKey];
+      const entries = data.entries;
+      // Get the active value the same way _applyLegendDimming does
+      let activeValue = null;
+      if (map && selectedId) {
+        // When a sensor is selected, find reading for this specific tab's pollutant
+        const st = _currentState();
+        const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
+        const sensor = all.find(s => String(s.id) === String(selectedId));
+        if (sensor && sensor.readings) {
+          const keys = _DIM_READING_KEYS[tabKey] || [];
+          for (const rk of keys) {
+            const rd = sensor.readings[rk];
+            if (rd && rd.value != null && isFinite(rd.value)) { activeValue = rd.value; break; }
+          }
+        }
+      } else {
+        // Use PA field max AQI to find the matching entry color
+        const aqiKey = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" }[tabKey] || "pm2.5";
+        if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
+          for (let i = entries.length - 1; i >= 0; i--) {
+            const loAqi = valueToAqi(aqiKey, entries[i].lo);
+            if (loAqi != null && map._paFieldMaxAqi >= loAqi) {
+              activeValue = entries[i].lo;
+              break;
+            }
+          }
+        }
+      }
+      // Find the matching entry color for activeValue
+      let color = null;
+      if (activeValue != null) {
+        for (let i = entries.length - 1; i >= 0; i--) {
+          if (activeValue >= entries[i].lo) {
+            color = entries[i].color;
+            break;
+          }
+        }
+      }
+      if (color) {
+        tab.style.color = color;
+        tab.style.filter = "none";
+        tab.style.textShadow = `0 0 6px ${hexToRgba(color, 0.4)}`;
+      } else {
+        tab.style.color = "";
+        tab.style.filter = "";
+        tab.style.textShadow = "";
+      }
+    }
+  }
+  function _clearLegendTabColors() {
+    if (!legendEl) return;
+    for (const tab of legendEl.querySelectorAll(".legendTab")) {
+      tab.style.color = "";
+      tab.style.filter = "";
+      tab.style.textShadow = "";
+    }
   }
 
   /** Sync PA field pollutant to match legend display (explicit tab or sensor-derived). */
@@ -1102,6 +1188,12 @@ function main() {
     legendCloseEl.addEventListener("click", () => {
       legendOpen = false;
       buildLegend();
+      updateLegendVisibility();
+    });
+  }
+  if (legendCollapseEl) {
+    legendCollapseEl.addEventListener("click", () => {
+      legendCollapsed = !legendCollapsed;
       updateLegendVisibility();
     });
   }
@@ -4277,11 +4369,7 @@ function main() {
     });
   }
 
-  // Debug button in playback bar
-  {
-    const dbBtn = document.getElementById("pbDebugBtn");
-    if (dbBtn) dbBtn.addEventListener("click", () => { if (window._fdToggle) window._fdToggle(); });
-  }
+  // Debug is now in the menu (data-action="debug"), no standalone button
   
   // Share button - opens native share dialog.
   // Hidden on desktop (browser already has a share/URL bar).
