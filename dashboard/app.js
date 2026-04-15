@@ -859,29 +859,21 @@ function main() {
     const tabKey = displayTab || "pm25";
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const entries = data.entries;
-    // Determine the active value: selected sensor's reading, or max across visible sensors
+    // Determine the active value: selected sensor's reading, or max across all sensors
     let activeValue = null;
     if (map && selectedId) {
       const v = map.getSelectedPollutantValue();
       if (v != null && isFinite(v)) activeValue = v;
     } else {
-      // Scan visible sensors for the displayed pollutant's max concentration.
-      const keys = _DIM_READING_KEYS[tabKey] || [];
-      const st = _currentState();
-      const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
-      const bounds = map ? map.getViewportBounds() : null;
-      for (const s of all) {
-        if (!s || s.outlier) continue;
-        if (bounds && isFinite(s.lat) && isFinite(s.lon)) {
-          if (s.lat < bounds.minLat || s.lat > bounds.maxLat
-              || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
-        }
-        const r = s && s.readings;
-        if (!r) continue;
-        for (const rk of keys) {
-          const rd = r[rk];
-          if (rd && rd.value != null && isFinite(rd.value)) {
-            if (activeValue == null || rd.value > activeValue) activeValue = rd.value;
+      // Sample the PA field's max AQI within the viewport. The field is
+      // IDW-smoothed across all sensors (PurpleAir + mobile trails) so it
+      // reflects what the user actually sees, not raw individual readings.
+      const aqiKey = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" }[tabKey] || "pm2.5";
+      if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const loAqi = valueToAqi(aqiKey, entries[i].lo);
+          if (loAqi != null && map._paFieldMaxAqi >= loAqi) {
+            activeValue = entries[i].lo;
             break;
           }
         }
