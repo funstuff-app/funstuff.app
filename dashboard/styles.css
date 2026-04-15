@@ -1422,10 +1422,19 @@ button#pbPlay.isLive {
   border-bottom: none;
 }
 /* In collapsed mode, tab text gets AQI colors via JS inline styles.
-   Override filter/color from active/dim states so inline styles win. */
+   Override the expanded-mode filter (which also desaturates) so the hue
+   survives; use opacity instead to signal active/inactive tabs without
+   muddying the color. */
 .legendPanel.legend--collapsed .legendTab {
   filter: none !important;
-  transition: color 0.3s ease, text-shadow 0.3s ease;
+  opacity: 0.35;
+  transition: color 0.3s ease, text-shadow 0.3s ease, opacity 0.2s ease-out;
+}
+.legendPanel.legend--collapsed .legendTab.auto-active {
+  opacity: 0.7;
+}
+.legendPanel.legend--collapsed .legendTab.active {
+  opacity: 1;
 }
 /* Collapse/expand arrow button */
 .legendCollapseBtn {
