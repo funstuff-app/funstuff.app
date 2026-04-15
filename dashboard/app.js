@@ -859,21 +859,29 @@ function main() {
     const tabKey = displayTab || "pm25";
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const entries = data.entries;
-    // Determine the active value: selected sensor's reading, or max across all sensors
+    // Determine the active value: selected sensor's reading, or max across visible sensors
     let activeValue = null;
     if (map && selectedId) {
       const v = map.getSelectedPollutantValue();
       if (v != null && isFinite(v)) activeValue = v;
     } else {
-      // Sample the PA field's max AQI within the viewport. The field is
-      // IDW-smoothed across all sensors (PurpleAir + mobile trails) so it
-      // reflects what the user actually sees, not raw individual readings.
-      const aqiKey = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" }[tabKey] || "pm2.5";
-      if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
-        for (let i = entries.length - 1; i >= 0; i--) {
-          const loAqi = valueToAqi(aqiKey, entries[i].lo);
-          if (loAqi != null && map._paFieldMaxAqi >= loAqi) {
-            activeValue = entries[i].lo;
+      // Scan visible sensors for the displayed pollutant's max concentration.
+      const keys = _DIM_READING_KEYS[tabKey] || [];
+      const st = _currentState();
+      const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
+      const bounds = map ? map.getViewportBounds() : null;
+      for (const s of all) {
+        if (!s || s.outlier) continue;
+        if (bounds && isFinite(s.lat) && isFinite(s.lon)) {
+          if (s.lat < bounds.minLat || s.lat > bounds.maxLat
+              || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
+        }
+        const r = s && s.readings;
+        if (!r) continue;
+        for (const rk of keys) {
+          const rd = r[rk];
+          if (rd && rd.value != null && isFinite(rd.value)) {
+            if (activeValue == null || rd.value > activeValue) activeValue = rd.value;
             break;
           }
         }
@@ -1061,20 +1069,49 @@ function main() {
   }
 
   let _lastTabColorKey = undefined;
+  const _persistedTabColors = {}; // last-known color per tab key
   /** In collapsed mode, color each tab's text using the same AQI color logic as the bars. */
   function _applyLegendTabColors() {
     if (!legendEl) return;
     const tabs = legendEl.querySelectorAll(".legendTab");
-    // Determine the active reading value for each pollutant
+
+    // No-sensor path: scan visible sensors for per-pollutant max concentrations
+    let perPollutantMax = null;
+    if (!selectedId) {
+      perPollutantMax = {};
+      const st = _currentState();
+      const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
+      const bounds = map ? map.getViewportBounds() : null;
+      for (const s of all) {
+        if (!s || s.outlier) continue;
+        if (bounds && isFinite(s.lat) && isFinite(s.lon)) {
+          if (s.lat < bounds.minLat || s.lat > bounds.maxLat
+              || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
+        }
+        const r = s && s.readings;
+        if (!r) continue;
+        for (const tabKey of Object.keys(_DIM_READING_KEYS)) {
+          const keys = _DIM_READING_KEYS[tabKey];
+          for (const rk of keys) {
+            const rd = r[rk];
+            if (rd && rd.value != null && isFinite(rd.value)) {
+              if (perPollutantMax[tabKey] == null || rd.value > perPollutantMax[tabKey]) {
+                perPollutantMax[tabKey] = rd.value;
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
+
     for (const tab of tabs) {
       const tabKey = tab.dataset.legend;
       if (!tabKey || !LEGEND_DATA[tabKey]) continue;
       const data = LEGEND_DATA[tabKey];
       const entries = data.entries;
-      // Get the active value the same way _applyLegendDimming does
       let activeValue = null;
       if (map && selectedId) {
-        // When a sensor is selected, find reading for this specific tab's pollutant
         const st = _currentState();
         const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
         const sensor = all.find(s => String(s.id) === String(selectedId));
@@ -1085,18 +1122,8 @@ function main() {
             if (rd && rd.value != null && isFinite(rd.value)) { activeValue = rd.value; break; }
           }
         }
-      } else {
-        // Use PA field max AQI to find the matching entry color
-        const aqiKey = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" }[tabKey] || "pm2.5";
-        if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
-          for (let i = entries.length - 1; i >= 0; i--) {
-            const loAqi = valueToAqi(aqiKey, entries[i].lo);
-            if (loAqi != null && map._paFieldMaxAqi >= loAqi) {
-              activeValue = entries[i].lo;
-              break;
-            }
-          }
-        }
+      } else if (perPollutantMax) {
+        activeValue = perPollutantMax[tabKey] != null ? perPollutantMax[tabKey] : null;
       }
       // Find the matching entry color for activeValue
       let color = null;
@@ -1107,6 +1134,12 @@ function main() {
             break;
           }
         }
+      }
+      // Persist: keep last-known color when current is null
+      if (color) {
+        _persistedTabColors[tabKey] = color;
+      } else {
+        color = _persistedTabColors[tabKey] || null;
       }
       if (color) {
         tab.style.color = color;
