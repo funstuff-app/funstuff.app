@@ -534,9 +534,14 @@ class AppState:
     # Structure: { sensor_id: { "lat": float, "lon": float, "name": str } }
     fixed_sensor_locations: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    # Cached MT-day prefixes for fast history filtering (recomputed once per day)
+    # Cached MT-day bounds for fast history filtering (recomputed once per day).
+    # _start_ms / _end_ms are epoch-ms for MT midnight → next MT midnight, used
+    # as the exact boundary. _prefixes are the 1–2 UTC date strings that cover
+    # the MT day — a coarse fast-reject before the exact check.
     _today_mt_date: str = ""
     _today_mt_prefixes: tuple[str, ...] = ()
+    _today_mt_start_ms: float = 0.0
+    _today_mt_end_ms: float = 0.0
 
     # Bumped on-demand (e.g., from the TUI) to force the web client to treat the
     # next /api/state poll as a "new data" event even if timestamps/trails are unchanged.
@@ -956,8 +961,11 @@ def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
     Before saving a snapshot we trim them to only the entries from date_str so
     loading a snapshot never shows data from other days.
 
-    Timestamps are UTC but date_str is a Mountain-time date, so we accept any
-    UTC date that falls within the MT day (at most 2 UTC dates due to offset).
+    Timestamps are UTC but date_str is a Mountain-time date. Prefix matching
+    alone admits a 48-hour superset because MT day boundaries don't align
+    with UTC date boundaries (6 PM MDT yesterday shares today's UTC date
+    prefix), so we do a fast prefix reject followed by an exact epoch-ms
+    comparison against the MT-day window.
     """
     try:
         day_mt = datetime.strptime(date_str, "%Y-%m-%d").replace(
@@ -965,6 +973,17 @@ def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
     except (ValueError, TypeError):
         return
     prefixes = _utc_date_prefixes_for_mt_day(day_mt)
+    start_ms = day_mt.astimezone(timezone.utc).timestamp() * 1000.0
+    end_ms = (day_mt + timedelta(days=1)).astimezone(timezone.utc).timestamp() * 1000.0
+
+    def _in_window(t: Any) -> bool:
+        if not isinstance(t, str) or t[:10] not in prefixes:
+            return False
+        dt = parse_utc_timestamp(t)
+        if dt is None:
+            return False
+        ms = dt.timestamp() * 1000.0
+        return start_ms <= ms < end_ms
 
     for sensor in (state.get("fixed") or []):
         if not isinstance(sensor, dict):
@@ -979,10 +998,7 @@ def _trim_history_to_date(state: dict[str, Any], date_str: str) -> None:
             colors = reading.get("history_colors")
             if not isinstance(times, list):
                 continue
-            # Fast prefix check: keep entries whose UTC date is one of the
-            # (at most 2) dates that cover this Mountain-time day.
-            keep = [i for i, t in enumerate(times)
-                    if isinstance(t, str) and t[:10] in prefixes]
+            keep = [i for i, t in enumerate(times) if _in_window(t)]
             reading["history_times"]  = [times[i]  for i in keep]
             reading["history"]        = [values[i] for i in keep] if isinstance(values, list) and len(values) == len(times) else []
             reading["history_colors"] = [colors[i] for i in keep] if isinstance(colors, list) and len(colors) == len(times) else []
@@ -1419,17 +1435,35 @@ def _accumulate_home_sensor_reading(app_state: AppState, st: dict[str, Any]) -> 
         return
 
 
-def _get_today_prefixes(app_state: AppState) -> tuple[str, ...]:
-    """Return cached UTC date prefixes for the current Mountain-time day.
+def _get_today_mt_bounds(app_state: AppState) -> tuple[float, float, tuple[str, ...]]:
+    """Return cached bounds for the current Mountain-time day.
 
-    Recomputes only when the MT date rolls over (once per day).
+    Returns ``(start_ms, end_ms, prefixes)`` where:
+      - start_ms / end_ms are epoch-ms for MT midnight → next MT midnight
+        (the exact 24-hour window that defines "today" in Mountain time).
+      - prefixes is the 1–2 UTC date strings that cover that MT day — a
+        coarse fast-reject before the exact numeric check.
+
+    Recomputes only when the MT date rolls over (once per day). The exact
+    numeric bounds matter because prefix matching alone lets in a 48-hour
+    superset: readings from 6 PM MDT yesterday share today's UTC date
+    prefix (06:00 UTC = midnight MDT), so a naive prefix filter shows
+    yesterday-evening readings as if they were today's.
     """
     today_mt_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     if today_mt_str != app_state._today_mt_date:
         day_mt = datetime.now(_MOUNTAIN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_utc = day_mt.astimezone(timezone.utc)
+        end_utc = (day_mt + timedelta(days=1)).astimezone(timezone.utc)
+        app_state._today_mt_start_ms = start_utc.timestamp() * 1000.0
+        app_state._today_mt_end_ms = end_utc.timestamp() * 1000.0
         app_state._today_mt_prefixes = _utc_date_prefixes_for_mt_day(day_mt)
         app_state._today_mt_date = today_mt_str
-    return app_state._today_mt_prefixes
+    return (
+        app_state._today_mt_start_ms,
+        app_state._today_mt_end_ms,
+        app_state._today_mt_prefixes,
+    )
 
 
 def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
@@ -1439,15 +1473,19 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
     history accumulated in fixed_history.json doesn't bleed into the live state.
 
     Timestamps are UTC but the "day" boundary is midnight Mountain Time.  A
-    single MT day spans at most 2 UTC dates (e.g. MT March 1 → UTC March 1 +
-    March 2), so we use fast string prefix matching on the first 10 chars
-    instead of per-entry datetime parsing (critical on Raspberry Pi).
+    single MT day spans at most 2 UTC dates, so we first do a fast prefix
+    reject on the UTC date, then an exact epoch-ms comparison against the
+    MT midnight → next MT midnight window. Prefix alone is a 48-hour
+    superset (readings from 6 PM MDT yesterday share today's UTC prefix),
+    so the exact check is required to avoid showing yesterday-evening data
+    as if it were today's. Parsed ms is cached on each entry dict
+    (``_time_ms``) so each timestamp string parses once (critical on Pi).
     """
     fixed_list = st.get("fixed", [])
     if not isinstance(fixed_list, list):
         return
 
-    prefixes = _get_today_prefixes(app_state)
+    start_ms, end_ms, prefixes = _get_today_mt_bounds(app_state)
 
     for sensor in fixed_list:
         sensor_id = sensor.get("id")
@@ -1496,7 +1534,18 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
 
             for entry in hist_entries:
                 t = entry.get("time") or ""
+                # Fast reject: UTC date must be one of the 1-2 dates that
+                # overlap today's MT day.
                 if t[:10] not in prefixes:
+                    continue
+                # Exact check: entry time must fall within the MT-day window.
+                # Cache parsed ms on the entry so the string parses once.
+                entry_ms = entry.get("_time_ms")
+                if entry_ms is None:
+                    dt = parse_utc_timestamp(t)
+                    entry_ms = dt.timestamp() * 1000.0 if dt else 0.0
+                    entry["_time_ms"] = entry_ms
+                if entry_ms < start_ms or entry_ms >= end_ms:
                     continue
                 val = entry.get("val")
                 try:
