@@ -495,7 +495,11 @@ class MapView {
     this._paFieldCanvas = null;
     this._paFieldCtx = null;
     this._paFieldKey = "";
-    // Cross-fade: previous field canvas + transition timing
+    // Cross-fade: previous field canvas + transition timing.
+    // The fade uses "lighter" (additive) compositing so prev*(1-t) + new*t
+    // produces a linear color blend. In cells where prev == new this collapses
+    // to a single draw at dimAlpha (no visible effect); in cells that changed
+    // you get a smooth color transition with no luminance dip.
     this._paFieldPrevCanvas = null;
     this._paFieldFadeStart = 0;
     this._paFieldFadeMs = 300;
@@ -6591,8 +6595,16 @@ class MapView {
       ? Math.min(1, (performance.now() - this._paFieldFadeStart) / this._paFieldFadeMs)
       : 1;
     if (this._paFieldPrevCanvas && fadeT < 1) {
+      // Additive crossfade: prev*(1-t) + new*t under "lighter" composite gives
+      // a linear color blend with constant alpha. In cells where prev == new
+      // this collapses to exactly new*dimAlpha (no visible fade), so unchanged
+      // regions stay still while changed regions smoothly morph. No masking,
+      // no cell-boundary banding.
       _drawPaCanvas(this._paFieldPrevCanvas, (1 - fadeT) * dimAlpha);
+      const prevOp = ctx.globalCompositeOperation;
+      ctx.globalCompositeOperation = "lighter";
       _drawPaCanvas(this._paFieldCanvas, fadeT * dimAlpha);
+      ctx.globalCompositeOperation = prevOp;
       ctx.globalAlpha = 1;
       // Schedule another frame to complete the fade (no-op if playback loop is running)
       if (!this._paFieldFadeRAF) {
@@ -7874,7 +7886,15 @@ class MapView {
     // so trails aren't fully redrawn every frame (the expensive O(vehicles*points) path).
     // 30s during scrub still gives smooth visual feedback; 2s during playback keeps fading smooth.
     const timeThreshold = this._scrubbing ? 30000 : 2000;
-    const timeChanged = Math.abs(timeDelta) > timeThreshold;
+    // Sim-time gate: has enough simulated time elapsed to warrant a redraw?
+    const simTimeElapsed = Math.abs(timeDelta) > timeThreshold;
+    // Wall-time floor: at high playback speeds (60x screensaver), the sim-time gate
+    // trips every ~33ms wall, causing the full O(vehicles*points) trail rebuild to
+    // run 30x/sec. Rate-limit sim-driven redraws to ~10 Hz wall. View changes
+    // (pan/zoom) still bypass this gate so interactive response stays snappy.
+    const nowPerf = performance.now();
+    const wallSinceRedraw = nowPerf - (this._lastTrailRedrawPerf || 0);
+    const timeChanged = simTimeElapsed && wallSinceRedraw > 100;
 
     // Precompute center world once per frame; avoids repeated center projection in worldToScreen().
     const centerW = latLonToWorld(this.center.lat, this.center.lon, this.zoom);

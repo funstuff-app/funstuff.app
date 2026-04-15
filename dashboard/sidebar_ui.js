@@ -134,6 +134,10 @@ function updateSidebarPlaybackValues() {
   // Fast path: skip DOM work when sidebar is not visible or during gestures.
   const sbEl = document.getElementById("sidebar");
   if (sbEl && sbEl.classList.contains("hidden")) return;
+  // Screensaver mode fades the sidebar via CSS (`body.screensaver #sidebar`)
+  // without adding `.hidden`, so the guard above misses it. At 60x playback,
+  // skipping this saves ~60 Hz of invisible DOM updates + getter work.
+  if (document.body && document.body.classList.contains("screensaver")) return;
   if (map._isTransientAnimating && map._isTransientAnimating()) return;
 
   const state = map._historicalMode ? window._historicalState : window.__lastState;
