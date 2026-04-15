@@ -1424,14 +1424,19 @@ button#pbPlay.isLive {
 /* In collapsed mode, tab text gets AQI colors via JS inline styles.
    Override the expanded-mode filter (which also desaturates) so the hue
    survives; use opacity instead to signal active/inactive tabs without
-   muddying the color. */
+   muddying the color. Only apply dimming when the user has actually
+   selected a pollutant (.active) — otherwise all titles render at full
+   opacity, since the auto-active/tab-dim classes are also applied for
+   the viewport-auto fallback and we don't want that to dim the header. */
 .legendPanel.legend--collapsed .legendTab {
   filter: none !important;
-  opacity: 0.35;
   transition: color 0.3s ease, text-shadow 0.3s ease, opacity 0.2s ease-out;
 }
-.legendPanel.legend--collapsed .legendTab.auto-active {
-  opacity: 0.7;
+.legendPanel.legend--collapsed:has(.legendTab.active) .legendTab.tab-dim {
+  opacity: 0.55;
+}
+.legendPanel.legend--collapsed:has(.legendTab.active) .legendTab.auto-active {
+  opacity: 0.8;
 }
 .legendPanel.legend--collapsed .legendTab.active {
   opacity: 1;
