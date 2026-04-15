@@ -5310,6 +5310,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                     except Exception:
                         pass  # wind playback just won't be available
 
+                # Ensure meta.date is set so the client can derive playback
+                # bounds even when no mobile trails exist.
+                if "meta" not in state:
+                    state["meta"] = {}
+                state["meta"]["date"] = date_str
+
                 # Trim to the requested day's 5 AM–5 AM MST window.
                 # Current saves are pre-trimmed, but older snapshots may not be.
                 _trim_trails_to_day(state, date_str)

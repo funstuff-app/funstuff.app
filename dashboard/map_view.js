@@ -4019,6 +4019,19 @@ class MapView {
         }
       }
     }
+
+    // In historical mode with no mobile trails (e.g. weekend with buses off),
+    // derive a 5AM-to-5AM window from the snapshot date so fixed sensors
+    // still render and the playback UI isn't frozen.
+    if (this._historicalMode && !isFinite(minMs)) {
+      const dateStr = state?.meta?.date || this._historicalDateStr;
+      if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        const [y, mo, d] = dateStr.split("-").map(Number);
+        // 5 AM local on snapshot day to 5 AM next day
+        minMs = new Date(y, mo - 1, d, 5, 0, 0, 0).getTime();
+        maxMs = minMs + 86400000;
+      }
+    }
     
     this._playbackMinMs = isFinite(minMs) ? minMs : null;
     this._playbackMaxMs = isFinite(maxMs) ? maxMs : null;
@@ -4585,7 +4598,7 @@ class MapView {
     try {
       const trailJson = JSON.stringify(trailSegment);
       const url = `${appConfig.apiBaseUrl}/match_segment?sensor=${encodeURIComponent(sensorId)}&trail=${encodeURIComponent(trailJson)}`;
-      const resp = await fetch(url);
+      const resp = await fetch(url, { headers: { "X-App-Token": APP_TOKEN } });
       if (!resp.ok) return;
       
       const data = await resp.json();

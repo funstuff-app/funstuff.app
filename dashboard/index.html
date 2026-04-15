@@ -32,7 +32,7 @@
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260414a" />
+  <link rel="stylesheet" href="/styles.css?v=20260414c" />
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -129,8 +129,8 @@
               <div class="legendTabs" role="tablist">
                 <button class="legendTab active" data-legend="pm25" type="button" title="Fine Particles">PM2.5</button>
                 <button class="legendTab" data-legend="pm10" type="button" title="Coarse Particles">PM10</button>
-                <button class="legendTab" data-legend="o3" type="button" title="Ozone">O₃</button>
-                <button class="legendTab" data-legend="no2" type="button" title="Nitrogen Dioxide">NO₂</button>
+                <button class="legendTab" data-legend="o3" type="button" title="Ozone">O<sub>3</sub></button>
+                <button class="legendTab" data-legend="no2" type="button" title="Nitrogen Dioxide">NO<sub>2</sub></button>
                 <button class="legendTab" data-legend="co" type="button" title="Carbon Monoxide">CO</button>
               </div>
               <button id="legendCollapse" class="legendCollapseBtn" type="button" title="Collapse legend" aria-label="Collapse legend"><svg width="10" height="6" viewBox="0 0 10 6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l4 4 4-4"/></svg></button>
@@ -311,10 +311,10 @@
   <script defer src="format_utils.js?v=20260224a"></script>
   <script defer src="data_utils.js?v=20260412a"></script>
   <script defer src="advection_solver.js?v=20260320a"></script>
-  <script defer src="map_view.js?v=20260414c"></script>
+  <script defer src="map_view.js?v=20260414d"></script>
   <script defer src="sidebar_ui.js?v=20260406a"></script>
   <script defer src="jog_wheel.js?v=20260327j"></script>
-  <script defer src="app.js?v=20260414q"></script>
+  <script defer src="app.js?v=20260414t"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">

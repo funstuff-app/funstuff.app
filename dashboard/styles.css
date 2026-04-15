@@ -1480,6 +1480,12 @@ button#pbPlay.isLive {
   background: rgba(255,255,255,0.06);
   filter: brightness(0.7) saturate(0.6);
 }
+.legendTab sub {
+  font-size: 0.75em;
+  vertical-align: baseline;
+  position: relative;
+  top: 0.2em;
+}
 .legendTab.active {
   color: var(--text);
   background: rgba(255,255,255,0.08);
@@ -1726,6 +1732,9 @@ button#pbPlay.isLive {
 .legendToggleBtn.pbLegendBtn:hover {
   color: rgba(232,238,247,0.8);
   border-color: rgba(255,255,255,0.12);
+}
+.legendToggleBtn.pbLegendBtn.active {
+  color: var(--accent);
 }
 .legendToggleBtn:hover {
   background: rgba(30, 40, 55, 0.95);

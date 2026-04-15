@@ -432,7 +432,7 @@ function main() {
   function _displayTab() {
     if (legendTab) return legendTab;
     if (selectedId) return _selectedSensorPollutantTab();
-    return _viewportAutoTab;
+    return _viewportAutoTab || "pm25";
   }
 
   let _viewportAutoTab = null; // auto-derived from highest-AQI pollutant in viewport
@@ -568,7 +568,7 @@ function main() {
     if (!legendOpen) return;
     if (map._isTransientAnimating && map._isTransientAnimating()) return;
     // Auto-detect highest-AQI pollutant in viewport when no explicit tab or sensor
-    if (!legendTab && !selectedId) { _updateViewportAutoTab(); return; }
+    if (!legendTab && !selectedId) { /* _updateViewportAutoTab(); */ _applyLegendDimming(); return; }
     // Re-run dimming when a tab is active (viewport may have changed)
     if (legendTab != null) { _applyLegendDimming(); if (!selectedId) return; }
     if (!selectedId) return;
@@ -1039,7 +1039,7 @@ function main() {
       legendEl.classList.toggle("hidden", !legendOpen);
       legendEl.classList.toggle("legend--collapsed", legendOpen && legendCollapsed);
     }
-    if (legendToggleEl) legendToggleEl.classList.toggle("hidden", legendOpen);
+    if (legendToggleEl) legendToggleEl.classList.toggle("active", legendOpen);
     if (legendCollapseEl) {
       const svg = legendCollapseEl.querySelector("svg");
       if (svg) svg.style.transform = legendCollapsed ? "rotate(180deg)" : "";
@@ -1088,13 +1088,33 @@ function main() {
       }
     }
 
+    // For the currently displayed tab, derive value the same way _applyLegendDimming
+    // does (PA field AQI when available) so collapsed color matches the lit bars exactly.
+    const displayTab = _displayTab() || "pm25";
+    let displayTabValue = null;
+    if (map && selectedId) {
+      const v = map.getSelectedPollutantValue();
+      if (v != null && isFinite(v)) displayTabValue = v;
+    } else if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
+      const aqiKey = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" }[displayTab] || "pm2.5";
+      displayTabValue = aqiToValue(aqiKey, map._paFieldMaxAqi);
+      if (displayTab === "o3" && displayTabValue != null) displayTabValue *= 1000;
+    }
+
     for (const tab of tabs) {
       const tabKey = tab.dataset.legend;
       if (!tabKey || !LEGEND_DATA[tabKey]) continue;
       const data = LEGEND_DATA[tabKey];
       const entries = data.entries;
       let activeValue = null;
-      if (map && selectedId) {
+      if (tabKey === displayTab) {
+        // Use the same value source as legend dimming for the displayed pollutant
+        activeValue = displayTabValue;
+        // Fall back to sensor scan if PA field didn't provide a value
+        if (activeValue == null && perPollutantMax) {
+          activeValue = perPollutantMax[tabKey] != null ? perPollutantMax[tabKey] : null;
+        }
+      } else if (map && selectedId) {
         const st = _currentState();
         const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
         const sensor = all.find(s => String(s.id) === String(selectedId));
@@ -1174,7 +1194,7 @@ function main() {
         if (legendTab) localStorage.setItem(LEGEND_TAB_KEY, legendTab);
         else localStorage.removeItem(LEGEND_TAB_KEY);
         _lastViewportAutoKey = undefined;
-        if (!legendTab && !selectedId) _updateViewportAutoTab();
+        // if (!legendTab && !selectedId) _updateViewportAutoTab();
         _syncMapPollutant();
         buildLegend(true);
       });
@@ -1215,12 +1235,14 @@ function main() {
   }
   if (legendToggleEl) {
     legendToggleEl.addEventListener("click", () => {
-      legendOpen = true;
+      legendOpen = !legendOpen;
       updateLegendVisibility();
-      _lastViewportAutoKey = undefined;
-      _updateViewportAutoTab();
-      _syncMapPollutant();
-      buildLegend(true);
+      if (legendOpen) {
+        _lastViewportAutoKey = undefined;
+        // _updateViewportAutoTab();
+        _syncMapPollutant();
+        buildLegend(true);
+      }
     });
   }
 
@@ -3606,6 +3628,7 @@ function main() {
     if (dateStr === "live") {
       window._historicalState = null;
       map._historicalMode = false;
+      map._historicalDateStr = null;
       // Clear all per-vehicle caches from historical viewing
       map.clearVehicleCaches();
       map._playbackPtsById = new Map();
@@ -3691,6 +3714,7 @@ function main() {
       // accumulate and progressively slow the render loop.
       map.clearVehicleCaches();
       map._historicalMode = true;
+      map._historicalDateStr = dateStr;
       map._playbackPtsById = new Map();
       map._playbackPtsKey = null;
       map._persistedTrailById = new Map();  // Clear persisted trails
@@ -3710,21 +3734,29 @@ function main() {
       // Build playback points and set time to 5AM
       map._ensurePlaybackPoints(window._historicalState);
       const b = map.getPlaybackBounds();
-      if (isFinite(b.minMs)) {
+      {
         // Set playhead to 5AM local on the loaded day
         let initMs;
-        if (dateStr === "demo") {
-          // Demo snapshot: start at 5AM using bounds
-          const startDate = new Date(b.minMs);
-          const fiveAM = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate(), 5, 0, 0, 0).getTime();
-          initMs = clamp(fiveAM, b.minMs, b.maxMs);
-        } else {
+        if (isFinite(b.minMs) && isFinite(b.maxMs)) {
+          if (dateStr === "demo") {
+            const startDate = new Date(b.minMs);
+            const fiveAM = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate(), 5, 0, 0, 0).getTime();
+            initMs = clamp(fiveAM, b.minMs, b.maxMs);
+          } else {
+            const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
+            const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
+            const fiveAM = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
+            initMs = clamp(fiveAM, b.minMs, b.maxMs);
+          }
+        } else if (dateStr && dateStr !== "demo") {
+          // No mobile trails at all (e.g. weekend). Derive 5AM from the date.
           const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
           const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
-          const fiveAM = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
-          initMs = clamp(fiveAM, b.minMs, b.maxMs);
+          if (isFinite(_y) && isFinite(_mo) && isFinite(_d)) {
+            initMs = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
+          }
         }
-        map.setPlaybackTimeMs(initMs);
+        if (initMs != null) map.setPlaybackTimeMs(initMs);
       }
       
       // Store state, render sidebar, draw ONLY tiles (no overlay yet)
@@ -3964,6 +3996,7 @@ function main() {
       
       // Reset ALL playback state for fresh historical data
       map._historicalMode = true;
+      map._historicalDateStr = dateStr;
       map._playbackPtsById = new Map();
       map._playbackPtsKey = null;
       map._persistedTrailById = new Map();
@@ -3983,6 +4016,13 @@ function main() {
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
         map.setPlaybackTimeMs(b.minMs + 30 * 60000);
+      } else if (dateStr && dateStr !== "demo") {
+        // No mobile trails. Derive 5AM from date so playback isn't frozen.
+        const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
+        const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
+        if (isFinite(_y) && isFinite(_mo) && isFinite(_d)) {
+          map.setPlaybackTimeMs(new Date(_y, _mo - 1, _d, 5, 30, 0, 0).getTime());
+        }
       }
       
       // Store state, render sidebar, draw
