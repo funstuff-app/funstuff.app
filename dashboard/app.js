@@ -398,7 +398,9 @@ function main() {
   let legendOpen = _isMobileWidth
     ? false
     : localStorage.getItem(LEGEND_OPEN_KEY) === "true";
-  let legendCollapsed = localStorage.getItem(LEGEND_COLLAPSED_KEY) === "true";
+  let legendCollapsed = _isMobileWidth
+    ? localStorage.getItem(LEGEND_COLLAPSED_KEY) !== "false"
+    : localStorage.getItem(LEGEND_COLLAPSED_KEY) === "true";
   let legendTab = null;
   let userLegendTab = null; // what the user manually chose (restored on deselect)
   let legendUserOverride = false; // true when user manually changed tab while marker selected
