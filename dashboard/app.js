@@ -395,11 +395,15 @@ function main() {
   const LEGEND_OPEN_KEY = "dusty_legend_open";
   const LEGEND_TAB_KEY = "dusty_legend_tab";
   const LEGEND_COLLAPSED_KEY = "dusty_legend_collapsed";
-  let legendOpen = _isMobileWidth
-    ? false
-    : localStorage.getItem(LEGEND_OPEN_KEY) === "true";
-  let legendCollapsed = _isMobileWidth
-    ? localStorage.getItem(LEGEND_COLLAPSED_KEY) !== "false"
+  // If the legend would have started hidden (mobile default, or desktop
+  // without an explicit open preference), start it open-but-collapsed instead
+  // so the pollutant tabs remain visible at a glance.
+  const _legendStartsHidden = _isMobileWidth
+    ? true
+    : localStorage.getItem(LEGEND_OPEN_KEY) !== "true";
+  let legendOpen = true;
+  let legendCollapsed = _legendStartsHidden
+    ? true
     : localStorage.getItem(LEGEND_COLLAPSED_KEY) === "true";
   let legendTab = null;
   let userLegendTab = null; // what the user manually chose (restored on deselect)
