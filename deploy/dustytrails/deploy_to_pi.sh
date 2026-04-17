@@ -185,6 +185,7 @@ FILES_ONLY=0
 SETUP_ONLY=0
 DATA_ONLY=0
 SKIP_DATA=0
+LANDING_DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -196,12 +197,22 @@ while [[ $# -gt 0 ]]; do
             SETUP_ONLY=1
             shift
             ;;
-        --data-only)
-            DATA_ONLY=1
-            shift
-            ;;
+        # --data-only DISABLED: would rsync into the Pi's ~/.mobileair which
+        # is live production state. Left commented so passing the flag falls
+        # through to the "Unknown argument" error and the script aborts
+        # before touching the Pi.
+        # --data-only)
+        #     DATA_ONLY=1
+        #     shift
+        #     ;;
         --skip-data)
             SKIP_DATA=1
+            shift
+            ;;
+        --landing-dry-run)
+            # Dry-run rsync of landing/ to the Pi's funstuff install dir.
+            # First draft: HARDCODED --dry-run, no files will be written.
+            LANDING_DRY_RUN=1
             shift
             ;;
         --host)
@@ -220,10 +231,11 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --files-only   Only sync app files, don't sync data or restart service"
-            echo "  --data-only    Only sync ~/.mobileair data directory"
-            echo "  --skip-data    Skip syncing ~/.mobileair (faster for code-only updates)"
-            echo "  --setup-only   Only setup service (assumes files already deployed)"
+            echo "  --files-only        Only sync app files (~/.mobileair sync is permanently disabled)"
+            echo "  --data-only         DISABLED — Pi's ~/.mobileair is authoritative production state"
+            echo "  --skip-data         No-op (data sync is disabled globally)"
+            echo "  --setup-only        Only setup service (assumes files already deployed)"
+            echo "  --landing-dry-run   Preview landing/ -> Pi rsync (dry-run; writes nothing)"
             echo "  --host HOST    Override PI_HOST from deploy.config"
             echo "  --user USER    Override PI_USER from deploy.config"
             echo "  -h, --help     Show this help"
@@ -351,38 +363,102 @@ deploy_files() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 2b: Deploy ~/.mobileair data directory
 # ─────────────────────────────────────────────────────────────────────────────
+# DISABLED: the Pi's ~/.mobileair is the authoritative live production state
+# (snapshots, road graphs, prefs) and MUST NOT be overwritten by this script.
+# The function body is commented out and replaced with a hard refusal so any
+# caller that reaches it exits cleanly without touching the remote host.
+# ─────────────────────────────────────────────────────────────────────────────
 deploy_data() {
-    log_step "Deploying data directory (~/.mobileair)..."
-    
-    if [[ ! -d "$LOCAL_DATA_DIR" ]]; then
-        log_warn "Local data directory not found: $LOCAL_DATA_DIR"
-        log_warn "Skipping data sync"
-        return 0
+    log_warn "deploy_data() is DISABLED — refusing to touch $REMOTE_DATA_DIR on Pi."
+    log_warn "The Pi's ~/.mobileair is authoritative production state."
+    return 0
+
+    # --- ORIGINAL BODY (intentionally left commented for reference) ---------
+    # log_step "Deploying data directory (~/.mobileair)..."
+    #
+    # if [[ ! -d "$LOCAL_DATA_DIR" ]]; then
+    #     log_warn "Local data directory not found: $LOCAL_DATA_DIR"
+    #     log_warn "Skipping data sync"
+    #     return 0
+    # fi
+    #
+    # # Create remote data directory
+    # log_info "Creating data directory on Pi..."
+    # ssh "$PI_TARGET" "mkdir -p '$REMOTE_DATA_DIR'"
+    #
+    # # Sync data directory, excluding secrets, logs, and snapshots.
+    # # Snapshots are NOT synced: the Pi saves its own daily and those are
+    # # the authoritative copies.  Road graphs and other data files ARE pushed.
+    # log_info "Syncing data files (this may take a while for road graphs)..."
+    # rsync -avz \
+    #     --exclude='.env' \
+    #     --exclude='*.log' \
+    #     --exclude='dev-cert.pem' \
+    #     --exclude='dev-key.pem' \
+    #     --exclude='*.pem' \
+    #     --exclude='prefs_log.ndjson' \
+    #     --exclude='snapshots/' \
+    #     "$LOCAL_DATA_DIR/" \
+    #     "$PI_TARGET:$REMOTE_DATA_DIR/"
+    #
+    # # Set permissions
+    # ssh "$PI_TARGET" "chmod -R 755 '$REMOTE_DATA_DIR' && chmod 700 '$REMOTE_DATA_DIR/snapshots' 2>/dev/null || true"
+    #
+    # log_info "Data deployed to $PI_TARGET:$REMOTE_DATA_DIR"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2c: Landing-page sync (DRY-RUN ONLY in this draft)
+#
+# Rsyncs the repo's landing/ directory to the Pi's funstuff landing install dir
+# (/home/${PI_USER}/funstuff/landing/). Mirrors the rsync flags used by
+# deploy/landing/deploy_landing.sh so the dry-run accurately previews what a
+# real run would change.
+#
+# rsync's default delta algorithm uses file size + mtime to decide what to
+# transfer — unmodified files are skipped on the wire. --itemize-changes
+# prints a one-line-per-file summary (f = regular file; the letter codes
+# starting with ">" indicate updates, "c" indicates a checksum/content change,
+# "t" indicates mtime change, etc.).
+#
+# FIRST DRAFT: --dry-run is hardcoded. Nothing is written to the Pi.
+# To actually publish: remove the --dry-run arg AND the DRY RUN logging below.
+# ─────────────────────────────────────────────────────────────────────────────
+LANDING_REMOTE_DIR="/home/${PI_USER}/funstuff/landing"
+LANDING_SRC_DIR="$REPO_ROOT/landing"
+
+landing_dry_run() {
+    log_step "Landing page DRY-RUN against $PI_TARGET:$LANDING_REMOTE_DIR"
+    log_warn "No files will be written. This is a preview only."
+
+    if [[ ! -d "$LANDING_SRC_DIR" ]]; then
+        log_error "Local landing source not found: $LANDING_SRC_DIR"
+        exit 1
     fi
-    
-    # Create remote data directory
-    log_info "Creating data directory on Pi..."
-    ssh "$PI_TARGET" "mkdir -p '$REMOTE_DATA_DIR'"
-    
-    # Sync data directory, excluding secrets, logs, and snapshots.
-    # Snapshots are NOT synced: the Pi saves its own daily and those are
-    # the authoritative copies.  Road graphs and other data files ARE pushed.
-    log_info "Syncing data files (this may take a while for road graphs)..."
-    rsync -avz \
-        --exclude='.env' \
-        --exclude='*.log' \
-        --exclude='dev-cert.pem' \
-        --exclude='dev-key.pem' \
-        --exclude='*.pem' \
-        --exclude='prefs_log.ndjson' \
-        --exclude='snapshots/' \
-        "$LOCAL_DATA_DIR/" \
-        "$PI_TARGET:$REMOTE_DATA_DIR/"
-    
-    # Set permissions
-    ssh "$PI_TARGET" "chmod -R 755 '$REMOTE_DATA_DIR' && chmod 700 '$REMOTE_DATA_DIR/snapshots' 2>/dev/null || true"
-    
-    log_info "Data deployed to $PI_TARGET:$REMOTE_DATA_DIR"
+
+    # Read-only SSH probe
+    if ! ssh -o ConnectTimeout=5 "$PI_TARGET" "echo 'SSH OK'" &>/dev/null; then
+        log_error "Cannot connect to $PI_TARGET"
+        exit 1
+    fi
+
+    # DO NOT create the remote directory here — creation is a side effect.
+    # If the directory doesn't exist on the Pi, rsync --dry-run will simply
+    # report every file as new; the actual deploy path will mkdir -p when run.
+
+    log_info "Running rsync --dry-run (only metadata-modified files would transfer)..."
+    # Flags match deploy/landing/deploy_landing.sh for fidelity:
+    #   -a archive, -v verbose, -z compress, --delete prune stale,
+    #   --exclude mp3s/ skip large audio dir.
+    # Added: --dry-run (forced) and --itemize-changes for visibility.
+    rsync -avz --delete --dry-run --itemize-changes \
+        --exclude='mp3s/' \
+        "$LANDING_SRC_DIR/" \
+        "$PI_TARGET:$LANDING_REMOTE_DIR/"
+
+    log_info "Dry run complete. Review the itemized output above."
+    log_info "Each line 'f...' = file; '.' in a column = unchanged, letter = would change."
+    log_info "To actually publish: remove --dry-run from landing_dry_run() in this script."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -503,24 +579,29 @@ main() {
     echo ""
     echo "  Target:  $PI_TARGET"
     echo "  Install: $INSTALL_DIR"
-    echo "  Data:    $REMOTE_DATA_DIR"
+    echo "  Data:    $REMOTE_DATA_DIR (sync DISABLED — authoritative on Pi)"
     echo "  Service: $SERVICE_NAME"
     echo ""
     
     if [[ "$SETUP_ONLY" == "1" ]]; then
         setup_service
-    elif [[ "$DATA_ONLY" == "1" ]]; then
-        deploy_data
+    elif [[ "$LANDING_DRY_RUN" == "1" ]]; then
+        # Landing-page sync preview. HARDCODED --dry-run — publishes nothing.
+        landing_dry_run
+    # DISABLED: DATA_ONLY branch would call deploy_data() against the Pi's
+    # ~/.mobileair. That directory is authoritative live production state.
+    # elif [[ "$DATA_ONLY" == "1" ]]; then
+    #     deploy_data
     elif [[ "$FILES_ONLY" == "1" ]]; then
         build_staging
         deploy_files
     else
-        # Full deploy: app files + data + service
+        # Full deploy: app files + service (data sync DISABLED — see above).
         build_staging
         deploy_files
-        if [[ "$SKIP_DATA" != "1" ]]; then
-            deploy_data
-        fi
+        # if [[ "$SKIP_DATA" != "1" ]]; then
+        #     deploy_data
+        # fi
         setup_service
     fi
     
