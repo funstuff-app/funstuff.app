@@ -87,6 +87,7 @@ function _readingForLegendTab(readings, legendTab) {
 
 function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab, bufW, bufH, refNowMs) {
   const isPm25 = !pollutantTab || pollutantTab === "pm25";
+  const aqiKey = _LEGEND_TAB_AQI_KEY[pollutantTab || "pm25"] || "pm2.5";
   const readingKeys = _LEGEND_TAB_READING_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_READING_KEYS.pm25;
   // Utah bounding box: skip sensors outside the Wasatch Front / Utah region
   const _UT_MIN_LAT = 36.9, _UT_MAX_LAT = 42.1, _UT_MIN_LON = -114.1, _UT_MAX_LON = -109.0;
@@ -168,7 +169,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
       value,
       weightMultiplier: (f.purpleair ? 1 : _PA_FIELD_FIXED_WEIGHT_MULTIPLIER) * staleWeight,
     });
-    fingerprint += _pm25ColorCat(value);
+    fingerprint += isPm25 ? _pm25ColorCat(value) : _aqiColorCat(valueToAqi(aqiKey, value) ?? 0);
   }
 
   return { sensors, fingerprint };
@@ -180,6 +181,8 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
  * that decays over the same time window as the trail fade.
  */
 function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs, pollutantTab, bufW, bufH) {
+  const isPm25 = !pollutantTab || pollutantTab === "pm25";
+  const aqiKey = _LEGEND_TAB_AQI_KEY[pollutantTab || "pm25"] || "pm2.5";
   const trailKeys = _LEGEND_TAB_TRAIL_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_TRAIL_KEYS.pm25;
   // Project to buffer center when overfetch dimensions supplied
   const projW = bufW || cssW;
@@ -265,7 +268,7 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
 
   const sensors = Array.from(sensorMap.values());
   let fingerprint = "";
-  for (const s of sensors) fingerprint += _pm25ColorCat(s.value);
+  for (const s of sensors) fingerprint += isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(valueToAqi(aqiKey, s.value) ?? 0);
   return { sensors, fingerprint };
 }
 
@@ -383,14 +386,29 @@ const _AQI_RGB_STOPS = [
   [0,     0x00,0xFF,0xFF],
   [6,     0x00,0xFF,0xFF],  // cyan    – AQI ~6
   [19,    0x00,0xCC,0xFF],  // lt-blue – AQI ~19
-  [39,    0x00,0xE4,0x00],  // green   – AQI ~39
-  [75,    0xFF,0xFF,0x00],  // yellow  – AQI ~75
-  [125,   0xFF,0x7E,0x00],  // orange  – AQI ~125
-  [176,   0xFF,0x00,0x00],  // red     – AQI ~176
-  [250,   0x8F,0x3F,0x97],  // purple  – AQI ~250
-  [350,   0x7E,0x00,0x23],  // maroon  – AQI ~350
-  [500,   0x7E,0x00,0x23]
+  [50,    0x00,0xE4,0x00],  // green   – AQI 50 (top of Good)
+  [51,    0xFF,0xFF,0x00],  // yellow  – AQI 51 (Moderate)
+  [100,   0xFF,0xFF,0x00],  // yellow  – AQI 100 (top of Moderate)
+  [101,   0xFF,0x7E,0x00],  // orange  – AQI 101 (USG)
+  [150,   0xFF,0x7E,0x00],  // orange  – AQI 150 (top of USG)
+  [151,   0xFF,0x00,0x00],  // red     – AQI 151 (Unhealthy)
+  [200,   0xFF,0x00,0x00],  // red     – AQI 200 (top of Unhealthy)
+  [201,   0x8F,0x3F,0x97],  // purple  – AQI 201 (Very Unhealthy)
+  [300,   0x8F,0x3F,0x97],  // purple  – AQI 300 (top of Very Unhealthy)
+  [500,   0x7E,0x00,0x23]   // maroon  – Hazardous (301+)
 ];
+
+/** AQI → color-category index matching _AQI_RGB_STOPS band boundaries. Used for fingerprinting. */
+function _aqiColorCat(aqi) {
+  if (aqi <= 6)   return 0;
+  if (aqi <= 19)  return 1;
+  if (aqi <= 50)  return 2;
+  if (aqi <= 100) return 3;
+  if (aqi <= 150) return 4;
+  if (aqi <= 200) return 5;
+  if (aqi <= 300) return 6;
+  return 7;
+}
 
 /** AQI index → RGB color.  Same colors as _pm25ToRgbSmooth, stops at AQI equivalents. */
 function _aqiToRgb(aqi) {
@@ -7416,8 +7434,21 @@ class MapView {
             }
           }
           if (found) {
-            // Use server's precomputed discrete band color for trails
-            base = safeHex(found.ci != null ? found.ci : found.color);
+            if (pollTab !== "pm25") {
+              // Non-PM2.5: use the same AQI continuous ramp as the field so trail dots
+              // match the heatmap color (server discrete palette uses pollutant-specific
+              // sub-band greens that diverge from the AQI ramp in the Good range).
+              const _tAqiKey = _LEGEND_TAB_AQI_KEY[pollTab] || "pm2.5";
+              const _tAqi = valueToAqi(_tAqiKey, found.value);
+              if (_tAqi != null && isFinite(_tAqi)) {
+                const [_tr, _tg, _tb] = _aqiToRgb(_tAqi);
+                base = '#' + ((1 << 24) + (_tr << 16) + (_tg << 8) + _tb).toString(16).slice(1);
+              } else {
+                base = safeHex(found.ci != null ? found.ci : found.color);
+              }
+            } else {
+              base = safeHex(found.ci != null ? found.ci : found.color);
+            }
           } else {
             base = "#333333";
           }
@@ -9523,7 +9554,9 @@ class MapView {
       const _offY = (_bufH - _vh) / 2;
       ctx.save();
       for (const vs of this._virtualMobileSensors) {
-        const rgb = _pm25ToRgb(vs.value);
+        const _ghostAqiKey = _LEGEND_TAB_AQI_KEY[this._paFieldPollutant || "pm25"] || "pm2.5";
+        const _ghostAqi = valueToAqi(_ghostAqiKey, vs.value);
+        const rgb = _aqiToRgb(_ghostAqi != null && isFinite(_ghostAqi) ? _ghostAqi : 0);
         const tint = 0.35;
         const cr = Math.round(128 * (1 - tint) + rgb[0] * tint);
         const cg = Math.round(128 * (1 - tint) + rgb[1] * tint);
