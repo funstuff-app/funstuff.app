@@ -243,17 +243,21 @@ def filter_history_outliers(
             if pv is not None and math.isfinite(pv):
                 hi, lo = max(fv, pv), min(fv, pv)
                 lo_safe = max(lo, 0.1)
-                is_cliff = hi / lo_safe >= 8.0 and hi >= 50.0
+                is_cliff = hi / lo_safe >= 8.0 and hi >= 500.0
                 if is_cliff:
                     if fv > pv:
-                        # jumped up
+                        # jumped up into impossible range
                         in_cliff = True
                         cliff_flagged[i] = True
                     else:
-                        # dropped back down
+                        # steep drop back out of impossible range
                         in_cliff = False
                 elif in_cliff:
-                    cliff_flagged[i] = True
+                    if fv < 500.0:
+                        # gradual recovery below impossible range — cliff is over
+                        in_cliff = False
+                    else:
+                        cliff_flagged[i] = True
         prev_idx = i
 
     # ── Filter pass ─────────────────────────────────────────────────

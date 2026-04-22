@@ -2743,9 +2743,11 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
                         history.get(sid, {}).get("PM2.5") or [])
 
         # ── Cliff detection: impossible rate-of-change between readings ──
-        # Walk history and detect cliff jumps (8x ratio, high side >= 50).
-        # Record the cliff window so _inject_fixed_history can null those
-        # readings during playback rewind, even after the sensor recovers.
+        # Walk history and detect cliff jumps (8x ratio, high side >= 500).
+        # "Impossible" means the high side is in hardware-malfunction territory
+        # (>= 500 µg/m³); valid air quality events (even heavy smoke) stay well
+        # below this.  Record the cliff window so _inject_fixed_history can null
+        # those readings during playback rewind, even after the sensor recovers.
         # Runs for ALL sensors (including spatial outliers) so cliff windows
         # are always recorded for playback nulling.
         if len(hist_entries) >= 2:
@@ -2765,15 +2767,20 @@ def _merge_purpleair_into_fixed(st: dict[str, Any], app_state: AppState) -> None
                 if prev_cv is not None:
                     hi_v, lo_v = max(cv, prev_cv), min(cv, prev_cv)
                     lo_safe = max(lo_v, 0.1)
-                    if hi_v / lo_safe >= 8.0 and hi_v >= 50.0:
+                    if hi_v / lo_safe >= 8.0 and hi_v >= 500.0:
                         if cv > prev_cv:
                             in_cliff = True
                             cliff_start_ts = h.get("recorded_at", 0)
                             cliff_end_ts = None
                         else:
+                            # steep drop back out of impossible range
                             in_cliff = False
                             cliff_end_ts = h.get("recorded_at", 0)
-                    # if not a cliff edge, in_cliff state persists
+                    elif in_cliff and cv < 500.0:
+                        # gradual recovery below impossible range — cliff is over
+                        in_cliff = False
+                        cliff_end_ts = h.get("recorded_at", 0)
+                    # otherwise in_cliff state persists
                 prev_cv = cv
 
             if cliff_start_ts is not None:

@@ -266,12 +266,25 @@ function main() {
   let _ssLoopInterval = null;   // poll interval that detects end-of-playback
   let _ssLoopTimer = null;      // 10s pause timer between loops
   let _ssEndMaxMs = null;       // maxMs when we started the 10s pause
+  // Hoisted handle for the screensaver-enter function, assigned inside the
+  // hot-corner block below so that ?demo=1 can trigger it on page load.
+  let _demoTriggerSS = null;
+  // Tracks whether the current screensaver session was entered via ?demo=1
+  // (as opposed to the bottom-left hot corner). On exit, demo-origin sessions
+  // use mode-appropriate defaults instead of restoring the stale entry-time
+  // snapshot — in live mode the captured `timeMs` can be tens of minutes old.
+  let _enteredViaDemo = false;
 
   // Lite mode: hide all chrome (sidebar, controls, legend, menu button)
   const _liteParam = new URLSearchParams(window.location.search).get('lite') === '1';
   if (_liteParam) {
     document.body.classList.add('lite');
   }
+
+  // Demo mode: start in the secret screensaver (as if triggered by the
+  // bottom-left hot corner). Any user interaction (keydown / mousemove out
+  // of the bottom strip / touchstart) restores the default view via _ssExit.
+  const _demoParam = new URLSearchParams(window.location.search).get('demo') === '1';
 
   // Force repaint of fixed elements on bfcache restore (fixes footer jumping to top on alt-tab)
   window.addEventListener('pageshow', function(e) {
@@ -395,11 +408,15 @@ function main() {
   const LEGEND_OPEN_KEY = "dusty_legend_open";
   const LEGEND_TAB_KEY = "dusty_legend_tab";
   const LEGEND_COLLAPSED_KEY = "dusty_legend_collapsed";
-  let legendOpen = _isMobileWidth
-    ? false
-    : localStorage.getItem(LEGEND_OPEN_KEY) === "true";
-  let legendCollapsed = _isMobileWidth
-    ? localStorage.getItem(LEGEND_COLLAPSED_KEY) !== "false"
+  // If the legend would have started hidden (mobile default, or desktop
+  // without an explicit open preference), start it open-but-collapsed instead
+  // so the pollutant tabs remain visible at a glance.
+  const _legendStartsHidden = _isMobileWidth
+    ? true
+    : localStorage.getItem(LEGEND_OPEN_KEY) !== "true";
+  let legendOpen = true;
+  let legendCollapsed = _legendStartsHidden
+    ? true
     : localStorage.getItem(LEGEND_COLLAPSED_KEY) === "true";
   let legendTab = null;
   let userLegendTab = null; // what the user manually chose (restored on deselect)
@@ -5560,6 +5577,11 @@ function main() {
       _performCameraFit({ force: true });
     };
 
+    // Expose to the URL-param handler in loadConfig().then() so ?demo=1
+    // can enter the screensaver once initial state is ready. Wrap so we can
+    // tag this session as demo-origin for the exit path.
+    _demoTriggerSS = () => { _enteredViaDemo = true; _ssEnter(); };
+
     const _ssExit = () => {
       clearTimeout(_ssTimer);
       _ssTimer = null;
@@ -5573,8 +5595,44 @@ function main() {
       var pb = document.getElementById("playbackBar");
       if (pb) pb.classList.remove("pb-ss-hidden");
 
-      // Restore pre-screensaver state
-      if (_ssSnapshot) {
+      // Restore pre-screensaver state.
+      // Demo-origin sessions (?demo=1) skip the _ssSnapshot.timeMs restoration:
+      // in live mode that captured time is the latest-sample timestamp at
+      // entry — often tens of minutes behind real time and unchanged across
+      // tick() arrivals during the demo run — so restoring it leaves the
+      // playback bar stuck in the past until the user scrubs. Center/zoom/
+      // speed from the snapshot are still sound (they reflect app defaults
+      // captured on page load) and are restored.
+      if (_enteredViaDemo && _ssSnapshot) {
+        _enteredViaDemo = false;
+        map.center.lat = _ssSnapshot.centerLat;
+        map.center.lon = _ssSnapshot.centerLon;
+        map.zoom = _ssSnapshot.zoom;
+        map.setPlaybackSpeed(_ssSnapshot.speed);
+        if (pbSpeedEl) pbSpeedEl.value = String(_ssSnapshot.speed);
+        map.setPlaybackPlaying(false);
+        _pbVelocity = 0;
+        if (_pbRAF) { cancelAnimationFrame(_pbRAF); _pbRAF = null; }
+        // Discriminate live vs snapshot mode via _historicalState, not
+        // map.playbackMode (which is true for both once canvas playback is
+        // initialized).
+        if (window._historicalState) {
+          // Snapshot mode (from ?date=...): live-follow stays off; leave the
+          // playhead where the demo left it so the user sees a coherent frame.
+          map._playbackLiveFollow = false;
+        } else {
+          // Live mode: re-engage live follow and snap to latest data so the
+          // playback bar reflects true "now" instead of the stale entry time.
+          // Next tick() keeps it synced.
+          map._playbackLiveFollow = true;
+          var _sb = map.getPlaybackBounds();
+          if (_sb && isFinite(_sb.maxMs)) map.setPlaybackTimeMs(_sb.maxMs);
+        }
+        _ssSnapshot = null;
+        _pbLastPerf = 0;
+        updatePlaybackUi();
+        map.drawOverlay(map.lastState, { cacheUnderlay: false });
+      } else if (_ssSnapshot) {
         map.center.lat = _ssSnapshot.centerLat;
         map.center.lon = _ssSnapshot.centerLon;
         map.zoom = _ssSnapshot.zoom;
@@ -5635,6 +5693,32 @@ function main() {
     const _urlParams = new URLSearchParams(window.location.search);
     const _urlDate = _urlParams.get('date');
     console.log("[EmbedParam] search:", window.location.search, "date:", _urlDate);
+
+    // Defer screensaver entry until the map has a meaningful playback-bounds
+    // span. Finite bounds alone aren't enough: the first tick() may produce
+    // minMs≈maxMs (a single datapoint), so _ssEnter's "rewind to start" lands
+    // right at the end and nothing animates. Require at least MIN_DEMO_SPAN_MS
+    // before firing. Polls on a 100ms interval, giving up after ~10s so we
+    // still enter even on a sparse/slow-loading day.
+    const MIN_DEMO_SPAN_MS = 60 * 1000; // at least 60s of playback data
+    const _demoEnterWhenReady = () => {
+      if (!_demoParam || !_demoTriggerSS) return;
+      let attempts = 0;
+      const tryEnter = () => {
+        if (!_demoTriggerSS) return; // already fired or unavailable
+        const sb = map.getPlaybackBounds();
+        const hasSpan = sb && isFinite(sb.minMs) && isFinite(sb.maxMs)
+          && (sb.maxMs - sb.minMs) >= MIN_DEMO_SPAN_MS;
+        if (hasSpan || attempts++ > 100) {
+          const fn = _demoTriggerSS;
+          _demoTriggerSS = null; // fire exactly once
+          try { fn(); } catch (e) { console.warn("[demo] _ssEnter failed:", e); }
+        } else {
+          setTimeout(tryEnter, 100);
+        }
+      };
+      tryEnter();
+    };
     if (_urlDate && /^\d{4}-\d{2}-\d{2}$/.test(_urlDate)) {
       console.log("[EmbedParam] Valid date, calling loadSnapshotByDate:", _urlDate);
       try {
@@ -5669,6 +5753,7 @@ function main() {
 
         updatePlaybackUi();
         console.log("[EmbedParam] Done. Skipping tick() — snapshot loaded.");
+        _demoEnterWhenReady();
         return; // Do NOT start live polling when viewing a snapshot
       } catch (e) {
         console.error("[EmbedParam] Failed to load snapshot for date:", _urlDate, e);
@@ -5680,6 +5765,7 @@ function main() {
 
     tick(); // finally block inside tick() schedules all subsequent polls
     connectSSE(); // open SSE stream for push-based updates
+    _demoEnterWhenReady();
   });
 }
 
