@@ -196,9 +196,22 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
   const FADE_TAIL_FRAC = 0.20;
   const fadeStartAgeMs = FADE_TIME_MS * (1.0 - FADE_TAIL_FRAC);
 
-  if (!refNowMs || !isFinite(refNowMs)) return { sensors: [], fingerprint: "" };
+  if (!refNowMs || !isFinite(refNowMs)) return { sensors: [], fingerprint: "", trailMaxAqi: null };
 
   const ws = worldSizeForZoom(zoom);
+
+  // Viewport bounds in buffer coords — trail points outside the visible
+  // viewport should not affect the on-screen max reading.
+  const vpXMin = (projW - cssW) / 2;
+  const vpXMax = vpXMin + cssW;
+  const vpYMin = (projH - cssH) / 2;
+  const vpYMax = vpYMin + cssH;
+
+  // Track max AQI from trail points with NO decay — we want the persisted trail
+  // to drive the legend max even after a vehicle has moved on. The kernel
+  // regression dilutes old points (decayWeight), so its max underreports what
+  // the user sees on screen. This raw max complements the regression.
+  let trailMaxAqi = -Infinity;
 
   for (const m of mobiles) {
     if (!m) continue;
@@ -224,12 +237,36 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
 
       // Extract reading for selected pollutant — skip if absent
       let rawVal = undefined;
+      let precomputedAqi = undefined;
       const rd = p.readings;
       if (rd) {
-        for (const rk of trailKeys) {
-          const rv = rd[rk]?.value ?? rd[rk];
-          if (rv != null && typeof rv !== "object") { rawVal = rv; break; }
-          if (rv != null && typeof rv === "object" && rv.value != null) { rawVal = rv.value; break; }
+        if (!pollutantTab) {
+          // Show-all mode: pick whichever pollutant has the highest AQI at this point
+          let bestAqi = undefined;
+          for (const [tab, keys] of Object.entries(_LEGEND_TAB_TRAIL_KEYS)) {
+            const ak = _LEGEND_TAB_AQI_KEY[tab];
+            let polVal = null;
+            for (const rk of keys) {
+              const rv = rd[rk]?.value ?? rd[rk];
+              if (rv != null && typeof rv !== "object") { polVal = rv; break; }
+              if (rv != null && typeof rv === "object" && rv.value != null) { polVal = rv.value; break; }
+            }
+            if (polVal == null) continue;
+            const num = Number(polVal);
+            if (!isFinite(num) || num < 0) continue;
+            const aqi = valueToAqi(ak, num);
+            if (aqi != null && isFinite(aqi) && (bestAqi === undefined || aqi > bestAqi)) {
+              bestAqi = aqi;
+              rawVal = num;
+            }
+          }
+          precomputedAqi = bestAqi;
+        } else {
+          for (const rk of trailKeys) {
+            const rv = rd[rk]?.value ?? rd[rk];
+            if (rv != null && typeof rv !== "object") { rawVal = rv; break; }
+            if (rv != null && typeof rv === "object" && rv.value != null) { rawVal = rv.value; break; }
+          }
         }
       }
       if (rawVal == null) continue;
@@ -262,14 +299,20 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       const sx = wx - centerW.x + projW / 2;
       const sy = wy - centerW.y + projH / 2;
 
-      sensorMap.set(slotKey, { sx, sy, value: pollVal, weightMultiplier: _PA_FIELD_FIXED_WEIGHT_MULTIPLIER * decayWeight });
+      // Raw trail-max tracking (viewport only, no decay)
+      if (sx >= vpXMin && sx < vpXMax && sy >= vpYMin && sy < vpYMax) {
+        const thisAqi = (precomputedAqi != null) ? precomputedAqi : valueToAqi(aqiKey, pollVal);
+        if (thisAqi != null && isFinite(thisAqi) && thisAqi > trailMaxAqi) trailMaxAqi = thisAqi;
+      }
+
+      sensorMap.set(slotKey, { sx, sy, value: pollVal, aqi: precomputedAqi, weightMultiplier: _PA_FIELD_FIXED_WEIGHT_MULTIPLIER * decayWeight });
     }
   }
 
   const sensors = Array.from(sensorMap.values());
   let fingerprint = "";
-  for (const s of sensors) fingerprint += isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(valueToAqi(aqiKey, s.value) ?? 0);
-  return { sensors, fingerprint };
+  for (const s of sensors) fingerprint += isPm25 ? (s.aqi != null ? _aqiColorCat(s.aqi) : _pm25ColorCat(s.value)) : _aqiColorCat(valueToAqi(aqiKey, s.value) ?? 0);
+  return { sensors, fingerprint, trailMaxAqi: trailMaxAqi > -Infinity ? trailMaxAqi : null };
 }
 
 /** Compute the playback time range over which the PA field fingerprint is unchanged.
@@ -6712,7 +6755,7 @@ class MapView {
     // ── Inject virtual sensors from mobile trail GPS points ──
     const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
     const virtualField = _collectVirtualMobileSensors(
-      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab, bufW, bufH
+      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, this._paFieldPollutant, bufW, bufH
     );
     this._virtualMobileSensors = virtualField.sensors;
 
@@ -6783,7 +6826,7 @@ class MapView {
       const si5 = i * 5;
       s5[si5] = sensor.sx;
       s5[si5 + 1] = sensor.sy;
-      const aqi = valueToAqi(aqiKey, sensor.value);
+      const aqi = sensor.aqi != null ? sensor.aqi : valueToAqi(aqiKey, sensor.value);
       s5[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
       s5[si5 + 3] = twoSigmaSq;
       s5[si5 + 4] = sensor.weightMultiplier;
@@ -6797,6 +6840,13 @@ class MapView {
 
     // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
     this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+
+    // Loft the raw trail max (no decay) into the field max so the persisted
+    // trail readings drive the legend, not just freshly-driven points.
+    if (virtualField.trailMaxAqi != null && isFinite(virtualField.trailMaxAqi)
+        && (this._paFieldMaxAqi == null || virtualField.trailMaxAqi > this._paFieldMaxAqi)) {
+      this._paFieldMaxAqi = virtualField.trailMaxAqi;
+    }
 
     // ── Per-pollutant field max: run the same kernel regression (viewport-
     // cells only, max AQI only) for each non-rendered pollutant so each
@@ -6910,11 +6960,16 @@ class MapView {
     const wStretch = isAniso ? wind.stretch : 1;
     const wUpwind = isAniso ? wind.upwindShrink : 1;
 
+    const isShowAll = !this._paFieldPollutant;
+
     for (const tab of pollutants) {
       // Rendered pollutant: reuse the main pass's _paFieldMaxAqi. It is the
       // max of the same kernel regression computed over the same viewport,
-      // so re-running would be redundant.
-      if (tab === renderedTab && this._paFieldMaxAqi != null && isFinite(this._paFieldMaxAqi)) {
+      // so re-running would be redundant. In show-all mode, the main pass's
+      // field is max-across-pollutants (not a pure per-pollutant field), so
+      // it does NOT represent any single tab's max — fall through to the
+      // per-pollutant regression below.
+      if (!isShowAll && tab === renderedTab && this._paFieldMaxAqi != null && isFinite(this._paFieldMaxAqi)) {
         result[tab] = this._paFieldMaxAqi;
         continue;
       }
@@ -6927,8 +6982,12 @@ class MapView {
         mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH,
         virtualRefNowMs, tab, bufW, bufH
       );
+      const trailMaxAqi = virtualField.trailMaxAqi;
       const allSensors = paField.sensors.concat(virtualField.sensors);
-      if (allSensors.length === 0) { result[tab] = null; continue; }
+      if (allSensors.length === 0) {
+        result[tab] = (trailMaxAqi != null && isFinite(trailMaxAqi)) ? trailMaxAqi : null;
+        continue;
+      }
 
       // Build stride-5 sensor array matching _computePaFieldSync's preparation
       const aqiKey = _LEGEND_TAB_AQI_KEY[tab] || "pm2.5";
@@ -6978,7 +7037,12 @@ class MapView {
           }
         }
       }
-      result[tab] = (fieldMaxAqi > -Infinity) ? fieldMaxAqi : null;
+      let mergedMax = (fieldMaxAqi > -Infinity) ? fieldMaxAqi : null;
+      // Loft raw trail max (no decay) so persisted trails drive legend max.
+      if (trailMaxAqi != null && isFinite(trailMaxAqi) && (mergedMax == null || trailMaxAqi > mergedMax)) {
+        mergedMax = trailMaxAqi;
+      }
+      result[tab] = mergedMax;
     }
     this._paFieldMaxAqiPerPollutant = result;
   }

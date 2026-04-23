@@ -1073,7 +1073,7 @@ function main() {
     }
     localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
     localStorage.setItem(LEGEND_COLLAPSED_KEY, legendCollapsed ? "true" : "false");
-    if (legendOpen && legendCollapsed) _applyLegendTabColors();
+    if (legendOpen) _applyLegendTabColors();
     else _clearLegendTabColors();
   }
 
