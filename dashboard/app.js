@@ -878,20 +878,18 @@ function main() {
     const tabKey = displayTab || "pm25";
     const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
     const entries = data.entries;
-    // Determine the active value: selected sensor's reading, or the
-    // per-pollutant field max for this tab.  The per-pollutant map is computed
-    // from the same sensor set (fixed + virtual mobile trail) as the rendered
-    // field, independent of which pollutant is currently being rendered — so
-    // each tab's dim bracket reflects its own pollutant data.
+    // Active value:
+    //   1. Selected sensor — its own reading for the displayed pollutant.
+    //   2. Otherwise — the rendered FIELD's max AQI, mapped through the
+    //      displayed tab's bracket scale. Sampled once in `_computePaFieldSync`
+    //      from the kernel-regressed field grid over the viewport — never
+    //      from raw trail readings.
     let activeValue = null;
     if (map && selectedId) {
       const v = map.getSelectedPollutantValue();
       if (v != null && isFinite(v)) activeValue = v;
-    } else if (map) {
-      const perPollField = map._paFieldMaxAqiPerPollutant || null;
-      if (perPollField) {
-        activeValue = _fieldAqiToLegendValue(tabKey, perPollField[tabKey]);
-      }
+    } else if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
+      activeValue = _fieldAqiToLegendValue(tabKey, map._paFieldMaxAqi);
     }
     // Only touch row DOM when the value crosses a bracket boundary. Tab
     // colors depend on the selected sensor / per-pollutant data and must
@@ -1092,13 +1090,17 @@ function main() {
     if (tabKey === "o3") v *= 1000;
     return v;
   }
-  /** In collapsed mode, color each tab's text using the same AQI color logic as the bars. */
+  /** In collapsed mode, color each tab's text using the same AQI color logic as the bars.
+   *  Sources, in priority order:
+   *    1. Selected sensor — color each tab from that sensor's own readings.
+   *    2. Otherwise — sample the rendered FIELD's max AQI (one value, set
+   *       by `_computePaFieldSync` from the kernel-regressed grid) and map
+   *       it through each tab's bracket scale. The field is authoritative;
+   *       trails are not consulted directly. */
   function _applyLegendTabColors() {
     if (!legendEl) return;
     const tabs = legendEl.querySelectorAll(".legendTab");
 
-    // Selected sensor (if any) — its own readings take precedence over field
-    // aggregates so tab colors reflect the user's focus.
     const selectedSensor = (map && selectedId)
       ? (() => {
           const st = _currentState();
@@ -1111,10 +1113,8 @@ function main() {
         })()
       : null;
 
-    // Per-pollutant field maxes from the map — one AQI value per tab,
-    // computed over the same viewport + sensor set as the rendered field.
-    // Independent of which pollutant is currently being rendered.
-    const perPollField = (map && map._paFieldMaxAqiPerPollutant) || null;
+    const fieldAqi = (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi))
+      ? map._paFieldMaxAqi : null;
 
     for (const tab of tabs) {
       const tabKey = tab.dataset.legend;
@@ -1122,7 +1122,6 @@ function main() {
       const data = LEGEND_DATA[tabKey];
       const entries = data.entries;
       let activeValue = null;
-      // 1. Selected sensor's reading for this pollutant.
       if (selectedSensor && selectedSensor.readings) {
         const keys = _DIM_READING_KEYS[tabKey] || [];
         for (const rk of keys) {
@@ -1132,12 +1131,9 @@ function main() {
             if (isFinite(n)) { activeValue = n; break; }
           }
         }
+      } else {
+        activeValue = _fieldAqiToLegendValue(tabKey, fieldAqi);
       }
-      // 2. Per-pollutant field max — this tab's own pollutant data.
-      if (activeValue == null && perPollField) {
-        activeValue = _fieldAqiToLegendValue(tabKey, perPollField[tabKey]);
-      }
-      // Find the matching entry color for activeValue
       let color = null;
       if (activeValue != null) {
         for (let i = entries.length - 1; i >= 0; i--) {
@@ -1147,7 +1143,6 @@ function main() {
           }
         }
       }
-      // Persist: keep last-known color when current is null
       if (color) {
         _persistedTabColors[tabKey] = color;
       } else {

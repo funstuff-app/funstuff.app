@@ -6798,16 +6798,6 @@ class MapView {
     // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
     this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
 
-    // ── Per-pollutant field max: run the same kernel regression (viewport-
-    // cells only, max AQI only) for each non-rendered pollutant so each
-    // legend tab's color reflects its own pollutant's field data. Rendered
-    // pollutant reuses the max from the main pass above. ──
-    this._computePerPollutantFieldMax(
-      state, playbackTimeMs, centerW, z, cssW, cssH, bufW, bufH,
-      paRefNowMs, virtualRefNowMs,
-      cellSize, gw, gh, cutoffSq, effectiveCutoffSq, wind, twoSigmaSq
-    );
-
     // ── Store overfetch buffer dimensions for composite offset ──
     this._paFieldBufW = bufW;
     this._paFieldBufH = bufH;
@@ -6875,112 +6865,6 @@ class MapView {
     this._windVecField = windField;
     this._windVecZoom = z;
     return result;
-  }
-
-  /**
-   * Compute max AQI per pollutant from the kernel-regression field grid
-   * (Nadaraya-Watson, same formulation as _computePaFieldSync) within the
-   * viewport — one max per pollutant, independent of which pollutant is
-   * currently being rendered.  This lets legend tab colors reflect each
-   * tab's own pollutant field data.
-   *
-   * For the currently-rendered pollutant, reuses `this._paFieldMaxAqi`
-   * already computed by the main pass.  For the other four pollutants, runs
-   * the regression inner loop over viewport cells only (no rendering, no
-   * blur) — ~0.5ms each on a 16px grid.
-   */
-  _computePerPollutantFieldMax(state, playbackTimeMs, centerW, z, cssW, cssH, bufW, bufH, paRefNowMs, virtualRefNowMs, cellSize, gw, gh, cutoffSq, effectiveCutoffSq, wind, twoSigmaSq) {
-    const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
-    const mobiles = Array.isArray(state && state.mobile) ? state.mobile : [];
-    const result = {};
-    const pollutants = ["pm25", "pm10", "o3", "no2", "co"];
-    const renderedTab = this._paFieldPollutant || "pm25";
-
-    // Viewport bounds in grid cells (match _computePaFieldSync's viewport logic)
-    const vpMarginX = (bufW - cssW) / 2;
-    const vpMarginY = (bufH - cssH) / 2;
-    const vpGxMin = Math.max(0, Math.floor(vpMarginX / cellSize));
-    const vpGyMin = Math.max(0, Math.floor(vpMarginY / cellSize));
-    const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + cssW) / cellSize));
-    const vpGyMax = Math.min(gh, Math.ceil((vpMarginY + cssH) / cellSize));
-
-    const isAniso = wind != null && wind.stretch > 1.001;
-    const wwx = isAniso ? wind.wx : 0;
-    const wwy = isAniso ? wind.wy : 0;
-    const wStretch = isAniso ? wind.stretch : 1;
-    const wUpwind = isAniso ? wind.upwindShrink : 1;
-
-    for (const tab of pollutants) {
-      // Rendered pollutant: reuse the main pass's _paFieldMaxAqi. It is the
-      // max of the same kernel regression computed over the same viewport,
-      // so re-running would be redundant.
-      if (tab === renderedTab && this._paFieldMaxAqi != null && isFinite(this._paFieldMaxAqi)) {
-        result[tab] = this._paFieldMaxAqi;
-        continue;
-      }
-
-      // Collect sensors for this pollutant (same rules as the rendered field)
-      const paField = _collectPaFieldSensors(
-        fixed, playbackTimeMs, centerW, z, cssW, cssH, tab, bufW, bufH, paRefNowMs
-      );
-      const virtualField = _collectVirtualMobileSensors(
-        mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH,
-        virtualRefNowMs, tab, bufW, bufH
-      );
-      const allSensors = paField.sensors.concat(virtualField.sensors);
-      if (allSensors.length === 0) { result[tab] = null; continue; }
-
-      // Build stride-5 sensor array matching _computePaFieldSync's preparation
-      const aqiKey = _LEGEND_TAB_AQI_KEY[tab] || "pm2.5";
-      const s5 = new Float64Array(allSensors.length * 5);
-      for (let i = 0; i < allSensors.length; i++) {
-        const s = allSensors[i];
-        const si5 = i * 5;
-        s5[si5]     = s.sx;
-        s5[si5 + 1] = s.sy;
-        const aqi = valueToAqi(aqiKey, s.value);
-        s5[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
-        s5[si5 + 3] = twoSigmaSq;
-        s5[si5 + 4] = s.weightMultiplier;
-      }
-
-      // Kernel regression inner loop — viewport cells only, max AQI only.
-      // Same math as _computePaFieldSync; skips rendering, blur, and composite.
-      let fieldMaxAqi = -Infinity;
-      for (let gy = vpGyMin; gy < vpGyMax; gy++) {
-        const py = (gy + 0.5) * cellSize;
-        for (let gx = vpGxMin; gx < vpGxMax; gx++) {
-          const pxx = (gx + 0.5) * cellSize;
-          let wSum = 0, vSum = 0;
-          for (let i = 0; i < s5.length; i += 5) {
-            const dx = pxx - s5[i];
-            const dy = py  - s5[i + 1];
-            const rawD2 = dx * dx + dy * dy;
-            if (rawD2 > effectiveCutoffSq) continue;
-            let d2;
-            if (isAniso) {
-              const along = dx * wwx + dy * wwy;
-              if (rawD2 > cutoffSq && along <= 0) continue;
-              const cross = dx * (-wwy) + dy * wwx;
-              const sf = along > 0 ? wStretch : wStretch * wUpwind;
-              const ea = along / sf;
-              d2 = ea * ea + cross * cross;
-            } else {
-              d2 = rawD2;
-            }
-            const w = s5[i + 4] * Math.exp(-d2 / s5[i + 3]);
-            wSum += w;
-            vSum += w * s5[i + 2];
-          }
-          if (wSum >= 0.001) {
-            const val = vSum / wSum;
-            if (val > fieldMaxAqi) fieldMaxAqi = val;
-          }
-        }
-      }
-      result[tab] = (fieldMaxAqi > -Infinity) ? fieldMaxAqi : null;
-    }
-    this._paFieldMaxAqiPerPollutant = result;
   }
 
   /** Synchronous Nadaraya-Watson kernel regression with Gaussian weights.

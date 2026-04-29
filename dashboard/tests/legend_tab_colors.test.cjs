@@ -1,14 +1,22 @@
 /**
- * Tests for collapsed-legend tab coloring logic (_applyLegendTabColors).
+ * Tests for collapsed-legend tab coloring (`_applyLegendTabColors`).
  *
- * Extracts the pure color-lookup from app.js and verifies that each tab
- * gets a color matching its OWN pollutant's reading, not a shared AQI.
+ * Contract after the field-only fix:
+ *   - There is ONE rendered field with ONE max AQI (`map._paFieldMaxAqi`),
+ *     sampled in `_computePaFieldSync` from the kernel-regressed grid over
+ *     the viewport.
+ *   - Every tab is colored by mapping that single field-AQI through that
+ *     tab's own bracket scale. No tab is left gray when the field has data.
+ *   - When a sensor is selected, every tab uses that sensor's own readings
+ *     for its pollutant — sensor-focus overrides the field aggregate.
+ *   - Trails / virtual mobile sensors / per-pollutant kernel regressions are
+ *     NOT consulted from this code path.
  */
 
 const assert = require("node:assert/strict");
 const { test, describe } = require("node:test");
 
-// ── Inline LEGEND_DATA (verbatim from app.js) ───────────────────────────────
+// ── Inline LEGEND_DATA + reading-key map (verbatim from app.js) ─────────────
 
 const LEGEND_DATA = {
   pm25: {
@@ -83,46 +91,56 @@ const _DIM_READING_KEYS = {
   co:   ["CO", "co"],
 };
 
-// ── Extract: FIXED logic -- scan per-pollutant max concentrations ────────────
+// EPA-ish breakpoint mock — just enough to exercise the dispatch logic.
+function aqiToValue(pollutant, aqi) {
+  if (aqi == null) return null;
+  if (pollutant === "pm2.5") return aqi * 0.24;
+  if (pollutant === "pm10")  return aqi * 0.5;
+  if (pollutant === "ozone") return aqi * 0.001; // ppm
+  if (pollutant === "no2")   return aqi * 0.4;
+  if (pollutant === "co")    return aqi * 0.03;
+  return aqi;
+}
 
-function colorForTab_fixed(tabKey, perPollutantMax, persistedColors) {
+const _TAB_AQI_KEY = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" };
+function _fieldAqiToLegendValue(tabKey, aqi) {
+  if (aqi == null || !isFinite(aqi)) return null;
+  const aqiKey = _TAB_AQI_KEY[tabKey] || "pm2.5";
+  let v = aqiToValue(aqiKey, aqi);
+  if (v == null || !isFinite(v)) return null;
+  if (tabKey === "o3") v *= 1000; // legend bands authored in ppb
+  return v;
+}
+
+// ── Mirror of the post-fix `_applyLegendTabColors` per-tab branch ───────────
+
+function colorForTab({ tabKey, fieldAqi, selectedSensor, persistedColors }) {
   const data = LEGEND_DATA[tabKey];
   if (!data) return null;
   const entries = data.entries;
 
-  const activeValue = perPollutantMax[tabKey] != null ? perPollutantMax[tabKey] : null;
+  let activeValue = null;
+  if (selectedSensor && selectedSensor.readings) {
+    const keys = _DIM_READING_KEYS[tabKey] || [];
+    for (const rk of keys) {
+      const rd = selectedSensor.readings[rk];
+      if (rd && rd.value != null && isFinite(rd.value)) {
+        activeValue = parseFloat(rd.value);
+        break;
+      }
+    }
+  } else {
+    activeValue = _fieldAqiToLegendValue(tabKey, fieldAqi);
+  }
+
   let color = null;
   if (activeValue != null) {
     for (let i = entries.length - 1; i >= 0; i--) {
-      if (activeValue >= entries[i].lo) {
-        color = entries[i].color;
-        break;
-      }
+      if (activeValue >= entries[i].lo) { color = entries[i].color; break; }
     }
   }
-  if (color) {
-    persistedColors[tabKey] = color;
-  } else {
-    color = persistedColors[tabKey] || null;
-  }
-  return color;
-}
-
-// ── Extract: color from raw concentration (sensor-selected path) ────────────
-
-function colorForConcentration(tabKey, concentration) {
-  const data = LEGEND_DATA[tabKey];
-  if (!data) return null;
-  const entries = data.entries;
-  let color = null;
-  if (concentration != null) {
-    for (let i = entries.length - 1; i >= 0; i--) {
-      if (concentration >= entries[i].lo) {
-        color = entries[i].color;
-        break;
-      }
-    }
-  }
+  if (color) persistedColors[tabKey] = color;
+  else color = persistedColors[tabKey] || null;
   return color;
 }
 
@@ -130,66 +148,64 @@ function colorForConcentration(tabKey, concentration) {
 // TESTS
 // ═════════════════════════════════════════════════════════════════════════════
 
-describe("legend tab color: basic concentration-to-color mapping", () => {
-  test("PM2.5 value 3 maps to #00CCFF (blue, lo=2)", () => {
-    assert.equal(colorForConcentration("pm25", 3), "#00CCFF");
+describe("legend tab colors: every tab is colored from the single field max", () => {
+  test("field AQI 25 colors all five tabs (no tab grays out)", () => {
+    const persisted = {};
+    const args = { fieldAqi: 25, selectedSensor: null, persistedColors: persisted };
+    for (const tab of ["pm25", "pm10", "o3", "no2", "co"]) {
+      assert.notEqual(colorForTab({ tabKey: tab, ...args }), null,
+        `${tab} must be colored — there is field data`);
+    }
   });
-  test("PM2.5 value 7 maps to #00E400 (green, lo=5)", () => {
-    assert.equal(colorForConcentration("pm25", 7), "#00E400");
+
+  test("field AQI 4 (low) → low-bracket cool colors across all tabs", () => {
+    const persisted = {};
+    const args = { fieldAqi: 4, selectedSensor: null, persistedColors: persisted };
+    // PM2.5 = 0.96 → cyan (lo=0). PM10 = 2 → cyan (lo=0). O3 = 4 ppb → cyan.
+    assert.equal(colorForTab({ tabKey: "pm25", ...args }), "#00FFFF");
+    assert.equal(colorForTab({ tabKey: "pm10", ...args }), "#00FFFF");
+    assert.equal(colorForTab({ tabKey: "o3",   ...args }), "#00CCFF");
   });
-  test("PM2.5 value 20 maps to #FFFF00 (yellow, lo=9)", () => {
-    assert.equal(colorForConcentration("pm25", 20), "#FFFF00");
+
+  test("field AQI 75 → mid-bracket warm colors across all tabs", () => {
+    const persisted = {};
+    const args = { fieldAqi: 75, selectedSensor: null, persistedColors: persisted };
+    // PM2.5 = 18 → yellow (9-35). PM10 = 37.5 → blue (30-40).
+    // O3 = 75 ppb → orange (70-85).
+    assert.equal(colorForTab({ tabKey: "pm25", ...args }), "#FFFF00");
+    assert.equal(colorForTab({ tabKey: "pm10", ...args }), "#0099FF");
+    assert.equal(colorForTab({ tabKey: "o3",   ...args }), "#FF7E00");
   });
-  test("O3 value 30 maps to #009900 (dark green, lo=25)", () => {
-    assert.equal(colorForConcentration("o3", 30), "#009900");
-  });
-  test("O3 value 60 maps to #FFFF00 (yellow, lo=54)", () => {
-    assert.equal(colorForConcentration("o3", 60), "#FFFF00");
-  });
-  test("NO2 value 10 maps to #00CCFF (cyan, lo=0)", () => {
-    assert.equal(colorForConcentration("no2", 10), "#00CCFF");
-  });
-  test("PM10 value 5 maps to #00FFFF (cyan, lo=0)", () => {
-    assert.equal(colorForConcentration("pm10", 5), "#00FFFF");
-  });
-  test("null concentration returns null", () => {
-    assert.equal(colorForConcentration("pm25", null), null);
+
+  test("varied field AQI yields a spread of colors across tabs (not all the same)", () => {
+    const persisted = {};
+    const args = { fieldAqi: 75, selectedSensor: null, persistedColors: persisted };
+    const colors = new Set();
+    for (const tab of ["pm25", "pm10", "o3", "no2", "co"]) {
+      colors.add(colorForTab({ tabKey: tab, ...args }));
+    }
+    assert.ok(colors.size >= 3, `expected ≥3 distinct colors, got ${colors.size}`);
   });
 });
 
-describe("legend tab color: per-pollutant max produces different colors per tab", () => {
-  test("varied concentrations give different colors per tab", () => {
-    const perPollutantMax = {
-      pm25: 7,   // Green range (#00E400, lo=5)
-      pm10: 20,  // Cyan-blue (#00CCFF, lo=15)
-      o3: 30,    // Dark green (#009900, lo=25)
-      no2: 10,   // Cyan (#00CCFF, lo=0)
-      co: 2.0,   // Blue (#0099FF, lo=1.5)
-    };
-    const persisted = {};
-    const colors = {};
-    for (const tab of ["pm25", "pm10", "o3", "no2", "co"]) {
-      colors[tab] = colorForTab_fixed(tab, perPollutantMax, persisted);
-    }
-    const uniqueColors = new Set(Object.values(colors));
-    assert.ok(uniqueColors.size >= 3,
-      `Expected at least 3 distinct colors but got ${uniqueColors.size}: ` +
-      `${JSON.stringify(colors)}`);
+describe("legend tab colors: null field falls back to persisted, never to trails", () => {
+  test("null field with persisted colors keeps the last good color", () => {
+    const persisted = { pm25: "#FFFF00", pm10: "#FF7E00" };
+    const args = { fieldAqi: null, selectedSensor: null, persistedColors: persisted };
+    assert.equal(colorForTab({ tabKey: "pm25", ...args }), "#FFFF00");
+    assert.equal(colorForTab({ tabKey: "pm10", ...args }), "#FF7E00");
   });
 
-  test("same concentration on all pollutants still maps to different colors", () => {
-    const perPollutantMax = { pm25: 10, pm10: 10, o3: 10, no2: 10, co: 10 };
+  test("null field with empty persistence returns null (no error, no trail fallback)", () => {
     const persisted = {};
-    const colors = {};
+    const args = { fieldAqi: null, selectedSensor: null, persistedColors: persisted };
     for (const tab of ["pm25", "pm10", "o3", "no2", "co"]) {
-      colors[tab] = colorForTab_fixed(tab, perPollutantMax, persisted);
+      assert.equal(colorForTab({ tabKey: tab, ...args }), null);
     }
-    assert.notEqual(colors.pm25, colors.pm10,
-      `PM2.5 (${colors.pm25}) and PM10 (${colors.pm10}) should differ at value=10`);
   });
 });
 
-describe("legend tab color: sensor selected with per-pollutant readings", () => {
+describe("legend tab colors: a sensor selection beats the field for every tab", () => {
   const sensorReadings = {
     "PM2.5": { value: 7 },
     "PM10":  { value: 20 },
@@ -197,109 +213,25 @@ describe("legend tab color: sensor selected with per-pollutant readings", () => 
     "NO2":   { value: 10 },
     "CO":    { value: 2.0 },
   };
+  const selectedSensor = { readings: sensorReadings };
 
-  function colorForTab_withSensor(tabKey, readings) {
-    const data = LEGEND_DATA[tabKey];
-    if (!data) return null;
-    const entries = data.entries;
-    const keys = _DIM_READING_KEYS[tabKey] || [];
-    let activeValue = null;
-    for (const rk of keys) {
-      const rd = readings[rk];
-      if (rd && rd.value != null && isFinite(rd.value)) {
-        activeValue = rd.value;
-        break;
-      }
-    }
-    let color = null;
-    if (activeValue != null) {
-      for (let i = entries.length - 1; i >= 0; i--) {
-        if (activeValue >= entries[i].lo) {
-          color = entries[i].color;
-          break;
-        }
-      }
-    }
-    return color;
-  }
-
-  test("PM2.5=7 should be green (#00E400)", () => {
-    assert.equal(colorForTab_withSensor("pm25", sensorReadings), "#00E400");
-  });
-  test("PM10=20 should be cyan-blue (#00CCFF)", () => {
-    assert.equal(colorForTab_withSensor("pm10", sensorReadings), "#00CCFF");
-  });
-  test("O3=30 should be dark green (#009900)", () => {
-    assert.equal(colorForTab_withSensor("o3", sensorReadings), "#009900");
-  });
-  test("NO2=10 should be cyan (#00CCFF)", () => {
-    assert.equal(colorForTab_withSensor("no2", sensorReadings), "#00CCFF");
-  });
-  test("CO=2.0 should be blue (#0099FF)", () => {
-    assert.equal(colorForTab_withSensor("co", sensorReadings), "#0099FF");
-  });
-  test("each tab gets a DIFFERENT color for varied readings", () => {
-    const colors = [];
-    for (const tab of ["pm25", "pm10", "o3", "no2", "co"]) {
-      colors.push(colorForTab_withSensor(tab, sensorReadings));
-    }
-    const uniqueColors = new Set(colors);
-    assert.ok(uniqueColors.size >= 3,
-      `Expected at least 3 distinct colors but got ${uniqueColors.size}: ${colors.join(", ")}`);
+  test("each tab uses the selected sensor's own pollutant reading", () => {
+    const persisted = {};
+    const args = { fieldAqi: 200, selectedSensor, persistedColors: persisted };
+    assert.equal(colorForTab({ tabKey: "pm25", ...args }), "#00E400");
+    assert.equal(colorForTab({ tabKey: "pm10", ...args }), "#00CCFF");
+    assert.equal(colorForTab({ tabKey: "o3",   ...args }), "#009900");
+    assert.equal(colorForTab({ tabKey: "no2",  ...args }), "#00CCFF");
+    assert.equal(colorForTab({ tabKey: "co",   ...args }), "#0099FF");
   });
 });
 
-describe("legend tab color: null/missing readings should persist last color", () => {
-  test("sensor with no PM10 reading: persisted color is returned", () => {
-    const persisted = { pm10: "#00CCFF" };
-    const perPollutantMax = { pm25: 7 };
-    const color = colorForTab_fixed("pm10", perPollutantMax, persisted);
-    assert.equal(color, "#00CCFF",
-      "Missing pollutant should return persisted color, not null");
-  });
-
-  test("first call with no data returns null (nothing persisted yet)", () => {
+describe("legend tab colors: same field AQI re-mapped per tab gives different colors", () => {
+  test("AQI 50 → PM2.5 yellow, O3 dark green (both Good→Moderate boundary)", () => {
     const persisted = {};
-    const perPollutantMax = {};
-    const color = colorForTab_fixed("pm25", perPollutantMax, persisted);
-    assert.equal(color, null);
-  });
-
-  test("new reading updates persisted color", () => {
-    const persisted = { pm25: "#00CCFF" };
-    const perPollutantMax = { pm25: 20 };
-    const color = colorForTab_fixed("pm25", perPollutantMax, persisted);
-    assert.equal(color, "#FFFF00", "New reading should produce yellow");
-    assert.equal(persisted.pm25, "#FFFF00", "Persisted should update to yellow");
-  });
-
-  test("subsequent null reading keeps persisted color", () => {
-    const persisted = { pm25: "#FFFF00" };
-    const perPollutantMax = {};
-    const color = colorForTab_fixed("pm25", perPollutantMax, persisted);
-    assert.equal(color, "#FFFF00", "Null reading should keep persisted yellow");
-  });
-});
-
-describe("legend tab color: show-all mode uses per-pollutant data, not shared AQI", () => {
-  test("after deselecting a tab, tabs reflect their own pollutant concentrations", () => {
-    const perPollutantMax = {
-      pm25: 12,
-      pm10: 25,
-      o3: 40,
-      no2: 5,
-      co: 1.0,
-    };
-    const persisted = {};
-    const colors = {};
-    for (const tab of ["pm25", "pm10", "o3", "no2", "co"]) {
-      colors[tab] = colorForTab_fixed(tab, perPollutantMax, persisted);
-    }
-    assert.equal(colors.pm25, "#FFFF00", "PM2.5=12 should be yellow");
-    assert.equal(colors.o3, "#006600", "O3=40 should be dark green");
-    assert.equal(colors.no2, "#00CCFF", "NO2=5 should be cyan");
-    const uniqueColors = new Set(Object.values(colors));
-    assert.ok(uniqueColors.size >= 3,
-      `Expected varied colors in show-all mode, got ${uniqueColors.size}`);
+    const args = { fieldAqi: 50, selectedSensor: null, persistedColors: persisted };
+    // PM2.5 = 12 → yellow (lo=9). O3 = 50 ppb → dark green (lo=35).
+    assert.equal(colorForTab({ tabKey: "pm25", ...args }), "#FFFF00");
+    assert.equal(colorForTab({ tabKey: "o3",   ...args }), "#006600");
   });
 });
