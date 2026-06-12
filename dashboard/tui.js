@@ -114,14 +114,25 @@ function handleAction(key) {
 async function fetchData() {
     document.getElementById('update-time').textContent = 'Fetching...';
     try {
-        // Fetch both raw state and TUI-formatted state in parallel
+        // Fetch both raw state and TUI-formatted state in parallel.
+        // X-App-Token gates /api/* server-side (bot deterrent in dashboard_server.py
+        // do_GET around line 4726). Without it, /api/state and /api/tui both 403.
+        const headers = { "X-App-Token": APP_TOKEN };
         const [rawRes, tuiRes] = await Promise.all([
-            fetch(API_URL),
-            fetch(TUI_API_URL)
+            fetch(API_URL, { headers, credentials: "same-origin" }),
+            fetch(TUI_API_URL, { headers, credentials: "same-origin" })
         ]);
-        
+
         const data = await rawRes.json();
-        appState = data;
+        // Defensive defaults: don't let a malformed/auth-rejected payload nuke
+        // the page with `appState.mobile.map(...)` undefined errors.
+        appState = {
+            mobile: Array.isArray(data?.mobile) ? data.mobile : [],
+            fixed: Array.isArray(data?.fixed) ? data.fixed : [],
+            meta: data?.meta || {},
+            ts: data?.ts || 0,
+            ...data,
+        };
         
         if (tuiRes.ok) {
             tuiState = await tuiRes.json();

@@ -3,6 +3,11 @@ const _isWindows = /Win/.test(navigator.platform || navigator.userAgent);
 const _isMac = /Mac/.test(navigator.platform || navigator.userAgent);
 const _isMobileDevice = /iPad|iPhone|iPod|Android/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1);
 
+// Wind loading kill switch: no-ops all wind data ingestion (fetch, SSE merge,
+// historical snapshot wind) to save load time. Code paths kept intact.
+const WIND_LOADING_DISABLED = true;
+window.WIND_LOADING_DISABLED = WIND_LOADING_DISABLED;
+
 /**
  * PM2.5 concentration → [r, g, b], matching Python color_for_value("pm2.5", v).
  * Same breakpoints so scalar field colors match dot colors exactly.
@@ -85,7 +90,7 @@ function _readingForLegendTab(readings, legendTab) {
   return null;
 }
 
-function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab, bufW, bufH, refNowMs) {
+function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab, bufW, bufH, refNowMs, maxMode) {
   const isPm25 = !pollutantTab || pollutantTab === "pm25";
   const aqiKey = _LEGEND_TAB_AQI_KEY[pollutantTab || "pm25"] || "pm2.5";
   const readingKeys = _LEGEND_TAB_READING_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_READING_KEYS.pm25;
@@ -141,6 +146,9 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
     let staleWeight = 1.0;
     if (f.purpleair && refNowMs) {
       const sMs = f.last_seen ? f.last_seen * 1000 : null;
+      // No last_seen at all (e.g. seeded from a snapshot while the PurpleAir
+      // API was failing) — age is unknown, so it must not render as current.
+      if (!sMs) continue;
       if (sMs) {
         const ageMs = refNowMs - sMs;
         if (ageMs >= PA_FADE_MS) continue;
@@ -154,22 +162,49 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
 
     const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
     let value = NaN;
-    let readingOutlier = false;
-    for (const rk of readingKeys) {
-      const r = interp && interp[rk];
-      if (r && r.value != null) { value = Number(r.value); readingOutlier = !!r.outlier; break; }
+    let maxAqi = null;
+    if (maxMode) {
+      // No pollutant selected: this sensor contributes its WORST pollutant
+      // (highest AQI across all tabs). Blending downstream is in AQI space.
+      for (const tab in _LEGEND_TAB_READING_KEYS) {
+        for (const rk of _LEGEND_TAB_READING_KEYS[tab]) {
+          const r = interp && interp[rk];
+          if (r && r.value != null) {
+            if (!r.outlier) {
+              const v = Number(r.value);
+              if (isFinite(v) && v >= 0) {
+                const a = valueToAqi(_LEGEND_TAB_AQI_KEY[tab], v);
+                if (a != null && isFinite(a) && (maxAqi == null || a > maxAqi)) { maxAqi = a; value = v; }
+              }
+            }
+            break;
+          }
+        }
+      }
+      if (maxAqi == null) continue;
+    } else {
+      let readingOutlier = false;
+      for (const rk of readingKeys) {
+        const r = interp && interp[rk];
+        if (r && r.value != null) { value = Number(r.value); readingOutlier = !!r.outlier; break; }
+      }
+      if (!isFinite(value) || value < 0) continue;
+      if (readingOutlier) continue;
     }
-    if (!isFinite(value) || value < 0) continue;
-    if (readingOutlier) continue;
 
     const wp = latLonToWorld(lat, lon, zoom);
     sensors.push({
       sx: wp.x - centerW.x + projW / 2,
       sy: wp.y - centerW.y + projH / 2,
       value,
+      aqi: maxAqi,
       weightMultiplier: (f.purpleair ? 1 : _PA_FIELD_FIXED_WEIGHT_MULTIPLIER) * staleWeight,
     });
-    fingerprint += isPm25 ? _pm25ColorCat(value) : _aqiColorCat(valueToAqi(aqiKey, value) ?? 0);
+    // Max mode quantizes at 4 AQI points (finer than _aqiColorCat) so the
+    // field recomputes when a sensor visibly changes within a coarse AQI band
+    // (PA dot sub-bands are finer than AQI categories).
+    fingerprint += maxMode ? ("m" + Math.round(maxAqi / 4) + ",")
+      : (isPm25 ? _pm25ColorCat(value) : _aqiColorCat(valueToAqi(aqiKey, value) ?? 0));
   }
 
   return { sensors, fingerprint };
@@ -180,7 +215,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
  * Each trail point with a reading for the selected pollutant becomes a transient sensor
  * that decays over the same time window as the trail fade.
  */
-function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs, pollutantTab, bufW, bufH) {
+function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs, pollutantTab, bufW, bufH, maxMode) {
   const isPm25 = !pollutantTab || pollutantTab === "pm25";
   const aqiKey = _LEGEND_TAB_AQI_KEY[pollutantTab || "pm25"] || "pm2.5";
   const trailKeys = _LEGEND_TAB_TRAIL_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_TRAIL_KEYS.pm25;
@@ -222,14 +257,47 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       if (ageMs < 0) continue;           // future point in playback
       if (ageMs >= FADE_TIME_MS) break;   // past fade window (older points only get older)
 
-      // Extract reading for selected pollutant — skip if absent
+      // Extract reading for selected pollutant — skip if absent.
+      // Derived values are cached on the (immutable) trail point: this
+      // collector runs once for the rendered field AND once per pollutant in
+      // the legend's per-pollutant max scan, so without the cache every trail
+      // point gets re-parsed ~6x per recompute cycle.
       let rawVal = undefined;
+      let trailMaxAqi = null;
       const rd = p.readings;
-      if (rd) {
-        for (const rk of trailKeys) {
-          const rv = rd[rk]?.value ?? rd[rk];
-          if (rv != null && typeof rv !== "object") { rawVal = rv; break; }
-          if (rv != null && typeof rv === "object" && rv.value != null) { rawVal = rv.value; break; }
+      if (rd && maxMode) {
+        // No pollutant selected: take the worst pollutant (highest AQI) at this point.
+        if (p._maxAqi !== undefined) {
+          trailMaxAqi = p._maxAqi;
+          rawVal = p._maxVal;
+        } else {
+          for (const tab in _LEGEND_TAB_TRAIL_KEYS) {
+            for (const rk of _LEGEND_TAB_TRAIL_KEYS[tab]) {
+              let rv = rd[rk]?.value ?? rd[rk];
+              if (rv != null && typeof rv === "object") rv = rv.value;
+              if (rv == null) continue;
+              const v = Number(rv);
+              if (isFinite(v) && v >= 0) {
+                const a = valueToAqi(_LEGEND_TAB_AQI_KEY[tab], v);
+                if (a != null && isFinite(a) && (trailMaxAqi == null || a > trailMaxAqi)) { trailMaxAqi = a; rawVal = v; }
+              }
+              break;
+            }
+          }
+          try { p._maxAqi = trailMaxAqi; p._maxVal = rawVal; } catch {}
+        }
+        if (trailMaxAqi == null) continue;
+      } else if (rd) {
+        const _tv = p._tabVals;
+        if (_tv && pollutantTab in _tv) {
+          rawVal = _tv[pollutantTab];
+        } else {
+          for (const rk of trailKeys) {
+            const rv = rd[rk]?.value ?? rd[rk];
+            if (rv != null && typeof rv !== "object") { rawVal = rv; break; }
+            if (rv != null && typeof rv === "object" && rv.value != null) { rawVal = rv.value; break; }
+          }
+          try { (p._tabVals || (p._tabVals = {}))[pollutantTab] = rawVal ?? null; } catch {}
         }
       }
       if (rawVal == null) continue;
@@ -262,13 +330,14 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       const sx = wx - centerW.x + projW / 2;
       const sy = wy - centerW.y + projH / 2;
 
-      sensorMap.set(slotKey, { sx, sy, value: pollVal, weightMultiplier: _PA_FIELD_FIXED_WEIGHT_MULTIPLIER * decayWeight });
+      sensorMap.set(slotKey, { sx, sy, value: pollVal, aqi: trailMaxAqi, weightMultiplier: _PA_FIELD_FIXED_WEIGHT_MULTIPLIER * decayWeight });
     }
   }
 
   const sensors = Array.from(sensorMap.values());
   let fingerprint = "";
-  for (const s of sensors) fingerprint += isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(valueToAqi(aqiKey, s.value) ?? 0);
+  for (const s of sensors) fingerprint += (maxMode && s.aqi != null) ? ("m" + Math.round(s.aqi / 4) + ",")
+    : (isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(valueToAqi(aqiKey, s.value) ?? 0));
   return { sensors, fingerprint };
 }
 
@@ -837,6 +906,29 @@ class MapView {
     this._paFieldKey = "";
     this._paFieldValidRange = null;
     this._preWarmScanValidUntilMs = null;
+    // The cached canvas pixels belong to the prior pollutant/view/state. Every
+    // reuse path keys off `_paFieldCanvas` truthiness (animation fast-path
+    // line ~6514, the transient-animating early-return in `_ensurePaField`
+    // line ~6664, the cross-fade pickup line ~6745). Leaving stale pixels
+    // here lets those paths replay the wrong pollutant's heatmap.
+    this._paFieldCanvas = null;
+    this._paFieldCtx = null;
+    this._paFieldPrevCanvas = null;
+    this._paFieldComputedView = null;
+    this._paFieldValidPollutant = null;
+    this._paFieldValidViewKey = null;
+    this._paFieldValidFixed = null;
+    this._paFieldFingerprint = "";
+    // Per-pollutant max bag is populated lazily by getPerPollutantFieldMax()
+    // and keyed by _paFieldKey. Clear both so the next legend read recomputes.
+    this._paFieldMaxAqi = null;
+    this._paFieldMaxAqiPerPollutant = null;
+    this._perPollCacheKey = null;
+    this._perPollLastInputs = null;
+    // `_compositePaFieldOnTiles` dedups itself within a 4 ms window. After an
+    // invalidation we want the *next* composite to actually run, even if
+    // another RAF chain (playback loop, follow, scrub) composited a moment ago.
+    this._compositeLastDrawMs = 0;
   }
 
   setMaxTrailLen(val) {
@@ -1771,7 +1863,7 @@ class MapView {
     this.selectedId = next;
     if (!next) this._selectedPollutantKey = null;
     if (!next) this._selectedNaturalPollutantKey = null;
-    if (!next) this._selectedPollutantValue = null;
+    if (!next) { this._selectedPollutantValue = null; this._selectedReadings = null; }
     this._followSuppressUntilMs = 0;
     this._invalidateOverlayStatic();
     this.drawOverlay(this.lastState);
@@ -1788,6 +1880,11 @@ class MapView {
 
   getSelectedPollutantValue() {
     return this._selectedPollutantValue ?? null;
+  }
+
+  /** Readings bag for the selected sensor at the displayed (playback) time. */
+  getSelectedReadings() {
+    return this._selectedReadings ?? null;
   }
 
   /** Return lat/lon bounds of the viewport with _OVERFETCH buffer.
@@ -2155,11 +2252,28 @@ class MapView {
     }
     const dLat = tLat - this.center.lat;
     const dLon = tLon - this.center.lon;
-    if (Math.abs(dLat) > 0.00005 || Math.abs(dLon) > 0.00005) {
+    const moved = Math.abs(dLat) > 0.00005 || Math.abs(dLon) > 0.00005;
+    if (moved) {
       this.center = { lat: this.center.lat + dLat * 0.03, lon: this.center.lon + dLon * 0.03 };
       this._redrawViewOnly();
+      this._followIdleFrames = 0;
+      this._followRAF = requestAnimationFrame(() => this._followTick());
+    } else {
+      // Drop from 60 Hz to ~6 Hz once the target has been stationary for a
+      // beat. Camera-recovery latency after a user pan stays well under a
+      // frame the user notices, but idle CPU stops burning watching a
+      // parked bus.
+      this._followIdleFrames = (this._followIdleFrames || 0) + 1;
+      const idleDelayMs = this._followIdleFrames > 15 ? 160 : 0;
+      if (idleDelayMs > 0) {
+        setTimeout(() => {
+          if (this._followTargetLat === null || !this.selectedId) return;
+          this._followRAF = requestAnimationFrame(() => this._followTick());
+        }, idleDelayMs);
+      } else {
+        this._followRAF = requestAnimationFrame(() => this._followTick());
+      }
     }
-    this._followRAF = requestAnimationFrame(() => this._followTick());
   }
 
   _hash01(s) {
@@ -2840,13 +2954,13 @@ class MapView {
       ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
       ...(this._paFieldPollutant == null || this._paFieldPollutant === "pm25" ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
     ];
-    const _clickRefMs = this.getPlaybackTimeMs() || this._dataNowMs();
+    const _clickRefMs = this._historicalMode ? (this.getPlaybackTimeMs() || this._dataNowMs()) : Date.now();
     const _PA_FADE_MS = 45 * 60 * 1000;
     for (const m of candidates) {
       // Skip fully-faded PurpleAir sensors
       if (m.purpleair) {
         const sMs = m.last_seen ? m.last_seen * 1000 : null;
-        if (sMs && (_clickRefMs - sMs) >= _PA_FADE_MS) continue;
+        if (!sMs || (_clickRefMs - sMs) >= _PA_FADE_MS) continue;
       }
       let lat = Number(m.lat), lon = Number(m.lon);
       if (m.type === "mobile") {
@@ -2898,13 +3012,13 @@ class MapView {
       ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
       ...(this._paFieldPollutant == null || this._paFieldPollutant === "pm25" ? [...fixed.filter(f => f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })) : []),
     ];
-    const _tapRefMs = this.getPlaybackTimeMs() || this._dataNowMs();
+    const _tapRefMs = this._historicalMode ? (this.getPlaybackTimeMs() || this._dataNowMs()) : Date.now();
     const _TAP_PA_FADE_MS = 45 * 60 * 1000;
     for (const m of candidates) {
       // Skip fully-faded PurpleAir sensors
       if (m.purpleair) {
         const sMs = m.last_seen ? m.last_seen * 1000 : null;
-        if (sMs && (_tapRefMs - sMs) >= _TAP_PA_FADE_MS) continue;
+        if (!sMs || (_tapRefMs - sMs) >= _TAP_PA_FADE_MS) continue;
       }
       let lat = Number(m.lat), lon = Number(m.lon);
       if (m.type === "mobile") {
@@ -6085,6 +6199,7 @@ class MapView {
    * @param {Array} points - Array of {lat, lon, u, v} objects
    */
   mergeWindSnapshot(key, points) {
+    if (WIND_LOADING_DISABLED) return;
     if (!key || !points) return;
     // Accept both grid objects and legacy point arrays
     if (Array.isArray(points) && !points.length) return;
@@ -6109,6 +6224,7 @@ class MapView {
   }
 
   _fetchWindField() {
+    if (WIND_LOADING_DISABLED) return;
     if (this._windFieldFetchInFlight) return;
     const now = performance.now();
     if (now - this._windFieldLastFetch < this._windFieldFetchInterval && this._windSnapshots) return;
@@ -6685,7 +6801,12 @@ class MapView {
     // once the bar advances 45 min past last_seen.
     const _pbBounds = this.playbackMode ? this.getPlaybackBounds() : null;
     const _boundsMaxMs = (_pbBounds?.maxMs != null && isFinite(_pbBounds.maxMs)) ? _pbBounds.maxMs : null;
-    const paRefNowMs = _boundsMaxMs ?? this._dataNowMs();
+    // LIVE view: PA staleness must be judged against the wall clock — data
+    // time (_boundsMaxMs/_dataNowMs) goes stale together with a dead feed,
+    // making day-old readings look fresh. Historical playback keeps data time.
+    const paRefNowMs = this._historicalMode
+      ? (_boundsMaxMs ?? this._dataNowMs())
+      : Date.now();
     // Virtual mobile sensors measure age against the scrub position so they
     // decay as the user moves the playhead (not pinned to data-max).
     const virtualRefNowMs = (this.playbackMode && playbackTimeMs != null && isFinite(playbackTimeMs))
@@ -6696,8 +6817,11 @@ class MapView {
     // color category — skip the expensive _collectPaFieldSensors entirely. ──
     const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
     const pollutantTab = this._paFieldPollutant || "pm25";
+    // No pollutant selected: render the worst pollutant per sensor (max AQI).
+    const maxMode = this._paFieldPollutant == null;
+    const renderTab = maxMode ? "max" : pollutantTab;
     if (this._paFieldCanvas
-        && this._paFieldValidPollutant === pollutantTab
+        && this._paFieldValidPollutant === renderTab
         && this._paFieldValidViewKey === viewKey
         && this._paFieldValidFixed === fixed
         && this._paFieldValidRange
@@ -6706,13 +6830,13 @@ class MapView {
       return;
     }
 
-    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH, paRefNowMs);
+    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH, paRefNowMs, maxMode);
     const paSensors = paField.sensors;
 
     // ── Inject virtual sensors from mobile trail GPS points ──
     const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
     const virtualField = _collectVirtualMobileSensors(
-      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab, bufW, bufH
+      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab, bufW, bufH, maxMode
     );
     this._virtualMobileSensors = virtualField.sensors;
 
@@ -6724,7 +6848,7 @@ class MapView {
     const hasVirtuals = virtualField.sensors.length > 0;
 
     // ── Cache key: view geometry + color fingerprint + pollutant ──
-    const key = `pa:${viewKey}|p:${pollutantTab}|f:${fingerprint}`;
+    const key = `pa:${viewKey}|p:${renderTab}|f:${fingerprint}`;
     if (this._paFieldCanvas && this._paFieldKey === key) {
       // Cache hit -- update validity window so future frames skip
       // _collectPaFieldSensors.  Skip when virtual sensors are present:
@@ -6733,7 +6857,7 @@ class MapView {
         this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
         this._paFieldValidViewKey = viewKey;
         this._paFieldValidFixed = fixed;
-        this._paFieldValidPollutant = pollutantTab;
+        this._paFieldValidPollutant = renderTab;
       }
       return;
     }
@@ -6783,7 +6907,7 @@ class MapView {
       const si5 = i * 5;
       s5[si5] = sensor.sx;
       s5[si5 + 1] = sensor.sy;
-      const aqi = valueToAqi(aqiKey, sensor.value);
+      const aqi = (maxMode && sensor.aqi != null) ? sensor.aqi : valueToAqi(aqiKey, sensor.value);
       s5[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
       s5[si5 + 3] = twoSigmaSq;
       s5[si5 + 4] = sensor.weightMultiplier;
@@ -6798,6 +6922,19 @@ class MapView {
     // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
     this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
 
+    // Stash the inputs needed to lazily compute per-pollutant field maxes
+    // when the legend asks. Tying it to this code path inflated CPU by ~5ms
+    // per field recompute even when no one was reading the legend colors.
+    this._perPollLastInputs = {
+      state, playbackTimeMs, centerW, z, cssW, cssH, bufW, bufH,
+      paRefNowMs, virtualRefNowMs,
+      cellSize, gw, gh, cutoffSq, effectiveCutoffSq, wind, twoSigmaSq,
+    };
+    // Drop the cached per-pollutant bag so the next legend read recomputes
+    // against the new field state (the cache key advances with _paFieldKey).
+    this._paFieldMaxAqiPerPollutant = null;
+    this._perPollCacheKey = null;
+
     // ── Store overfetch buffer dimensions for composite offset ──
     this._paFieldBufW = bufW;
     this._paFieldBufH = bufH;
@@ -6809,7 +6946,7 @@ class MapView {
       this._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
       this._paFieldValidViewKey = viewKey;
       this._paFieldValidFixed = fixed;
-      this._paFieldValidPollutant = pollutantTab;
+      this._paFieldValidPollutant = renderTab;
     } else {
       this._paFieldValidRange = null;
     }
@@ -6865,6 +7002,140 @@ class MapView {
     this._windVecField = windField;
     this._windVecZoom = z;
     return result;
+  }
+
+  /**
+   * Lazy accessor for per-pollutant field maxes. Returns the memoized bag
+   * if it's current with the last main-pass cache key; otherwise runs the
+   * kernel regression for each non-rendered pollutant and caches the
+   * result. Cheap when nothing changed since the last call (single key
+   * comparison). Called from the legend code path only.
+   */
+  getPerPollutantFieldMax() {
+    const inputs = this._perPollLastInputs;
+    if (!inputs) return this._paFieldMaxAqiPerPollutant || null;
+    const key = this._paFieldKey || "";
+    if (this._perPollCacheKey === key && this._paFieldMaxAqiPerPollutant) {
+      return this._paFieldMaxAqiPerPollutant;
+    }
+    // Throttle: this runs 5 full kernel passes. During zoom/scrub the field
+    // key churns every few frames — serve the stale bag (legend tint only)
+    // rather than recomputing 5 passes per churn.
+    {
+      const _now = performance.now();
+      if (this._paFieldMaxAqiPerPollutant && this._perPollLastComputeMs
+          && (_now - this._perPollLastComputeMs) < 2000) {
+        return this._paFieldMaxAqiPerPollutant;
+      }
+      this._perPollLastComputeMs = _now;
+    }
+    this._computePerPollutantFieldMax(
+      inputs.state, inputs.playbackTimeMs, inputs.centerW, inputs.z,
+      inputs.cssW, inputs.cssH, inputs.bufW, inputs.bufH,
+      inputs.paRefNowMs, inputs.virtualRefNowMs,
+      inputs.cellSize, inputs.gw, inputs.gh,
+      inputs.cutoffSq, inputs.effectiveCutoffSq, inputs.wind, inputs.twoSigmaSq
+    );
+    this._perPollCacheKey = key;
+    return this._paFieldMaxAqiPerPollutant;
+  }
+
+  /**
+   * Sample max AQI per pollutant from the kernel-regression numerical field
+   * within the viewport — one max per pollutant. The same Nadaraya-Watson
+   * formulation as _computePaFieldSync, run for each pollutant's sensor set.
+   * No pixels are painted; only the grid maxes are extracted. The rendered
+   * pollutant reuses `this._paFieldMaxAqi` already produced by the main pass.
+   * Do not call this directly — go through getPerPollutantFieldMax() so the
+   * result is cached against the current field key.
+   */
+  _computePerPollutantFieldMax(state, playbackTimeMs, centerW, z, cssW, cssH, bufW, bufH, paRefNowMs, virtualRefNowMs, cellSize, gw, gh, cutoffSq, effectiveCutoffSq, wind, twoSigmaSq) {
+    const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
+    const mobiles = Array.isArray(state && state.mobile) ? state.mobile : [];
+    const result = {};
+    const pollutants = ["pm25", "pm10", "o3", "no2", "co"];
+    // In max mode the rendered field is the cross-pollutant max — it is NOT
+    // a valid stand-in for any single pollutant's max, so no reuse (null
+    // matches no tab and every pollutant computes its own pass).
+    const renderedTab = this._paFieldPollutant;
+
+    const vpMarginX = (bufW - cssW) / 2;
+    const vpMarginY = (bufH - cssH) / 2;
+    const vpGxMin = Math.max(0, Math.floor(vpMarginX / cellSize));
+    const vpGyMin = Math.max(0, Math.floor(vpMarginY / cellSize));
+    const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + cssW) / cellSize));
+    const vpGyMax = Math.min(gh, Math.ceil((vpMarginY + cssH) / cellSize));
+
+    const isAniso = wind != null && wind.stretch > 1.001;
+    const wwx = isAniso ? wind.wx : 0;
+    const wwy = isAniso ? wind.wy : 0;
+    const wStretch = isAniso ? wind.stretch : 1;
+    const wUpwind = isAniso ? wind.upwindShrink : 1;
+
+    for (const tab of pollutants) {
+      if (tab === renderedTab && this._paFieldMaxAqi != null && isFinite(this._paFieldMaxAqi)) {
+        result[tab] = this._paFieldMaxAqi;
+        continue;
+      }
+
+      const paField = _collectPaFieldSensors(
+        fixed, playbackTimeMs, centerW, z, cssW, cssH, tab, bufW, bufH, paRefNowMs
+      );
+      const virtualField = _collectVirtualMobileSensors(
+        mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH,
+        virtualRefNowMs, tab, bufW, bufH
+      );
+      const allSensors = paField.sensors.concat(virtualField.sensors);
+      if (allSensors.length === 0) { result[tab] = null; continue; }
+
+      const aqiKey = _LEGEND_TAB_AQI_KEY[tab] || "pm2.5";
+      const s5 = new Float64Array(allSensors.length * 5);
+      for (let i = 0; i < allSensors.length; i++) {
+        const s = allSensors[i];
+        const si5 = i * 5;
+        s5[si5]     = s.sx;
+        s5[si5 + 1] = s.sy;
+        const aqi = valueToAqi(aqiKey, s.value);
+        s5[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
+        s5[si5 + 3] = twoSigmaSq;
+        s5[si5 + 4] = s.weightMultiplier;
+      }
+
+      let fieldMaxAqi = -Infinity;
+      for (let gy = vpGyMin; gy < vpGyMax; gy++) {
+        const py = (gy + 0.5) * cellSize;
+        for (let gx = vpGxMin; gx < vpGxMax; gx++) {
+          const pxx = (gx + 0.5) * cellSize;
+          let wSum = 0, vSum = 0;
+          for (let i = 0; i < s5.length; i += 5) {
+            const dx = pxx - s5[i];
+            const dy = py  - s5[i + 1];
+            const rawD2 = dx * dx + dy * dy;
+            if (rawD2 > effectiveCutoffSq) continue;
+            let d2;
+            if (isAniso) {
+              const along = dx * wwx + dy * wwy;
+              if (rawD2 > cutoffSq && along <= 0) continue;
+              const cross = dx * (-wwy) + dy * wwx;
+              const sf = along > 0 ? wStretch : wStretch * wUpwind;
+              const ea = along / sf;
+              d2 = ea * ea + cross * cross;
+            } else {
+              d2 = rawD2;
+            }
+            const w = s5[i + 4] * Math.exp(-d2 / s5[i + 3]);
+            wSum += w;
+            vSum += w * s5[i + 2];
+          }
+          if (wSum >= 0.001) {
+            const val = vSum / wSum;
+            if (val > fieldMaxAqi) fieldMaxAqi = val;
+          }
+        }
+      }
+      result[tab] = (fieldMaxAqi > -Infinity) ? fieldMaxAqi : null;
+    }
+    this._paFieldMaxAqiPerPollutant = result;
   }
 
   /** Synchronous Nadaraya-Watson kernel regression with Gaussian weights.
@@ -7471,8 +7742,14 @@ class MapView {
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
-          const _refMs = this.getPlaybackTimeMs() || this._dataNowMs();
+          // Wall clock in live view (see paRefNowMs note in _ensurePaField).
+          const _refMs = this._historicalMode
+            ? (this.getPlaybackTimeMs() || this._dataNowMs())
+            : Date.now();
           const _sensorMs = (pr && pr.timeMs) || (f.last_seen ? f.last_seen * 1000 : null);
+          // Unknown age (no reading time, no last_seen) — hide rather than
+          // showing a possibly day-old value as live.
+          if (!isSel && !_sensorMs) { ctx.restore(); return; }
           if (!isSel && _sensorMs) {
             const PA_FADE_MS = 45 * 60 * 1000;
             const PA_FADE_TAIL = 0.20;
@@ -7913,10 +8190,12 @@ class MapView {
     const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}|${this._paFieldPollutant || 'default'}`;
     const viewChanged = this._trailCacheViewKey !== trailViewKey;
     const timeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? (pbTimeMs - this._trailCacheTimeMs) : 0;
-    // Trail fading uses 45-min window. During active scrubbing, widen the threshold
-    // so trails aren't fully redrawn every frame (the expensive O(vehicles*points) path).
-    // 30s during scrub still gives smooth visual feedback; 2s during playback keeps fading smooth.
-    const timeThreshold = this._scrubbing ? 30000 : 2000;
+    // Trail fading uses a 45-min window with fade in the last 9 minutes — that's
+    // ~1% alpha drop per 5.4 seconds, so the rebuild cadence can be coarse and
+    // still look smooth. 30s during active scrub, 8s during normal playback.
+    // (Was 2s, which redrew the O(vehicles*points) trail cache ~30× per minute
+    // during playback even at 1× speed — measurable laptop heat.)
+    const timeThreshold = this._scrubbing ? 30000 : 8000;
     // Sim-time gate: has enough simulated time elapsed to warrant a redraw?
     const simTimeElapsed = Math.abs(timeDelta) > timeThreshold;
     // Wall-time floor: at high playback speeds (60x screensaver), the sim-time gate
@@ -8967,6 +9246,10 @@ class MapView {
           if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
           if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
           if (isSel && pr && pr.key) this._selectedPollutantValue = parseFloat(pr.value);
+          // Full readings bag at the displayed time (see mobile path note).
+          if (isSel) this._selectedReadings = (fixedPbTimeMs != null)
+            ? (interpolateFixedReadingsAtTime(f, fixedPbTimeMs) || f.readings)
+            : f.readings;
         }
 
         // Legend pollutant override: show the selected pollutant on ALL non-PurpleAir markers
@@ -9001,8 +9284,14 @@ class MapView {
           // Outlier PurpleAir sensors still render (grey dot) so user can investigate
           // ── Per-sensor staleness fade matching trail duration ──
           let staleAlpha = 1.0;
-          const _refMs = this.getPlaybackTimeMs() || this._dataNowMs();
+          // Wall clock in live view (see paRefNowMs note in _ensurePaField).
+          const _refMs = this._historicalMode
+            ? (this.getPlaybackTimeMs() || this._dataNowMs())
+            : Date.now();
           const _sensorMs = (pr && pr.timeMs) || (f.last_seen ? f.last_seen * 1000 : null);
+          // Unknown age (no reading time, no last_seen) — hide rather than
+          // showing a possibly day-old value as live.
+          if (!isSel && !_sensorMs) { ctx.restore(); return; }
           if (!isSel && _sensorMs) {
             const PA_FADE_MS = 45 * 60 * 1000;
             const PA_FADE_TAIL = 0.20;
@@ -9201,6 +9490,9 @@ class MapView {
         if (isSel && pr && pr.key) this._selectedPollutantKey = pr.key;
         if (isSel && pr && pr.key) this._selectedNaturalPollutantKey = pr.key;
         if (isSel && pr && pr.key) this._selectedPollutantValue = parseFloat(pr.value);
+        // Full readings bag at the displayed time — legend tab colors must use
+        // the same source as the marker, not the live state snapshot.
+        if (isSel) this._selectedReadings = (this.playbackMode && pose && pose.readings) ? pose.readings : m.readings;
       }
 
       // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers

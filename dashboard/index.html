@@ -32,7 +32,7 @@
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260415b" />
+  <link rel="stylesheet" href="/styles.css?v=20260611a" />
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -122,6 +122,9 @@
           <canvas id="tilesCanvas"></canvas>
           <canvas id="paFieldCanvas"></canvas>
           <canvas id="overlayCanvas"></canvas>
+
+          <!-- Loading shade: covers the map (not the UI) while data loads -->
+          <div id="mapLoadingShade" class="hidden">LOADING...</div>
 
           <!-- Legend panel (top-right, overlays map) -->
           <aside id="legend" class="legendPanel hidden">
@@ -311,20 +314,20 @@
   <script defer src="colors.js?v=20260406a"></script>
   <script defer src="aqi.js?v=20260414a"></script>
   <script defer src="format_utils.js?v=20260224a"></script>
-  <script defer src="data_utils.js?v=20260412a"></script>
+  <script defer src="data_utils.js?v=20260612c"></script>
   <script defer src="advection_solver.js?v=20260320a"></script>
-  <script defer src="map_view.js?v=20260424a"></script>
+  <script defer src="map_view.js?v=20260611g"></script>
   <script defer src="sidebar_ui.js?v=20260415a"></script>
   <script defer src="jog_wheel.js?v=20260327j"></script>
-  <script defer src="app.js?v=20260424c"></script>
+  <script defer src="app.js?v=20260612a"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">
     <div style="font-weight:bold; margin-bottom:4px; color:#fff; font-size:10px;">Field Debug</div>
     <div style="display:grid; grid-template-columns:42px 30px 1fr; gap:2px 4px; align-items:center;">
-      <span>sigma÷</span><span id="fdSigmaVal" style="text-align:right">8</span><input id="fdSigma" type="range" min="1" max="20" step="0.5" value="8" style="height:14px;width:100%;">
-      <span>cut°</span><span id="fdCutoffVal" style="text-align:right">0.14</span><input id="fdCutoff" type="range" min="0.02" max="1.0" step="0.01" value="0.14" style="height:14px;width:100%;">
-      <span>blur</span><span id="fdBlurVal" style="text-align:right">2</span><input id="fdBlur" type="range" min="0" max="6" step="1" value="2" style="height:14px;width:100%;">
+      <span>sigma÷</span><span id="fdSigmaVal" style="text-align:right">20</span><input id="fdSigma" type="range" min="1" max="20" step="0.5" value="20" style="height:14px;width:100%;">
+      <span>cut°</span><span id="fdCutoffVal" style="text-align:right">0.6</span><input id="fdCutoff" type="range" min="0.02" max="1.0" step="0.01" value="0.6" style="height:14px;width:100%;">
+      <span>blur</span><span id="fdBlurVal" style="text-align:right">3</span><input id="fdBlur" type="range" min="0" max="6" step="1" value="3" style="height:14px;width:100%;">
     </div>
     <div style="margin-top:4px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
       <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowWind" type="checkbox" style="margin:0;"> wind vectors</label>
@@ -344,7 +347,7 @@
   <script>
   (function(){
     var ids=['fdSigma','fdCutoff','fdBlur'];
-    var _fdState={sigmaDivisor:8,cutoffDeg:0.14,blur:2,showWind:false,showVirtual:false,upscaleQuality:'high'};
+    var _fdState={sigmaDivisor:20,cutoffDeg:0.6,blur:3,showWind:false,showVirtual:false,upscaleQuality:'high'};
     window._fieldDebug=_fdState;
     function _fdEnable() {
       document.getElementById('fieldDebugPanel').classList.remove('fdHidden');
@@ -434,7 +437,7 @@
         if (!_fdRAF) { _fdLastPerf = performance.now(); _fdRAF = requestAnimationFrame(_fdCoastLoop); }
       },{passive:false});
       // Detents: snap to default when within threshold
-      var _fdDefaults={fdSigma:8,fdCutoff:0.14};
+      var _fdDefaults={fdSigma:20,fdCutoff:0.6};
       var _fdSnap={fdSigma:0.8,fdCutoff:0.03};
       el.addEventListener('input',function(){
         var def=_fdDefaults[id], snap=_fdSnap[id];
