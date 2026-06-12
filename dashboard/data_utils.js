@@ -91,8 +91,19 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
     const r = readings[key];
     if (!r) continue;
     
-    // If no history_times, just copy the current value
+    // If no history_times, just copy the current value — but a reading with a
+    // KNOWN single report time must not exist before that time (same rule as
+    // the tMin gate below): without this, a sensor with one history entry
+    // renders its current value at scrub positions before its data existed.
+    // Forward staleness is owned by the per-sensor decay heuristics
+    // (last_seen fade), not here.
     if (!Array.isArray(r.history_times) || !Array.isArray(r.history) || r.history_times.length < 2) {
+      const _soloT = (Array.isArray(r.history_times) && r.history_times.length === 1)
+        ? parseUtcMs(r.history_times[0]) : null;
+      if (_soloT != null && isFinite(_soloT) && playbackTimeMs < _soloT) {
+        result[key] = { value: null, ci: 0, history: r.history, history_times: r.history_times, hci: r.hci, scrubbed: r.scrubbed || 0 };
+        continue;
+      }
       result[key] = r;
       continue;
     }
@@ -181,10 +192,16 @@ function interpolateFixedReadingsAtTime(f, playbackTimeMs) {
  * @returns {object} - { key, value, color, aqi }
  */
 function primaryReadingForFixedAtTime(f, playbackTimeMs) {
-  if (playbackTimeMs == null || !fixedSensorHasHistoryTimes(f)) {
+  // Only bypass interpolation when there is NO playback time. Sensors with
+  // 0-1 history entries must still go through the interpolator: it owns the
+  // before-first-report gate, and bypassing it rendered such sensors' live
+  // values at every scrub position (phantom dots at times before their data
+  // existed). For untimed readings the interpolator copies them through, so
+  // legacy sensors behave exactly as before.
+  if (playbackTimeMs == null) {
     return primaryReadingForSensor(f);
   }
-  
+
   const interpolated = interpolateFixedReadingsAtTime(f, playbackTimeMs);
   const w = pickWorstReadingKey(interpolated);
   if (w && w.key && interpolated[w.key] && interpolated[w.key].value != null) {

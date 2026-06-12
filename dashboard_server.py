@@ -18,6 +18,7 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import ssl
 import socket
@@ -562,6 +563,7 @@ class AppState:
     purpleair_meta_last_fetch: float = 0.0  # last time we fetched name/lat/lon
     purpleair_last_seen_cache: dict[int, int] = field(default_factory=dict)  # sensor_index -> last_seen timestamp
     purpleair_pm25_cache: dict[int, str] = field(default_factory=dict)  # sensor_index -> committed AQI color category
+    purpleair_pm25_value: dict[int, float] = field(default_factory=dict)  # sensor_index -> committed pm2.5 (debounce delta baseline)
 
     # Optional offline road graph cache for map-matching.
     road_graph: Any | None = None
@@ -930,6 +932,10 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
                             "latitude": lat,
                             "longitude": lon,
                             "pm2.5": pm25,
+                            # Carry the snapshot's last_seen so the client's
+                            # staleness fade applies to seeded (possibly old)
+                            # readings instead of showing them as fresh forever.
+                            "last_seen": f.get("last_seen"),
                         })
                         pa_seeded += 1
                 if pa_seeded:
@@ -2571,13 +2577,16 @@ PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
 
 
 def _fetch_purpleair_sensors(fields: str = "pm2.5,last_seen",
-                             sensor_indices: list[int] | None = None) -> list[dict[str, Any]]:
+                             sensor_indices: list[int] | None = None,
+                             bbox: dict[str, float] | None = None) -> list[dict[str, Any]]:
     """Fetch PurpleAir sensors in the SLC bounding box.
 
     *fields* controls which columns are requested.
     *sensor_indices* — if provided, uses the ``show_only`` parameter to fetch
     only those specific sensors (no bounding box needed).  Used for targeted
     neighbour refreshes so we don't burn points fetching the entire grid.
+    *bbox* — optional {lat_min, lat_max, lon_min, lon_max} overriding the full
+    SLC box; used by the rotating discovery cell (one small cell per pass).
     """
     if sensor_indices is not None:
         # Targeted fetch: specific sensor indices only, no bbox
@@ -2586,12 +2595,13 @@ def _fetch_purpleair_sensors(fields: str = "pm2.5,last_seen",
             "show_only": ",".join(str(i) for i in sensor_indices),
         }
     else:
+        b = bbox or SLC_BOUNDS
         params = {
             "fields": fields,
-            "nwlng": str(SLC_BOUNDS["lon_min"]),
-            "nwlat": str(SLC_BOUNDS["lat_max"]),
-            "selng": str(SLC_BOUNDS["lon_max"]),
-            "selat": str(SLC_BOUNDS["lat_min"]),
+            "nwlng": str(b["lon_min"]),
+            "nwlat": str(b["lat_max"]),
+            "selng": str(b["lon_max"]),
+            "selat": str(b["lat_min"]),
             "location_type": "0",  # outdoor only
         }
     qs = "&".join(f"{k}={v}" for k, v in params.items())
@@ -2989,38 +2999,64 @@ def purpleair_fetch_loop(
 ) -> None:
     """Background loop to fetch PurpleAir sensor data.
 
-    SPARSE SENTINEL STRATEGY:
-    Each cycle polls one sentinel sensor per ~2 km grid cell (typically ~30–50
-    sentinels for SLC's ~242 outdoor sensors).  If a sentinel's pm2.5 crosses
-    a visible color boundary, every sensor in that cell is fetched immediately
-    via show_only.  Cells whose sentinel didn't change color are skipped.
+    GEOMETRY-BASED "SLIME-MOLD" WALK:
+    Most of the time the air is stagnant, so polling every sensor every cycle
+    just burns API points.  Instead each cycle fetches only:
 
-    Color change detection uses 7 bands (the 8 display colors with lt-blue
-    and green merged to avoid jitter at the noisy 5.0 µg/m³ boundary).
+      probe ∪ frontier
 
-    Metadata (name, lat, lon + full pm2.5 sweep) refreshes every 3 hours so
-    the complete sensor picture stays current regardless of sentinel activity.
+      • probe    — a sparse, spatially-even ~1/10 sample (one sensor per coarse
+                   PROBE_GRID_DEG cell, picked at random each cycle so coverage
+                   rotates through every sensor over time).  Always watched.
+      • frontier — the sensors a *previous* poll's significant changes queued
+                   for this poll (the moving wavefront).  Empty when quiet.
 
-    Budget math (1,000,000 pts/month, ~392 sensors, ~1 pt/sensor/field):
-      Sentinel poll  ~81 pts/cycle (one per occupied grid cell)
-      Cluster fetch  up to ~792 pts if ALL cells trigger (worst case)
-      Metadata       ~1,568 pts per refresh (392 sensors × 4 fields)
+    A probed/frontier sensor counts as a SIGNIFICANT change only if its pm2.5
+    crosses an AQI color band AND moves by ≥ DEBOUNCE_DELTA µg/m³ (this fuzzes
+    band boundaries so a sensor jittering 8.9↔9.1 never flips).
 
-      Day  (19h, 5 min):   228 cycles × 81  =  18,468 pts (sentinel only)
-      Night (5h, 30 min):   10 cycles × 81  =    810 pts
-      Metadata (8×/day):     8       × 1568 = 12,544 pts
-      ──────────────────────────────────────────────────────
-      Sentinel-only day: ~31,822 pts/day → ~969K/month
-      Hysteresis means clusters only fire on genuine band changes,
-      not boundary jitter — observed ~270K/day should drop to ~32K.
-      Budget: 1,000,000 pts/month ✓
+    On a significant change we do a 1-step walk: cast SWEEP_SPOKES rays at
+    evenly-spaced angles around the changed sensor, with each spoke's radius
+    spiralling SWEEP_RADIUS_MIN_DEG → SWEEP_RADIUS_MAX_DEG (a staggered pinwheel
+    mixing nearest & furthest neighbours).  Each spoke snaps to the closest real
+    sensor; that cluster becomes the frontier fetched on the NEXT poll.
+
+    Net effect: quiet regions decay to the cheap sparse probe; a wind shift or
+    local event "wakes" an area and the frontier walks outward through it, the
+    range/speed scaling with how many sensors are changing.  Stale sensors fade
+    on the map on their own, so partial cluster coverage per poll is fine.
+
+    The periodic full-bbox metadata sweep is DISABLED (kill switch above); a
+    rotating one-cell discovery query covers new sensors and metadata instead.
     """
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
     META_INTERVAL       = 10800.0  # 3 hours
     DATA_INTERVAL_DAY   = 300.0    # 5 min during day
     DATA_INTERVAL_NIGHT = 1800.0   # 30 min during night (12 AM – 5 AM MST)
-    NEIGHBOR_RADIUS_DEG = 0.018    # ~2 km grid cell side length
+
+    # ── WALK TUNABLES (geometry-based adaptive sampling) ──────────────────────
+    # The probe: one sensor per coarse cell → sparse, spatially even baseline.
+    PROBE_GRID_DEG       = 0.05    # ~5 km cell. Bigger ⇒ fewer probes (~1/10 here).
+    # Full-bbox metadata refresh kill switch: the 3-hour all-sensors call burns
+    # a full-population API credit and updates every sensor at once. Probe
+    # rotation (random per-cell pick) refreshes last_seen/pm2.5 across all
+    # known sensors over time, and the rotating DISCOVERY CELL below covers
+    # new-sensor discovery — so the full sweep is unnecessary. Code intact.
+    PURPLEAIR_META_REFRESH_DISABLED = True
+    # Rotating discovery: every Nth poll cycle, one ~PROBE_GRID_DEG cell of the
+    # SLC box is queried by bbox (a handful of rows). Cells come from a
+    # shuffled deck, so coverage is random but EQUAL — every cell is visited
+    # once per deck pass before any repeats. Discovers newly installed sensors
+    # and refreshes name/lat/lon, replacing the disabled full sweep.
+    DISCOVERY_EVERY_N_CYCLES = 6
+    # Significant-change debounce: must cross a color band AND move this much.
+    DEBOUNCE_DELTA       = 2.5     # µg/m³  (anti-flicker fuzz around boundaries)
+    # The pinwheel sweep fired around each changed sensor (the 1-step walk).
+    SWEEP_SPOKES         = 8       # rays per changed sensor (360° / N apart)
+    SWEEP_RADIUS_MIN_DEG = 0.006   # inner sweep radius ~0.7 km  ("nearest")
+    SWEEP_RADIUS_MAX_DEG = 0.045   # outer sweep radius ~5 km    ("furthest") — TUNE
+    #   spokes spiral MIN→MAX so each pinwheel mixes near & far neighbours.
 
     debug_log_path = data_dir / "purpleair_debug.json"
 
@@ -3044,11 +3080,10 @@ def purpleair_fetch_loop(
         if pm25 <= 225.4: return "#8F3F97"   # purple – Very Unhealthy
         return "#7E0023"                     # maroon – Hazardous
 
-    def _build_grid(sensors: list[dict]) -> dict[tuple[int, int], list[int]]:
-        """Divide all sensors into spatial grid cells (NEIGHBOR_RADIUS_DEG × NEIGHBOR_RADIUS_DEG).
-        Returns a dict mapping (grid_x, grid_y) → list of sensor_index values in that cell.
-        Sensors in adjacent cells breathe the same air, so when any sentinel in a cell
-        detects a color change we fetch every sensor in that cell."""
+    def _build_grid(sensors: list[dict], radius: float) -> dict[tuple[int, int], list[int]]:
+        """Bucket sensors into spatial cells of `radius`×`radius` degrees.
+        Returns {(grid_x, grid_y): [sensor_index, ...]}.  Used to spread the
+        sparse probe set evenly across space (one probe per coarse cell)."""
         grid: dict[tuple[int, int], list[int]] = {}
         for s in sensors:
             lat = s.get("latitude")
@@ -3056,39 +3091,76 @@ def purpleair_fetch_loop(
             sid = s.get("sensor_index")
             if lat is None or lon is None or sid is None:
                 continue
-            cell = (int(lat / NEIGHBOR_RADIUS_DEG), int(lon / NEIGHBOR_RADIUS_DEG))
+            cell = (int(lat / radius), int(lon / radius))
             grid.setdefault(cell, []).append(sid)
         return grid
 
-    def _pick_sentinels(sensors: list[dict], grid: dict[tuple[int, int], list[int]]) -> list[dict]:
-        """Pick one sensor per grid cell as the sentinel for that cell.
-        This guarantees every cluster has exactly one representative regardless
-        of how densely packed sensors are in any particular area."""
+    def _pick_probe(sensors: list[dict], grid: dict[tuple[int, int], list[int]]) -> list[dict]:
+        """The sparse probe: one representative sensor per coarse grid cell,
+        picked UNIFORMLY AT RANDOM among the cell's members on every call so
+        coverage rotates through the whole population over successive polls
+        (and keeps last_seen fresh everywhere without a full-bbox sweep).
+        When the air is quiescent these ~1/10 sensors are all that hit the API."""
         by_sid = {s["sensor_index"]: s for s in sensors if s.get("sensor_index") is not None}
-        sentinels = []
+        probe = []
         for cell_members in grid.values():
-            # Pick whichever member we have full data for (lat/lon present)
+            candidates = []
             for sid in cell_members:
                 s = by_sid.get(sid)
                 if s and s.get("latitude") is not None and s.get("longitude") is not None:
-                    sentinels.append(s)
-                    break
-        return sentinels
+                    candidates.append(s)
+            if candidates:
+                probe.append(random.choice(candidates))
+        return probe
 
-    def _cluster_of(sid: int, grid: dict[tuple[int, int], list[int]],
-                    sensors: list[dict]) -> list[int]:
-        """Return all sensor_index values in the same grid cell as sid.
-        These are the sensors that breathe the same air and need updating
-        when their sentinel detects an AQI color change."""
-        by_sid = {s["sensor_index"]: s for s in sensors if s.get("sensor_index") is not None}
-        s = by_sid.get(sid)
-        if s is None:
-            return []
-        lat, lon = s.get("latitude"), s.get("longitude")
-        if lat is None or lon is None:
-            return []
-        cell = (int(lat / NEIGHBOR_RADIUS_DEG), int(lon / NEIGHBOR_RADIUS_DEG))
-        return grid.get(cell, [])
+    def _discovery_cells() -> list[dict[str, float]]:
+        """Tile the full SLC box into PROBE_GRID_DEG cells for rotating
+        discovery. Covers EMPTY cells too — that is the point: a brand-new
+        sensor in a cell with no known sensors must still be found."""
+        cells = []
+        r = PROBE_GRID_DEG
+        lat = SLC_BOUNDS["lat_min"]
+        while lat < SLC_BOUNDS["lat_max"]:
+            lon = SLC_BOUNDS["lon_min"]
+            while lon < SLC_BOUNDS["lon_max"]:
+                cells.append({
+                    "lat_min": lat, "lat_max": min(lat + r, SLC_BOUNDS["lat_max"]),
+                    "lon_min": lon, "lon_max": min(lon + r, SLC_BOUNDS["lon_max"]),
+                })
+                lon += r
+            lat += r
+        return cells
+
+    def _pinwheel_sweep(center_lat: float, center_lon: float,
+                        sensors_xy: list[tuple[float, float, int]],
+                        spokes: int, r_min: float, r_max: float,
+                        exclude: set[int]) -> set[int]:
+        """1-step walk around a changed sensor.  Cast `spokes` rays at evenly
+        spaced angles; each spoke's radius spirals r_min → r_max so the ring
+        mixes nearest & furthest neighbours into a staggered pinwheel.  Snap
+        each spoke tip to the closest real sensor → that set is the frontier
+        fetched on the NEXT poll.  `exclude` keeps the centre out of its own
+        sweep so the wavefront walks outward."""
+        cos_lat = math.cos(math.radians(center_lat)) or 1e-6
+        picked: set[int] = set()
+        for k in range(spokes):
+            ang = 2.0 * math.pi * k / spokes
+            frac = (k / (spokes - 1)) if spokes > 1 else 0.0
+            r = r_min + (r_max - r_min) * frac
+            t_lat = center_lat + r * math.sin(ang)
+            t_lon = center_lon + (r * math.cos(ang)) / cos_lat
+            best_sid, best_d2 = None, None
+            for lat, lon, sid in sensors_xy:
+                if sid in exclude:
+                    continue
+                dlat = lat - t_lat
+                dlon = (lon - t_lon) * cos_lat
+                d2 = dlat * dlat + dlon * dlon
+                if best_d2 is None or d2 < best_d2:
+                    best_d2, best_sid = d2, sid
+            if best_sid is not None:
+                picked.add(best_sid)
+        return picked
 
     def _apply_fetched(fetched: list[dict], now: float) -> None:
         """Merge fetched pm2.5 readings into app_state and accumulate history.
@@ -3152,18 +3224,44 @@ def purpleair_fetch_loop(
     try:
         debug_log_path.write_text(json.dumps({
             "status": "initialized",
+            "strategy": "geometry-walk",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "interval_day_s": DATA_INTERVAL_DAY,
             "interval_night_s": DATA_INTERVAL_NIGHT,
-            "neighbor_radius_deg": NEIGHBOR_RADIUS_DEG,
-            "budget": "2M pts/month — worst-case ~207K/day, typical ~43K/day",
+            "probe_grid_deg": PROBE_GRID_DEG,
+            "debounce_delta": DEBOUNCE_DELTA,
+            "sweep_spokes": SWEEP_SPOKES,
+            "sweep_radius_min_deg": SWEEP_RADIUS_MIN_DEG,
+            "sweep_radius_max_deg": SWEEP_RADIUS_MAX_DEG,
         }, indent=2), encoding="utf-8")
     except Exception as e:
         _log(f"[PurpleAir] Debug log init error: {e}")
 
     _log("[PurpleAir] Waiting 3s for main fetch loop to start...")
     stop_event.wait(3.0)
-    _log("[PurpleAir] Starting PurpleAir fetch loop (sparse sentinel strategy)")
+    _log("[PurpleAir] Starting PurpleAir fetch loop (geometry-based slime-mold walk)")
+
+    # Walk state carried across polls: the frontier the previous poll's
+    # significant changes queued for THIS poll. (probe ∪ frontier == fetched.)
+    walk_frontier: set[int] = set()
+    discovery_deck: list[dict[str, float]] = []  # shuffled cells; refilled when empty
+    cycle_n = 0
+
+    # Seed change-detection baselines from the cached population (snapshot or
+    # cache pm2.5) so band flips are detected on a sensor's FIRST poll after a
+    # restart. The disabled metadata sweep used to provide this warmup.
+    with app_state.lock:
+        for _s in app_state.purpleair_sensors:
+            _sid = _s.get("sensor_index")
+            _pm = _s.get("pm2.5")
+            if _sid is None or _pm is None or _sid in app_state.purpleair_pm25_cache:
+                continue
+            try:
+                _pmf = float(_pm)
+            except (TypeError, ValueError):
+                continue
+            app_state.purpleair_pm25_cache[_sid] = _aqi_color_category(_pmf)
+            app_state.purpleair_pm25_value[_sid] = _pmf
 
     while not stop_event.is_set():
         now = time.time()
@@ -3175,7 +3273,7 @@ def purpleair_fetch_loop(
         try:
             # ── Metadata refresh (every 6 hours) ──────────────────────────────
             # Also fetches all pm2.5 values so the full picture stays current.
-            need_meta = (now - app_state.purpleair_meta_last_fetch) >= META_INTERVAL
+            need_meta = (not PURPLEAIR_META_REFRESH_DISABLED) and (now - app_state.purpleair_meta_last_fetch) >= META_INTERVAL
             if need_meta:
                 _log("[PurpleAir] Metadata refresh: fetching name,latitude,longitude,pm2.5,last_seen for all sensors")
                 meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude,pm2.5,last_seen")
@@ -3200,24 +3298,40 @@ def purpleair_fetch_loop(
                         _apply_fetched(meta_sensors, now)
                     _log(f"[PurpleAir] Metadata+pm2.5 refreshed ({len(meta_sensors)} sensors)")
 
-            # ── Sparse sentinel poll ───────────────────────────────────────────
-            # Build the spatial grid fresh each cycle (sensors list may have grown
-            # after a metadata refresh). One sentinel per grid cell.
+            # ── Build this poll's fetch set: probe ∪ frontier ──────────────────
+            # Probe = sparse, spatially-even ~1/10 (one per coarse cell), rebuilt
+            # each cycle so it tracks sensors added by a metadata refresh.
+            # Frontier = the pinwheel the previous poll's changes queued for now.
+            incoming_frontier = walk_frontier
             with app_state.lock:
-                grid = _build_grid(app_state.purpleair_sensors)
-                sentinels = _pick_sentinels(app_state.purpleair_sensors, grid)
-            sentinel_ids = [s["sensor_index"] for s in sentinels]
+                probe_grid = _build_grid(app_state.purpleair_sensors, PROBE_GRID_DEG)
+                probe = _pick_probe(app_state.purpleair_sensors, probe_grid)
+                sensors_xy = [(s["latitude"], s["longitude"], s["sensor_index"])
+                              for s in app_state.purpleair_sensors
+                              if s.get("latitude") is not None
+                              and s.get("longitude") is not None
+                              and s.get("sensor_index") is not None]
+            by_xy = {sid: (lat, lon) for lat, lon, sid in sensors_xy}
+            probe_ids = {s["sensor_index"] for s in probe}
+            poll_ids = sorted(probe_ids | incoming_frontier)
 
-            sentinel_data = _fetch_purpleair_sensors(fields="pm2.5,last_seen", sensor_indices=sentinel_ids)
-            debug_info["calls"].append({"type": "sentinel_poll", "count": len(sentinel_ids)})
+            if not poll_ids:
+                walk_frontier = set()
+                debug_info["polled_total"] = 0
+                stop_event.wait(_current_interval())
+                continue
 
-            # Detect AQI color-category changes and queue full cluster fetches.
-            # Uses hysteresis: we cache the *committed color* per sentinel
-            # (the color that last triggered a cluster fetch).  A new color
-            # only triggers if it differs from that committed color — so a
-            # sensor oscillating 8.9↔9.1 around a boundary won't flip-flop.
-            cluster_ids_to_fetch: set[int] = set()
-            for s in sentinel_data:
+            poll_data = _fetch_purpleair_sensors(fields="pm2.5,last_seen", sensor_indices=poll_ids)
+            debug_info["calls"].append({"type": "walk_poll", "count": len(poll_ids)})
+
+            # ── Detect SIGNIFICANT changes ─────────────────────────────────────
+            # Significant = pm2.5 crosses an AQI color band AND moves ≥ DEBOUNCE_
+            # DELTA µg/m³ from the last committed value (fuzzes band boundaries
+            # so a sensor oscillating 8.9↔9.1 never flips).  First sight of a
+            # sensor just commits a baseline — the walk reacts to CHANGE, and
+            # startup is already seeded by the metadata sweep.
+            changed: list[int] = []
+            for s in poll_data:
                 sid = s.get("sensor_index")
                 pm25_raw = s.get("pm2.5")
                 if sid is None or pm25_raw is None:
@@ -3227,35 +3341,74 @@ def purpleair_fetch_loop(
                 except (TypeError, ValueError):
                     continue
                 new_color = _aqi_color_category(pm25_val)
-                committed_color = app_state.purpleair_pm25_cache.get(sid)
-                app_state.purpleair_pm25_cache[sid] = committed_color or new_color
-                if committed_color is None or new_color != committed_color:
-                    # First read or genuine color band change — fetch cluster
-                    # and commit the new color as the baseline.
+                prev_color = app_state.purpleair_pm25_cache.get(sid)
+                prev_val = app_state.purpleair_pm25_value.get(sid)
+                if prev_color is None or prev_val is None:
                     app_state.purpleair_pm25_cache[sid] = new_color
-                    with app_state.lock:
-                        cluster = _cluster_of(sid, grid, app_state.purpleair_sensors)
-                    cluster_ids_to_fetch.update(cluster)
+                    app_state.purpleair_pm25_value[sid] = pm25_val
+                elif new_color != prev_color and abs(pm25_val - prev_val) >= DEBOUNCE_DELTA:
+                    app_state.purpleair_pm25_cache[sid] = new_color
+                    app_state.purpleair_pm25_value[sid] = pm25_val
+                    changed.append(sid)
+                # else: jitter / sub-threshold drift — leave the baseline alone.
 
-            # Apply sentinel readings
+            # Apply this poll's readings to the map + history.
             with app_state.lock:
-                _apply_fetched(sentinel_data, now)
+                _apply_fetched(poll_data, now)
 
-            # ── Cluster fetch (only for cells whose sentinel changed color) ────
-            # Remove sentinels — already fetched above.
-            cluster_ids_to_fetch -= set(sentinel_ids)
-            if cluster_ids_to_fetch:
-                cluster_list = list(cluster_ids_to_fetch)
-                cluster_data = _fetch_purpleair_sensors(fields="pm2.5,last_seen",
-                                                        sensor_indices=cluster_list)
-                debug_info["calls"].append({"type": "cluster_fetch", "count": len(cluster_list)})
-                with app_state.lock:
-                    _apply_fetched(cluster_data, now)
-            else:
-                pass  # routine cycle, no color changes — stay quiet
+            # ── 1-step walk: pinwheel around each changed sensor → next frontier
+            next_frontier: set[int] = set()
+            for sid in changed:
+                c = by_xy.get(sid)
+                if c is None:
+                    continue
+                next_frontier |= _pinwheel_sweep(c[0], c[1], sensors_xy,
+                                                 SWEEP_SPOKES,
+                                                 SWEEP_RADIUS_MIN_DEG,
+                                                 SWEEP_RADIUS_MAX_DEG,
+                                                 exclude={sid})
+            # Consumed next cycle. Recedes to the bare probe when nothing changes,
+            # expands and walks outward while a region keeps changing.
+            walk_frontier = next_frontier
 
-            debug_info["sentinel_count"] = len(sentinel_ids)
-            debug_info["cluster_sensors_fetched"] = len(cluster_ids_to_fetch)
+            # ── Rotating discovery cell ────────────────────────────────────────
+            # One small bbox query every Nth cycle from a shuffled deck of all
+            # cells. Equal random coverage; discovers new sensors and refreshes
+            # metadata a few rows at a time instead of the whole population.
+            cycle_n += 1
+            if (cycle_n % DISCOVERY_EVERY_N_CYCLES) == 0:
+                if not discovery_deck:
+                    discovery_deck = _discovery_cells()
+                    random.shuffle(discovery_deck)
+                cell = discovery_deck.pop()
+                disc_sensors = _fetch_purpleair_sensors(
+                    fields="name,latitude,longitude,pm2.5,last_seen", bbox=cell)
+                debug_info["calls"].append({"type": "discovery_cell", "count": len(disc_sensors)})
+                if disc_sensors:
+                    disc_by_id = {d["sensor_index"]: d for d in disc_sensors if d.get("sensor_index")}
+                    with app_state.lock:
+                        for s2 in app_state.purpleair_sensors:
+                            sid2 = s2.get("sensor_index")
+                            if sid2 and sid2 in disc_by_id:
+                                d = disc_by_id.pop(sid2)
+                                s2["name"]      = d.get("name",      s2.get("name"))
+                                s2["latitude"]  = d.get("latitude",  s2.get("latitude"))
+                                s2["longitude"] = d.get("longitude", s2.get("longitude"))
+                                if d.get("last_seen") is not None:
+                                    s2["last_seen"] = d["last_seen"]
+                                if d.get("pm2.5") is not None:
+                                    s2["pm2.5"] = d["pm2.5"]
+                        for d in disc_by_id.values():
+                            app_state.purpleair_sensors.append(d)
+                        _apply_fetched(disc_sensors, now)
+                    if disc_by_id:
+                        _log(f"[PurpleAir] Discovery cell: {len(disc_by_id)} new sensor(s)")
+
+            debug_info["probe_count"]  = len(probe_ids)
+            debug_info["frontier_in"]  = len(incoming_frontier)
+            debug_info["changed_count"] = len(changed)
+            debug_info["frontier_out"] = len(walk_frontier)
+            debug_info["polled_total"] = len(poll_ids)
 
         except Exception as e:
             _log(f"[PurpleAir] Error: {type(e).__name__}: {e}")

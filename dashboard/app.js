@@ -193,7 +193,9 @@ function _mergeStateDelta(acc, delta) {
   return acc;
 }
 
+let _lastStateWasNotModified = false;
 async function fetchState() {
+  _lastStateWasNotModified = false;
   let url = `${appConfig.apiBaseUrl}/state`;
   // Delta delivery: ask the server to strip trail points we already have.
   if (_newestTrailMs != null) {
@@ -206,7 +208,10 @@ async function fetchState() {
     const headers = { "X-App-Token": APP_TOKEN };
     if (_stateEtag) headers["If-None-Match"] = _stateEtag;
     const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers, credentials: "same-origin" });
-    if (res.status === 304 && _accumulatedState) return _accumulatedState;
+    if (res.status === 304 && _accumulatedState) {
+      _lastStateWasNotModified = true;
+      return _accumulatedState;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     _stateEtag = res.headers.get("ETag") || null;
     const payload = await res.json();
@@ -895,7 +900,7 @@ function main() {
     // colors depend on the selected sensor / per-pollutant data and must
     // refresh whenever this function runs, even if the dim bracket is
     // unchanged, so we update them ahead of the dim-row skip.
-    if (legendCollapsed) _applyLegendTabColors();
+    _applyLegendTabColors();
     // Find the first row that would dim (lo > activeValue) — that index IS the bracket.
     // When activeValue is null (no field data yet), keep the last bracket — never
     // revert to showing all rows undimmed.
@@ -1071,7 +1076,7 @@ function main() {
     }
     localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
     localStorage.setItem(LEGEND_COLLAPSED_KEY, legendCollapsed ? "true" : "false");
-    if (legendOpen && legendCollapsed) _applyLegendTabColors();
+    if (legendOpen) _applyLegendTabColors();
     else _clearLegendTabColors();
   }
 
@@ -1113,8 +1118,12 @@ function main() {
         })()
       : null;
 
-    const fieldAqi = (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi))
-      ? map._paFieldMaxAqi : null;
+    // Per-pollutant field maxes from the map — one AQI value per tab.
+    // Lazy getter: only computes when stale; reuses memoized bag otherwise.
+    // Keeps the field render path cheap when no one is reading legend colors.
+    const perPollField = (map && typeof map.getPerPollutantFieldMax === "function")
+      ? map.getPerPollutantFieldMax()
+      : null;
 
     for (const tab of tabs) {
       const tabKey = tab.dataset.legend;
@@ -1122,17 +1131,24 @@ function main() {
       const data = LEGEND_DATA[tabKey];
       const entries = data.entries;
       let activeValue = null;
-      if (selectedSensor && selectedSensor.readings) {
+      // Prefer the map's readings bag at the DISPLAYED time — same source as
+      // the marker label and legend bars. The state snapshot is live-only and
+      // diverges from the marker during playback (wrong title colors).
+      const selReadings = (selectedId && map && typeof map.getSelectedReadings === "function" && map.getSelectedReadings())
+        || (selectedSensor && selectedSensor.readings) || null;
+      if (selReadings) {
         const keys = _DIM_READING_KEYS[tabKey] || [];
         for (const rk of keys) {
-          const rd = selectedSensor.readings[rk];
+          let rd = selReadings[rk];
+          if (rd != null && typeof rd !== "object") rd = { value: rd };
           if (rd && rd.value != null && isFinite(rd.value)) {
             const n = parseFloat(rd.value);
             if (isFinite(n)) { activeValue = n; break; }
           }
         }
-      } else {
-        activeValue = _fieldAqiToLegendValue(tabKey, fieldAqi);
+      }
+      if (activeValue == null && perPollField) {
+        activeValue = _fieldAqiToLegendValue(tabKey, perPollField[tabKey]);
       }
       let color = null;
       if (activeValue != null) {
@@ -1152,10 +1168,17 @@ function main() {
         tab.style.color = color;
         tab.style.filter = "none";
         tab.style.textShadow = `0 0 6px ${hexToRgba(color, 0.4)}`;
+        // Preserve the pre-color dim contrast: the active/auto-active tab
+        // reads full-strength, others read at reduced opacity so the
+        // selected pollutant pops without graying out the others.
+        const isPrimary = tab.classList.contains("active")
+          || tab.classList.contains("auto-active");
+        tab.style.opacity = isPrimary ? "" : "0.5";
       } else {
         tab.style.color = "";
         tab.style.filter = "";
         tab.style.textShadow = "";
+        tab.style.opacity = "";
       }
     }
   }
@@ -1189,16 +1212,19 @@ function main() {
   if (legendEl) {
     const allTabs = legendEl.querySelectorAll(".legendTab");
     for (const tab of allTabs) {
-      tab.addEventListener("click", () => {
+      // Activate on mousedown (not click) for snappier perceived response.
+      // Button 0 only — ignore right/middle. preventDefault so a follow-up
+      // click event doesn't double-fire the toggle.
+      tab.addEventListener("mousedown", (ev) => {
+        if (ev.button !== 0) return;
+        ev.preventDefault();
         const clicked = tab.dataset.legend || "pm25";
-        // Clicking the active tab deselects back to default (null)
         legendTab = (clicked === legendTab) ? null : clicked;
         userLegendTab = legendTab;
         legendUserOverride = !!selectedId;
         if (legendTab) localStorage.setItem(LEGEND_TAB_KEY, legendTab);
         else localStorage.removeItem(LEGEND_TAB_KEY);
         _lastViewportAutoKey = undefined;
-        // if (!legendTab && !selectedId) _updateViewportAutoTab();
         _syncMapPollutant();
         buildLegend(true);
       });
@@ -2899,12 +2925,10 @@ function main() {
       // If playhead is now outside bounds (data trimmed or server restarted), handle it
       if (tMs != null && isFinite(tMs)) {
         if (tMs < b.minMs) {
-          // In LIVE mode, jump to live edge; otherwise clamp to minMs
-          if (map._playbackLiveFollow) {
-            tMs = b.maxMs;
-          } else {
-            tMs = b.minMs;
-          }
+          // Data trimmed past the playhead: clamp to the new start and keep
+          // playing. Never jump to the live edge — new server data must not
+          // move the playhead; playback simply continues into it.
+          tMs = b.minMs;
           map.setPlaybackTimeMs(tMs);
         }
         if (tMs > b.maxMs) {
@@ -3235,13 +3259,13 @@ function main() {
     }
 
     // When playback enters the live buffer window, stop and show Live button.
-    // Buffer window = predictedInterval * speed, but only for 1x and 5x.
+    // Buffer window = predictedInterval * speed, at every speed.
     {
       const _spd2 = map.getPlaybackSpeed() || 1.0;
       const _nextInS2 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
       const _wallElapsed3 = (Date.now() - _pbLastServerResponseMs) / 1000;
       const _remS3 = Math.max(0, _nextInS2 - _wallElapsed3);
-      const _lwMs2 = (_spd2 <= 5) ? _remS3 * 1000 * _spd2 : 0;
+      const _lwMs2 = _remS3 * 1000 * _spd2;
       const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
       var _inLiveWindow2 = hasBounds && tMs != null && isFinite(tMs) && tMs >= bufferEdge;
       // Only trigger if we CROSSED into the window this frame (were below, now at/above).
@@ -3390,14 +3414,13 @@ function main() {
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
       const atEnd = map.isPlaybackAtEnd(100);
-      // Buffer snap target: always calculated regardless of speed.
-      // Live window (button shows "Live"): only for 1x and 5x.
+      // Buffer snap target and Live window: all speeds.
       const _spd = map.getPlaybackSpeed() || 1.0;
       const _nextInS3 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
       const _wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
       const _remS = Math.max(0, _nextInS3 - _wallElapsed);
       const _snapMs = _remS * 1000 * _spd;
-      const _lwMs = (_spd <= 5) ? _snapMs : 0;
+      const _lwMs = _snapMs;
       const curMs = map.getPlaybackTimeMs();
       const inLiveWindow = atEnd || (
         _lwMs > 0 && curMs != null && isFinite(curMs) && curMs >= b.maxMs - _lwMs
@@ -3425,8 +3448,8 @@ function main() {
         return;
       }
 
-      // If in live window (1x/5x), enable LIVE mode (not available for historical replays)
-      if (inLiveWindow && _spd <= 5 && !map._playbackLiveFollow && !map._historicalMode) {
+      // If in live window, enable LIVE mode at any speed (not for historical replays)
+      if (inLiveWindow && !map._playbackLiveFollow && !map._historicalMode) {
         map._playbackLiveFollow = true;
         _pbPageAutoFollow = true; // resume page tracking in LIVE mode
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
@@ -3506,13 +3529,9 @@ function main() {
       const newSpeed = map.getPlaybackSpeed() || 1.0;
 
       // If in LIVE mode, recalculate buffer position when speed changes.
+      // LIVE mode is supported at every speed.
       if (map._playbackLiveFollow) {
-        // Speeds >5x don't support Live mode
-        if (newSpeed > 5) {
-          map._playbackLiveFollow = false;
-          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-          _resetLiveTracking();
-        } else {
+        {
           // Recalculate buffer start for the new speed.
           // Larger speed = larger buffer window = playhead must move back.
           // Smaller speed = smaller buffer window = playhead should move forward
@@ -3582,6 +3601,12 @@ function main() {
   
   // Loading state tracking - shared between historical and snapshot loading
   let _isLoadingData = false;
+
+  // Shade over the map (not the UI) while data is loading
+  function setMapLoadingShade(on) {
+    const shade = document.getElementById("mapLoadingShade");
+    if (shade) shade.classList.toggle("hidden", !on);
+  }
   
   // Track current selected day for menu display
   let _selectedDayValue = "live";
@@ -3674,6 +3699,7 @@ function main() {
     
     // Disable save while loading
     _isLoadingData = true;
+    setMapLoadingShade(true);
     updateSaveButtonState();
     
     try {
@@ -3800,6 +3826,7 @@ function main() {
       alert(`Failed to load historical data:\n${e.message}`);
     } finally {
       _isLoadingData = false;
+      setMapLoadingShade(false);
       updateSaveButtonState();
     }
   }
@@ -3954,6 +3981,7 @@ function main() {
     
     // Disable save while loading
     _isLoadingData = true;
+    setMapLoadingShade(true);
     updateSaveButtonState();
     
     try {
@@ -3973,7 +4001,7 @@ function main() {
       window._historicalState = loadedState;
 
       // Load wind snapshots from the historical snapshot if present
-      if (loadedState.wind_snapshots && typeof loadedState.wind_snapshots === "object") {
+      if (!window.WIND_LOADING_DISABLED && loadedState.wind_snapshots && typeof loadedState.wind_snapshots === "object") {
         map._windSnapshots = loadedState.wind_snapshots;
         map._windSnapshotKeys = Object.keys(loadedState.wind_snapshots).sort();
         if (map._windSnapshotKeys.length > 0) {
@@ -4057,6 +4085,7 @@ function main() {
       }
     } finally {
       _isLoadingData = false;
+      setMapLoadingShade(false);
       updateSaveButtonState();
     }
   }
@@ -4202,23 +4231,9 @@ function main() {
     pbDaysSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, e));
   }
   
-  async function updateDaysSubmenu() {
+  function updateDaysSubmenu() {
     if (!pbDaysSubmenu) return;
     pbDaysSubmenu.innerHTML = "";
-
-    // Fetch available snapshots to know which days have data
-    const snapshotDates = new Map(); // dateStr -> {size_bytes, demo}
-    try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`, { headers: { "X-App-Token": APP_TOKEN } });
-      if (resp.ok) {
-        const data = await resp.json();
-        for (const snap of (data.snapshots || [])) {
-          snapshotDates.set(snap.date, { size_bytes: snap.size_bytes, demo: !!snap.demo });
-        }
-      }
-    } catch (e) {
-      console.warn("Failed to fetch snapshot list:", e);
-    }
 
     // Always show Today (Live) first
     const liveItem = document.createElement("div");
@@ -4232,23 +4247,9 @@ function main() {
     });
     pbDaysSubmenu.appendChild(liveItem);
 
-    // Show demo entries from the snapshot list (if any)
-    for (const [snap, info] of snapshotDates.entries()) {
-      if (!info.demo) continue;
-      const item = document.createElement("div");
-      item.className = "pbSubmenuItem";
-      if (_selectedDayValue === snap) item.classList.add("active");
-      item.textContent = `🧪 ${snap} (demo)`;
-      item.addEventListener("click", (e) => {
-        e.stopPropagation();
-        _selectedDayValue = snap;
-        loadHistoricalDay(snap);
-        closePlaybackMenu();
-      });
-      pbDaysSubmenu.appendChild(item);
-    }
-
-    // Show the past 7 days, every day, snapshot or not
+    // Show the past 7 days, built purely from the local calendar — no network.
+    // Whether a snapshot actually exists is discovered when the user clicks
+    // (snapshot/load returns an error for missing days).
     const now = new Date();
     for (let i = 1; i <= 7; i++) {
       const d = new Date(now);
@@ -4259,26 +4260,16 @@ function main() {
       const dateStr = `${yyyy}-${mm}-${dd}`;
       const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
       const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-      const snapInfo = snapshotDates.get(dateStr);
-      const hasSnapshot = snapInfo && !snapInfo.demo;
-
       const item = document.createElement("div");
       item.className = "pbSubmenuItem";
-      if (hasSnapshot) {
-        const sizeMB = (snapInfo.size_bytes / (1024 * 1024)).toFixed(1);
-        item.textContent = `${dayName} ${monthDay} (${sizeMB} MB)`;
-        if (_selectedDayValue === dateStr) item.classList.add("active");
-        item.addEventListener("click", (e) => {
-          e.stopPropagation();
-          _selectedDayValue = dateStr;
-          loadHistoricalDay(dateStr);
-          closePlaybackMenu();
-        });
-      } else {
-        item.textContent = `${dayName} ${monthDay}`;
-        item.style.opacity = "0.35";
-        item.style.pointerEvents = "none";
-      }
+      item.textContent = `${dayName} ${monthDay}`;
+      if (_selectedDayValue === dateStr) item.classList.add("active");
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        _selectedDayValue = dateStr;
+        loadHistoricalDay(dateStr);
+        closePlaybackMenu();
+      });
       pbDaysSubmenu.appendChild(item);
     }
   }
@@ -5282,6 +5273,25 @@ function main() {
     }
 
     try {
+    // 304 fast-path: server confirmed nothing changed. Just heartbeat the
+    // status indicators (so "Live" doesn't drift to "Offline") and reschedule.
+    // Skip the full draw + sidebar re-render: same data → same pixels.
+    if (_lastStateWasNotModified) {
+      _pbLastServerResponseMs = Date.now();
+      _tickConsecutiveFailures = 0;
+      const statusElLive = document.getElementById("statusText");
+      if (statusElLive && !statusElLive.classList.contains("live")) {
+        statusElLive.textContent = "Live";
+        statusElLive.classList.remove("offline");
+        statusElLive.classList.add("live");
+      }
+      _tickInFlight = false;
+      const pollMs = _sseConnected ? POLL_MS_SSE : POLL_MS;
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      _tickTimeout = setTimeout(tick, pollMs);
+      return;
+    }
+
     // Ensure st.fixed is always an array (Home sensor now provided by backend)
     if (!Array.isArray(st.fixed)) st.fixed = [];
 
@@ -5353,11 +5363,6 @@ function main() {
           const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
           const speed = map.getPlaybackSpeed() || 1.0;
           const offsetMs = nextInS * 1000 * speed;
-          
-          // Only activate Live mode for speeds 1-5x
-          if (speed > 5) {
-            map._playbackLiveFollow = false;
-          }
           
           const initMs = map._playbackLiveFollow 
             ? Math.max(b.minMs, b.maxMs - offsetMs)
