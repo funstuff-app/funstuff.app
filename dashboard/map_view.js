@@ -4022,44 +4022,10 @@ class MapView {
     let minMs = Infinity;
     let maxMs = -Infinity;
 
-    // Live playback is "today only"; clamp the window start to 5:00 AM Mountain Time.
-    // Use wall-clock time (not data timestamps) to determine what "today" means,
-    // so the scrub range stays anchored even when buses aren't running.
-    const liveDayStartMs = (!this._historicalMode)
-      ? (() => {
-          // Get current date/time in Mountain Time via toLocaleString.
-          // This survives JS obfuscation (no property-name lookups on Intl objects).
-          const mtStr = new Date().toLocaleString("en-US", { timeZone: "America/Denver", hour12: false });
-          // Format: "M/D/YYYY, HH:MM:SS"
-          const parts = mtStr.split(/[/,: ]+/);
-          const mtMonth = Number(parts[0]) - 1;
-          const mtDay = Number(parts[1]);
-          const mtYear = Number(parts[2]);
-          const mtHour = Number(parts[3]);
-
-          // Build 5:00 AM Mountain Time as an epoch-ms value.
-          // Create a local Date for the MT calendar date at noon, then use
-          // toLocaleString round-trip to derive the UTC offset for that day.
-          const noonLocal = new Date(mtYear, mtMonth, mtDay, 12, 0, 0, 0);
-          const noonUtcStr = noonLocal.toLocaleString("en-US", { timeZone: "UTC", hour12: false });
-          const utcParts = noonUtcStr.split(/[/,: ]+/);
-          const noonUtcRecon = new Date(Date.UTC(
-            Number(utcParts[2]), Number(utcParts[0]) - 1, Number(utcParts[1]),
-            Number(utcParts[3]), Number(utcParts[4]), Number(utcParts[5])
-          ));
-          const offsetMs = noonUtcRecon.getTime() - noonLocal.getTime();
-
-          // 5 AM MT = local-constructed 5 AM + offset
-          let fiveAmMs = new Date(mtYear, mtMonth, mtDay, 5, 0, 0, 0).getTime() + offsetMs;
-
-          // If it's currently before 5 AM MT, the window started at yesterday's 5 AM.
-          if (mtHour < 5) {
-            fiveAmMs -= 86400000;
-          }
-
-          return isFinite(fiveAmMs) ? fiveAmMs : null;
-        })()
-      : null;
+    // No day-start clamp: the timeline begins at the earliest data that exists,
+    // not an explicit 5 AM boundary. (liveDayStartMs left null so the trail
+    // filter below is a no-op.)
+    const liveDayStartMs = null;
 
     const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
     for (const m of mobiles) {
@@ -4125,7 +4091,26 @@ class MapView {
     }
 
     this._playbackPtsById = nextPtsById;
-    
+
+    // Extend the timeline to cover fixed/PA sensor history, not just mobile
+    // trails. Fixed sensors report from midnight while buses only start at
+    // 5 AM, so deriving bounds from trails alone makes the scrub range begin
+    // at the first bus instead of the day's earliest data. Timelines are
+    // monotonic, so the first/last history entry per reading is its min/max.
+    const fixedArr = Array.isArray(state?.fixed) ? state.fixed : [];
+    for (const f of fixedArr) {
+      const readings = f && f.readings;
+      if (!readings) continue;
+      for (const key in readings) {
+        const ht = readings[key] && readings[key].history_times;
+        if (!Array.isArray(ht) || ht.length === 0) continue;
+        const t0 = parseUtcMs(ht[0]);
+        const t1 = parseUtcMs(ht[ht.length - 1]);
+        if (t0 != null && isFinite(t0) && t0 < minMs) minMs = t0;
+        if (t1 != null && isFinite(t1) && t1 > maxMs) maxMs = t1;
+      }
+    }
+
     // Use server meta timestamps as fallback when no trails qualify
     const serverStartMs = state?.meta?.trail_update_start_ms;
     const serverEndMs = state?.meta?.trail_update_end_ms;
@@ -4141,8 +4126,10 @@ class MapView {
       maxMs = serverEndMs;
     }
 
-    // In live mode, if fixed sensors exist but mobile data is stale,
-    // extend the timeline to now so playback doesn't freeze.
+    // In live mode the timeline end is "now": extend stale data up to now so
+    // playback doesn't freeze, AND cap it back down to now if a fixed sensor's
+    // history carries future-dated (forecast) timestamps — the LIVE end must
+    // never be in the future.
     if (!this._historicalMode) {
       const fixed = Array.isArray(state?.fixed) ? state.fixed : [];
       if (fixed.length > 0) {
@@ -4152,9 +4139,7 @@ class MapView {
           minMs = (typeof serverStartMs === "number" && isFinite(serverStartMs))
             ? serverStartMs : (nowMs - 3600000);
         }
-        if (!isFinite(maxMs) || nowMs > maxMs) {
-          maxMs = nowMs;
-        }
+        maxMs = nowMs;
       }
     }
 
