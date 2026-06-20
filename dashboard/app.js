@@ -3761,33 +3761,10 @@ function main() {
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
       
-      // Build playback points and set time to 5AM
+      // Build playback points; start the playhead at the earliest data.
       map._ensurePlaybackPoints(window._historicalState);
       const b = map.getPlaybackBounds();
-      {
-        // Set playhead to 5AM local on the loaded day
-        let initMs;
-        if (isFinite(b.minMs) && isFinite(b.maxMs)) {
-          if (dateStr === "demo") {
-            const startDate = new Date(b.minMs);
-            const fiveAM = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate(), 5, 0, 0, 0).getTime();
-            initMs = clamp(fiveAM, b.minMs, b.maxMs);
-          } else {
-            const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
-            const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
-            const fiveAM = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
-            initMs = clamp(fiveAM, b.minMs, b.maxMs);
-          }
-        } else if (dateStr && dateStr !== "demo") {
-          // No mobile trails at all (e.g. weekend). Derive 5AM from the date.
-          const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
-          const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
-          if (isFinite(_y) && isFinite(_mo) && isFinite(_d)) {
-            initMs = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
-          }
-        }
-        if (initMs != null) map.setPlaybackTimeMs(initMs);
-      }
+      if (isFinite(b.minMs)) map.setPlaybackTimeMs(b.minMs);
       
       // Store state, render sidebar, draw ONLY tiles (no overlay yet)
       map.lastState = window._historicalState;
@@ -4043,18 +4020,11 @@ function main() {
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
       
-      // Build playback points and set time to 30 min in (so trails are visible)
+      // Build playback points; start the playhead at the earliest data.
       map._ensurePlaybackPoints(window._historicalState);
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
-        map.setPlaybackTimeMs(b.minMs + 30 * 60000);
-      } else if (dateStr && dateStr !== "demo") {
-        // No mobile trails. Derive 5AM from date so playback isn't frozen.
-        const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
-        const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
-        if (isFinite(_y) && isFinite(_mo) && isFinite(_d)) {
-          map.setPlaybackTimeMs(new Date(_y, _mo - 1, _d, 5, 30, 0, 0).getTime());
-        }
+        map.setPlaybackTimeMs(b.minMs);
       }
       
       // Store state, render sidebar, draw

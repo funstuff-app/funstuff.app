@@ -121,6 +121,14 @@ def get_cached_road_graph() -> RoadGraph | None:
         return _cached_road_graph
     
     _road_graph_load_attempted = True
+    # The all-Utah centerline graph is ~541k nodes that explode to ~0.5 GB of
+    # Python objects in RAM — and ~430k of those nodes are in the served metro,
+    # so a bounding-box clip barely helps. On the 1.8 GB Pi that half-gig is the
+    # dominant heap consumer, spent only to cosmetically snap bus GPS to roads.
+    # Default OFF; set MOBILEAIR_ENABLE_ROAD_GRAPH=1 to re-enable map-matching.
+    if os.environ.get("MOBILEAIR_ENABLE_ROAD_GRAPH", "") not in ("1", "true", "yes"):
+        _cached_road_graph = None
+        return _cached_road_graph
     try:
         p = os.environ.get("MOBILEAIR_ROAD_GRAPH") or RoadGraph.default_graph_path()
         if os.path.exists(p):

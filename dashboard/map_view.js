@@ -57,6 +57,8 @@ const _LEGEND_TAB_READING_KEYS = {
 const _LEGEND_TAB_AQI_KEY = {
   pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co",
 };
+/** Pollutants composited in "no selection" max-mode field (one kernel each). */
+const _MAX_MODE_POLLUTANTS = ["pm25", "pm10", "o3", "no2", "co"];
 /** Map legend tab id → display label for marker. */
 const _LEGEND_TAB_LABEL = {
   pm25: "PM25", pm10: "PM10", o3: "O\u2083", no2: "NO\u2082", co: "CO",
@@ -4020,44 +4022,10 @@ class MapView {
     let minMs = Infinity;
     let maxMs = -Infinity;
 
-    // Live playback is "today only"; clamp the window start to 5:00 AM Mountain Time.
-    // Use wall-clock time (not data timestamps) to determine what "today" means,
-    // so the scrub range stays anchored even when buses aren't running.
-    const liveDayStartMs = (!this._historicalMode)
-      ? (() => {
-          // Get current date/time in Mountain Time via toLocaleString.
-          // This survives JS obfuscation (no property-name lookups on Intl objects).
-          const mtStr = new Date().toLocaleString("en-US", { timeZone: "America/Denver", hour12: false });
-          // Format: "M/D/YYYY, HH:MM:SS"
-          const parts = mtStr.split(/[/,: ]+/);
-          const mtMonth = Number(parts[0]) - 1;
-          const mtDay = Number(parts[1]);
-          const mtYear = Number(parts[2]);
-          const mtHour = Number(parts[3]);
-
-          // Build 5:00 AM Mountain Time as an epoch-ms value.
-          // Create a local Date for the MT calendar date at noon, then use
-          // toLocaleString round-trip to derive the UTC offset for that day.
-          const noonLocal = new Date(mtYear, mtMonth, mtDay, 12, 0, 0, 0);
-          const noonUtcStr = noonLocal.toLocaleString("en-US", { timeZone: "UTC", hour12: false });
-          const utcParts = noonUtcStr.split(/[/,: ]+/);
-          const noonUtcRecon = new Date(Date.UTC(
-            Number(utcParts[2]), Number(utcParts[0]) - 1, Number(utcParts[1]),
-            Number(utcParts[3]), Number(utcParts[4]), Number(utcParts[5])
-          ));
-          const offsetMs = noonUtcRecon.getTime() - noonLocal.getTime();
-
-          // 5 AM MT = local-constructed 5 AM + offset
-          let fiveAmMs = new Date(mtYear, mtMonth, mtDay, 5, 0, 0, 0).getTime() + offsetMs;
-
-          // If it's currently before 5 AM MT, the window started at yesterday's 5 AM.
-          if (mtHour < 5) {
-            fiveAmMs -= 86400000;
-          }
-
-          return isFinite(fiveAmMs) ? fiveAmMs : null;
-        })()
-      : null;
+    // No day-start clamp: the timeline begins at the earliest data that exists,
+    // not an explicit 5 AM boundary. (liveDayStartMs left null so the trail
+    // filter below is a no-op.)
+    const liveDayStartMs = null;
 
     const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
     for (const m of mobiles) {
@@ -4123,7 +4091,26 @@ class MapView {
     }
 
     this._playbackPtsById = nextPtsById;
-    
+
+    // Extend the timeline to cover fixed/PA sensor history, not just mobile
+    // trails. Fixed sensors report from midnight while buses only start at
+    // 5 AM, so deriving bounds from trails alone makes the scrub range begin
+    // at the first bus instead of the day's earliest data. Timelines are
+    // monotonic, so the first/last history entry per reading is its min/max.
+    const fixedArr = Array.isArray(state?.fixed) ? state.fixed : [];
+    for (const f of fixedArr) {
+      const readings = f && f.readings;
+      if (!readings) continue;
+      for (const key in readings) {
+        const ht = readings[key] && readings[key].history_times;
+        if (!Array.isArray(ht) || ht.length === 0) continue;
+        const t0 = parseUtcMs(ht[0]);
+        const t1 = parseUtcMs(ht[ht.length - 1]);
+        if (t0 != null && isFinite(t0) && t0 < minMs) minMs = t0;
+        if (t1 != null && isFinite(t1) && t1 > maxMs) maxMs = t1;
+      }
+    }
+
     // Use server meta timestamps as fallback when no trails qualify
     const serverStartMs = state?.meta?.trail_update_start_ms;
     const serverEndMs = state?.meta?.trail_update_end_ms;
@@ -4139,8 +4126,10 @@ class MapView {
       maxMs = serverEndMs;
     }
 
-    // In live mode, if fixed sensors exist but mobile data is stale,
-    // extend the timeline to now so playback doesn't freeze.
+    // In live mode the timeline end is "now": extend stale data up to now so
+    // playback doesn't freeze, AND cap it back down to now if a fixed sensor's
+    // history carries future-dated (forecast) timestamps — the LIVE end must
+    // never be in the future.
     if (!this._historicalMode) {
       const fixed = Array.isArray(state?.fixed) ? state.fixed : [];
       if (fixed.length > 0) {
@@ -4150,9 +4139,7 @@ class MapView {
           minMs = (typeof serverStartMs === "number" && isFinite(serverStartMs))
             ? serverStartMs : (nowMs - 3600000);
         }
-        if (!isFinite(maxMs) || nowMs > maxMs) {
-          maxMs = nowMs;
-        }
+        maxMs = nowMs;
       }
     }
 
@@ -6830,22 +6817,42 @@ class MapView {
       return;
     }
 
-    const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH, paRefNowMs, maxMode);
-    const paSensors = paField.sensors;
-
-    // ── Inject virtual sensors from mobile trail GPS points ──
     const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
-    const virtualField = _collectVirtualMobileSensors(
-      mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab, bufW, bufH, maxMode
-    );
-    this._virtualMobileSensors = virtualField.sensors;
+    let allSensors = null;          // single-pollutant: mixed sensor list
+    let perPollSensors = null;      // max-mode: [{ tab, sensors }, ...]
+    let fingerprint, nSensors, hasVirtuals;
 
-    const allSensors = paSensors.concat(virtualField.sensors);
-    const fingerprint = paField.fingerprint + (virtualField.fingerprint ? "|v:" + virtualField.fingerprint : "");
-    const nSensors = allSensors.length;
+    if (maxMode) {
+      // Collect each pollutant's sensor set INDEPENDENTLY. PurpleAir is only
+      // included in the pm25 set (non-max collection excludes PA for other
+      // tabs), so PA can never bleed into ozone/NO2/etc. — that is the fix.
+      perPollSensors = [];
+      let fp = "", total = 0, anyVirtual = false;
+      for (const tab of _MAX_MODE_POLLUTANTS) {
+        const pf = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, tab, bufW, bufH, paRefNowMs);
+        const vf = _collectVirtualMobileSensors(mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, tab, bufW, bufH);
+        const sensors = pf.sensors.concat(vf.sensors);
+        if (vf.sensors.length) anyVirtual = true;
+        total += sensors.length;
+        fp += tab + ":" + pf.fingerprint + (vf.fingerprint ? "|v" + vf.fingerprint : "") + ";";
+        perPollSensors.push({ tab, sensors });
+        if (tab === "pm25") this._virtualMobileSensors = vf.sensors; // debug ghost overlay
+      }
+      fingerprint = fp;
+      nSensors = total;
+      hasVirtuals = anyVirtual;
+    } else {
+      const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH, paRefNowMs, maxMode);
+      const virtualField = _collectVirtualMobileSensors(
+        mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab, bufW, bufH, maxMode
+      );
+      this._virtualMobileSensors = virtualField.sensors;
+      allSensors = paField.sensors.concat(virtualField.sensors);
+      fingerprint = paField.fingerprint + (virtualField.fingerprint ? "|v:" + virtualField.fingerprint : "");
+      nSensors = allSensors.length;
+      hasVirtuals = virtualField.sensors.length > 0;
+    }
     if (nSensors === 0) { this._paFieldCanvas = null; this._paFieldCtx = null; return; }
-
-    const hasVirtuals = virtualField.sensors.length > 0;
 
     // ── Cache key: view geometry + color fingerprint + pollutant ──
     const key = `pa:${viewKey}|p:${renderTab}|f:${fingerprint}`;
@@ -6896,22 +6903,24 @@ class MapView {
     const sigma = cutoffPx / sigmaDivisor;
     const twoSigmaSq = 2 * sigma * sigma;
 
-    // ── Build stride-5 sensor array: [sx, sy, aqi, twoSigSq, weightMultiplier, ...] ──
+    // ── Build stride-5 sensor array(s): [sx, sy, aqi, twoSigSq, weightMultiplier, ...] ──
     // Blend in AQI space: the non-linear concentration→AQI transform gives high
     // concentrations proportionally more weight in the kernel average,
     // so a local spike stays visible instead of being diluted by neighbors.
-    const aqiKey = _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5";
-    const s5 = new Float64Array(nSensors * 5);
-    for (let i = 0; i < nSensors; i++) {
-      const sensor = allSensors[i];
-      const si5 = i * 5;
-      s5[si5] = sensor.sx;
-      s5[si5 + 1] = sensor.sy;
-      const aqi = (maxMode && sensor.aqi != null) ? sensor.aqi : valueToAqi(aqiKey, sensor.value);
-      s5[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
-      s5[si5 + 3] = twoSigmaSq;
-      s5[si5 + 4] = sensor.weightMultiplier;
-    }
+    const buildS5 = (sensors, aqiKey) => {
+      const arr = new Float64Array(sensors.length * 5);
+      for (let i = 0; i < sensors.length; i++) {
+        const sensor = sensors[i];
+        const si5 = i * 5;
+        arr[si5] = sensor.sx;
+        arr[si5 + 1] = sensor.sy;
+        const aqi = valueToAqi(aqiKey, sensor.value);
+        arr[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
+        arr[si5 + 3] = twoSigmaSq;
+        arr[si5 + 4] = sensor.weightMultiplier;
+      }
+      return arr;
+    };
 
     // ── Wind-anisotropic kernel: single wind vector at map center ──
     // Wind field is smooth (~10s of km scale) — uniform across viewport at zoom 11-13.
@@ -6920,7 +6929,16 @@ class MapView {
     const effectiveCutoffSq = wind ? cutoffSq * wind.stretch * wind.stretch : cutoffSq;
 
     // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
-    this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+    if (maxMode) {
+      // One stride-5 array per pollutant; composite per-cell max across fields.
+      const perPollS5 = perPollSensors.map(pp =>
+        buildS5(pp.sensors, _LEGEND_TAB_AQI_KEY[pp.tab] || "pm2.5")
+      );
+      this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+    } else {
+      const s5 = buildS5(allSensors, _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5");
+      this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+    }
 
     // Stash the inputs needed to lazily compute per-pollutant field maxes
     // when the legend asks. Tying it to this code path inflated CPU by ~5ms
@@ -7145,59 +7163,49 @@ class MapView {
    *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
    *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
    *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
-  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
-    // ── Reuse tiny canvas + ImageData if grid size unchanged ──
+  /** Ensure the coarse grid canvas + reusable per-cell buffers exist for gw×gh. */
+  _ensurePaGrid(gw, gh) {
     if (!this._paGrid || this._paGrid.gw !== gw || this._paGrid.gh !== gh) {
       const tc = document.createElement("canvas");
       tc.width = gw; tc.height = gh;
       const tctx = tc.getContext("2d");
       this._paGrid = { tc, tctx, imgData: tctx.createImageData(gw, gh), gw, gh };
     }
-    const { tc, tctx, imgData } = this._paGrid;
-    const px = imgData.data;
+    const n = gw * gh;
+    const g = this._paGrid;
+    if (!g.aqiCell || g.aqiCell.length !== n) {
+      g.aqiCell = new Float32Array(n);
+      g.wCell = new Float32Array(n);
+    }
+    return g;
+  }
 
-    // Hoist wind parameters — uniform across viewport, no per-cell lookup
+  /** Nadaraya-Watson kernel regression over the whole grid for ONE sensor set.
+   *  Fills outAqi[cell] = weighted-mean AQI (0 where uncovered) and
+   *  outW[cell] = total kernel weight (used for fade/coverage). Pure numeric —
+   *  no pixels. Shared by the single-pollutant and max-mode render paths.
+   *  sensors: stride-5 Float64Array [sx, sy, aqi, twoSigSq, weightMultiplier, ...].
+   *  cutoffSq: expanded range²; isoCutoffSq: isotropic range²; wind or null. */
+  _kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, outAqi, outW) {
     const isAniso = wind != null && wind.stretch > 1.001;
     const wwx = isAniso ? wind.wx : 0;
     const wwy = isAniso ? wind.wy : 0;
     const wStretch = isAniso ? wind.stretch : 1;
     const wUpwind  = isAniso ? wind.upwindShrink : 1;
-
-    // ── Nadaraya-Watson kernel regression with optional wind-anisotropic Gaussian weights ──
-    // Track max interpolated AQI within the actual viewport (not overfetch margin)
-    let fieldMaxAqi = -Infinity;
-    const vpW = vpCssW || cssW;
-    const vpH = vpCssH || cssH;
-    const vpMarginX = (cssW - vpW) / 2;
-    const vpMarginY = (cssH - vpH) / 2;
-    // Sample only the viewport region (exclude overfetch margins)
-    const vpGxMin = Math.floor(vpMarginX / cellSize);
-    const vpGyMin = Math.floor(vpMarginY / cellSize);
-    const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + vpW) / cellSize));
-    const vpGyMax = Math.min(gh, Math.ceil((vpMarginY + vpH) / cellSize));
-
     for (let gy = 0; gy < gh; gy++) {
       const py = (gy + 0.5) * cellSize;
-      const inVpY = gy >= vpGyMin && gy <= vpGyMax;
       for (let gx = 0; gx < gw; gx++) {
         const pxx = (gx + 0.5) * cellSize;
-
         let wSum = 0, vSum = 0;
         for (let i = 0; i < sensors.length; i += 5) {
           const dx = pxx - sensors[i];
           const dy = py  - sensors[i + 1];
           const rawD2 = dx * dx + dy * dy;
-          if (rawD2 > cutoffSq) {
-            // Beyond expanded cutoff — always skip
-            continue;
-          }
-
+          if (rawD2 > cutoffSq) continue;
           let d2;
           if (isAniso) {
             const along = dx * wwx + dy * wwy;
-            if (rawD2 > isoCutoffSq && along <= 0) continue; // upwind/crosswind beyond iso range — skip
-            // Decompose into wind-parallel and perpendicular components.
-            // Downwind (along > 0): full stretch. Upwind: partial (teardrop kernel).
+            if (rawD2 > isoCutoffSq && along <= 0) continue;
             const cross = dx * (-wwy) + dy * wwx;
             const sf = along > 0 ? wStretch : wStretch * wUpwind;
             const ea = along / sf;
@@ -7205,19 +7213,46 @@ class MapView {
           } else {
             d2 = rawD2;
           }
-
           const w = sensors[i + 4] * Math.exp(-d2 / sensors[i + 3]);
           wSum += w;
           vSum += w * sensors[i + 2];
         }
+        const cell = gy * gw + gx;
+        outW[cell] = wSum;
+        outAqi[cell] = wSum >= 0.001 ? vSum / wSum : 0;
+      }
+    }
+  }
 
-        const off = (gy * gw + gx) * 4;
+  /** Color a per-cell (aqi, weight) grid into the grid canvas, apply the
+   *  Cauchy blur, commit, and upscale. Also sets this._paFieldMaxAqi to the
+   *  max AQI within the viewport region. Shared painter for both render paths. */
+  _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH) {
+    const { tc, tctx, imgData } = this._paGrid;
+    const px = imgData.data;
+
+    let fieldMaxAqi = -Infinity;
+    const vpW = vpCssW || cssW;
+    const vpH = vpCssH || cssH;
+    const vpMarginX = (cssW - vpW) / 2;
+    const vpMarginY = (cssH - vpH) / 2;
+    const vpGxMin = Math.floor(vpMarginX / cellSize);
+    const vpGyMin = Math.floor(vpMarginY / cellSize);
+    const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + vpW) / cellSize));
+    const vpGyMax = Math.min(gh, Math.ceil((vpMarginY + vpH) / cellSize));
+
+    for (let gy = 0; gy < gh; gy++) {
+      const inVpY = gy >= vpGyMin && gy <= vpGyMax;
+      for (let gx = 0; gx < gw; gx++) {
+        const cell = gy * gw + gx;
+        const off = cell * 4;
+        const wSum = wCell[cell];
         if (wSum < 0.001) {
           px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
         } else {
           const fade = Math.min(1, wSum * 2);
           const alpha = Math.round(FIELD_ALPHA * fade);
-          const val = vSum / wSum;
+          const val = aqiCell[cell];
           if (inVpY && gx >= vpGxMin && gx < vpGxMax && val > fieldMaxAqi) {
             fieldMaxAqi = val;
           }
@@ -7234,7 +7269,6 @@ class MapView {
     // ── Cauchy blur (1/(1+d²) kernel) to soften band-edge staircase artifacts ──
     const _fd = window._fieldDebug;
     const BLUR_R = _fd ? _fd.blur : 2;
-    // Reuse blur buffer across frames when grid dimensions match
     const bufLen = px.length;
     if (!this._paGrid.blurBuf || this._paGrid.blurBuf.length !== bufLen) {
       this._paGrid.blurBuf = new Uint8ClampedArray(bufLen);
@@ -7278,6 +7312,53 @@ class MapView {
 
     tctx.putImageData(imgData, 0, 0);
     this._upscalePaField(tc, cssW, cssH, dpr);
+  }
+
+  /** Synchronous Nadaraya-Watson kernel regression with Gaussian weights.
+   *  Optionally wind-anisotropic: kernels stretch along wind direction (teardrop shape).
+   *  Blends in AQI space so high concentrations retain visual weight.
+   *  sensors: stride-5 Float64Array [sx, sy, aqi, twoSigSq, weightMultiplier, ...]
+   *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
+   *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
+   *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
+    const g = this._ensurePaGrid(gw, gh);
+    this._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, g.aqiCell, g.wCell);
+    this._paintPaCells(g.aqiCell, g.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
+  }
+
+  /** Max-mode field: render EACH pollutant's own kernel field independently
+   *  (so PurpleAir, which only measures PM2.5, never enters other pollutants'
+   *  fields), then composite the PER-CELL MAX AQI across pollutants. This is
+   *  the true "worst pollutant wins" surface — a single blended pass over
+   *  mixed per-sensor maxes instead averages dense low-PM2.5 PA sensors down
+   *  and suppresses a region's high ozone/NO2/etc.
+   *  perPollS5: array of stride-5 Float64Arrays, one per pollutant. */
+  _computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
+    const g = this._ensurePaGrid(gw, gh);
+    const n = gw * gh;
+    if (!g.bestAqi || g.bestAqi.length !== n) {
+      g.bestAqi = new Float32Array(n);
+      g.bestW   = new Float32Array(n);
+      g.tmpAqi  = new Float32Array(n);
+      g.tmpW    = new Float32Array(n);
+    }
+    g.bestAqi.fill(0);
+    g.bestW.fill(0);
+    for (const s5 of perPollS5) {
+      if (!s5 || !s5.length) continue;
+      this._kernelGrid(s5, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, g.tmpAqi, g.tmpW);
+      for (let c = 0; c < n; c++) {
+        // A pollutant claims a cell only where it has coverage AND its AQI is
+        // the highest seen there. The winning pollutant's own weight drives
+        // fade, so the cell renders exactly as that pollutant's field would.
+        if (g.tmpW[c] >= 0.001 && g.tmpAqi[c] > g.bestAqi[c]) {
+          g.bestAqi[c] = g.tmpAqi[c];
+          g.bestW[c]   = g.tmpW[c];
+        }
+      }
+    }
+    this._paintPaCells(g.bestAqi, g.bestW, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
   }
 
   /** Upscale the coarse interpolation grid to viewport size with bilinear smoothing. */
