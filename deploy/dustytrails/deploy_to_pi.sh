@@ -347,13 +347,19 @@ deploy_files() {
     log_info "Creating directory structure on Pi..."
     ssh "$PI_TARGET" "mkdir -p '$INSTALL_DIR'"
     
-    # Sync files using rsync (efficient, only transfers changes)
+    # Sync files using rsync (efficient, only transfers changes).
+    # NOTE: --delete removes anything on the Pi not in staging. The landing
+    # page app (funstuff-landing.service) lives co-located in $INSTALL_DIR but
+    # is NOT part of dashboard staging — exclude it so a dashboard deploy never
+    # wipes it (it did once: landing_server.py + landing/ got --delete'd).
     log_info "Syncing application files..."
     rsync -avz --delete \
         --exclude='*.pyc' \
         --exclude='__pycache__' \
         --exclude='.staging' \
         --exclude='venv' \
+        --exclude='landing_server.py' \
+        --exclude='landing/' \
         "$STAGING_DIR/" \
         "$PI_TARGET:$INSTALL_DIR/"
     
