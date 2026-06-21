@@ -58,7 +58,18 @@ const _LEGEND_TAB_AQI_KEY = {
   pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co",
 };
 /** Pollutants composited in "no selection" max-mode field (one kernel each). */
-const _MAX_MODE_POLLUTANTS = ["pm25", "pm10", "o3", "no2", "co"];
+// Max-mode field groups. Particulates (PM2.5 + PM10) form ONE field: same
+// unit/scale and fixed sensors report both, so they blend smoothly instead of
+// competing cell-by-cell (which left black rings where sparse PM10 won the AQI
+// max at near-zero weight). Gases stay separate (different sensor sets), which
+// preserves "PA can't suppress ozone". `incl` drives sensor inclusion (pm25 ->
+// PurpleAir + nearby fixed); `tabs` are max'd per sensor in AQI space.
+const _MAX_MODE_GROUPS = [
+  { incl: "pm25", tabs: ["pm25", "pm10"] },
+  { incl: "o3",   tabs: ["o3"] },
+  { incl: "no2",  tabs: ["no2"] },
+  { incl: "co",   tabs: ["co"] },
+];
 /** Map legend tab id → display label for marker. */
 const _LEGEND_TAB_LABEL = {
   pm25: "PM25", pm10: "PM10", o3: "O\u2083", no2: "NO\u2082", co: "CO",
@@ -92,7 +103,7 @@ function _readingForLegendTab(readings, legendTab) {
   return null;
 }
 
-function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab, bufW, bufH, refNowMs, maxMode) {
+function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH, pollutantTab, bufW, bufH, refNowMs, maxTabs) {
   const isPm25 = !pollutantTab || pollutantTab === "pm25";
   const aqiKey = _LEGEND_TAB_AQI_KEY[pollutantTab || "pm25"] || "pm2.5";
   const readingKeys = _LEGEND_TAB_READING_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_READING_KEYS.pm25;
@@ -165,10 +176,10 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
     const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
     let value = NaN;
     let maxAqi = null;
-    if (maxMode) {
-      // No pollutant selected: this sensor contributes its WORST pollutant
-      // (highest AQI across all tabs). Blending downstream is in AQI space.
-      for (const tab in _LEGEND_TAB_READING_KEYS) {
+    if (maxTabs && maxTabs.length) {
+      // Sensor contributes its WORST pollutant (highest AQI) across the group's
+      // tabs — ['pm25','pm10'] merges both particulates into one field.
+      for (const tab of maxTabs) {
         for (const rk of _LEGEND_TAB_READING_KEYS[tab]) {
           const r = interp && interp[rk];
           if (r && r.value != null) {
@@ -205,7 +216,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
     // Max mode quantizes at 4 AQI points (finer than _aqiColorCat) so the
     // field recomputes when a sensor visibly changes within a coarse AQI band
     // (PA dot sub-bands are finer than AQI categories).
-    fingerprint += maxMode ? ("m" + Math.round(maxAqi / 4) + ",")
+    fingerprint += (maxTabs && maxTabs.length) ? ("m" + Math.round(maxAqi / 4) + ",")
       : (isPm25 ? _pm25ColorCat(value) : _aqiColorCat(valueToAqi(aqiKey, value) ?? 0));
   }
 
@@ -217,7 +228,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
  * Each trail point with a reading for the selected pollutant becomes a transient sensor
  * that decays over the same time window as the trail fade.
  */
-function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs, pollutantTab, bufW, bufH, maxMode) {
+function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, centerW, zoom, cssW, cssH, refNowMs, pollutantTab, bufW, bufH, maxTabs) {
   const isPm25 = !pollutantTab || pollutantTab === "pm25";
   const aqiKey = _LEGEND_TAB_AQI_KEY[pollutantTab || "pm25"] || "pm2.5";
   const trailKeys = _LEGEND_TAB_TRAIL_KEYS[pollutantTab || "pm25"] || _LEGEND_TAB_TRAIL_KEYS.pm25;
@@ -267,13 +278,16 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
       let rawVal = undefined;
       let trailMaxAqi = null;
       const rd = p.readings;
-      if (rd && maxMode) {
-        // No pollutant selected: take the worst pollutant (highest AQI) at this point.
-        if (p._maxAqi !== undefined) {
-          trailMaxAqi = p._maxAqi;
-          rawVal = p._maxVal;
+      if (rd && maxTabs && maxTabs.length) {
+        // Worst pollutant (highest AQI) across the group's tabs at this point.
+        // Cache per group key so each group memoizes once on the trail point.
+        const _gk = maxTabs.join(",");
+        const _gc = p._grpMax ? p._grpMax[_gk] : undefined;
+        if (_gc !== undefined) {
+          trailMaxAqi = _gc ? _gc.aqi : null;
+          rawVal = _gc ? _gc.val : null;
         } else {
-          for (const tab in _LEGEND_TAB_TRAIL_KEYS) {
+          for (const tab of maxTabs) {
             for (const rk of _LEGEND_TAB_TRAIL_KEYS[tab]) {
               let rv = rd[rk]?.value ?? rd[rk];
               if (rv != null && typeof rv === "object") rv = rv.value;
@@ -286,7 +300,7 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
               break;
             }
           }
-          try { p._maxAqi = trailMaxAqi; p._maxVal = rawVal; } catch {}
+          try { (p._grpMax || (p._grpMax = {}))[_gk] = (trailMaxAqi == null) ? null : { aqi: trailMaxAqi, val: rawVal }; } catch {}
         }
         if (trailMaxAqi == null) continue;
       } else if (rd) {
@@ -338,7 +352,7 @@ function _collectVirtualMobileSensors(mobiles, playbackTimeMs, isPlayback, cente
 
   const sensors = Array.from(sensorMap.values());
   let fingerprint = "";
-  for (const s of sensors) fingerprint += (maxMode && s.aqi != null) ? ("m" + Math.round(s.aqi / 4) + ",")
+  for (const s of sensors) fingerprint += (maxTabs && maxTabs.length && s.aqi != null) ? ("m" + Math.round(s.aqi / 4) + ",")
     : (isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(valueToAqi(aqiKey, s.value) ?? 0));
   return { sensors, fingerprint };
 }
@@ -6828,15 +6842,15 @@ class MapView {
       // tabs), so PA can never bleed into ozone/NO2/etc. — that is the fix.
       perPollSensors = [];
       let fp = "", total = 0, anyVirtual = false;
-      for (const tab of _MAX_MODE_POLLUTANTS) {
-        const pf = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, tab, bufW, bufH, paRefNowMs);
-        const vf = _collectVirtualMobileSensors(mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, tab, bufW, bufH);
+      for (const grp of _MAX_MODE_GROUPS) {
+        const pf = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, grp.incl, bufW, bufH, paRefNowMs, grp.tabs);
+        const vf = _collectVirtualMobileSensors(mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, grp.incl, bufW, bufH, grp.tabs);
         const sensors = pf.sensors.concat(vf.sensors);
         if (vf.sensors.length) anyVirtual = true;
         total += sensors.length;
-        fp += tab + ":" + pf.fingerprint + (vf.fingerprint ? "|v" + vf.fingerprint : "") + ";";
-        perPollSensors.push({ tab, sensors });
-        if (tab === "pm25") this._virtualMobileSensors = vf.sensors; // debug ghost overlay
+        fp += grp.incl + ":" + pf.fingerprint + (vf.fingerprint ? "|v" + vf.fingerprint : "") + ";";
+        perPollSensors.push({ incl: grp.incl, sensors });
+        if (grp.incl === "pm25") this._virtualMobileSensors = vf.sensors; // debug ghost overlay
       }
       fingerprint = fp;
       nSensors = total;
@@ -6914,7 +6928,7 @@ class MapView {
         const si5 = i * 5;
         arr[si5] = sensor.sx;
         arr[si5 + 1] = sensor.sy;
-        const aqi = valueToAqi(aqiKey, sensor.value);
+        const aqi = (sensor.aqi != null && isFinite(sensor.aqi)) ? sensor.aqi : valueToAqi(aqiKey, sensor.value);
         arr[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
         arr[si5 + 3] = twoSigmaSq;
         arr[si5 + 4] = sensor.weightMultiplier;
@@ -6932,7 +6946,7 @@ class MapView {
     if (maxMode) {
       // One stride-5 array per pollutant; composite per-cell max across fields.
       const perPollS5 = perPollSensors.map(pp =>
-        buildS5(pp.sensors, _LEGEND_TAB_AQI_KEY[pp.tab] || "pm2.5")
+        buildS5(pp.sensors, _LEGEND_TAB_AQI_KEY[pp.incl] || "pm2.5")
       );
       this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
     } else {

@@ -2862,20 +2862,22 @@ function main() {
     const followingLive = map._playbackLiveFollow;
 
     if (pbPlayEl) {
-      if (followingLive && !map._historicalMode) {
-        // LIVE mode enabled: show Live button highlighted
+      // "Live" shows at the live edge: LIT only when actively live-following at
+      // 1x; UNLIT when following at >1x, or when in the live window but not yet
+      // following (clicking the unlit button enters live-follow — at any speed,
+      // handled in the click listener). Otherwise a plain Pause/Play transport.
+      const _liveFollowing = followingLive && !map._historicalMode;
+      const _inLiveWin = inLiveWindow && !map._historicalMode;
+      if (_liveFollowing) {
         pbPlayEl.textContent = "Live";
-        pbPlayEl.classList.add("isLive");
-      } else if (inLiveWindow && !map._historicalMode) {
-        // In live buffer window but LIVE not enabled: show Live button (not highlighted)
+        pbPlayEl.classList.toggle("isLive", _speed === 1);
+      } else if (_inLiveWin) {
         pbPlayEl.textContent = "Live";
         pbPlayEl.classList.remove("isLive");
       } else if (map.getPlaybackPlaying()) {
-        // Playing but not at end: show Pause
         pbPlayEl.textContent = "Pause";
         pbPlayEl.classList.remove("isLive");
       } else {
-        // Paused: show Play
         pbPlayEl.textContent = "Play";
         pbPlayEl.classList.remove("isLive");
       }

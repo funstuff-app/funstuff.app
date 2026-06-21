@@ -1549,6 +1549,14 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
         return
 
     start_ms, end_ms, prefixes = _get_today_mt_bounds(app_state)
+    # PurpleAir sensors get a grace window BEFORE the MT-day start equal to the
+    # client's PA staleness fade (45 min): a PA reading taken shortly before
+    # midnight is only minutes old just after midnight and should keep showing
+    # (the client fades PA on age, not on the calendar flip). Without it, the
+    # slime-mold walk's sparse re-polling makes most PA sensors vanish at
+    # midnight until the walk re-polls them. Non-PA fixed sensors keep the
+    # strict midnight boundary.
+    _PA_HISTORY_GRACE_MS = 45 * 60 * 1000.0
 
     for sensor in fixed_list:
         sensor_id = sensor.get("id")
@@ -1558,6 +1566,9 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
         hist_for_sensor = app_state.fixed_history.get(sensor_id, {})
         if not hist_for_sensor:
             continue
+
+        # PA sensors: allow recent pre-midnight readings across the rollover.
+        _lower_ms = (start_ms - _PA_HISTORY_GRACE_MS) if sensor_id.startswith("PA_") else start_ms
 
         readings = sensor.get("readings", {})
         if not isinstance(readings, dict):
@@ -1608,7 +1619,7 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
                     dt = parse_utc_timestamp(t)
                     entry_ms = dt.timestamp() * 1000.0 if dt else 0.0
                     entry["_time_ms"] = entry_ms
-                if entry_ms < start_ms or entry_ms >= end_ms:
+                if entry_ms < _lower_ms or entry_ms >= end_ms:
                     continue
                 val = entry.get("val")
                 try:
