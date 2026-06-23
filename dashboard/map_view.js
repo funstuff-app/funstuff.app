@@ -6788,12 +6788,26 @@ class MapView {
     // once the bar advances 45 min past last_seen.
     const _pbBounds = this.playbackMode ? this.getPlaybackBounds() : null;
     const _boundsMaxMs = (_pbBounds?.maxMs != null && isFinite(_pbBounds.maxMs)) ? _pbBounds.maxMs : null;
-    // LIVE view: PA staleness must be judged against the wall clock — data
-    // time (_boundsMaxMs/_dataNowMs) goes stale together with a dead feed,
-    // making day-old readings look fresh. Historical playback keeps data time.
-    const paRefNowMs = this._historicalMode
-      ? (_boundsMaxMs ?? this._dataNowMs())
-      : Date.now();
+    // LIVE view: PA staleness vs the wall clock (data time goes stale with a
+    // dead feed, making day-old readings look fresh).
+    // HISTORICAL: reference the snapshot's PA "now" = the freshest PA last_seen
+    // — the data-time analog of live's Date.now(). Do NOT use the timeline
+    // bounds max: it now extends to fixed-sensor history end (≈5 AM next day),
+    // far past when PA last reported, so every PA reads >45 min stale and the
+    // whole PM2.5 field drops out on historical days.
+    let paRefNowMs;
+    if (this._historicalMode) {
+      let _maxPaLs = -Infinity;
+      for (const f of fixed) {
+        if (f && f.purpleair && f.last_seen) {
+          const _ms = Number(f.last_seen) * 1000;
+          if (isFinite(_ms) && _ms > _maxPaLs) _maxPaLs = _ms;
+        }
+      }
+      paRefNowMs = (_maxPaLs > -Infinity) ? _maxPaLs : (_boundsMaxMs ?? this._dataNowMs());
+    } else {
+      paRefNowMs = Date.now();
+    }
     // Virtual mobile sensors measure age against the scrub position so they
     // decay as the user moves the playhead (not pinned to data-max).
     const virtualRefNowMs = (this.playbackMode && playbackTimeMs != null && isFinite(playbackTimeMs))
