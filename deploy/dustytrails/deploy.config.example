@@ -1,12 +1,15 @@
 # Personal deployment configuration for dustytrails
-# Copy to deploy.config and customize for your environment
+# Copy to deploy.config and customize for your environment.
+# NOTE: put real secrets in deploy.secrets (gitignored), NOT here — this file is
+# also read by the app as a local-dev fallback. See deploy.secrets.example.
 
-PI_HOST="raspi.local"
+PI_HOST="raspi.local"   # an mDNS name (e.g. host.local) survives DHCP changes
 PI_USER="pi"
 
-# Secrets (injected into systemd service Environment)
-DUSTY_PURPLEAIR_API_KEY="your-purpleair-api-key"
-AIRNOW_API_KEY="your-airnow-api-key"
+# Keep these EMPTY for local dev (empty PurpleAir key = no API quota burned).
+# deploy_to_pi.sh sources deploy.secrets after this file to inject the real keys.
+DUSTY_PURPLEAIR_API_KEY=""
+AIRNOW_API_KEY=""
 
 # If empty or commented out, deploy will auto-generate one.
 DUSTY_OWNER_TOKEN=""

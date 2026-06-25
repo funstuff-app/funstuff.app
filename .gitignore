@@ -34,6 +34,7 @@ HANDOFF_SCREENSHOTS/
 deploy/*/.staging/
 deploy/*/.minify_cache/
 deploy/*/deploy.config
+deploy/*/deploy.secrets
 deploy/*/tunnel.config
 
 # Deployment

@@ -837,6 +837,29 @@ class MapView {
     this._paFieldKey = "";
     this._paFieldValidRange = null;
     this._preWarmScanValidUntilMs = null;
+    // The cached canvas pixels belong to the prior pollutant/view/state. Every
+    // reuse path keys off `_paFieldCanvas` truthiness (animation fast-path
+    // line ~6514, the transient-animating early-return in `_ensurePaField`
+    // line ~6664, the cross-fade pickup line ~6745). Leaving stale pixels
+    // here lets those paths replay the wrong pollutant's heatmap.
+    this._paFieldCanvas = null;
+    this._paFieldCtx = null;
+    this._paFieldPrevCanvas = null;
+    this._paFieldComputedView = null;
+    this._paFieldValidPollutant = null;
+    this._paFieldValidViewKey = null;
+    this._paFieldValidFixed = null;
+    this._paFieldFingerprint = "";
+    // Per-pollutant max bag is populated lazily by getPerPollutantFieldMax()
+    // and keyed by _paFieldKey. Clear both so the next legend read recomputes.
+    this._paFieldMaxAqi = null;
+    this._paFieldMaxAqiPerPollutant = null;
+    this._perPollCacheKey = null;
+    this._perPollLastInputs = null;
+    // `_compositePaFieldOnTiles` dedups itself within a 4 ms window. After an
+    // invalidation we want the *next* composite to actually run, even if
+    // another RAF chain (playback loop, follow, scrub) composited a moment ago.
+    this._compositeLastDrawMs = 0;
   }
 
   setMaxTrailLen(val) {
@@ -2155,11 +2178,28 @@ class MapView {
     }
     const dLat = tLat - this.center.lat;
     const dLon = tLon - this.center.lon;
-    if (Math.abs(dLat) > 0.00005 || Math.abs(dLon) > 0.00005) {
+    const moved = Math.abs(dLat) > 0.00005 || Math.abs(dLon) > 0.00005;
+    if (moved) {
       this.center = { lat: this.center.lat + dLat * 0.03, lon: this.center.lon + dLon * 0.03 };
       this._redrawViewOnly();
+      this._followIdleFrames = 0;
+      this._followRAF = requestAnimationFrame(() => this._followTick());
+    } else {
+      // Drop from 60 Hz to ~6 Hz once the target has been stationary for a
+      // beat. Camera-recovery latency after a user pan stays well under a
+      // frame the user notices, but idle CPU stops burning watching a
+      // parked bus.
+      this._followIdleFrames = (this._followIdleFrames || 0) + 1;
+      const idleDelayMs = this._followIdleFrames > 15 ? 160 : 0;
+      if (idleDelayMs > 0) {
+        setTimeout(() => {
+          if (this._followTargetLat === null || !this.selectedId) return;
+          this._followRAF = requestAnimationFrame(() => this._followTick());
+        }, idleDelayMs);
+      } else {
+        this._followRAF = requestAnimationFrame(() => this._followTick());
+      }
     }
-    this._followRAF = requestAnimationFrame(() => this._followTick());
   }
 
   _hash01(s) {
@@ -6685,7 +6725,24 @@ class MapView {
     // once the bar advances 45 min past last_seen.
     const _pbBounds = this.playbackMode ? this.getPlaybackBounds() : null;
     const _boundsMaxMs = (_pbBounds?.maxMs != null && isFinite(_pbBounds.maxMs)) ? _pbBounds.maxMs : null;
-    const paRefNowMs = _boundsMaxMs ?? this._dataNowMs();
+    // HISTORICAL snapshots: the data-max can sit far past when PA last reported
+    // (other fixed/AirNow data extends later), so judging PA against it marks
+    // every PA sensor >45 min stale and drops the entire PM2.5 field — even
+    // though the dots still render. Reference the snapshot's own freshest PA
+    // report instead, so PA feeds the field the same as other sensors.
+    let paRefNowMs;
+    if (this._historicalMode) {
+      let _maxPaLs = -Infinity;
+      for (const f of fixed) {
+        if (f && f.purpleair && f.last_seen) {
+          const _ms = Number(f.last_seen) * 1000;
+          if (isFinite(_ms) && _ms > _maxPaLs) _maxPaLs = _ms;
+        }
+      }
+      paRefNowMs = (_maxPaLs > -Infinity) ? _maxPaLs : (_boundsMaxMs ?? this._dataNowMs());
+    } else {
+      paRefNowMs = _boundsMaxMs ?? this._dataNowMs();
+    }
     // Virtual mobile sensors measure age against the scrub position so they
     // decay as the user moves the playhead (not pinned to data-max).
     const virtualRefNowMs = (this.playbackMode && playbackTimeMs != null && isFinite(playbackTimeMs))
@@ -6798,6 +6855,19 @@ class MapView {
     // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
     this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
 
+    // Stash the inputs needed to lazily compute per-pollutant field maxes
+    // when the legend asks. Tying it to this code path inflated CPU by ~5ms
+    // per field recompute even when no one was reading the legend colors.
+    this._perPollLastInputs = {
+      state, playbackTimeMs, centerW, z, cssW, cssH, bufW, bufH,
+      paRefNowMs, virtualRefNowMs,
+      cellSize, gw, gh, cutoffSq, effectiveCutoffSq, wind, twoSigmaSq,
+    };
+    // Drop the cached per-pollutant bag so the next legend read recomputes
+    // against the new field state (the cache key advances with _paFieldKey).
+    this._paFieldMaxAqiPerPollutant = null;
+    this._perPollCacheKey = null;
+
     // ── Store overfetch buffer dimensions for composite offset ──
     this._paFieldBufW = bufW;
     this._paFieldBufH = bufH;
@@ -6865,6 +6935,126 @@ class MapView {
     this._windVecField = windField;
     this._windVecZoom = z;
     return result;
+  }
+
+  /**
+   * Lazy accessor for per-pollutant field maxes. Returns the memoized bag
+   * if it's current with the last main-pass cache key; otherwise runs the
+   * kernel regression for each non-rendered pollutant and caches the
+   * result. Cheap when nothing changed since the last call (single key
+   * comparison). Called from the legend code path only.
+   */
+  getPerPollutantFieldMax() {
+    const inputs = this._perPollLastInputs;
+    if (!inputs) return this._paFieldMaxAqiPerPollutant || null;
+    const key = this._paFieldKey || "";
+    if (this._perPollCacheKey === key && this._paFieldMaxAqiPerPollutant) {
+      return this._paFieldMaxAqiPerPollutant;
+    }
+    this._computePerPollutantFieldMax(
+      inputs.state, inputs.playbackTimeMs, inputs.centerW, inputs.z,
+      inputs.cssW, inputs.cssH, inputs.bufW, inputs.bufH,
+      inputs.paRefNowMs, inputs.virtualRefNowMs,
+      inputs.cellSize, inputs.gw, inputs.gh,
+      inputs.cutoffSq, inputs.effectiveCutoffSq, inputs.wind, inputs.twoSigmaSq
+    );
+    this._perPollCacheKey = key;
+    return this._paFieldMaxAqiPerPollutant;
+  }
+
+  /**
+   * Sample max AQI per pollutant from the kernel-regression numerical field
+   * within the viewport — one max per pollutant. The same Nadaraya-Watson
+   * formulation as _computePaFieldSync, run for each pollutant's sensor set.
+   * No pixels are painted; only the grid maxes are extracted. The rendered
+   * pollutant reuses `this._paFieldMaxAqi` already produced by the main pass.
+   * Do not call this directly — go through getPerPollutantFieldMax() so the
+   * result is cached against the current field key.
+   */
+  _computePerPollutantFieldMax(state, playbackTimeMs, centerW, z, cssW, cssH, bufW, bufH, paRefNowMs, virtualRefNowMs, cellSize, gw, gh, cutoffSq, effectiveCutoffSq, wind, twoSigmaSq) {
+    const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
+    const mobiles = Array.isArray(state && state.mobile) ? state.mobile : [];
+    const result = {};
+    const pollutants = ["pm25", "pm10", "o3", "no2", "co"];
+    const renderedTab = this._paFieldPollutant || "pm25";
+
+    const vpMarginX = (bufW - cssW) / 2;
+    const vpMarginY = (bufH - cssH) / 2;
+    const vpGxMin = Math.max(0, Math.floor(vpMarginX / cellSize));
+    const vpGyMin = Math.max(0, Math.floor(vpMarginY / cellSize));
+    const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + cssW) / cellSize));
+    const vpGyMax = Math.min(gh, Math.ceil((vpMarginY + cssH) / cellSize));
+
+    const isAniso = wind != null && wind.stretch > 1.001;
+    const wwx = isAniso ? wind.wx : 0;
+    const wwy = isAniso ? wind.wy : 0;
+    const wStretch = isAniso ? wind.stretch : 1;
+    const wUpwind = isAniso ? wind.upwindShrink : 1;
+
+    for (const tab of pollutants) {
+      if (tab === renderedTab && this._paFieldMaxAqi != null && isFinite(this._paFieldMaxAqi)) {
+        result[tab] = this._paFieldMaxAqi;
+        continue;
+      }
+
+      const paField = _collectPaFieldSensors(
+        fixed, playbackTimeMs, centerW, z, cssW, cssH, tab, bufW, bufH, paRefNowMs
+      );
+      const virtualField = _collectVirtualMobileSensors(
+        mobiles, playbackTimeMs, !!this.playbackMode, centerW, z, cssW, cssH,
+        virtualRefNowMs, tab, bufW, bufH
+      );
+      const allSensors = paField.sensors.concat(virtualField.sensors);
+      if (allSensors.length === 0) { result[tab] = null; continue; }
+
+      const aqiKey = _LEGEND_TAB_AQI_KEY[tab] || "pm2.5";
+      const s5 = new Float64Array(allSensors.length * 5);
+      for (let i = 0; i < allSensors.length; i++) {
+        const s = allSensors[i];
+        const si5 = i * 5;
+        s5[si5]     = s.sx;
+        s5[si5 + 1] = s.sy;
+        const aqi = valueToAqi(aqiKey, s.value);
+        s5[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
+        s5[si5 + 3] = twoSigmaSq;
+        s5[si5 + 4] = s.weightMultiplier;
+      }
+
+      let fieldMaxAqi = -Infinity;
+      for (let gy = vpGyMin; gy < vpGyMax; gy++) {
+        const py = (gy + 0.5) * cellSize;
+        for (let gx = vpGxMin; gx < vpGxMax; gx++) {
+          const pxx = (gx + 0.5) * cellSize;
+          let wSum = 0, vSum = 0;
+          for (let i = 0; i < s5.length; i += 5) {
+            const dx = pxx - s5[i];
+            const dy = py  - s5[i + 1];
+            const rawD2 = dx * dx + dy * dy;
+            if (rawD2 > effectiveCutoffSq) continue;
+            let d2;
+            if (isAniso) {
+              const along = dx * wwx + dy * wwy;
+              if (rawD2 > cutoffSq && along <= 0) continue;
+              const cross = dx * (-wwy) + dy * wwx;
+              const sf = along > 0 ? wStretch : wStretch * wUpwind;
+              const ea = along / sf;
+              d2 = ea * ea + cross * cross;
+            } else {
+              d2 = rawD2;
+            }
+            const w = s5[i + 4] * Math.exp(-d2 / s5[i + 3]);
+            wSum += w;
+            vSum += w * s5[i + 2];
+          }
+          if (wSum >= 0.001) {
+            const val = vSum / wSum;
+            if (val > fieldMaxAqi) fieldMaxAqi = val;
+          }
+        }
+      }
+      result[tab] = (fieldMaxAqi > -Infinity) ? fieldMaxAqi : null;
+    }
+    this._paFieldMaxAqiPerPollutant = result;
   }
 
   /** Synchronous Nadaraya-Watson kernel regression with Gaussian weights.
@@ -7913,10 +8103,12 @@ class MapView {
     const trailViewKey = `${this.center.lat.toFixed(6)}|${this.center.lon.toFixed(6)}|${this.zoom.toFixed(3)}|${w}|${h}|${this.selectedId || ''}|${this._paFieldPollutant || 'default'}`;
     const viewChanged = this._trailCacheViewKey !== trailViewKey;
     const timeDelta = (pbTimeMs != null && this._trailCacheTimeMs != null) ? (pbTimeMs - this._trailCacheTimeMs) : 0;
-    // Trail fading uses 45-min window. During active scrubbing, widen the threshold
-    // so trails aren't fully redrawn every frame (the expensive O(vehicles*points) path).
-    // 30s during scrub still gives smooth visual feedback; 2s during playback keeps fading smooth.
-    const timeThreshold = this._scrubbing ? 30000 : 2000;
+    // Trail fading uses a 45-min window with fade in the last 9 minutes — that's
+    // ~1% alpha drop per 5.4 seconds, so the rebuild cadence can be coarse and
+    // still look smooth. 30s during active scrub, 8s during normal playback.
+    // (Was 2s, which redrew the O(vehicles*points) trail cache ~30× per minute
+    // during playback even at 1× speed — measurable laptop heat.)
+    const timeThreshold = this._scrubbing ? 30000 : 8000;
     // Sim-time gate: has enough simulated time elapsed to warrant a redraw?
     const simTimeElapsed = Math.abs(timeDelta) > timeThreshold;
     // Wall-time floor: at high playback speeds (60x screensaver), the sim-time gate

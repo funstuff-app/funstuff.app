@@ -193,7 +193,9 @@ function _mergeStateDelta(acc, delta) {
   return acc;
 }
 
+let _lastStateWasNotModified = false;
 async function fetchState() {
+  _lastStateWasNotModified = false;
   let url = `${appConfig.apiBaseUrl}/state`;
   // Delta delivery: ask the server to strip trail points we already have.
   if (_newestTrailMs != null) {
@@ -206,7 +208,10 @@ async function fetchState() {
     const headers = { "X-App-Token": APP_TOKEN };
     if (_stateEtag) headers["If-None-Match"] = _stateEtag;
     const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers, credentials: "same-origin" });
-    if (res.status === 304 && _accumulatedState) return _accumulatedState;
+    if (res.status === 304 && _accumulatedState) {
+      _lastStateWasNotModified = true;
+      return _accumulatedState;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     _stateEtag = res.headers.get("ETag") || null;
     const payload = await res.json();
@@ -895,7 +900,7 @@ function main() {
     // colors depend on the selected sensor / per-pollutant data and must
     // refresh whenever this function runs, even if the dim bracket is
     // unchanged, so we update them ahead of the dim-row skip.
-    if (legendCollapsed) _applyLegendTabColors();
+    _applyLegendTabColors();
     // Find the first row that would dim (lo > activeValue) — that index IS the bracket.
     // When activeValue is null (no field data yet), keep the last bracket — never
     // revert to showing all rows undimmed.
@@ -1071,7 +1076,7 @@ function main() {
     }
     localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
     localStorage.setItem(LEGEND_COLLAPSED_KEY, legendCollapsed ? "true" : "false");
-    if (legendOpen && legendCollapsed) _applyLegendTabColors();
+    if (legendOpen) _applyLegendTabColors();
     else _clearLegendTabColors();
   }
 
@@ -1113,8 +1118,12 @@ function main() {
         })()
       : null;
 
-    const fieldAqi = (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi))
-      ? map._paFieldMaxAqi : null;
+    // Per-pollutant field maxes from the map — one AQI value per tab.
+    // Lazy getter: only computes when stale; reuses memoized bag otherwise.
+    // Keeps the field render path cheap when no one is reading legend colors.
+    const perPollField = (map && typeof map.getPerPollutantFieldMax === "function")
+      ? map.getPerPollutantFieldMax()
+      : null;
 
     for (const tab of tabs) {
       const tabKey = tab.dataset.legend;
@@ -1131,8 +1140,9 @@ function main() {
             if (isFinite(n)) { activeValue = n; break; }
           }
         }
-      } else {
-        activeValue = _fieldAqiToLegendValue(tabKey, fieldAqi);
+      }
+      if (activeValue == null && perPollField) {
+        activeValue = _fieldAqiToLegendValue(tabKey, perPollField[tabKey]);
       }
       let color = null;
       if (activeValue != null) {
@@ -1152,10 +1162,17 @@ function main() {
         tab.style.color = color;
         tab.style.filter = "none";
         tab.style.textShadow = `0 0 6px ${hexToRgba(color, 0.4)}`;
+        // Preserve the pre-color dim contrast: the active/auto-active tab
+        // reads full-strength, others read at reduced opacity so the
+        // selected pollutant pops without graying out the others.
+        const isPrimary = tab.classList.contains("active")
+          || tab.classList.contains("auto-active");
+        tab.style.opacity = isPrimary ? "" : "0.5";
       } else {
         tab.style.color = "";
         tab.style.filter = "";
         tab.style.textShadow = "";
+        tab.style.opacity = "";
       }
     }
   }
@@ -1189,16 +1206,19 @@ function main() {
   if (legendEl) {
     const allTabs = legendEl.querySelectorAll(".legendTab");
     for (const tab of allTabs) {
-      tab.addEventListener("click", () => {
+      // Activate on mousedown (not click) for snappier perceived response.
+      // Button 0 only — ignore right/middle. preventDefault so a follow-up
+      // click event doesn't double-fire the toggle.
+      tab.addEventListener("mousedown", (ev) => {
+        if (ev.button !== 0) return;
+        ev.preventDefault();
         const clicked = tab.dataset.legend || "pm25";
-        // Clicking the active tab deselects back to default (null)
         legendTab = (clicked === legendTab) ? null : clicked;
         userLegendTab = legendTab;
         legendUserOverride = !!selectedId;
         if (legendTab) localStorage.setItem(LEGEND_TAB_KEY, legendTab);
         else localStorage.removeItem(LEGEND_TAB_KEY);
         _lastViewportAutoKey = undefined;
-        // if (!legendTab && !selectedId) _updateViewportAutoTab();
         _syncMapPollutant();
         buildLegend(true);
       });
@@ -5282,6 +5302,25 @@ function main() {
     }
 
     try {
+    // 304 fast-path: server confirmed nothing changed. Just heartbeat the
+    // status indicators (so "Live" doesn't drift to "Offline") and reschedule.
+    // Skip the full draw + sidebar re-render: same data → same pixels.
+    if (_lastStateWasNotModified) {
+      _pbLastServerResponseMs = Date.now();
+      _tickConsecutiveFailures = 0;
+      const statusElLive = document.getElementById("statusText");
+      if (statusElLive && !statusElLive.classList.contains("live")) {
+        statusElLive.textContent = "Live";
+        statusElLive.classList.remove("offline");
+        statusElLive.classList.add("live");
+      }
+      _tickInFlight = false;
+      const pollMs = _sseConnected ? POLL_MS_SSE : POLL_MS;
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      _tickTimeout = setTimeout(tick, pollMs);
+      return;
+    }
+
     // Ensure st.fixed is always an array (Home sensor now provided by backend)
     if (!Array.isArray(st.fixed)) st.fixed = [];
 

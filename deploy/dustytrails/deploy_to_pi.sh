@@ -36,6 +36,15 @@ else
     exit 1
 fi
 
+# Source deploy-only secrets LAST so they override deploy.config. Real secrets
+# (e.g. the PurpleAir key) live here, NOT in deploy.config — the app reads
+# deploy.config as a local-dev fallback, so keeping its key empty means local
+# testing never burns PurpleAir API quota, while the Pi still gets the real key.
+if [[ -f "$SCRIPT_DIR/deploy.secrets" ]]; then
+    # shellcheck source=deploy.secrets.example
+    source "$SCRIPT_DIR/deploy.secrets"
+fi
+
 # Validate required config
 if [[ -z "${PI_HOST:-}" || -z "${PI_USER:-}" ]]; then
     echo -e "\033[0;31m[ERROR]\033[0m deploy.config must set PI_HOST and PI_USER"
@@ -186,11 +195,19 @@ SETUP_ONLY=0
 DATA_ONLY=0
 SKIP_DATA=0
 LANDING_DRY_RUN=0
+DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --files-only)
             FILES_ONLY=1
+            shift
+            ;;
+        --dry-run)
+            # Preview the file sync (rsync --dry-run): writes NOTHING to the Pi
+            # and skips service/secrets setup. Use it to confirm what would
+            # change before a real deploy.
+            DRY_RUN=1
             shift
             ;;
         --setup-only)
@@ -236,6 +253,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-data         No-op (data sync is disabled globally)"
             echo "  --setup-only        Only setup service (assumes files already deployed)"
             echo "  --landing-dry-run   Preview landing/ -> Pi rsync (dry-run; writes nothing)"
+            echo "  --dry-run           Preview app file sync (rsync --dry-run); writes nothing, no restart"
             echo "  --host HOST    Override PI_HOST from deploy.config"
             echo "  --user USER    Override PI_USER from deploy.config"
             echo "  -h, --help     Show this help"
@@ -299,6 +317,8 @@ build_staging() {
     cp "$REPO_ROOT/dashboard/manifest.json" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/pa_advection_worker.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/pa_field_worker.js" "$STAGING_DIR/dashboard/"
+    cp "$REPO_ROOT/dashboard/jog_wheel.js" "$STAGING_DIR/dashboard/"
+    cp "$REPO_ROOT/dashboard/playback_state.js" "$STAGING_DIR/dashboard/"
     
     # Patch dashboard files for subpath deployment
     # The reverse proxy uses handle_path which strips /dustytrails prefix,
@@ -343,68 +363,48 @@ deploy_files() {
         exit 1
     fi
     
-    # Create install directory on Pi (in user home, no sudo needed)
-    log_info "Creating directory structure on Pi..."
-    ssh "$PI_TARGET" "mkdir -p '$INSTALL_DIR'"
-    
-    # Sync files using rsync (efficient, only transfers changes)
-    log_info "Syncing application files..."
-    rsync -avz --delete \
-        --exclude='*.pyc' \
-        --exclude='__pycache__' \
-        --exclude='.staging' \
-        --exclude='venv' \
-        "$STAGING_DIR/" \
-        "$PI_TARGET:$INSTALL_DIR/"
-    
-    log_info "Files deployed to $PI_TARGET:$INSTALL_DIR"
+    # Create install directory on Pi (in user home, no sudo needed).
+    # Skipped under --dry-run so a preview writes NOTHING to the Pi.
+    if [[ "${DRY_RUN:-0}" != "1" ]]; then
+        log_info "Creating directory structure on Pi..."
+        ssh "$PI_TARGET" "mkdir -p '$INSTALL_DIR'"
+    fi
+
+    # Sync files using rsync. NOTE: --delete intentionally omitted — the Pi's
+    # install dir may contain manually-placed files (full repo checkout, local
+    # tooling, .env) that must not be pruned. --update skips any file whose
+    # remote mtime is newer than the local copy, so a hotfix made directly on
+    # the Pi won't be silently overwritten by an older staged version.
+    # Destination is ALWAYS $INSTALL_DIR — never ~/.mobileair.
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        log_warn "DRY RUN — rsync --dry-run: previewing changes, writing nothing."
+        rsync -avzu --dry-run --itemize-changes \
+            --exclude='*.pyc' --exclude='__pycache__' --exclude='.staging' --exclude='venv' \
+            "$STAGING_DIR/" \
+            "$PI_TARGET:$INSTALL_DIR/"
+    else
+        log_info "Syncing application files..."
+        rsync -avzu \
+            --exclude='*.pyc' --exclude='__pycache__' --exclude='.staging' --exclude='venv' \
+            "$STAGING_DIR/" \
+            "$PI_TARGET:$INSTALL_DIR/"
+        log_info "Files deployed to $PI_TARGET:$INSTALL_DIR"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 2b: Deploy ~/.mobileair data directory
+# Step 2b: ~/.mobileair data sync — PERMANENTLY DISABLED
 # ─────────────────────────────────────────────────────────────────────────────
-# DISABLED: the Pi's ~/.mobileair is the authoritative live production state
-# (snapshots, road graphs, prefs) and MUST NOT be overwritten by this script.
-# The function body is commented out and replaced with a hard refusal so any
-# caller that reaches it exits cleanly without touching the remote host.
+# The Pi's ~/.mobileair is authoritative live production state (snapshots, road
+# graphs, prefs, caches, SQLite DB) and must NEVER be overwritten by a deploy.
+# The sync logic has been REMOVED outright — not just commented — so there is no
+# code path, and nothing to "uncomment", that can write to the remote data dir.
+# This function survives only as an explicit no-op so any stray caller is inert.
 # ─────────────────────────────────────────────────────────────────────────────
 deploy_data() {
-    log_warn "deploy_data() is DISABLED — refusing to touch $REMOTE_DATA_DIR on Pi."
-    log_warn "The Pi's ~/.mobileair is authoritative production state."
+    log_warn "deploy_data() is a no-op — ~/.mobileair sync is permanently disabled."
+    log_warn "The Pi's $REMOTE_DATA_DIR is authoritative production state and is never touched."
     return 0
-
-    # --- ORIGINAL BODY (intentionally left commented for reference) ---------
-    # log_step "Deploying data directory (~/.mobileair)..."
-    #
-    # if [[ ! -d "$LOCAL_DATA_DIR" ]]; then
-    #     log_warn "Local data directory not found: $LOCAL_DATA_DIR"
-    #     log_warn "Skipping data sync"
-    #     return 0
-    # fi
-    #
-    # # Create remote data directory
-    # log_info "Creating data directory on Pi..."
-    # ssh "$PI_TARGET" "mkdir -p '$REMOTE_DATA_DIR'"
-    #
-    # # Sync data directory, excluding secrets, logs, and snapshots.
-    # # Snapshots are NOT synced: the Pi saves its own daily and those are
-    # # the authoritative copies.  Road graphs and other data files ARE pushed.
-    # log_info "Syncing data files (this may take a while for road graphs)..."
-    # rsync -avz \
-    #     --exclude='.env' \
-    #     --exclude='*.log' \
-    #     --exclude='dev-cert.pem' \
-    #     --exclude='dev-key.pem' \
-    #     --exclude='*.pem' \
-    #     --exclude='prefs_log.ndjson' \
-    #     --exclude='snapshots/' \
-    #     "$LOCAL_DATA_DIR/" \
-    #     "$PI_TARGET:$REMOTE_DATA_DIR/"
-    #
-    # # Set permissions
-    # ssh "$PI_TARGET" "chmod -R 755 '$REMOTE_DATA_DIR' && chmod 700 '$REMOTE_DATA_DIR/snapshots' 2>/dev/null || true"
-    #
-    # log_info "Data deployed to $PI_TARGET:$REMOTE_DATA_DIR"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,17 +482,19 @@ echo "Python environment ready!"
 REMOTE_VENV
     log_info "Python environment set up."
 
-    # Install system-level native libraries needed by cfgrib/eccodes on ARM
-    log_info "Ensuring native ecCodes library is installed..."
-    ssh "$PI_TARGET" bash <<'REMOTE_APT'
-if ! dpkg -s libeccodes-dev >/dev/null 2>&1; then
+    # Ensure the native ecCodes lib (used by cfgrib/wind) is present — BEST EFFORT.
+    # A code deploy must never be blocked by an optional native lib or a stale apt
+    # index, so any failure here only warns and the deploy continues.
+    log_info "Checking native ecCodes library (best-effort)..."
+    ssh "$PI_TARGET" bash <<'REMOTE_APT' || log_warn "libeccodes-dev not installed (apt failed) — continuing; wind/GRIB may be degraded."
+if dpkg -s libeccodes-dev >/dev/null 2>&1; then
+    echo "libeccodes-dev already installed."
+else
     echo "Installing libeccodes-dev..."
     sudo apt-get install -y libeccodes-dev
-else
-    echo "libeccodes-dev already installed."
 fi
 REMOTE_APT
-    log_info "Native dependencies OK."
+    log_info "Native dependency check done."
 
     # Template the service file from the repo copy (single source of truth).
     # Replace the hardcoded user/paths with values from deploy.config.
@@ -515,6 +517,17 @@ REMOTE_APT
     local pa_key="${DUSTY_PURPLEAIR_API_KEY:-}"
     local an_key="${AIRNOW_API_KEY:-}"
     local ow_tok="${DUSTY_OWNER_TOKEN:-}"
+
+    # Guard against the 2026-06 outage: silently shipping an empty PurpleAir key
+    # makes the Pi fall back to whatever's in its deploy.config (or nothing).
+    # Put the real key in deploy.secrets. Override only for a deliberate keyless deploy.
+    if [[ -z "$pa_key" && "${ALLOW_EMPTY_PURPLEAIR:-0}" != "1" ]]; then
+        log_error "DUSTY_PURPLEAIR_API_KEY is empty — refusing to deploy."
+        log_error "Add it to $SCRIPT_DIR/deploy.secrets (copy deploy.secrets.example)."
+        log_error "To deploy without a PurpleAir key anyway: ALLOW_EMPTY_PURPLEAIR=1 $0 ..."
+        exit 1
+    fi
+
     ssh -t "$PI_TARGET" bash <<REMOTE_SUDO
 set -e
 sudo cp "$INSTALL_DIR/dustytrails.service" /etc/systemd/system/dustytrails.service
@@ -583,25 +596,26 @@ main() {
     echo "  Service: $SERVICE_NAME"
     echo ""
     
-    if [[ "$SETUP_ONLY" == "1" ]]; then
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_warn "════════ DRY RUN ════════"
+        log_warn "Previewing app file sync only: NO service restart, NO secrets, NO systemd changes."
+        log_warn "~/.mobileair is never touched (data sync was removed entirely)."
+        build_staging
+        deploy_files
+    elif [[ "$SETUP_ONLY" == "1" ]]; then
         setup_service
     elif [[ "$LANDING_DRY_RUN" == "1" ]]; then
         # Landing-page sync preview. HARDCODED --dry-run — publishes nothing.
         landing_dry_run
-    # DISABLED: DATA_ONLY branch would call deploy_data() against the Pi's
-    # ~/.mobileair. That directory is authoritative live production state.
-    # elif [[ "$DATA_ONLY" == "1" ]]; then
-    #     deploy_data
     elif [[ "$FILES_ONLY" == "1" ]]; then
         build_staging
         deploy_files
     else
-        # Full deploy: app files + service (data sync DISABLED — see above).
+        # Default full deploy = app files + service ONLY.
+        # ~/.mobileair is NEVER synced: deploy_data is permanently disabled and
+        # deliberately not called from any branch (no --data-only path exists).
         build_staging
         deploy_files
-        # if [[ "$SKIP_DATA" != "1" ]]; then
-        #     deploy_data
-        # fi
         setup_service
     fi
     

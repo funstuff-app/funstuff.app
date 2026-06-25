@@ -406,11 +406,7 @@
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeStartMenu(); });
 
   var smShutdown = document.getElementById("sm-shutdown");
-  var smInstagram = document.getElementById("sm-instagram");
 
-  if (smInstagram) smInstagram.addEventListener("click", function () {
-    closeStartMenu();
-  });
   if (smShutdown) smShutdown.addEventListener("click", function () {
     closeStartMenu();
     minimizeWindow();
@@ -526,6 +522,26 @@
     }
   }
 
+  /* Clicks INSIDE an iframe don't bubble to the parent doc, so a
+   * desktop window containing an iframe can't catch them with its own
+   * mousedown listener. When the iframe gets focus (which any click
+   * inside does), the parent window fires `blur` and document.activeElement
+   * becomes the iframe. Use that to bring the owning desktop window to
+   * front, matching the behavior of canvas-based apps where mousedown
+   * bubbles normally. */
+  window.addEventListener("blur", function () {
+    setTimeout(function () {
+      var ae = document.activeElement;
+      if (!ae || ae.tagName !== "IFRAME") return;
+      for (var id in _deskWins) {
+        if (_deskWins[id].el && _deskWins[id].el.contains(ae)) {
+          _bringToFront(id);
+          break;
+        }
+      }
+    }, 0);
+  });
+
   function _bringToFront(id) {
     _topZ++;
     var w = _deskWins[id];
@@ -613,6 +629,99 @@
       _lastWinY = Math.round(wr.top);
     }
   }
+
+  function _toggleDeskMax(id) {
+    var w = _deskWins[id];
+    if (!w) return;
+    var el = w.el;
+    var titleH = el.querySelector(".desktop-titlebar").offsetHeight;
+    var tbar = document.querySelector(".taskbar");
+    var tbarH = tbar ? tbar.offsetHeight : 32;
+    /* Find the iframe (if any) inside body so we can resize it too —
+     * canvases (pipes/flowerbox) auto-fill via existing style. */
+    var iframe = w.bodyEl ? w.bodyEl.querySelector("iframe") : null;
+
+    if (w.maximized) {
+      el.style.left = w._restLeft || "";
+      el.style.top = w._restTop || "";
+      el.style.width = w._restWidth || "";
+      el.style.height = w._restHeight || "";
+      if (w.bodyEl) w.bodyEl.style.height = w._restBodyHeight || "";
+      if (iframe && w._restIframeHeight !== undefined) {
+        iframe.style.height = w._restIframeHeight;
+      }
+      w.maximized = false;
+    } else {
+      w._restLeft = el.style.left;
+      w._restTop = el.style.top;
+      w._restWidth = el.style.width;
+      w._restHeight = el.style.height;
+      if (w.bodyEl) w._restBodyHeight = w.bodyEl.style.height;
+      if (iframe) w._restIframeHeight = iframe.style.height;
+
+      el.style.left = "0px";
+      el.style.top = "0px";
+      el.style.width = window.innerWidth + "px";
+      el.style.height = (window.innerHeight - tbarH) + "px";
+      if (w.bodyEl) {
+        w.bodyEl.style.height = (window.innerHeight - tbarH - titleH) + "px";
+      }
+      if (iframe) iframe.style.height = "100%";
+      w.maximized = true;
+      _bringToFront(id);
+    }
+  }
+
+  /* Browser resize → keep desktop windows in-frame. Maximized windows
+   * stretch to the new viewport. Non-maximized windows call their app-
+   * specific onResize (if any) and then get clamped so titlebar
+   * buttons / right edge never disappear off-screen. */
+  function _onDesktopBrowserResize() {
+    var tbar = document.querySelector(".taskbar");
+    var tbarH = tbar ? tbar.offsetHeight : 32;
+    var availW = window.innerWidth;
+    var availH = window.innerHeight - tbarH;
+    for (var id in _deskWins) {
+      var w = _deskWins[id];
+      if (!w || !w.el || w.minimized) continue;
+      // The main page is registered as _deskWins["__main"] for the z-stack,
+      // but it has its own page-level responsive layout and doesn't carry
+      // a .desktop-titlebar — skip it here.
+      if (w.isMain) continue;
+      var titlebar = w.el.querySelector(".desktop-titlebar");
+      if (!titlebar) continue; // non-standard window (e.g. winamp) — skip
+      var titleH = titlebar.offsetHeight;
+      if (w.maximized) {
+        w.el.style.left = "0px";
+        w.el.style.top = "0px";
+        w.el.style.width = availW + "px";
+        w.el.style.height = availH + "px";
+        if (w.bodyEl) w.bodyEl.style.height = (availH - titleH) + "px";
+        continue;
+      }
+      if (typeof w.onResize === "function") {
+        try { w.onResize(w, { availW: availW, availH: availH, titleH: titleH }); }
+        catch (e) { console.error("[desk-resize] onResize threw", e); }
+      }
+      // Clamp into viewport so titlebar buttons stay reachable.
+      var rect = w.el.getBoundingClientRect();
+      if (rect.width > availW) w.el.style.width = availW + "px";
+      var newRect = w.el.getBoundingClientRect();
+      if (newRect.right > availW) {
+        w.el.style.left = Math.max(0, availW - newRect.width) + "px";
+      }
+      if (newRect.bottom > availH) {
+        w.el.style.top = Math.max(0, availH - newRect.height) + "px";
+      }
+    }
+  }
+  window.addEventListener("resize", _onDesktopBrowserResize);
+  window.addEventListener("orientationchange", _onDesktopBrowserResize);
+  /* Expose for manual testing: paste `window.__deskResize()` into console
+   * to fire the handler without actually resizing the browser. Useful when
+   * you suspect the listener isn't bound. */
+  window.__deskResize = _onDesktopBrowserResize;
+  window.__deskWins = _deskWins;
 
   function _closeDeskWin(id) {
     var w = _deskWins[id];
@@ -713,6 +822,7 @@
       '</div>' +
       '<div class="desk-tb-btns">' +
         '<button class="desk-tb-btn" data-action="min" aria-label="Minimize">_</button>' +
+        '<button class="desk-tb-btn" data-action="max" aria-label="Maximize">&#9633;</button>' +
         '<button class="desk-tb-btn desk-tb-close" data-action="close" aria-label="Close">&#10005;</button>' +
       '</div>';
     win.appendChild(tb);
@@ -731,6 +841,10 @@
     tb.querySelector('[data-action="min"]').addEventListener("click", function (e) {
       e.stopPropagation();
       _toggleDeskMin(opts.id);
+    });
+    tb.querySelector('[data-action="max"]').addEventListener("click", function (e) {
+      e.stopPropagation();
+      _toggleDeskMax(opts.id);
     });
     tb.querySelector('[data-action="close"]').addEventListener("click", function (e) {
       e.stopPropagation();
@@ -771,6 +885,7 @@
       onClose: opts.onClose,
       onRestore: opts.onRestore,
       onMinimize: opts.onMinimize,
+      onResize: opts.onResize,
     };
     _bringToFront(opts.id);
 
@@ -1123,11 +1238,85 @@
     });
   }
 
+  /* ── Pictures (Instagram likes projector) window ── */
+  /* Compute window width + body height that keeps the 3:5 portrait
+   * aspect AND fills the viewport. ~40px margin so the window doesn't
+   * butt up against the screen edges. titlebar (~24px) is added on top
+   * by the desktop-window flex layout, so subtract it from body height. */
+  function _picturesDimsForViewport(viewportW, viewportH) {
+    var margin = 40;
+    var titlebar = 28;            // approximate; flex layout absorbs slack
+    var maxH = Math.max(120, viewportH - margin - titlebar);
+    var maxW = Math.max(120, viewportW - margin);
+    // Start from the larger of the two and let aspect pick the other.
+    var h = maxH;
+    var w = Math.round(h * 720 / 1200);
+    if (w > maxW) { w = maxW; h = Math.round(w * 1200 / 720); }
+    return { w: w, h: h };
+  }
+
+  var PICTURES_TB_ICON =
+    '<svg class="tb-icon" width="14" height="14" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true">' +
+    '<rect x="1" y="1" width="14" height="14" rx="2" fill="#1a1a2e" stroke="#c0c0c0" stroke-width="1"/>' +
+    '<rect x="4" y="3" width="8" height="6" fill="#444"/>' +
+    '<circle cx="8" cy="6" r="2" fill="#999" stroke="#c0c0c0" stroke-width="0.5"/>' +
+    '<rect x="10" y="3" width="2" height="2" fill="#ff0"/>' +
+    '<rect x="3" y="11" width="10" height="2" rx="1" fill="#808080"/>' +
+    '</svg>';
+
+  function openPicturesWindow() {
+    closeStartMenu();
+    if (_deskWins.pictures) {
+      if (_deskWins.pictures.minimized) _toggleDeskMin("pictures");
+      _bringToFront("pictures");
+      return;
+    }
+
+    /* The app is designed as a 720x1200 portrait canvas (projector.css:50).
+       Fill the available viewport while keeping 3:5 aspect — no hard cap
+       so the window grows/shrinks with the browser. */
+    var dim = _picturesDimsForViewport(window.innerWidth, window.innerHeight - 32);
+    var w = dim.w;
+    var h = dim.h;
+
+    var iframe = document.createElement("iframe");
+    iframe.src = "https://likes.funstuff.app/";
+    iframe.setAttribute("title", "Pictures");
+    iframe.setAttribute("loading", "lazy");
+    iframe.setAttribute("allow", "autoplay; encrypted-media; picture-in-picture; fullscreen");
+    iframe.setAttribute("allowfullscreen", "");
+    /* width:100% + height:100% — fully responsive to the containing
+       desktop-window-body. The body itself is given an explicit pixel
+       height below so the percent has something to resolve against. */
+    iframe.style.cssText =
+      "display:block;width:100%;height:100%;border:0;background:#000;";
+
+    var bodyEl = openDesktopWindow({
+      id: "pictures",
+      title: "Pictures",
+      icon: "&#x1F4F7;",
+      tbIconSVG: PICTURES_TB_ICON,
+      width: w,
+      bodyEl: iframe,
+      /* Recompute portrait dimensions on browser resize so the iframe
+         grows/shrinks with the viewport. Only fires when not maximized. */
+      onResize: function (winRef, env) {
+        var d = _picturesDimsForViewport(env.availW, env.availH);
+        winRef.el.style.width = d.w + "px";
+        if (winRef.bodyEl) winRef.bodyEl.style.height = d.h + "px";
+      },
+    });
+    /* Give the body a real pixel height now so the iframe's 100% works,
+       and a real pixel height that the maximize handler can save+restore. */
+    if (bodyEl) bodyEl.style.height = h + "px";
+  }
+
   /* ── Wire up Start Menu items ── */
   var smPipes = document.getElementById("sm-pipes");
   var smFlowerbox = document.getElementById("sm-flowerbox");
   var smVideos = document.getElementById("sm-videos");
   var smWinamp = document.getElementById("sm-winamp");
+  var smPictures = document.getElementById("sm-pictures");
 
   if (smPipes) smPipes.addEventListener("click", function (e) {
     e.preventDefault();
@@ -1144,6 +1333,10 @@
   if (smWinamp) smWinamp.addEventListener("click", function (e) {
     e.preventDefault();
     openWinampWindow();
+  });
+  if (smPictures) smPictures.addEventListener("click", function (e) {
+    e.preventDefault();
+    openPicturesWindow();
   });
 
   /* ── On load: derive active taskbar button from restored scroll position ── */
