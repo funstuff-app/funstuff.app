@@ -127,6 +127,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
   }
 
   const sensors = [];
+  const _fixedSlot = new Map();  // overlapping non-PA fixed dedup: slotKey -> {idx, tMs}
   let fingerprint = "";
   for (const f of fixed) {
     if (!f) continue;
@@ -176,6 +177,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
     const interp = interpolateFixedReadingsAtTime(f, playbackTimeMs);
     let value = NaN;
     let maxAqi = null;
+    let tMs = null;  // reading time of the value used — drives overlap recency
     if (maxTabs && maxTabs.length) {
       // Sensor contributes its WORST pollutant (highest AQI) across the group's
       // tabs — ['pm25','pm10'] merges both particulates into one field.
@@ -187,7 +189,7 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
               const v = Number(r.value);
               if (isFinite(v) && v >= 0) {
                 const a = valueToAqi(_LEGEND_TAB_AQI_KEY[tab], v);
-                if (a != null && isFinite(a) && (maxAqi == null || a > maxAqi)) { maxAqi = a; value = v; }
+                if (a != null && isFinite(a) && (maxAqi == null || a > maxAqi)) { maxAqi = a; value = v; tMs = r.timeMs; }
               }
             }
             break;
@@ -199,25 +201,49 @@ function _collectPaFieldSensors(fixed, playbackTimeMs, centerW, zoom, cssW, cssH
       let readingOutlier = false;
       for (const rk of readingKeys) {
         const r = interp && interp[rk];
-        if (r && r.value != null) { value = Number(r.value); readingOutlier = !!r.outlier; break; }
+        if (r && r.value != null) { value = Number(r.value); readingOutlier = !!r.outlier; tMs = r.timeMs; break; }
       }
       if (!isFinite(value) || value < 0) continue;
       if (readingOutlier) continue;
     }
 
     const wp = latLonToWorld(lat, lon, zoom);
-    sensors.push({
+    const cand = {
       sx: wp.x - centerW.x + projW / 2,
       sy: wp.y - centerW.y + projH / 2,
       value,
       aqi: maxAqi,
       weightMultiplier: (f.purpleair ? 1 : _PA_FIELD_FIXED_WEIGHT_MULTIPLIER) * staleWeight,
-    });
-    // Max mode quantizes at 4 AQI points (finer than _aqiColorCat) so the
-    // field recomputes when a sensor visibly changes within a coarse AQI band
-    // (PA dot sub-bands are finer than AQI categories).
-    fingerprint += (maxTabs && maxTabs.length) ? ("m" + Math.round(maxAqi / 4) + ",")
-      : (isPm25 ? _pm25ColorCat(value) : _aqiColorCat(valueToAqi(aqiKey, value) ?? 0));
+    };
+    if (f.purpleair) {
+      // PurpleAir are server-thinned (~1 per 500 m) so they don't overlap.
+      sensors.push(cand);
+    } else {
+      // Overlapping FIXED sensors (literally co-located, e.g. QUURB + MTMET at
+      // the same DAQ site): the field must be fed by the MOST RECENTLY updated
+      // one, not an averaged blend of fresh + stale. Same idea as the mobile
+      // ghost dedup — one sensor per fine spatial slot, freshest reading wins.
+      // ~22 m grid so only truly co-located instruments merge, never distinct
+      // sites. If the fresh sensor goes offline its time stops advancing and
+      // the other naturally takes over on the next update.
+      const slotKey = ((lat * 5000) | 0) + "," + ((lon * 5000) | 0);
+      const candTMs = (tMs != null && isFinite(tMs)) ? tMs : -Infinity;
+      const ex = _fixedSlot.get(slotKey);
+      if (ex === undefined) {
+        sensors.push(cand);
+        _fixedSlot.set(slotKey, { idx: sensors.length - 1, tMs: candTMs });
+      } else if (candTMs > ex.tMs) {
+        sensors[ex.idx] = cand;  // newer co-located sensor replaces the stale one
+        ex.tMs = candTMs;
+      }
+      // else: older co-located sensor — drop it (the fresher one is kept)
+    }
+  }
+
+  // Fingerprint built AFTER dedup so it reflects only the kept sensors.
+  for (const s of sensors) {
+    fingerprint += (maxTabs && maxTabs.length) ? ("m" + Math.round(s.aqi / 4) + ",")
+      : (isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(valueToAqi(aqiKey, s.value) ?? 0));
   }
 
   return { sensors, fingerprint };
