@@ -6933,7 +6933,23 @@ class MapView {
 
     // ── Cutoff in screen pixels ──
     const _fd = window._fieldDebug;
-    const cutoffDeg = _fd.cutoffDeg;
+    // Cut° scales with zoom: it is a linear function of the visible vertical
+    // span (degrees of latitude filling the map height). Two zoom anchors, both
+    // "this pair fills the screen vertically":
+    //   QHV(41.3028) ↔ QP2(39.5958)            span≈1.707° → cut = ceil knob
+    //   Rose Park QRP(40.7955) ↔ Herriman QH3  span≈0.299° → cut = floor knob
+    // floor/ceil knobs set the ramp endpoints; delta multiplies the whole ramp.
+    const _visTop = worldToLatLon(centerW.x, centerW.y - cssH / 2, z).lat;
+    const _visBot = worldToLatLon(centerW.x, centerW.y + cssH / 2, z).lat;
+    const _visVDeg = Math.abs(_visTop - _visBot);
+    const _VIS_A = 1.707, _VIS_B = 0.299;
+    const _delta = _fd.delta != null ? _fd.delta : 1;
+    const _f0 = _fd.cutFloor != null ? _fd.cutFloor : 0.3;
+    const _c0 = _fd.cutCeil  != null ? _fd.cutCeil  : 0.7;
+    const _floor = Math.min(_f0, _c0), _ceil = Math.max(_f0, _c0);
+    const _slope = (_ceil - _floor) / (_VIS_A - _VIS_B);
+    let cutoffDeg = (_floor + _slope * (_visVDeg - _VIS_B)) * _delta;
+    cutoffDeg = Math.max(0.02, Math.min(cutoffDeg, _ceil));
     const refW = latLonToWorld(clat, clon + cutoffDeg, z);
     const cutoffPx = Math.abs(refW.x - centerW.x);
     const cutoffSq = cutoffPx * cutoffPx;
