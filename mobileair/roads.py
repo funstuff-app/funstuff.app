@@ -1,8 +1,26 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
+from array import array
+
+
+def _malloc_trim() -> None:
+    """Best-effort return of freed heap pages to the OS (glibc/Linux only).
+
+    After loading the graph we drop a ~400 MB JSON parse tree; without this the
+    freed memory stays mapped to the process and inflates RSS. No-op elsewhere.
+    """
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+        if hasattr(libc, "malloc_trim"):
+            libc.malloc_trim(0)
+    except Exception:
+        pass
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from heapq import heappop, heappush
@@ -82,6 +100,73 @@ class RoadGraphConfig:
     max_expansions: int = 25_000
 
 
+class _NodesView:
+    """Sequence view over parallel lat/lon arrays; ``nodes[i]`` -> ``(lat, lon)``.
+
+    Backed by compact ``array('d')`` storage instead of a list of tuples, which
+    cuts the Utah graph (~541k nodes) from hundreds of MB to a few MB while
+    keeping every existing ``nodes[i]`` / ``enumerate(nodes)`` / ``len(nodes)``
+    call site working unchanged.
+    """
+    __slots__ = ("_lat", "_lon")
+
+    def __init__(self, lat, lon):
+        self._lat = lat
+        self._lon = lon
+
+    def __len__(self):
+        return len(self._lat)
+
+    def __getitem__(self, i):
+        return (self._lat[i], self._lon[i])
+
+    def __iter__(self):
+        lat = self._lat
+        lon = self._lon
+        for i in range(len(lat)):
+            yield (lat[i], lon[i])
+
+    def __eq__(self, other):
+        try:
+            n = len(other)
+        except TypeError:
+            return NotImplemented
+        if n != len(self._lat):
+            return False
+        for i in range(n):
+            o = other[i]
+            if self._lat[i] != o[0] or self._lon[i] != o[1]:
+                return False
+        return True
+
+    __hash__ = None
+
+
+class _AdjView:
+    """Sequence view over CSR arrays; ``adj[i]`` -> ``[(to, dist), ...]``."""
+    __slots__ = ("_indptr", "_indices", "_wt")
+
+    def __init__(self, indptr, indices, wt):
+        self._indptr = indptr
+        self._indices = indices
+        self._wt = wt
+
+    def __len__(self):
+        return len(self._indptr) - 1
+
+    def __getitem__(self, i):
+        s = self._indptr[i]
+        e = self._indptr[i + 1]
+        idx = self._indices
+        wt = self._wt
+        return [(idx[k], wt[k]) for k in range(s, e)]
+
+    def __iter__(self):
+        indptr = self._indptr
+        for i in range(len(indptr) - 1):
+            yield self[i]
+
+
 class RoadGraph:
     """Lightweight offline road graph.
 
@@ -97,14 +182,43 @@ class RoadGraph:
     on how the file is built; routing treats adjacency as given.
     """
 
-    def __init__(self, nodes: list[tuple[float, float]], adj: list[list[tuple[int, float]]], *, 
-                 cfg: RoadGraphConfig | None = None, 
+    def __init__(self, nodes: list[tuple[float, float]], adj: list[list[tuple[int, float]]], *,
+                 cfg: RoadGraphConfig | None = None,
                  elevations: list[float] | None = None):
-        self.nodes = nodes  # [(lat, lon), ...]
-        self.adj = adj
+        # Compatibility constructor: accept Python lists, store as compact arrays.
+        lat = array("d")
+        lon = array("d")
+        for n in nodes:
+            lat.append(float(n[0]))
+            lon.append(float(n[1]))
+        elev = array("d", (float(e) for e in elevations)) if elevations is not None else None
+        indptr = array("l", [0])
+        indices = array("l")
+        wt = array("d")
+        for row in adj:
+            for to, dist in row:
+                indices.append(int(to))
+                wt.append(float(dist))
+            indptr.append(len(indices))
+        self._setup(lat, lon, indptr, indices, wt, elev, cfg)
+
+    @classmethod
+    def _from_arrays(cls, lat, lon, indptr, indices, wt, elev, cfg) -> "RoadGraph":
+        self = cls.__new__(cls)
+        self._setup(lat, lon, indptr, indices, wt, elev, cfg)
+        return self
+
+    def _setup(self, lat, lon, indptr, indices, wt, elev, cfg) -> None:
+        self._lat = lat  # array('d')
+        self._lon = lon  # array('d')
+        self._indptr = indptr    # CSR row offsets, array('l'), len == n_nodes+1
+        self._indices = indices  # CSR neighbor node ids, array('l')
+        self._wt = wt            # CSR edge weights (meters), array('d')
+        self.elevations = elev   # array('d') or None
         self.cfg = cfg or RoadGraphConfig()
-        self.elevations = elevations  # [elev_m, ...] or None if no elevation data
-        self._grid: dict[tuple[int, int], list[int]] = {}
+        self.nodes = _NodesView(lat, lon)
+        self.adj = _AdjView(indptr, indices, wt)
+        self._grid: dict = {}
         self._build_grid_index()
 
     @staticmethod
@@ -112,7 +226,15 @@ class RoadGraph:
         return os.path.expanduser("~/.mobileair/roads/utah_centerlines_graph.json")
 
     @classmethod
-    def load(cls, path: str | None = None, *, cfg: RoadGraphConfig | None = None) -> "RoadGraph":
+    def load(cls, path: str | None = None, *, cfg: RoadGraphConfig | None = None,
+             bbox: tuple[float, float, float, float] | None = None) -> "RoadGraph":
+        """Load a road graph into compact typed arrays (~35 MB for the full Utah
+        graph, versus ~500 MB as Python lists of tuples).
+
+        *bbox* = (lat_min, lat_max, lon_min, lon_max), if given, clips to that
+        box at load time: nodes outside are dropped, edges are remapped to the
+        kept-node index space, and edges leaving the box are dropped.
+        """
         p = path or cls.default_graph_path()
         with open(p, "r", encoding="utf-8") as f:
             obj = json.load(f)
@@ -128,41 +250,80 @@ class RoadGraph:
         adj_raw = obj.get("adj")
         if not isinstance(nodes_raw, list) or not isinstance(adj_raw, list):
             raise ValueError("invalid road graph shape")
+        if len(adj_raw) != len(nodes_raw):
+            raise ValueError("adj length must equal nodes length")
 
-        nodes: list[tuple[float, float]] = []
-        elevations: list[float] | None = [] if has_elevation else None
-        
-        for n in nodes_raw:
+        # Optional bbox clip: pick kept source indices and their old->new remap.
+        keep_new_idx: dict[int, int] | None = None
+        if bbox is not None:
+            la0, la1, lo0, lo1 = bbox
+            keep_new_idx = {}
+            for i, n in enumerate(nodes_raw):
+                if not isinstance(n, list) or len(n) < 2:
+                    continue
+                lat_i, lon_i = float(n[0]), float(n[1])
+                if la0 <= lat_i <= la1 and lo0 <= lon_i <= lo1:
+                    keep_new_idx[i] = len(keep_new_idx)
+
+        # Build compact arrays directly from the parsed JSON so we never
+        # materialize the ~500 MB list-of-tuples form.
+        lat = array("d")
+        lon = array("d")
+        elev = array("d") if has_elevation else None
+        for i, n in enumerate(nodes_raw):
+            if keep_new_idx is not None and i not in keep_new_idx:
+                continue
             if not isinstance(n, list) or len(n) < 2:
                 raise ValueError("invalid node")
-            lat, lon = float(n[0]), float(n[1])
-            nodes.append((lat, lon))
-            if elevations is not None:
-                elev = float(n[2]) if len(n) >= 3 else 0.0
-                elevations.append(elev)
+            lat.append(float(n[0]))
+            lon.append(float(n[1]))
+            if elev is not None:
+                elev.append(float(n[2]) if len(n) >= 3 else 0.0)
 
-        adj: list[list[tuple[int, float]]] = []
-        for row in adj_raw:
+        indptr = array("l", [0])
+        indices = array("l")
+        wt = array("d")
+        for i, row in enumerate(adj_raw):
+            if keep_new_idx is not None and i not in keep_new_idx:
+                continue
             if not isinstance(row, list):
                 raise ValueError("invalid adjacency")
-            out: list[tuple[int, float]] = []
             for e in row:
                 if not isinstance(e, list) or len(e) != 2:
                     raise ValueError("invalid edge")
                 to = int(e[0])
-                dist = float(e[1])
-                out.append((to, dist))
-            adj.append(out)
+                if keep_new_idx is not None:
+                    nt = keep_new_idx.get(to)
+                    if nt is None:
+                        continue  # edge leaves the clipped region
+                    indices.append(nt)
+                else:
+                    indices.append(to)
+                wt.append(float(e[1]))
+            indptr.append(len(indices))
 
-        if len(adj) != len(nodes):
-            raise ValueError("adj length must equal nodes length")
-        return cls(nodes, adj, cfg=cfg, elevations=elevations)
+        # Release the ~400 MB JSON parse tree and hand the pages back to the OS
+        # before building the grid, so steady-state RSS reflects the compact
+        # arrays (~35 MB) rather than the transient parse peak.
+        del obj, nodes_raw, adj_raw
+        gc.collect()
+        _malloc_trim()
+
+        return cls._from_arrays(lat, lon, indptr, indices, wt, elev, cfg)
 
     def _build_grid_index(self) -> None:
         g = self.cfg.grid_deg
-        for i, (lat, lon) in enumerate(self.nodes):
-            key = (int(math.floor(lat / g)), int(math.floor(lon / g)))
-            self._grid.setdefault(key, []).append(i)
+        lat = self._lat
+        lon = self._lon
+        grid = self._grid
+        floor = math.floor
+        for i in range(len(lat)):
+            key = (int(floor(lat[i] / g)), int(floor(lon[i] / g)))
+            cell = grid.get(key)
+            if cell is None:
+                cell = array("l")
+                grid[key] = cell
+            cell.append(i)
 
     def nearest_node(self, lat: float, lon: float) -> int | None:
         if not self.nodes:
