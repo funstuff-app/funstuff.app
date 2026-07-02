@@ -1131,10 +1131,16 @@ function main() {
       const data = LEGEND_DATA[tabKey];
       const entries = data.entries;
       let activeValue = null;
-      if (selectedSensor && selectedSensor.readings) {
+      // Prefer the map's readings bag at the DISPLAYED time — same source as
+      // the marker label and legend bars. The state snapshot is live-only and
+      // diverges from the marker during playback (wrong title colors).
+      const selReadings = (selectedId && map && typeof map.getSelectedReadings === "function" && map.getSelectedReadings())
+        || (selectedSensor && selectedSensor.readings) || null;
+      if (selReadings) {
         const keys = _DIM_READING_KEYS[tabKey] || [];
         for (const rk of keys) {
-          const rd = selectedSensor.readings[rk];
+          let rd = selReadings[rk];
+          if (rd != null && typeof rd !== "object") rd = { value: rd };
           if (rd && rd.value != null && isFinite(rd.value)) {
             const n = parseFloat(rd.value);
             if (isFinite(n)) { activeValue = n; break; }
@@ -2856,20 +2862,22 @@ function main() {
     const followingLive = map._playbackLiveFollow;
 
     if (pbPlayEl) {
-      if (followingLive && !map._historicalMode) {
-        // LIVE mode enabled: show Live button highlighted
+      // "Live" shows at the live edge: LIT only when actively live-following at
+      // 1x; UNLIT when following at >1x, or when in the live window but not yet
+      // following (clicking the unlit button enters live-follow — at any speed,
+      // handled in the click listener). Otherwise a plain Pause/Play transport.
+      const _liveFollowing = followingLive && !map._historicalMode;
+      const _inLiveWin = inLiveWindow && !map._historicalMode;
+      if (_liveFollowing) {
         pbPlayEl.textContent = "Live";
-        pbPlayEl.classList.add("isLive");
-      } else if (inLiveWindow && !map._historicalMode) {
-        // In live buffer window but LIVE not enabled: show Live button (not highlighted)
+        pbPlayEl.classList.toggle("isLive", _speed === 1);
+      } else if (_inLiveWin) {
         pbPlayEl.textContent = "Live";
         pbPlayEl.classList.remove("isLive");
       } else if (map.getPlaybackPlaying()) {
-        // Playing but not at end: show Pause
         pbPlayEl.textContent = "Pause";
         pbPlayEl.classList.remove("isLive");
       } else {
-        // Paused: show Play
         pbPlayEl.textContent = "Play";
         pbPlayEl.classList.remove("isLive");
       }
@@ -2919,12 +2927,10 @@ function main() {
       // If playhead is now outside bounds (data trimmed or server restarted), handle it
       if (tMs != null && isFinite(tMs)) {
         if (tMs < b.minMs) {
-          // In LIVE mode, jump to live edge; otherwise clamp to minMs
-          if (map._playbackLiveFollow) {
-            tMs = b.maxMs;
-          } else {
-            tMs = b.minMs;
-          }
+          // Data trimmed past the playhead: clamp to the new start and keep
+          // playing. Never jump to the live edge — new server data must not
+          // move the playhead; playback simply continues into it.
+          tMs = b.minMs;
           map.setPlaybackTimeMs(tMs);
         }
         if (tMs > b.maxMs) {
@@ -3255,13 +3261,13 @@ function main() {
     }
 
     // When playback enters the live buffer window, stop and show Live button.
-    // Buffer window = predictedInterval * speed, but only for 1x and 5x.
+    // Buffer window = predictedInterval * speed, at every speed.
     {
       const _spd2 = map.getPlaybackSpeed() || 1.0;
       const _nextInS2 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
       const _wallElapsed3 = (Date.now() - _pbLastServerResponseMs) / 1000;
       const _remS3 = Math.max(0, _nextInS2 - _wallElapsed3);
-      const _lwMs2 = (_spd2 <= 5) ? _remS3 * 1000 * _spd2 : 0;
+      const _lwMs2 = _remS3 * 1000 * _spd2;
       const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
       var _inLiveWindow2 = hasBounds && tMs != null && isFinite(tMs) && tMs >= bufferEdge;
       // Only trigger if we CROSSED into the window this frame (were below, now at/above).
@@ -3410,14 +3416,13 @@ function main() {
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
       const atEnd = map.isPlaybackAtEnd(100);
-      // Buffer snap target: always calculated regardless of speed.
-      // Live window (button shows "Live"): only for 1x and 5x.
+      // Buffer snap target and Live window: all speeds.
       const _spd = map.getPlaybackSpeed() || 1.0;
       const _nextInS3 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
       const _wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
       const _remS = Math.max(0, _nextInS3 - _wallElapsed);
       const _snapMs = _remS * 1000 * _spd;
-      const _lwMs = (_spd <= 5) ? _snapMs : 0;
+      const _lwMs = _snapMs;
       const curMs = map.getPlaybackTimeMs();
       const inLiveWindow = atEnd || (
         _lwMs > 0 && curMs != null && isFinite(curMs) && curMs >= b.maxMs - _lwMs
@@ -3445,8 +3450,8 @@ function main() {
         return;
       }
 
-      // If in live window (1x/5x), enable LIVE mode (not available for historical replays)
-      if (inLiveWindow && _spd <= 5 && !map._playbackLiveFollow && !map._historicalMode) {
+      // If in live window, enable LIVE mode at any speed (not for historical replays)
+      if (inLiveWindow && !map._playbackLiveFollow && !map._historicalMode) {
         map._playbackLiveFollow = true;
         _pbPageAutoFollow = true; // resume page tracking in LIVE mode
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
@@ -3526,13 +3531,9 @@ function main() {
       const newSpeed = map.getPlaybackSpeed() || 1.0;
 
       // If in LIVE mode, recalculate buffer position when speed changes.
+      // LIVE mode is supported at every speed.
       if (map._playbackLiveFollow) {
-        // Speeds >5x don't support Live mode
-        if (newSpeed > 5) {
-          map._playbackLiveFollow = false;
-          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-          _resetLiveTracking();
-        } else {
+        {
           // Recalculate buffer start for the new speed.
           // Larger speed = larger buffer window = playhead must move back.
           // Smaller speed = smaller buffer window = playhead should move forward
@@ -3602,6 +3603,12 @@ function main() {
   
   // Loading state tracking - shared between historical and snapshot loading
   let _isLoadingData = false;
+
+  // Shade over the map (not the UI) while data is loading
+  function setMapLoadingShade(on) {
+    const shade = document.getElementById("mapLoadingShade");
+    if (shade) shade.classList.toggle("hidden", !on);
+  }
   
   // Track current selected day for menu display
   let _selectedDayValue = "live";
@@ -3694,6 +3701,7 @@ function main() {
     
     // Disable save while loading
     _isLoadingData = true;
+    setMapLoadingShade(true);
     updateSaveButtonState();
     
     try {
@@ -3755,33 +3763,10 @@ function main() {
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
       
-      // Build playback points and set time to 5AM
+      // Build playback points; start the playhead at the earliest data.
       map._ensurePlaybackPoints(window._historicalState);
       const b = map.getPlaybackBounds();
-      {
-        // Set playhead to 5AM local on the loaded day
-        let initMs;
-        if (isFinite(b.minMs) && isFinite(b.maxMs)) {
-          if (dateStr === "demo") {
-            const startDate = new Date(b.minMs);
-            const fiveAM = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate(), 5, 0, 0, 0).getTime();
-            initMs = clamp(fiveAM, b.minMs, b.maxMs);
-          } else {
-            const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
-            const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
-            const fiveAM = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
-            initMs = clamp(fiveAM, b.minMs, b.maxMs);
-          }
-        } else if (dateStr && dateStr !== "demo") {
-          // No mobile trails at all (e.g. weekend). Derive 5AM from the date.
-          const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
-          const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
-          if (isFinite(_y) && isFinite(_mo) && isFinite(_d)) {
-            initMs = new Date(_y, _mo - 1, _d, 5, 0, 0, 0).getTime();
-          }
-        }
-        if (initMs != null) map.setPlaybackTimeMs(initMs);
-      }
+      if (isFinite(b.minMs)) map.setPlaybackTimeMs(b.minMs);
       
       // Store state, render sidebar, draw ONLY tiles (no overlay yet)
       map.lastState = window._historicalState;
@@ -3820,6 +3805,7 @@ function main() {
       alert(`Failed to load historical data:\n${e.message}`);
     } finally {
       _isLoadingData = false;
+      setMapLoadingShade(false);
       updateSaveButtonState();
     }
   }
@@ -3974,6 +3960,7 @@ function main() {
     
     // Disable save while loading
     _isLoadingData = true;
+    setMapLoadingShade(true);
     updateSaveButtonState();
     
     try {
@@ -3993,7 +3980,7 @@ function main() {
       window._historicalState = loadedState;
 
       // Load wind snapshots from the historical snapshot if present
-      if (loadedState.wind_snapshots && typeof loadedState.wind_snapshots === "object") {
+      if (!window.WIND_LOADING_DISABLED && loadedState.wind_snapshots && typeof loadedState.wind_snapshots === "object") {
         map._windSnapshots = loadedState.wind_snapshots;
         map._windSnapshotKeys = Object.keys(loadedState.wind_snapshots).sort();
         if (map._windSnapshotKeys.length > 0) {
@@ -4035,18 +4022,11 @@ function main() {
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
       
-      // Build playback points and set time to 30 min in (so trails are visible)
+      // Build playback points; start the playhead at the earliest data.
       map._ensurePlaybackPoints(window._historicalState);
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
-        map.setPlaybackTimeMs(b.minMs + 30 * 60000);
-      } else if (dateStr && dateStr !== "demo") {
-        // No mobile trails. Derive 5AM from date so playback isn't frozen.
-        const baseDateStr = dateStr.replace(/\s*\(.*\)$/, "");
-        const [_y, _mo, _d] = baseDateStr.split("-").map(Number);
-        if (isFinite(_y) && isFinite(_mo) && isFinite(_d)) {
-          map.setPlaybackTimeMs(new Date(_y, _mo - 1, _d, 5, 30, 0, 0).getTime());
-        }
+        map.setPlaybackTimeMs(b.minMs);
       }
       
       // Store state, render sidebar, draw
@@ -4077,6 +4057,7 @@ function main() {
       }
     } finally {
       _isLoadingData = false;
+      setMapLoadingShade(false);
       updateSaveButtonState();
     }
   }
@@ -4222,23 +4203,9 @@ function main() {
     pbDaysSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, e));
   }
   
-  async function updateDaysSubmenu() {
+  function updateDaysSubmenu() {
     if (!pbDaysSubmenu) return;
     pbDaysSubmenu.innerHTML = "";
-
-    // Fetch available snapshots to know which days have data
-    const snapshotDates = new Map(); // dateStr -> {size_bytes, demo}
-    try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`, { headers: { "X-App-Token": APP_TOKEN } });
-      if (resp.ok) {
-        const data = await resp.json();
-        for (const snap of (data.snapshots || [])) {
-          snapshotDates.set(snap.date, { size_bytes: snap.size_bytes, demo: !!snap.demo });
-        }
-      }
-    } catch (e) {
-      console.warn("Failed to fetch snapshot list:", e);
-    }
 
     // Always show Today (Live) first
     const liveItem = document.createElement("div");
@@ -4252,23 +4219,9 @@ function main() {
     });
     pbDaysSubmenu.appendChild(liveItem);
 
-    // Show demo entries from the snapshot list (if any)
-    for (const [snap, info] of snapshotDates.entries()) {
-      if (!info.demo) continue;
-      const item = document.createElement("div");
-      item.className = "pbSubmenuItem";
-      if (_selectedDayValue === snap) item.classList.add("active");
-      item.textContent = `🧪 ${snap} (demo)`;
-      item.addEventListener("click", (e) => {
-        e.stopPropagation();
-        _selectedDayValue = snap;
-        loadHistoricalDay(snap);
-        closePlaybackMenu();
-      });
-      pbDaysSubmenu.appendChild(item);
-    }
-
-    // Show the past 7 days, every day, snapshot or not
+    // Show the past 7 days, built purely from the local calendar — no network.
+    // Whether a snapshot actually exists is discovered when the user clicks
+    // (snapshot/load returns an error for missing days).
     const now = new Date();
     for (let i = 1; i <= 7; i++) {
       const d = new Date(now);
@@ -4279,26 +4232,16 @@ function main() {
       const dateStr = `${yyyy}-${mm}-${dd}`;
       const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
       const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-      const snapInfo = snapshotDates.get(dateStr);
-      const hasSnapshot = snapInfo && !snapInfo.demo;
-
       const item = document.createElement("div");
       item.className = "pbSubmenuItem";
-      if (hasSnapshot) {
-        const sizeMB = (snapInfo.size_bytes / (1024 * 1024)).toFixed(1);
-        item.textContent = `${dayName} ${monthDay} (${sizeMB} MB)`;
-        if (_selectedDayValue === dateStr) item.classList.add("active");
-        item.addEventListener("click", (e) => {
-          e.stopPropagation();
-          _selectedDayValue = dateStr;
-          loadHistoricalDay(dateStr);
-          closePlaybackMenu();
-        });
-      } else {
-        item.textContent = `${dayName} ${monthDay}`;
-        item.style.opacity = "0.35";
-        item.style.pointerEvents = "none";
-      }
+      item.textContent = `${dayName} ${monthDay}`;
+      if (_selectedDayValue === dateStr) item.classList.add("active");
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        _selectedDayValue = dateStr;
+        loadHistoricalDay(dateStr);
+        closePlaybackMenu();
+      });
       pbDaysSubmenu.appendChild(item);
     }
   }
@@ -5392,11 +5335,6 @@ function main() {
           const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
           const speed = map.getPlaybackSpeed() || 1.0;
           const offsetMs = nextInS * 1000 * speed;
-          
-          // Only activate Live mode for speeds 1-5x
-          if (speed > 5) {
-            map._playbackLiveFollow = false;
-          }
           
           const initMs = map._playbackLiveFollow 
             ? Math.max(b.minMs, b.maxMs - offsetMs)

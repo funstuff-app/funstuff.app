@@ -1056,6 +1056,42 @@
     });
   }
 
+  /* ── Music (MIDI CLIPZ) window ── */
+  var MUSIC_TB_ICON =
+    '<svg class="tb-icon" width="14" height="14" viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true">' +
+    '<rect width="16" height="16" rx="1" fill="#1a1a2e"/>' +
+    '<rect x="6" y="3" width="2" height="8" fill="#0cc"/>' +
+    '<rect x="11" y="2" width="2" height="8" fill="#0cc"/>' +
+    '<rect x="6" y="2" width="7" height="2" fill="#0cc"/>' +
+    '<circle cx="5" cy="11" r="2" fill="#f0f"/>' +
+    '<circle cx="10" cy="10" r="2" fill="#f0f"/>' +
+    '</svg>';
+
+  function openMusicWindow() {
+    closeStartMenu();
+    if (_deskWins.music) {
+      if (_deskWins.music.minimized) _toggleDeskMin("music");
+      _bringToFront("music");
+      return;
+    }
+
+    var w = Math.min(520, window.innerWidth - 40);
+    var h = Math.min(460, window.innerHeight - 120);
+
+    openDesktopWindow({
+      id: "music",
+      title: "Music",
+      icon: "&#9835;",
+      tbIconSVG: MUSIC_TB_ICON,
+      width: w,
+      bodyHTML:
+        '<iframe width="100%" height="' + h + '" ' +
+        'src="https://midi.funstuff.app/" ' +
+        'title="MIDI CLIPZ" frameborder="0" ' +
+        'style="display:block;"></iframe>',
+    });
+  }
+
   /* ── Winamp (Webamp) ── */
   var _webampInst = null;
   var _webampContainer = null;
@@ -1333,6 +1369,11 @@
   if (smWinamp) smWinamp.addEventListener("click", function (e) {
     e.preventDefault();
     openWinampWindow();
+  });
+  var smMusic = document.getElementById("sm-music");
+  if (smMusic) smMusic.addEventListener("click", function (e) {
+    e.preventDefault();
+    openMusicWindow();
   });
   if (smPictures) smPictures.addEventListener("click", function (e) {
     e.preventDefault();

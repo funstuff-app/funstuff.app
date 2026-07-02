@@ -18,6 +18,7 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import ssl
 import socket
@@ -120,6 +121,14 @@ def get_cached_road_graph() -> RoadGraph | None:
         return _cached_road_graph
     
     _road_graph_load_attempted = True
+    # The all-Utah centerline graph is ~541k nodes that explode to ~0.5 GB of
+    # Python objects in RAM — and ~430k of those nodes are in the served metro,
+    # so a bounding-box clip barely helps. On the 1.8 GB Pi that half-gig is the
+    # dominant heap consumer, spent only to cosmetically snap bus GPS to roads.
+    # Default OFF; set MOBILEAIR_ENABLE_ROAD_GRAPH=1 to re-enable map-matching.
+    if os.environ.get("MOBILEAIR_ENABLE_ROAD_GRAPH", "") not in ("1", "true", "yes"):
+        _cached_road_graph = None
+        return _cached_road_graph
     try:
         p = os.environ.get("MOBILEAIR_ROAD_GRAPH") or RoadGraph.default_graph_path()
         if os.path.exists(p):
@@ -931,6 +940,10 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
                             "latitude": lat,
                             "longitude": lon,
                             "pm2.5": pm25,
+                            # Carry the snapshot's last_seen so the client's
+                            # staleness fade applies to seeded (possibly old)
+                            # readings instead of showing them as fresh forever.
+                            "last_seen": f.get("last_seen"),
                         })
                         pa_seeded += 1
                 if pa_seeded:
@@ -1536,6 +1549,14 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
         return
 
     start_ms, end_ms, prefixes = _get_today_mt_bounds(app_state)
+    # PurpleAir sensors get a grace window BEFORE the MT-day start equal to the
+    # client's PA staleness fade (45 min): a PA reading taken shortly before
+    # midnight is only minutes old just after midnight and should keep showing
+    # (the client fades PA on age, not on the calendar flip). Without it, the
+    # slime-mold walk's sparse re-polling makes most PA sensors vanish at
+    # midnight until the walk re-polls them. Non-PA fixed sensors keep the
+    # strict midnight boundary.
+    _PA_HISTORY_GRACE_MS = 45 * 60 * 1000.0
 
     for sensor in fixed_list:
         sensor_id = sensor.get("id")
@@ -1545,6 +1566,9 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
         hist_for_sensor = app_state.fixed_history.get(sensor_id, {})
         if not hist_for_sensor:
             continue
+
+        # PA sensors: allow recent pre-midnight readings across the rollover.
+        _lower_ms = (start_ms - _PA_HISTORY_GRACE_MS) if sensor_id.startswith("PA_") else start_ms
 
         readings = sensor.get("readings", {})
         if not isinstance(readings, dict):
@@ -1595,7 +1619,7 @@ def _inject_fixed_history(app_state: AppState, st: dict[str, Any]) -> None:
                     dt = parse_utc_timestamp(t)
                     entry_ms = dt.timestamp() * 1000.0 if dt else 0.0
                     entry["_time_ms"] = entry_ms
-                if entry_ms < start_ms or entry_ms >= end_ms:
+                if entry_ms < _lower_ms or entry_ms >= end_ms:
                     continue
                 val = entry.get("val")
                 try:
@@ -2572,13 +2596,16 @@ PURPLEAIR_API_URL = "https://api.purpleair.com/v1/sensors"
 
 
 def _fetch_purpleair_sensors(fields: str = "pm2.5,last_seen",
-                             sensor_indices: list[int] | None = None) -> list[dict[str, Any]]:
+                             sensor_indices: list[int] | None = None,
+                             bbox: dict[str, float] | None = None) -> list[dict[str, Any]]:
     """Fetch PurpleAir sensors in the SLC bounding box.
 
     *fields* controls which columns are requested.
     *sensor_indices* — if provided, uses the ``show_only`` parameter to fetch
     only those specific sensors (no bounding box needed).  Used for targeted
     neighbour refreshes so we don't burn points fetching the entire grid.
+    *bbox* — optional {lat_min, lat_max, lon_min, lon_max} overriding the full
+    SLC box; used by the rotating discovery cell (one small cell per pass).
     """
     if sensor_indices is not None:
         # Targeted fetch: specific sensor indices only, no bbox
@@ -2587,12 +2614,13 @@ def _fetch_purpleair_sensors(fields: str = "pm2.5,last_seen",
             "show_only": ",".join(str(i) for i in sensor_indices),
         }
     else:
+        b = bbox or SLC_BOUNDS
         params = {
             "fields": fields,
-            "nwlng": str(SLC_BOUNDS["lon_min"]),
-            "nwlat": str(SLC_BOUNDS["lat_max"]),
-            "selng": str(SLC_BOUNDS["lon_max"]),
-            "selat": str(SLC_BOUNDS["lat_min"]),
+            "nwlng": str(b["lon_min"]),
+            "nwlat": str(b["lat_max"]),
+            "selng": str(b["lon_max"]),
+            "selat": str(b["lat_min"]),
             "location_type": "0",  # outdoor only
         }
     qs = "&".join(f"{k}={v}" for k, v in params.items())
@@ -2997,7 +3025,8 @@ def purpleair_fetch_loop(
       probe ∪ frontier
 
       • probe    — a sparse, spatially-even ~1/10 sample (one sensor per coarse
-                   PROBE_GRID_DEG cell).  Stable across polls; always watched.
+                   PROBE_GRID_DEG cell, picked at random each cycle so coverage
+                   rotates through every sensor over time).  Always watched.
       • frontier — the sensors a *previous* poll's significant changes queued
                    for this poll (the moving wavefront).  Empty when quiet.
 
@@ -3016,8 +3045,8 @@ def purpleair_fetch_loop(
     range/speed scaling with how many sensors are changing.  Stale sensors fade
     on the map on their own, so partial cluster coverage per poll is fine.
 
-    Metadata (name, lat, lon + full pm2.5 sweep) still refreshes periodically so
-    every sensor has a position for the geometry and the map stays current.
+    The periodic full-bbox metadata sweep is DISABLED (kill switch above); a
+    rotating one-cell discovery query covers new sensors and metadata instead.
     """
     _log("[PurpleAir] purpleair_fetch_loop thread STARTED")
 
@@ -3028,6 +3057,18 @@ def purpleair_fetch_loop(
     # ── WALK TUNABLES (geometry-based adaptive sampling) ──────────────────────
     # The probe: one sensor per coarse cell → sparse, spatially even baseline.
     PROBE_GRID_DEG       = 0.05    # ~5 km cell. Bigger ⇒ fewer probes (~1/10 here).
+    # Full-bbox metadata refresh kill switch: the 3-hour all-sensors call burns
+    # a full-population API credit and updates every sensor at once. Probe
+    # rotation (random per-cell pick) refreshes last_seen/pm2.5 across all
+    # known sensors over time, and the rotating DISCOVERY CELL below covers
+    # new-sensor discovery — so the full sweep is unnecessary. Code intact.
+    PURPLEAIR_META_REFRESH_DISABLED = True
+    # Rotating discovery: every Nth poll cycle, one ~PROBE_GRID_DEG cell of the
+    # SLC box is queried by bbox (a handful of rows). Cells come from a
+    # shuffled deck, so coverage is random but EQUAL — every cell is visited
+    # once per deck pass before any repeats. Discovers newly installed sensors
+    # and refreshes name/lat/lon, replacing the disabled full sweep.
+    DISCOVERY_EVERY_N_CYCLES = 6
     # Significant-change debounce: must cross a color band AND move this much.
     DEBOUNCE_DELTA       = 2.5     # µg/m³  (anti-flicker fuzz around boundaries)
     # The pinwheel sweep fired around each changed sensor (the 1-step walk).
@@ -3074,19 +3115,40 @@ def purpleair_fetch_loop(
         return grid
 
     def _pick_probe(sensors: list[dict], grid: dict[tuple[int, int], list[int]]) -> list[dict]:
-        """The sparse probe: one representative sensor per coarse grid cell.
-        Deterministic (first member with valid lat/lon) so the probe set is
-        stable across polls — it is the *walk*, not the probe, that moves.
+        """The sparse probe: one representative sensor per coarse grid cell,
+        picked UNIFORMLY AT RANDOM among the cell's members on every call so
+        coverage rotates through the whole population over successive polls
+        (and keeps last_seen fresh everywhere without a full-bbox sweep).
         When the air is quiescent these ~1/10 sensors are all that hit the API."""
         by_sid = {s["sensor_index"]: s for s in sensors if s.get("sensor_index") is not None}
         probe = []
         for cell_members in grid.values():
+            candidates = []
             for sid in cell_members:
                 s = by_sid.get(sid)
                 if s and s.get("latitude") is not None and s.get("longitude") is not None:
-                    probe.append(s)
-                    break
+                    candidates.append(s)
+            if candidates:
+                probe.append(random.choice(candidates))
         return probe
+
+    def _discovery_cells() -> list[dict[str, float]]:
+        """Tile the full SLC box into PROBE_GRID_DEG cells for rotating
+        discovery. Covers EMPTY cells too — that is the point: a brand-new
+        sensor in a cell with no known sensors must still be found."""
+        cells = []
+        r = PROBE_GRID_DEG
+        lat = SLC_BOUNDS["lat_min"]
+        while lat < SLC_BOUNDS["lat_max"]:
+            lon = SLC_BOUNDS["lon_min"]
+            while lon < SLC_BOUNDS["lon_max"]:
+                cells.append({
+                    "lat_min": lat, "lat_max": min(lat + r, SLC_BOUNDS["lat_max"]),
+                    "lon_min": lon, "lon_max": min(lon + r, SLC_BOUNDS["lon_max"]),
+                })
+                lon += r
+            lat += r
+        return cells
 
     def _pinwheel_sweep(center_lat: float, center_lon: float,
                         sensors_xy: list[tuple[float, float, int]],
@@ -3201,6 +3263,24 @@ def purpleair_fetch_loop(
     # Walk state carried across polls: the frontier the previous poll's
     # significant changes queued for THIS poll. (probe ∪ frontier == fetched.)
     walk_frontier: set[int] = set()
+    discovery_deck: list[dict[str, float]] = []  # shuffled cells; refilled when empty
+    cycle_n = 0
+
+    # Seed change-detection baselines from the cached population (snapshot or
+    # cache pm2.5) so band flips are detected on a sensor's FIRST poll after a
+    # restart. The disabled metadata sweep used to provide this warmup.
+    with app_state.lock:
+        for _s in app_state.purpleair_sensors:
+            _sid = _s.get("sensor_index")
+            _pm = _s.get("pm2.5")
+            if _sid is None or _pm is None or _sid in app_state.purpleair_pm25_cache:
+                continue
+            try:
+                _pmf = float(_pm)
+            except (TypeError, ValueError):
+                continue
+            app_state.purpleair_pm25_cache[_sid] = _aqi_color_category(_pmf)
+            app_state.purpleair_pm25_value[_sid] = _pmf
 
     while not stop_event.is_set():
         now = time.time()
@@ -3212,7 +3292,7 @@ def purpleair_fetch_loop(
         try:
             # ── Metadata refresh (every 6 hours) ──────────────────────────────
             # Also fetches all pm2.5 values so the full picture stays current.
-            need_meta = (now - app_state.purpleair_meta_last_fetch) >= META_INTERVAL
+            need_meta = (not PURPLEAIR_META_REFRESH_DISABLED) and (now - app_state.purpleair_meta_last_fetch) >= META_INTERVAL
             if need_meta:
                 _log("[PurpleAir] Metadata refresh: fetching name,latitude,longitude,pm2.5,last_seen for all sensors")
                 meta_sensors = _fetch_purpleair_sensors(fields="name,latitude,longitude,pm2.5,last_seen")
@@ -3309,6 +3389,39 @@ def purpleair_fetch_loop(
             # Consumed next cycle. Recedes to the bare probe when nothing changes,
             # expands and walks outward while a region keeps changing.
             walk_frontier = next_frontier
+
+            # ── Rotating discovery cell ────────────────────────────────────────
+            # One small bbox query every Nth cycle from a shuffled deck of all
+            # cells. Equal random coverage; discovers new sensors and refreshes
+            # metadata a few rows at a time instead of the whole population.
+            cycle_n += 1
+            if (cycle_n % DISCOVERY_EVERY_N_CYCLES) == 0:
+                if not discovery_deck:
+                    discovery_deck = _discovery_cells()
+                    random.shuffle(discovery_deck)
+                cell = discovery_deck.pop()
+                disc_sensors = _fetch_purpleair_sensors(
+                    fields="name,latitude,longitude,pm2.5,last_seen", bbox=cell)
+                debug_info["calls"].append({"type": "discovery_cell", "count": len(disc_sensors)})
+                if disc_sensors:
+                    disc_by_id = {d["sensor_index"]: d for d in disc_sensors if d.get("sensor_index")}
+                    with app_state.lock:
+                        for s2 in app_state.purpleair_sensors:
+                            sid2 = s2.get("sensor_index")
+                            if sid2 and sid2 in disc_by_id:
+                                d = disc_by_id.pop(sid2)
+                                s2["name"]      = d.get("name",      s2.get("name"))
+                                s2["latitude"]  = d.get("latitude",  s2.get("latitude"))
+                                s2["longitude"] = d.get("longitude", s2.get("longitude"))
+                                if d.get("last_seen") is not None:
+                                    s2["last_seen"] = d["last_seen"]
+                                if d.get("pm2.5") is not None:
+                                    s2["pm2.5"] = d["pm2.5"]
+                        for d in disc_by_id.values():
+                            app_state.purpleair_sensors.append(d)
+                        _apply_fetched(disc_sensors, now)
+                    if disc_by_id:
+                        _log(f"[PurpleAir] Discovery cell: {len(disc_by_id)} new sensor(s)")
 
             debug_info["probe_count"]  = len(probe_ids)
             debug_info["frontier_in"]  = len(incoming_frontier)
