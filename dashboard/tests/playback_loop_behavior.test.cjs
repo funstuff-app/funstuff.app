@@ -99,7 +99,7 @@ function makeMap(dataEdgeLagMs) {
 function makePb() {
   return {
     _pbRAF: null, _pbLastPerf: 0, _pbLastUiPerf: 0,
-    _pbScrubbing: false, _pbResumeAfterScrub: false,
+    _pbScrubbing: false, _pbResumeAfterScrub: false, _pbPaused: false, _pbMoveDeltaMs: 0,
     _pbVelocity: 0, _pbAtEndSincePerf: null, _pbArrivedAtEndViaPlayback: false,
     _pbEaseStartPerf: null, _pbEaseStartVelocity: 0, _pbEaseStartPos: 0,
     _pbIsRewinding: false, _pbIsWheelCoasting: false, _pbWheelAccum: 0,
@@ -239,26 +239,31 @@ describe("an idle playhead at the edge GOES LIVE (never freezes)", () => {
     assert.ok(h.shade.classList.contains("hidden"), "no dim while live");
   });
 
-  it("only the EXPLICIT pause step-back parks behind the window (button path)", () => {
+  it("an explicit pause at the wall edge FREEZES IN PLACE — no skip-back", () => {
     const h = makeHarness();
-    // explicit pause sequence, as the pbPlay button does it: clear active
-    // flags + velocity, then call the synchronous step-back.
-    h.map.setPlaybackPlaying(false);
+    // Ride the edge, then pause exactly as the pbPlay button does: clear the
+    // active flags, zero velocity, and SET the paused hold. The playhead must
+    // NOT jump backward, and the loop must not re-ride it.
+    h.map.setPlaybackPlaying(true);
+    h.map.setPlaybackTimeMs(h.map.getPlaybackBounds().maxMs - 50);
+    h.startLoop();
+    h.step(300);
+    const atEdge = h.map.getPlaybackTimeMs();
+    // pause
     h.map._playbackLiveFollow = false;
+    h.map.setPlaybackPlaying(false);
+    h.pb._pbPaused = true;
     h.pb._pbVelocity = 0;
-    h.map.setPlaybackTimeMs(h.map.getPlaybackBounds().maxMs); // at wall edge
-    const moved = h.playback._pbEnforceNoPauseAtEdge();
-    assert.equal(moved, true, "step-back reports relocation");
-    assert.ok(h.map.getPlaybackTimeMs() <= h.map._playbackMaxMs - h.syncEps(),
-      "playhead parked behind the sync window (no rAF needed — works in hidden tabs)");
     h.playback.updatePlaybackUi();
-    assert.ok(!h.badge.classList.contains("hidden"), "REW badge visible (behind live)");
-    assert.ok(!h.shade.classList.contains("hidden"), "dim shade visible (paused)");
-    // and the loop does NOT re-ride it (it is behind the window now)
+    assert.ok(Math.abs(h.map.getPlaybackTimeMs() - atEdge) < 1000,
+      "playhead frozen in place (no minutes-long skip-back)");
+    assert.ok(!h.shade.classList.contains("hidden"), "dim shows immediately on pause, even at the edge");
+    // the loop leaves it paused (the paused hold suppresses go-live)
     h.startLoop();
     h.step(16);
-    assert.equal(h.map.getPlaybackPlaying(), false, "stays paused behind the window");
-    assert.equal(h.map._playbackLiveFollow, false, "stays out of live-follow");
+    assert.equal(h.map.getPlaybackPlaying(), false, "stays paused");
+    assert.equal(h.map._playbackLiveFollow, false, "does not re-ride");
+    assert.ok(Math.abs(h.map.getPlaybackTimeMs() - atEdge) < 1000, "still in place after a loop frame");
   });
 });
 

@@ -159,6 +159,7 @@
             // Same cancel-all-physics as classic pointerdown
             pb._pbVelocity = 0;
             pb._pbWheelAccum = 0;
+            pb._pbPaused = false;
             pb._pbAtEndSincePerf = null;
             pb._pbArrivedAtEndViaPlayback = false;
             pb._pbIsRewinding = false;
@@ -521,18 +522,21 @@
       // wheel are all judged by which way they actually went.
       //   REW badge : behind the live zone AND not advancing (moving backward
       //               or fully stopped). Any forward motion clears it.
-      //   Dim shade : behind the live zone AND stopped (paused, no motion).
+      //   Dim shade : stopped (paused) in live view — position-independent, so
+      //               it shows the instant you pause, even at the edge (pause
+      //               freezes in place, no skip-back).
       const _dataEdgeMs = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
         ? map._playbackMaxMs : b.maxMs;
       const _syncEpsMs = Math.max(15000, (hasBounds ? (b.maxMs - b.minMs) : 0) * 0.005);
       const _behindLive = !map._historicalMode && hasBounds
         && tMs != null && isFinite(tMs)
         && tMs < _dataEdgeMs - _syncEpsMs;
-      const _stopped = !map.getPlaybackPlaying() && !map._playbackLiveFollow
+      const _stopped = !!map.playbackMode && !map._historicalMode
+        && !map.getPlaybackPlaying() && !map._playbackLiveFollow
         && !pb._pbScrubbing && Math.abs(pb._pbVelocity) <= _pbVelocityThreshold;
       const _advancing = !_stopped && pb._pbMoveDeltaMs > 1;
       if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !(_behindLive && !_advancing));
-      if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !(_behindLive && _stopped));
+      if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !_stopped);
     };
 
     // Establish the riding / live state (idempotent). Reaching the leading
@@ -545,6 +549,7 @@
       pb._pbAtEndSincePerf = null;
       pb._pbIsRewinding = false;
       pb._pbEaseStartPerf = null;
+      pb._pbPaused = false;          // going live clears an explicit pause
       if (!map.getPlaybackPlaying()) map.setPlaybackPlaying(true);
       if (!map._playbackLiveFollow) {
         map._playbackLiveFollow = true;
@@ -553,37 +558,10 @@
       }
     };
 
-    // ── EXPLICIT-PAUSE step-back ─────────────────────────────────────────────
-    // Pausing while at/near the leading edge must not freeze time at the end.
-    // An explicit pause (the pbPlay button) calls this SYNCHRONOUSLY to move
-    // the playhead just behind the sync window, into the rewound state where
-    // the dim + ◀◀ REW badge make the frozen view honest. This is the ONLY
-    // path that steps back: forward motion that reaches the edge goes live
-    // (see _pbGoLive / the ride block) — the loop must never yank a
-    // finger-scroll-to-end backward. Returns true if it moved the playhead.
-    const _pbEnforceNoPauseAtEdge = () => {
-      if (map._historicalMode) return false;
-      if (map.getPlaybackPlaying() || map._playbackLiveFollow) return false;
-      if (pb._pbScrubbing || pb._pbIsRewinding) return false;
-      if (Math.abs(pb._pbVelocity) > _pbVelocityThreshold) return false;
-      if (Math.abs(pb._pbWheelAccum) > 0.1) return false;
-      const b = map.getPlaybackBounds();
-      if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return false;
-      const tMs = map.getPlaybackTimeMs();
-      if (tMs == null || !isFinite(tMs)) return false;
-      const dataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
-        ? map._playbackMaxMs : b.maxMs;
-      const syncEps = Math.max(15000, (b.maxMs - b.minMs) * 0.005);
-      if (tMs <= dataEdge - syncEps) return false;
-      const backTo = Math.max(b.minMs, dataEdge - syncEps - 1000);
-      map.setPlaybackTimeMs(backTo);
-      pb._pbLoopStartMs = backTo;
-      map._compositePaFieldOnTiles(map.lastState);
-      map.drawOverlay(map.lastState);
-      updatePlaybackUi();
-      return true;
-    };
-
+    // Explicit pause freezes the playhead IN PLACE (no skip-back). The paused
+    // flag (pb._pbPaused, set by the pbPlay pause branch) suppresses the loop's
+    // go-live so it isn't immediately re-ridden; the dim shade shows at once
+    // and ◀◀ REW appears as wall time carries the edge past the frozen head.
     const playbackLoop = () => {
       pb._pbRAF = null;
       // Allow loop to run in DVR mode OR LIVE mode (both need playback time updates)
@@ -795,6 +773,7 @@
           ? map._playbackMaxMs : b.maxMs;
         const _rideSyncEps = Math.max(15000, (b.maxMs - b.minMs) * 0.005);
         const _atLeadingEdge = !map._historicalMode
+          && !pb._pbPaused           // an explicit pause holds; don't re-ride it
           && !pb._pbScrubbing
           && !pb._pbIsRewinding
           && pb._pbVelocity >= -_pbVelocityThreshold
@@ -1217,7 +1196,6 @@
       fmtTime,
       updatePlaybackUi,
       playbackLoop,
-      _pbEnforceNoPauseAtEdge,
       _setBarrelMode,
       applyScrub,
       _pbStartEdgeJog,

@@ -746,6 +746,7 @@ function main() {
     _pbScrubbing: false,  // true when pointer is down on scrub bar
     _pbResumeAfterScrub: false,  // was playback active when the scrub began
     _pbMoveDeltaMs: 0,  // signed ms the playhead last moved (REW direction)
+    _pbPaused: false,  // explicit pause hold — suppresses loop go-live at the edge
     _pbVelocity: 0,
     _pbAtEndSincePerf: null,  // performance.now() when we started waiting at end
     _pbArrivedAtEndViaPlayback: false,  // true only if we PLAYED to the end (not scrolled)
@@ -814,7 +815,6 @@ function main() {
   const fmtTime = (ms) => playback.fmtTime(ms);
   const updatePlaybackUi = () => playback.updatePlaybackUi();
   const playbackLoop = () => playback.playbackLoop();
-  const _pbEnforceNoPauseAtEdge = () => playback._pbEnforceNoPauseAtEdge();
   function _setBarrelMode(on) { return playback._setBarrelMode(on); }
   function setMapLoadingShade(on) { return playback.setMapLoadingShade(on); }
   const applyScrub = () => playback.applyScrub();
@@ -1499,14 +1499,16 @@ function main() {
       const active = map.getPlaybackPlaying() || map._playbackLiveFollow;
 
       if (active) {
-        // PAUSE: freeze the playhead and leave the live edge. There is no
-        // paused-yet-pinned-to-edge state — the edge keeps ticking with wall
-        // time and the paused view falls behind it. updatePlaybackUi dims
-        // the map and shows the ◀◀ REW badge in live view.
+        // PAUSE: freeze the playhead exactly where it is (no skip-back). The
+        // _pbPaused flag holds it there — it suppresses the loop's go-live so
+        // a pause at the wall edge isn't immediately re-ridden. The dim shade
+        // shows at once (stopped in live view); ◀◀ REW appears once wall time
+        // carries the ticking edge past the frozen playhead.
         map._playbackLiveFollow = false;
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
         if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
         map.setPlaybackPlaying(false);
+        pb._pbPaused = true;
         pb._pbVelocity = 0;
         pb._pbWheelAccum = 0;
         pb._pbAtEndSincePerf = null;
@@ -1515,9 +1517,6 @@ function main() {
         const curMs = map.getPlaybackTimeMs();
         if (curMs != null && isFinite(curMs)) pb._pbLoopStartMs = curMs;
         updatePlaybackUi();
-        // Paused-at-the-edge is not a state: enforce synchronously (the loop
-        // also enforces, but rAF does not fire in hidden tabs).
-        _pbEnforceNoPauseAtEdge();
         return;
       }
 
@@ -1527,6 +1526,7 @@ function main() {
       pb._pbAtEndSincePerf = null;
       pb._pbWheelAccum = 0;
       pb._pbIsRewinding = false;
+      pb._pbPaused = false;   // play clears the explicit pause hold
       // Capture replay point A if it hasn't been set via scrubbing.
       if (pb._pbLoopStartMs == null || !isFinite(Number(pb._pbLoopStartMs))) {
         const cur = map.getPlaybackTimeMs();
@@ -1622,9 +1622,6 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
-    // A pause that happened while backgrounded (no rAF frames) may have left
-    // the playhead parked at the edge — enforce the invariant on return.
-    _pbEnforceNoPauseAtEdge();
     if (!map._playbackLiveFollow) return; // only applies in LIVE mode
     const b = map.getPlaybackBounds();
     if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;
@@ -1901,6 +1898,7 @@ function main() {
       pb._pbEaseStartPerf = null;
       pb._pbIsWheelCoasting = false;
       pb._pbScrubbing = true;
+      pb._pbPaused = false;
       map._scrubbing = true;
       pb._pbDidDrag = false; // track if user actually dragged
       _pbLastScrubPos = Number(pbScrubEl.value);
@@ -2112,6 +2110,7 @@ function main() {
       pb._pbEaseStartPerf = null;
       pb._pbIsWheelCoasting = false;
       pb._pbScrubbing = true;
+      pb._pbPaused = false;
       map._scrubbing = true;
       pb._pbDidDrag = false;
       _pbLastScrubPos = Number(pbScrubEl.value);
