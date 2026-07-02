@@ -514,31 +514,25 @@
       }
       if (pbSpeedEl) pbSpeedEl.value = String(map.getPlaybackSpeed() || 1.0);
 
-      // Two signals (live view only; historical snapshots are deliberate time
-      // travel and show neither):
-      //
-      // ◀◀ REW badge — you are behind the live zone and NOT playing forward:
-      // paused in the past, or actively rewinding toward it. Playing forward
-      // (catching up to live) is not rewinding, so no badge then.
-      //
-      // Dim shade — PAUSE indicator: visible while playback is frozen. A
-      // paused playhead can only exist behind the window (the no-pause-at-
-      // the-edge invariant), so the dim always coincides with the badge.
+      // ◀◀ REW badge + dim shade (live view only; historical snapshots show
+      // neither). Direction is the signed distance the playhead LAST MOVED
+      // (pb._pbMoveDeltaMs, recorded wherever the playhead actually moves —
+      // the loop's physics commit and applyScrub), so play, scrub, rewind and
+      // wheel are all judged by which way they actually went.
+      //   REW badge : behind the live zone AND not advancing (moving backward
+      //               or fully stopped). Any forward motion clears it.
+      //   Dim shade : behind the live zone AND stopped (paused, no motion).
       const _dataEdgeMs = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
         ? map._playbackMaxMs : b.maxMs;
       const _syncEpsMs = Math.max(15000, (hasBounds ? (b.maxMs - b.minMs) : 0) * 0.005);
       const _behindLive = !map._historicalMode && hasBounds
         && tMs != null && isFinite(tMs)
         && tMs < _dataEdgeMs - _syncEpsMs;
-      const _playingForward = (map.getPlaybackPlaying() || map._playbackLiveFollow)
-        && !pb._pbIsRewinding
-        && pb._pbVelocity >= -_pbVelocityThreshold;
-      const _pausedStill = !!map.playbackMode && !map._historicalMode && hasBounds
-        && !map.getPlaybackPlaying() && !map._playbackLiveFollow
-        && !pb._pbScrubbing
-        && Math.abs(pb._pbVelocity) <= _pbVelocityThreshold;
-      if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !(_behindLive && !_playingForward));
-      if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !_pausedStill);
+      const _stopped = !map.getPlaybackPlaying() && !map._playbackLiveFollow
+        && !pb._pbScrubbing && Math.abs(pb._pbVelocity) <= _pbVelocityThreshold;
+      const _advancing = !_stopped && pb._pbMoveDeltaMs > 1;
+      if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !(_behindLive && !_advancing));
+      if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !(_behindLive && _stopped));
     };
 
     // Establish the riding / live state (idempotent). Reaching the leading
@@ -812,6 +806,7 @@
         if (_atLeadingEdge) {
           _pbGoLive();
           if (b.maxMs - tMs >= 250) {
+            pb._pbMoveDeltaMs = b.maxMs - tMs;   // forward: riding the edge
             map.setPlaybackTimeMs(b.maxMs);
             tMs = b.maxMs;
             didAdvanceTime = true;
@@ -963,6 +958,7 @@
           }
 
           if (nextMs !== tMs) {
+            pb._pbMoveDeltaMs = nextMs - tMs;   // signed: which way the playhead went
             map.setPlaybackTimeMs(nextMs);
             tMs = nextMs;
             didAdvanceTime = true;
@@ -1082,6 +1078,10 @@
         ? Math.min(b.maxMs, map._playbackMaxMs) : b.maxMs;
       const clampedT = clamp(tMs, b.minMs, scrubEdge);
 
+      const _prevScrubT = map.getPlaybackTimeMs();
+      if (_prevScrubT != null && isFinite(_prevScrubT)) {
+        pb._pbMoveDeltaMs = clampedT - _prevScrubT;   // signed drag direction
+      }
       map.setPlaybackTimeMs(clampedT);
 
       // Don't auto-enable LIVE mode when dragging - user must click the Live button.

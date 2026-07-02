@@ -745,6 +745,7 @@ function main() {
     _pbLastUiPerf: 0,
     _pbScrubbing: false,  // true when pointer is down on scrub bar
     _pbResumeAfterScrub: false,  // was playback active when the scrub began
+    _pbMoveDeltaMs: 0,  // signed ms the playhead last moved (REW direction)
     _pbVelocity: 0,
     _pbAtEndSincePerf: null,  // performance.now() when we started waiting at end
     _pbArrivedAtEndViaPlayback: false,  // true only if we PLAYED to the end (not scrolled)
