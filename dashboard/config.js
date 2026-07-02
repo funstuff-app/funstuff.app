@@ -67,6 +67,11 @@ var TILE_THEMES = {
 // Not secret; matched server-side to reject bare curl/scraper traffic.
 // ─────────────────────────────────────────────────────────────────────────────
 const APP_TOKEN = "42c86460b903df7b764887b6278a17a7";
+// Top-level const/let do NOT attach to the global object; the extracted
+// engine_*/ui_* modules resolve these via the global at call time, so mirror
+// them explicitly (root alias keeps this loadable in node tests).
+const _cfgRoot = (typeof window !== "undefined") ? window : globalThis;
+_cfgRoot.APP_TOKEN = APP_TOKEN;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Server Configuration (loaded from /api/config for CDN/scaling support)
@@ -77,6 +82,7 @@ let appConfig = {
   cacheTtl: 30,          // Server-side cache TTL hint (seconds)
   version: "1.0.0",      // Server version for compatibility checks
 };
+_cfgRoot.appConfig = appConfig;
 
 /**
  * Load server configuration from /api/config endpoint.
@@ -89,6 +95,7 @@ async function loadConfig() {
       const cfg = await res.json();
       // Merge with defaults (server may not provide all fields)
       appConfig = { ...appConfig, ...cfg };
+      _cfgRoot.appConfig = appConfig;
       console.log("[Config] Loaded:", appConfig);
 
       // Apply server-pushed localStorage defaults.

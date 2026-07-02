@@ -269,6 +269,11 @@ test("index.html scripts load in order and register all module globals", () => {
       // ui_* modules + wired-in playback state + jog wheel
       "StateSync", "LegendUI", "ThemeUI", "PlaybackState", "PlaybackUI",
       "SnapshotsMenusUI", "ScreensaverUI", "JogWheel",
+      // config.js values the modules resolve via the global at call time.
+      // Top-level const/let do NOT auto-attach to window — config.js must
+      // mirror them explicitly (regression: modules sent
+      // "X-App-Token: undefined" and every gated API call 403'd).
+      "APP_TOKEN", "appConfig",
     ];
     for (const name of expectedGlobals) {
       assert.ok(win[name] != null, `global "${name}" is defined after load`);
