@@ -569,225 +569,45 @@ function main() {
     }
   }
 
-  // Theme + per-theme dimming/saturation sliders (persisted).
-  const themeEl = document.getElementById("mapTheme");
-  const dimEl = document.getElementById("mapDim");
-  const satEl = document.getElementById("mapSat");
-
   map.setMaxTrailLen(MAX_TRAIL_LEN);
 
-  function dimToBrightness(dim01) {
-    // dim01: 0..1 where 1 == brightest; map to a conservative brightness range.
-    // 0 -> 0.55, 1 -> 0.90
-    return 0.55 + dim01 * 0.35;
-  }
-
-  // Map theme variants to shared settings key (e.g., carto_dark_all and carto_dark_nolabels share settings)
-  function getThemeSettingsKey(themeKey) {
-    const k = String(themeKey);
-    if (k.startsWith("carto_dark")) return "carto_dark";
-    if (k.startsWith("carto_positron")) return "carto_positron";
-    return k; // osm, carto_voyager, etc. stay as-is
-  }
-
-  function loadDimForTheme(themeKey) {
-    const settingsKey = getThemeSettingsKey(themeKey);
-    const raw = localStorage.getItem(DIM_STORAGE_PREFIX + settingsKey);
-    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
-    const def = t.defaultDim ?? 50;
-    const v = raw == null ? def : Number(raw);
-    const dimMax = isThemeDark(themeKey) ? 150 : 100;
-    const clamped = Math.max(0, Math.min(dimMax, isFinite(v) ? v : def));
-    return clamped;
-  }
-
-  function loadSatForTheme(themeKey) {
-    const settingsKey = getThemeSettingsKey(themeKey);
-    const raw = localStorage.getItem(SAT_STORAGE_PREFIX + settingsKey);
-    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
-    const def = t.defaultSat ?? Math.round(100 * (t.filter?.saturate ?? 0.55));
-    const v = raw == null ? def : Number(raw);
-    const clamped = Math.max(0, Math.min(150, isFinite(v) ? v : def));
-    return clamped;
-  }
-
-  function applyThemeAndFilters(themeKey, dimVal0to100, satVal0to150) {
-    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
-    // Only call setTheme when the theme actually changes — it clears the tile
-    // cache and forces a full reload, which causes visible flashing when just
-    // adjusting dim/sat sliders.
-    if (map.themeKey !== themeKey) {
-      map.setTheme(themeKey);
-    }
-
-    const dim01 = (dimVal0to100 / 100);
-    const brightness = dimToBrightness(dim01);
-    const isDarkTheme = String(themeKey).includes("dark");
-    // For dark themes, use Sat slider as a "shadow lift" mix (only tiles, overlays unaffected).
-    // Saturation still applies, but we clamp it to avoid making dark basemaps neon.
-    const sat = isDarkTheme ? Math.min(1.0, (satVal0to150 / 100)) : (satVal0to150 / 100);
-    // Lift only kicks in above 100; 100..150 -> 0..0.28 opacity.
-    const shadowLift = isDarkTheme ? clamp((satVal0to150 - 100) / 50, 0, 1) * 0.28 : 0;
-    applyMapFilterVars({
-      saturate: sat,
-      brightness: brightness,
-      contrast: t.filter?.contrast ?? 1.12,
-      shadowLift,
-    });
-    // Set map background color to match theme (prevents flash while tiles load)
-    if (t.bgColor) {
-      document.documentElement.style.setProperty('--map-bg', t.bgColor);
-    }
-  }
-
-  // Detect system color scheme preference
-  function isSystemDarkMode() {
-    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-  }
-  
-  function isThemeDark(themeKey) {
-    return String(themeKey).includes("dark");
-  }
-  
-  function getThemeStorageKey() {
-    return isSystemDarkMode() ? THEME_STORAGE_KEY_DARK : THEME_STORAGE_KEY_LIGHT;
-  }
-  
-  function getDefaultThemeForMode() {
-    // Light themes disabled — always default to dark
-    return "carto_dark_all";
-    // return isSystemDarkMode() ? "carto_dark_all" : "carto_voyager";
-  }
-  
-  function getSavedThemeForCurrentMode() {
-    const key = getThemeStorageKey();
-    const saved = localStorage.getItem(key);
-    return (saved && TILE_THEMES[saved]) ? saved : getDefaultThemeForMode();
-  }
-  
-  function saveThemeForMode(themeKey) {
-    // Save to the appropriate key based on whether this is a dark or light theme
-    const isDark = isThemeDark(themeKey);
-    const key = isDark ? THEME_STORAGE_KEY_DARK : THEME_STORAGE_KEY_LIGHT;
-    localStorage.setItem(key, themeKey);
-    // Also save as the last-active theme so launch doesn't override user choice
-    localStorage.setItem("mobileair.mapTheme.last", themeKey);
-  }
-
-  function getInitialTheme() {
-    // On launch, prefer the last theme the user actively selected.
-    // Only fall back to system-mode default if user never chose a theme.
-    const last = localStorage.getItem("mobileair.mapTheme.last");
-    if (last && TILE_THEMES[last]) return last;
-    return getSavedThemeForCurrentMode();
-  }
-
-  // Track current theme for menu updates
-  let _currentThemeKey = getInitialTheme();
-
-  function applyTheme(themeKey, skipSubmenuUpdate) {
-    _currentThemeKey = themeKey;
-    if (themeEl) themeEl.value = themeKey;
-    const dim = loadDimForTheme(themeKey);
-    if (dimEl) dimEl.value = String(dim);
-    const sat = loadSatForTheme(themeKey);
-    if (satEl) satEl.value = String(sat);
-    applyThemeAndFilters(themeKey, dim, sat);
-    // updateThemeSubmenu is defined later, only call it when triggered by system theme change
-    if (!skipSubmenuUpdate && window._updateThemeSubmenu) window._updateThemeSubmenu();
-  }
-
-  if (themeEl) {
-    const keys = Object.keys(TILE_THEMES);
-    for (const k of keys) {
-      const opt = document.createElement("option");
-      opt.value = k;
-      opt.textContent = TILE_THEMES[k].label || k;
-      themeEl.appendChild(opt);
-    }
-
-    // Load saved theme (prefers last user selection over system mode)
-    const initialTheme = getInitialTheme();
-    applyTheme(initialTheme, true); // skip submenu update on init (not created yet)
-
-    themeEl.addEventListener("change", () => {
-      const k = themeEl.value;
-      _currentThemeKey = k;
-      saveThemeForMode(k);
-      const dim = loadDimForTheme(k);
-      if (dimEl) dimEl.value = String(dim);
-      const sat = loadSatForTheme(k);
-      if (satEl) satEl.value = String(sat);
-      applyThemeAndFilters(k, dim, sat);
-      updateThemeSubmenu();
-    });
-  } else {
-    // Fallback (no UI) - prefer last user selection
-    const fallbackTheme = getInitialTheme();
-    _currentThemeKey = fallbackTheme;
-    const fallbackT = TILE_THEMES[fallbackTheme];
-    applyThemeAndFilters(fallbackTheme, fallbackT.defaultDim ?? 70, Math.round(100 * (fallbackT.filter?.saturate ?? 1.30)));
-  }
-  
-  // System theme auto-switching disabled (light themes disabled)
-  // if (window.matchMedia) {
-  //   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-  //     const newTheme = getSavedThemeForCurrentMode();
-  //     applyTheme(newTheme);
-  //   });
-  // }
-
-  // // Re-check system theme when app returns to foreground (PWA / tab switch).
-  // // The matchMedia 'change' event may not fire while the app is backgrounded,
-  // // so the theme can get out of sync until the user interacts.
-  // {
-  //   let _lastKnownSystemDark = isSystemDarkMode();
-  //   document.addEventListener("visibilitychange", () => {
-  //     if (document.visibilityState !== "visible") return;
-  //     const nowDark = isSystemDarkMode();
-  //     if (nowDark !== _lastKnownSystemDark) {
-  //       _lastKnownSystemDark = nowDark;
-  //       const newTheme = getSavedThemeForCurrentMode();
-  //       // Only switch if the current theme's dark/light doesn't match system
-  //       if (isThemeDark(_currentThemeKey) !== nowDark) {
-  //         applyTheme(newTheme);
-  //       }
-  //     }
-  //   });
-  // }
+  // ── Theme + per-theme dimming/saturation sliders (persisted) ────────────
+  // Extracted to ui_theme.js (ThemeUI). Instantiated here with callbacks so
+  // it can read/write `_currentThemeKey`, which is also written by
+  // updateThemeSubmenu's click handler (still in main()) and read at the
+  // post-loadConfig re-apply below — it stays a main()-owned variable rather
+  // than moving into ThemeUI. These local consts/wrappers preserve the
+  // original call sites used elsewhere in main() (applyTheme,
+  // applyThemeAndFilters, and the DOM refs themeEl/dimEl/satEl used by
+  // updateThemeSubmenu). ThemeUI's constructor performs all of the original
+  // module-load-time wiring (option population, initial applyTheme call,
+  // change/input listeners) as a side effect of construction.
+  let _currentThemeKey;
+  const theme = new ThemeUI({
+    map,
+    document,
+    setCurrentThemeKey: (k) => { _currentThemeKey = k; },
+    getUpdateThemeSubmenu: () => window._updateThemeSubmenu,
+  });
+  const themeEl = theme.themeEl;
+  const dimEl = theme.dimEl;
+  const satEl = theme.satEl;
+  function dimToBrightness(dim01) { return theme.dimToBrightness(dim01); }
+  function getThemeSettingsKey(themeKey) { return theme.getThemeSettingsKey(themeKey); }
+  function loadDimForTheme(themeKey) { return theme.loadDimForTheme(themeKey); }
+  function loadSatForTheme(themeKey) { return theme.loadSatForTheme(themeKey); }
+  function applyThemeAndFilters(themeKey, dimVal0to100, satVal0to150) { return theme.applyThemeAndFilters(themeKey, dimVal0to100, satVal0to150); }
+  function isSystemDarkMode() { return theme.isSystemDarkMode(); }
+  function isThemeDark(themeKey) { return theme.isThemeDark(themeKey); }
+  function getThemeStorageKey() { return theme.getThemeStorageKey(); }
+  function getDefaultThemeForMode() { return theme.getDefaultThemeForMode(); }
+  function getSavedThemeForCurrentMode() { return theme.getSavedThemeForCurrentMode(); }
+  function saveThemeForMode(themeKey) { return theme.saveThemeForMode(themeKey); }
+  function getInitialTheme() { return theme.getInitialTheme(); }
+  function applyTheme(themeKey, skipSubmenuUpdate) { return theme.applyTheme(themeKey, skipSubmenuUpdate); }
 
   // Restore view after map is initialized (theme/filter doesn't affect center/zoom).
   restoreViewIfAny();
-
-  if (dimEl) {
-    dimEl.addEventListener("input", () => {
-      const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_dark_all";
-      const settingsKey = getThemeSettingsKey(themeKey);
-      const isDark = isThemeDark(themeKey);
-      const dimMax = isDark ? 150 : 100;
-      const v = Number(dimEl.value);
-      const clamped = Math.max(0, Math.min(dimMax, isFinite(v) ? v : 50));
-      localStorage.setItem(DIM_STORAGE_PREFIX + settingsKey, String(clamped));
-      const sat = satEl ? Number(satEl.value) : loadSatForTheme(themeKey);
-      const satClamped = Math.max(0, Math.min(150, isFinite(sat) ? sat : loadSatForTheme(themeKey)));
-      applyThemeAndFilters(themeKey, clamped, satClamped);
-    });
-  }
-
-  if (satEl) {
-    satEl.addEventListener("input", () => {
-      const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_dark_all";
-      const settingsKey = getThemeSettingsKey(themeKey);
-      const isDark = isThemeDark(themeKey);
-      const dimMax = isDark ? 150 : 100;
-      const v = Number(satEl.value);
-      const clamped = Math.max(0, Math.min(150, isFinite(v) ? v : loadSatForTheme(themeKey)));
-      localStorage.setItem(SAT_STORAGE_PREFIX + settingsKey, String(clamped));
-      const dim = dimEl ? Number(dimEl.value) : loadDimForTheme(themeKey);
-      const dimClamped = Math.max(0, Math.min(dimMax, isFinite(dim) ? dim : loadDimForTheme(themeKey)));
-      applyThemeAndFilters(themeKey, dimClamped, clamped);
-    });
-  }
 
   /** Return the correct state object for the current mode (historical or live). */
   function _currentState() {
