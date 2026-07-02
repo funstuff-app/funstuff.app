@@ -4,6 +4,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const mapViewSrc = fs.readFileSync(path.join(__dirname, "..", "map_view.js"), "utf-8");
+// _compositePaFieldOnTiles and _ensurePaField moved to engine_pa_field.js (S7).
+const paFieldSrc = fs.readFileSync(path.join(__dirname, "..", "engine_pa_field.js"), "utf-8");
 
 // ── Helper: extract a method body by name ──
 function extractMethod(src, name) {
@@ -71,7 +73,7 @@ test("_isGesturing includes all four original gesture flags", () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 test("_compositePaFieldOnTiles fast-path checks _isTransientAnimating", () => {
-  const body = extractMethod(mapViewSrc, "_compositePaFieldOnTiles");
+  const body = extractMethod(paFieldSrc, "_compositePaFieldOnTiles");
   assert.ok(body, "_compositePaFieldOnTiles method not found");
   const stripped = stripComments(body);
   // The fast-path guard: if (_isTransientAnimating() && _paFieldCanvas && ...)
@@ -84,7 +86,7 @@ test("_compositePaFieldOnTiles fast-path checks _isTransientAnimating", () => {
 });
 
 test("_ensurePaField returns early when _isTransientAnimating", () => {
-  const body = extractMethod(mapViewSrc, "_ensurePaField");
+  const body = extractMethod(paFieldSrc, "_ensurePaField");
   assert.ok(body, "_ensurePaField method not found");
   const stripped = stripComments(body);
   assert.ok(
