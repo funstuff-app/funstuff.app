@@ -813,6 +813,7 @@ function main() {
   const fmtTime = (ms) => playback.fmtTime(ms);
   const updatePlaybackUi = () => playback.updatePlaybackUi();
   const playbackLoop = () => playback.playbackLoop();
+  const _pbEnforceNoPauseAtEdge = () => playback._pbEnforceNoPauseAtEdge();
   function _setBarrelMode(on) { return playback._setBarrelMode(on); }
   function setMapLoadingShade(on) { return playback.setMapLoadingShade(on); }
   const applyScrub = () => playback.applyScrub();
@@ -1513,6 +1514,9 @@ function main() {
         const curMs = map.getPlaybackTimeMs();
         if (curMs != null && isFinite(curMs)) pb._pbLoopStartMs = curMs;
         updatePlaybackUi();
+        // Paused-at-the-edge is not a state: enforce synchronously (the loop
+        // also enforces, but rAF does not fire in hidden tabs).
+        _pbEnforceNoPauseAtEdge();
         return;
       }
 
@@ -1617,6 +1621,9 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
+    // A pause that happened while backgrounded (no rAF frames) may have left
+    // the playhead parked at the edge — enforce the invariant on return.
+    _pbEnforceNoPauseAtEdge();
     if (!map._playbackLiveFollow) return; // only applies in LIVE mode
     const b = map.getPlaybackBounds();
     if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;

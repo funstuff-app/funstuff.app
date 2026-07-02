@@ -512,11 +512,11 @@
       if (pbSpeedEl) pbSpeedEl.value = String(map.getPlaybackSpeed() || 1.0);
 
       // Paused-and-REWOUND signal (live view only): a frozen real-time app
-      // must look frozen — dim the map and show the ◀◀ REW badge. But only
-      // when the playhead is genuinely BEHIND the leading-edge sync window:
-      // paused at/near the data edge is still "roughly now" and gets neither
-      // (it self-resolves — wall time walks the edge away and the badge
-      // appears once the view is actually stale). Historical snapshots are
+      // must look frozen — dim the map and show the ◀◀ REW badge, but only
+      // when the playhead is genuinely BEHIND the leading-edge sync window.
+      // Paused inside the window is not a state: the playbackLoop invariant
+      // steps such a pause back behind the window on the next frame, so this
+      // condition goes true immediately after. Historical snapshots are
       // deliberate time travel; nothing shows there.
       const _pausedStill = !!map.playbackMode && !map._historicalMode && hasBounds
         && !map.getPlaybackPlaying() && !map._playbackLiveFollow
@@ -529,6 +529,35 @@
         && tMs < _dataEdgeMs - _syncEpsMs;
       if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !_rewound);
       if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !_rewound);
+    };
+
+    // ── INVARIANT: paused-at-the-edge is not a state ─────────────────────────
+    // Time must never appear to stop at the end. A pause that lands inside
+    // the leading-edge sync window steps the playhead back to just behind the
+    // window, where the dim + ◀◀ REW badge make the frozen view honest.
+    // Riding (playing) is the only way to sit at the wall-clock edge.
+    // Returns true if it moved the playhead.
+    const _pbEnforceNoPauseAtEdge = () => {
+      if (map._historicalMode) return false;
+      if (map.getPlaybackPlaying() || map._playbackLiveFollow) return false;
+      if (pb._pbScrubbing || pb._pbIsRewinding) return false;
+      if (Math.abs(pb._pbVelocity) > _pbVelocityThreshold) return false;
+      if (Math.abs(pb._pbWheelAccum) > 0.1) return false;
+      const b = map.getPlaybackBounds();
+      if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return false;
+      const tMs = map.getPlaybackTimeMs();
+      if (tMs == null || !isFinite(tMs)) return false;
+      const dataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+        ? map._playbackMaxMs : b.maxMs;
+      const syncEps = Math.max(15000, (b.maxMs - b.minMs) * 0.005);
+      if (tMs <= dataEdge - syncEps) return false;
+      const backTo = Math.max(b.minMs, dataEdge - syncEps - 1000);
+      map.setPlaybackTimeMs(backTo);
+      pb._pbLoopStartMs = backTo;
+      map._compositePaFieldOnTiles(map.lastState);
+      map.drawOverlay(map.lastState);
+      updatePlaybackUi();
+      return true;
     };
 
     const playbackLoop = () => {
@@ -586,6 +615,15 @@
             map.setPlaybackTimeMs(tMs);
           }
         }
+      }
+
+      // ── INVARIANT: paused-at-the-edge is not a state ─────────────────────
+      // Runs in the loop (not just the button) so every pause path — button,
+      // trace toggle, screensaver exit — is covered while frames are alive.
+      // The pause transitions themselves also call this synchronously (rAF
+      // does not fire in hidden tabs).
+      if (_pbEnforceNoPauseAtEdge()) {
+        tMs = map.getPlaybackTimeMs();
       }
 
       // Forced refresh: treat as a new-data event even if bounds didn't move.
@@ -1141,6 +1179,7 @@
       fmtTime,
       updatePlaybackUi,
       playbackLoop,
+      _pbEnforceNoPauseAtEdge,
       _setBarrelMode,
       applyScrub,
       _pbStartEdgeJog,
