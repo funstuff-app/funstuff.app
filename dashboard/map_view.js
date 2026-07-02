@@ -284,6 +284,10 @@ class MapView {
     this.tileSubdomains = t.subdomains;
     this._tileEpoch = 1; // increments on theme swap; used to ignore late tile loads
 
+    // Tile drawing/cache/snapshot/redraw-scheduling controller (engine_tile_renderer.js).
+    const TileRendererCtor = (typeof window !== "undefined" ? window : globalThis).TileRenderer;
+    this.tiles = new TileRendererCtor(this);
+
     // Coalesce pinch-zoom redraws to rAF for smoother feel (no extra easing math).
     this._zoomDrawRAF = null;
 
@@ -3300,229 +3304,25 @@ class MapView {
     }
   }
 
-  drawTiles() {
-    const ctx = this.tctx;
-    if (!ctx) return;
-    // Avoid per-frame layout reads during panning.
-    const w = this._cssW || 1;
-    const h = this._cssH || 1;
-    const dpr = this._dpr || (window.devicePixelRatio || 1);
+  /** Delegates to TileRenderer (engine_tile_renderer.js). */
+  drawTiles() { this.tiles.drawTiles(); }
 
-    // Reset transform to canonical dpr-scaled state to prevent scaling bugs
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  /** Delegates to TileRenderer (engine_tile_renderer.js). */
+  _captureTilesSnapshot() { this.tiles._captureTilesSnapshot(); }
 
-    const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
-    const ws = c.ws;
+  /** Delegates to TileRenderer (engine_tile_renderer.js). */
+  _tileCacheGet(key) { return this.tiles._tileCacheGet(key); }
 
-    // Backdrop: reuse previous frame so *panning* doesn't flicker while tiles stream in.
-    // During active pinch/inertia we also reuse+scale the snapshot (fast path) so zooming
-    // is closer to the OS-native feel and doesn't spend time drawing N tiles every event.
-    const hasSnapshot = !!(this._tilesSnapshotCanvas && this._tilesSnapshotMeta);
-    ctx.clearRect(0, 0, w, h);
-    if (hasSnapshot) {
-      try {
-        const prev = this._tilesSnapshotMeta;
-        ctx.save();
-        if (this._pinchZooming) {
-          // Scale around the screen center; also translate for center changes.
-          const sZoom = Math.pow(2, this.zoom - prev.zoom);
-          const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
-          const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
-          const txPan = (prevC.x - currC.x) * sZoom;
-          const tyPan = (prevC.y - currC.y) * sZoom;
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          ctx.translate(w / 2, h / 2);
-          ctx.scale(sZoom, sZoom);
-          ctx.translate((-w / 2) + (txPan / sZoom), (-h / 2) + (tyPan / sZoom));
-          ctx.drawImage(this._tilesSnapshotCanvas, 0, 0, w, h);
-          ctx.restore();
-          // Fast path: don't draw individual tiles while pinch-zooming. We'll do a full tiles
-          // render once the gesture/inertia completes.
-          return;
-        }
+  /** Delegates to TileRenderer (engine_tile_renderer.js). */
+  _tileCacheSet(key, value) { return this.tiles._tileCacheSet(key, value); }
 
-        // Non-pinch: translate-only (same integer zoom snapshots).
-        if (Math.floor(prev.zoom) !== Math.floor(this.zoom)) throw new Error("zoom changed");
-        const prevC = latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
-        const currC = latLonToWorld(this.center.lat, this.center.lon, prev.zoom);
-        const tx = (prevC.x - currC.x);
-        const ty = (prevC.y - currC.y);
-        ctx.setTransform(dpr, 0, 0, dpr, dpr * tx, dpr * ty);
-        ctx.drawImage(this._tilesSnapshotCanvas, 0, 0, w, h);
-        ctx.restore();
-      } catch {
-        // ignore snapshot issues
-      }
-    }
-
-    const topLeftX = c.x - w / 2;
-    const topLeftY = c.y - h / 2;
-
-    // Use integer tile zoom for fetching, scaled to fractional zoom.
-    const tileZ = clamp(Math.floor(this.zoom), this._zoomMin, this._zoomMax);
-    const s = Math.pow(2, this.zoom - tileZ); // scale factor from tileZ world to zoom world
-
-    const topLeftX_Z = topLeftX / s;
-    const topLeftY_Z = topLeftY / s;
-    const w_Z = w / s;
-    const h_Z = h / s;
-
-    const minTileX = Math.floor(topLeftX_Z / TILE_SIZE);
-    const minTileY = Math.floor(topLeftY_Z / TILE_SIZE);
-    const maxTileX = Math.floor((topLeftX_Z + w_Z) / TILE_SIZE);
-    const maxTileY = Math.floor((topLeftY_Z + h_Z) / TILE_SIZE);
-
-    const tilesPerAxis = Math.pow(2, tileZ);
-    for (let ty = minTileY; ty <= maxTileY; ty++) {
-      if (ty < 0 || ty >= tilesPerAxis) continue;
-      for (let tx = minTileX; tx <= maxTileX; tx++) {
-        // wrap X
-        let wrappedX = tx;
-        while (wrappedX < 0) wrappedX += tilesPerAxis;
-        while (wrappedX >= tilesPerAxis) wrappedX -= tilesPerAxis;
-
-        // IMPORTANT: key includes theme to prevent "checkerboard" mixing when switching themes.
-        const key = `${this.themeKey}:${tileZ}/${wrappedX}/${ty}`;
-        const px = (tx * TILE_SIZE * s) - topLeftX;
-        const py = (ty * TILE_SIZE * s) - topLeftY;
-
-        this.drawTile(ctx, key, tileZ, wrappedX, ty, px, py, s, hasSnapshot);
-      }
-    }
-
-    // Capture snapshot for the next frame - but skip during active touch to avoid blocking input.
-    if (!this._touchActive) this._captureTilesSnapshot();
-  }
-
-  /** Capture the tiles canvas into a snapshot for smooth pan/zoom transitions. */
-  _captureTilesSnapshot() {
-    try {
-      const tw = this.tilesCanvas.width;
-      const th = this.tilesCanvas.height;
-      if (!this._tilesSnapshotCanvas) {
-        this._tilesSnapshotCanvas = document.createElement("canvas");
-        this._tilesSnapshotCanvas.width = tw;
-        this._tilesSnapshotCanvas.height = th;
-      } else if (this._tilesSnapshotCanvas.width !== tw || this._tilesSnapshotCanvas.height !== th) {
-        this._tilesSnapshotCanvas.width = tw;
-        this._tilesSnapshotCanvas.height = th;
-      }
-      const sctx = this._tilesSnapshotCanvas.getContext("2d");
-      if (sctx) {
-        sctx.setTransform(1, 0, 0, 1, 0, 0);
-        sctx.clearRect(0, 0, tw, th);
-        sctx.drawImage(this.tilesCanvas, 0, 0);
-        this._tilesSnapshotMeta = { zoom: this.zoom, centerLat: this.center.lat, centerLon: this.center.lon };
-      }
-    } catch {
-      // ignore snapshot capture errors
-    }
-  }
-
-  _tileCacheGet(key) {
-    if (!this.tileCache || !key) return null;
-    const v = this.tileCache.get(key) || null;
-    if (!v) return null;
-    // LRU: refresh insertion order.
-    this.tileCache.delete(key);
-    this.tileCache.set(key, v);
-    return v;
-  }
-
-  _tileCacheSet(key, value) {
-    if (!this.tileCache || !key) return;
-    if (this.tileCache.has(key)) this.tileCache.delete(key);
-    this.tileCache.set(key, value);
-    const max = (typeof this._tileCacheMax === "number" && isFinite(this._tileCacheMax) && this._tileCacheMax > 0)
-      ? Math.floor(this._tileCacheMax)
-      : 420;
-    while (this.tileCache.size > max) {
-      const oldestKey = this.tileCache.keys().next().value;
-      if (oldestKey == null) break;
-      this.tileCache.delete(oldestKey);
-    }
-  }
-
+  /** Delegates to TileRenderer (engine_tile_renderer.js). */
   drawTile(ctx, key, z, x, y, px, py, scale, hasSnapshot) {
-    const cached = this._tileCacheGet(key);
-    if (cached && cached.ok) {
-      const sz = TILE_SIZE * scale;
-      ctx.filter = "none";
-      ctx.drawImage(cached.img, Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
-      return;
-    }
-
-    if (!cached) {
-      const img = new Image();
-      const epoch = this._tileEpoch;
-      img.crossOrigin = "anonymous";
-      img.onload = () => {
-        if (epoch !== this._tileEpoch) return;
-        this._tileCacheSet(key, { img, ok: true });
-        this._scheduleTileRedraw();
-      };
-      img.onerror = () => {
-        if (epoch !== this._tileEpoch) return;
-        this._tileCacheSet(key, { img, ok: false });
-      };
-      const subs = this.tileSubdomains || [""];
-      const sub = subs[(x + y) % subs.length] || "";
-      img.src = this.tileTemplate
-        .replace("{s}", sub)
-        .replace("{z}", z)
-        .replace("{x}", x)
-        .replace("{y}", y);
-      if (epoch === this._tileEpoch) this._tileCacheSet(key, { img, ok: false });
-    }
-
-    // Tile not ready yet — try to draw a parent tile (lower zoom) scaled up as fallback.
-    // Walk up zoom levels to find a cached ancestor tile covering this area.
-    for (let pz = z - 1; pz >= Math.max(z - 4, this._zoomMin); pz--) {
-      const diff = z - pz;
-      const parentX = x >> diff;
-      const parentY = y >> diff;
-      const parentKey = `${this.themeKey}:${pz}/${parentX}/${parentY}`;
-      const parentCached = this._tileCacheGet(parentKey);
-      if (parentCached && parentCached.ok) {
-        // Draw the sub-region of the parent tile that corresponds to this tile.
-        const subScale = 1 << diff;
-        const subX = x - (parentX << diff);
-        const subY = y - (parentY << diff);
-        const srcSize = TILE_SIZE / subScale;
-        const srcX = subX * srcSize;
-        const srcY = subY * srcSize;
-        const sz = TILE_SIZE * scale;
-        ctx.filter = "none";
-        ctx.drawImage(parentCached.img, srcX, srcY, srcSize, srcSize,
-          Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
-        return;
-      }
-    }
-
-    // No parent available — only draw placeholder if there's no snapshot backdrop.
-    if (!hasSnapshot) {
-      const sz = TILE_SIZE * scale;
-      ctx.fillStyle = "rgba(255,255,255,0.03)";
-      ctx.fillRect(Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
-      ctx.strokeStyle = "rgba(255,255,255,0.04)";
-      ctx.strokeRect(Math.floor(px), Math.floor(py), Math.ceil(sz), Math.ceil(sz));
-    }
+    return this.tiles.drawTile(ctx, key, z, x, y, px, py, scale, hasSnapshot);
   }
 
-  _scheduleTileRedraw() {
-    // Debounce tile-load redraws: wait a short time for more tiles to finish loading
-    // before redrawing, to avoid N separate redraws when N tiles load in quick succession.
-    if (this._touchActive) {
-      // Mark pending so tiles redraw when touch ends
-      this._tileRedrawPending = true;
-      return;
-    }
-    if (this._tileLoadRedrawTimer) return; // already scheduled
-    this._tileLoadRedrawTimer = setTimeout(() => {
-      this._tileLoadRedrawTimer = null;
-      this.drawTiles();
-    }, 50);
-  }
+  /** Delegates to TileRenderer (engine_tile_renderer.js). */
+  _scheduleTileRedraw() { this.tiles._scheduleTileRedraw(); }
 
   _tracePointsKeyForState(state) {
     const rev = state?.meta?.server_revision;
