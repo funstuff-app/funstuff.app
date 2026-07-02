@@ -117,146 +117,15 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", _syncViewToServer);
 
-// ETag for conditional polling — avoids re-downloading unchanged payloads.
-let _stateEtag = null;
-let _stateCached = null;
-
-// Delta delivery: track newest trail timestamp so subsequent polls
-// only receive new trail points (the server strips old ones via ?since_ms=).
-let _newestTrailMs = null;
-// Accumulated full state (trails grow across polls).
-let _accumulatedState = null;
-
-/** Extract the newest trail timestamp (epoch ms) from a state object. */
-function _extractNewestTrailMs(st) {
-  let best = null;
-  const mobiles = Array.isArray(st?.mobile) ? st.mobile : [];
-  for (const m of mobiles) {
-    const trail = Array.isArray(m?.trail) ? m.trail : [];
-    for (let i = trail.length - 1; i >= 0; i--) {
-      const t = trail[i]?.t;
-      if (typeof t === "string") {
-        const ms = parseUtcMs(t);
-        if (ms != null && (best == null || ms > best)) { best = ms; break; }
-      }
-    }
-  }
-  return best;
-}
-
-/** Merge a delta state into the accumulated state.
- *  - Mobile trails: append new points to existing vehicles.
- *  - Fixed sensors / meta: replace entirely (always current).
- */
-function _mergeStateDelta(acc, delta) {
-  // Replace top-level fields the server always sends in full.
-  acc.ts = delta.ts;
-  acc.meta = delta.meta;
-  acc.fixed = delta.fixed;
-
-  // Merge mobile trails.
-  const deltaM = Array.isArray(delta.mobile) ? delta.mobile : [];
-  const accById = new Map();
-  const accMobiles = Array.isArray(acc.mobile) ? acc.mobile : [];
-  for (const m of accMobiles) {
-    if (m && m.id != null) accById.set(String(m.id), m);
-  }
-
-  for (const dm of deltaM) {
-    if (!dm || dm.id == null) continue;
-    const id = String(dm.id);
-    const existing = accById.get(id);
-    if (!existing) {
-      // New vehicle — add as-is.
-      accMobiles.push(dm);
-      accById.set(id, dm);
-      continue;
-    }
-    // Append new trail points, capping to prevent unbounded growth.
-    const newPts = Array.isArray(dm.trail) ? dm.trail : [];
-    if (newPts.length > 0) {
-      const oldTrail = Array.isArray(existing.trail) ? existing.trail : [];
-      const merged = oldTrail.concat(newPts);
-      const cap = (typeof MAX_TRAIL_LEN === "number" && MAX_TRAIL_LEN > 0) ? MAX_TRAIL_LEN : 3000;
-      existing.trail = merged.length > cap ? merged.slice(merged.length - cap) : merged;
-    }
-    // Update non-trail fields (readings, ghosted, color, etc.)
-    for (const k of Object.keys(dm)) {
-      if (k !== "trail" && k !== "id") existing[k] = dm[k];
-    }
-  }
-
-  // Remove vehicles that disappeared from the server response.
-  const deltaIds = new Set(deltaM.map(m => m && m.id != null ? String(m.id) : null).filter(Boolean));
-  acc.mobile = accMobiles.filter(m => m && m.id != null && deltaIds.has(String(m.id)));
-
-  return acc;
-}
-
-let _lastStateWasNotModified = false;
-async function fetchState() {
-  _lastStateWasNotModified = false;
-  let url = `${appConfig.apiBaseUrl}/state`;
-  // Delta delivery: ask the server to strip trail points we already have.
-  if (_newestTrailMs != null) {
-    const sep = url.includes("?") ? "&" : "?";
-    url = `${url}${sep}since_ms=${_newestTrailMs}`;
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000); // 15s timeout
-  try {
-    const headers = { "X-App-Token": APP_TOKEN };
-    if (_stateEtag) headers["If-None-Match"] = _stateEtag;
-    const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers, credentials: "same-origin" });
-    if (res.status === 304 && _accumulatedState) {
-      _lastStateWasNotModified = true;
-      return _accumulatedState;
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    _stateEtag = res.headers.get("ETag") || null;
-    const payload = await res.json();
-
-    // Merge or replace accumulated state.
-    if (payload.meta?.delta && _accumulatedState) {
-      _mergeStateDelta(_accumulatedState, payload);
-    } else {
-      // First fetch or full payload — replace entirely.
-      _accumulatedState = payload;
-    }
-
-    // Track newest trail timestamp for next delta request.
-    const nms = _extractNewestTrailMs(_accumulatedState);
-    if (nms != null) _newestTrailMs = nms;
-
-    _stateCached = _accumulatedState;
-    return _accumulatedState;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// injectCastleFixedMarker removed - Home sensor now provided by backend with real PM2.5 data
-
-function newestReadingMsFromState(st) {
-  // Prefer the most recent timestamp from any mobile breadcrumb point.
-  // Fixed sensors currently do not include timestamps in the normalized payload.
-  let bestMs = null;
-  const mobiles = Array.isArray(st?.mobile) ? st.mobile : [];
-  for (const m of mobiles) {
-    const trail = Array.isArray(m?.trail) ? m.trail : [];
-    const last = trail.length ? trail[trail.length - 1] : null;
-    const t = last && typeof last.t === "string" ? last.t : null;
-    const ms = t ? parseUtcMs(t) : null;
-    if (ms != null && (bestMs == null || ms > bestMs)) bestMs = ms;
-  }
-  if (bestMs != null) return bestMs;
-
-  // Fallbacks: server meta (seconds) or state ts.
-  const sec = (st && st.meta && typeof st.meta.last_position_change_ts === "number")
-    ? st.meta.last_position_change_ts
-    : (typeof st?.ts === "number" ? st.ts : null);
-  return (sec != null && isFinite(sec)) ? (sec * 1000) : null;
-}
+// ── State sync (fetchState/etag/delta-merge/SSE/analytics) ────────────────
+// Extracted to ui_state_sync.js (StateSync). Instantiated inside main() once
+// `map`/`selectedId` exist; the module owns etag/accumulated-state/SSE/
+// analytics fields internally. These top-level wrappers preserve the
+// original call sites (fetchState(), newestReadingMsFromState()); both
+// were only ever called from within main(), so they simply delegate to
+// the StateSync instance created there.
+function fetchState() { return window.__stateSync.fetchState(); }
+function newestReadingMsFromState(st) { return StateSync.newestReadingMsFromState(st); }
 
 function main() {
   const tiles = document.getElementById("tilesCanvas");
@@ -3613,30 +3482,9 @@ function main() {
   // Track current selected day for menu display
   let _selectedDayValue = "live";
   
-  /**
-   * Validate that a state object has the expected schema.
-   * Returns true if valid, false if not.
-   * This is a security boundary - validates structure before any processing.
-   */
-  function validateStateSchema(state) {
-    if (!state || typeof state !== "object") return false;
-    // Must have mobile or fixed arrays
-    if (!Array.isArray(state.mobile) && !Array.isArray(state.fixed)) return false;
-    // Check mobile entries have id
-    if (Array.isArray(state.mobile)) {
-      for (const m of state.mobile) {
-        if (!m || typeof m !== "object" || !("id" in m)) return false;
-      }
-    }
-    // Check fixed entries have id
-    if (Array.isArray(state.fixed)) {
-      for (const f of state.fixed) {
-        if (!f || typeof f !== "object" || !("id" in f)) return false;
-      }
-    }
-    return true;
-  }
-  
+  // validateStateSchema moved to ui_state_sync.js (StateSync.validateStateSchema)
+  const validateStateSchema = StateSync.validateStateSchema;
+
   /**
    * Check if we have valid data that can be saved.
    */
@@ -3737,9 +3585,7 @@ function main() {
       
       // Release accumulated live-polling state — not needed during history
       // and can be very large (unbounded trail concatenation).
-      _accumulatedState = null;
-      _newestTrailMs = null;
-      _stateEtag = null;
+      window.__stateSync.resetAccumulated();
 
       // Reset ALL playback state and per-vehicle caches for fresh historical data.
       // Without this, smooth-path, physics, and trace caches from prior snapshots
@@ -4993,207 +4839,32 @@ function main() {
   let _tickLastForceRefreshSeq = null;
   let _tickConsecutiveFailures = 0; // for exponential backoff on errors
 
-  /**
-   * Map backend "immobile" field → frontend "parked" field on all mobile sensors.
-   * The backend sends `immobile: bool` but the UI reads `parked`.
-   */
-  function _mapImmobileToParked(st) {
-    if (!st || !Array.isArray(st.mobile)) return;
-    for (var i = 0; i < st.mobile.length; i++) {
-      var m = st.mobile[i];
-      if (m && m.immobile != null) m.parked = !!m.immobile;
-    }
-  }
-
-  // ── SSE (Server-Sent Events) — push-based state change notifications ──
-  let _sseConnected = false;
-  let _sseLastSeq = null;
-  let _sseSource = null;
-
-  // ── Client ID: reuse the one declared at file scope (line ~88) ──
-
-  // ── Analytics batching ──
-  var _analyticsQueue = [];
-  var _analyticsLastFlush = 0;
-  var _ANALYTICS_FLUSH_MS = 300000; // 5 min
-
-  function _flushAnalytics() {
-    if (!_analyticsQueue.length) return;
-    var events = _analyticsQueue.splice(0, 50);
-    var body = JSON.stringify({ client_id: _clientId, events: events });
-    try {
-      fetch((appConfig.apiBaseUrl || "/api") + "/analytics", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: body
-      }).catch(function() {});
-    } catch (e) {}
-    _analyticsLastFlush = Date.now();
-  }
-
-  function pushAnalyticsEvent(type, payload) {
-    _analyticsQueue.push({ type: type, payload: payload });
-    if (Date.now() - _analyticsLastFlush > _ANALYTICS_FLUSH_MS) {
-      _flushAnalytics();
-    }
-  }
-
-  /**
-   * Merge an SSE delta into the current live state.
-   * delta.trail_new: { sensorId: [points...], ... }
-   * delta.mobile: [ { id, lat, lon, idle, readings }, ... ]
-   */
-  function _mergeDelta(delta) {
-    var st = window.__lastState;
-    if (!st || !st.mobile) return false;
-
-    var changed = false;
-
-    // Merge new trail points
-    var trailNew = delta.trail_new;
-    if (trailNew && typeof trailNew === "object") {
-      var mobileById = {};
-      for (var i = 0; i < st.mobile.length; i++) {
-        var m = st.mobile[i];
-        if (m && m.id) mobileById[m.id] = m;
-      }
-      for (var sid in trailNew) {
-        var sensor = mobileById[sid] || mobileById["mobile:" + sid];
-        if (!sensor) continue;
-        var existing = sensor.trail || [];
-        var incoming = trailNew[sid];
-        if (!Array.isArray(incoming) || !incoming.length) continue;
-        // Find the latest timestamp in existing trail to avoid duplicates
-        var maxExistingT = 0;
-        for (var j = existing.length - 1; j >= 0 && j >= existing.length - 5; j--) {
-          var pt = existing[j];
-          if (pt && typeof pt.t === "number" && pt.t > maxExistingT) maxExistingT = pt.t;
-        }
-        var appended = 0;
-        for (var k = 0; k < incoming.length; k++) {
-          var np = incoming[k];
-          if (np && typeof np.t === "number" && np.t > maxExistingT) {
-            existing.push(np);
-            appended++;
-          }
-        }
-        if (appended > 0) {
-          sensor.trail = existing;
-          changed = true;
-        }
-      }
-    }
-
-    // Merge mobile sensor summaries (readings, position)
-    var mobileSummaries = delta.mobile;
-    if (Array.isArray(mobileSummaries)) {
-      var byId = {};
-      for (var mi = 0; mi < st.mobile.length; mi++) {
-        if (st.mobile[mi] && st.mobile[mi].id) byId[st.mobile[mi].id] = st.mobile[mi];
-      }
-      for (var si = 0; si < mobileSummaries.length; si++) {
-        var summ = mobileSummaries[si];
-        if (!summ || !summ.id) continue;
-        var target = byId[summ.id];
-        if (!target) continue;
-        if (summ.lat != null) target.lat = summ.lat;
-        if (summ.lon != null) target.lon = summ.lon;
-        if (summ.immobile != null) { target.immobile = summ.immobile; target.parked = !!summ.immobile; }
-        if (summ.readings) target.readings = summ.readings;
-        changed = true;
-      }
-    }
-
-    // Update meta timestamps
-    if (delta.ts) {
-      st.ts = delta.ts;
-      if (st.meta) st.meta.ts = delta.ts;
-    }
-
-    return changed;
-  }
-
-  var _sseDeferTimer = null; // deferred render after gesture settles
-
-  function connectSSE() {
-    if (_sseSource) { try { _sseSource.close(); } catch {} }
-    var url = (appConfig.apiBaseUrl || "/api") + "/events";
-    _sseSource = new EventSource(url);
-
-    _sseSource.onopen = function () {
-      _sseConnected = true;
-      // Shorten the next scheduled poll now that SSE is live.
-      if (_tickTimeout) {
-        clearTimeout(_tickTimeout);
-        _tickTimeout = setTimeout(tick, POLL_MS_SSE);
-      }
-    };
-
-    // Named event: "delta" — incremental state update pushed by server
-    _sseSource.addEventListener("delta", function (ev) {
-      try {
-        var delta = JSON.parse(ev.data);
-        var seq = delta.seq;
-        if (seq != null && seq !== _sseLastSeq) {
-          _sseLastSeq = seq;
-          // Skip delta merge if viewing historical data
-          if (window._historicalState || _isLoadingData) return;
-          if (_mergeDelta(delta) && map) {
-            if (map._isGesturing()) {
-              // State merged in-place; gesture redraws reflect it via lastState ref.
-              // Defer full render + sidebar until gesture settles.
-              clearTimeout(_sseDeferTimer);
-              _sseDeferTimer = setTimeout(function() {
-                map.draw(window.__lastState);
-                try { renderLists(window.__lastState, selectedId); } catch (e) {}
-                try { renderDetails(window.__lastState, selectedId); } catch (e) {}
-              }, 300);
-            } else {
-              map.draw(window.__lastState);
-              try { renderLists(window.__lastState, selectedId); } catch (e) {}
-              try { renderDetails(window.__lastState, selectedId); } catch (e) {}
-            }
-          }
-          // Reschedule safety-net poll
-          if (_tickTimeout) clearTimeout(_tickTimeout);
-          _tickTimeout = setTimeout(tick, POLL_MS_SSE);
-        }
-      } catch (e) { try { console.warn("[SSE delta]", e); } catch {} }
-    });
-
-    // Named event: "wind" — new wind snapshot pushed by server
-    _sseSource.addEventListener("wind", function (ev) {
-      try {
-        var snap = JSON.parse(ev.data);
-        if (snap.key && snap.points && map) {
-          map.mergeWindSnapshot(snap.key, snap.points);
-        }
-      } catch (e) { try { console.warn("[SSE wind]", e); } catch {} }
-    });
-
-    // Default "message" event — backward-compatible notification
-    _sseSource.onmessage = function (ev) {
-      try {
-        var msg = JSON.parse(ev.data);
-        var seq = msg.seq;
-        if (seq != null && seq !== _sseLastSeq) {
-          _sseLastSeq = seq;
-          // New data available — fetch immediately.
-          if (_tickTimeout) clearTimeout(_tickTimeout);
-          tick();
-        }
-      } catch {}
-    };
-
-    _sseSource.onerror = function () {
-      _sseConnected = false;
-      // EventSource auto-reconnects; revert to normal polling in the meantime.
-      if (_tickTimeout) {
-        clearTimeout(_tickTimeout);
-        _tickTimeout = setTimeout(tick, POLL_MS);
-      }
-    };
-  }
+  // fetchState/etag/delta-merge/SSE/analytics moved to ui_state_sync.js
+  // (StateSync). Instantiate here (once `map`/`selectedId`/`tick` exist in
+  // this closure) and wire the callbacks it needs to reach into main()'s
+  // state. window.__stateSync is used by the top-level fetchState()/
+  // resetAccumulated() shims declared before main().
+  const _mapImmobileToParked = StateSync._mapImmobileToParked;
+  window.__stateSync = new StateSync({
+    appToken: APP_TOKEN,
+    apiBaseUrl: appConfig.apiBaseUrl,
+    getMap: () => map,
+    getSelectedId: () => selectedId,
+    isLoadingData: () => _isLoadingData,
+    getClientId: () => _clientId,
+    rescheduleTick: (delayMs) => {
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      _tickTimeout = setTimeout(tick, delayMs);
+    },
+    tickNow: () => {
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      tick();
+    },
+    POLL_MS: POLL_MS,
+    POLL_MS_SSE: POLL_MS_SSE,
+  });
+  const pushAnalyticsEvent = (type, payload) => window.__stateSync.pushAnalyticsEvent(type, payload);
+  const connectSSE = () => window.__stateSync.connectSSE();
 
   async function tick() {
     // Safety valve: if _tickInFlight has been true for over 60 seconds, force-reset it.
@@ -5234,9 +4905,7 @@ function main() {
       _tickInFlight = false;
       // Reset delta/etag state so recovery gets a full refresh
       // (server may have restarted with different state).
-      _stateEtag = null;
-      _newestTrailMs = null;
-      _accumulatedState = null;
+      window.__stateSync.resetAccumulated();
       // Reschedule with exponential backoff: 5s, 10s, 20s, 40s … capped at POLL_MS.
       const backoffMs = Math.min(POLL_MS, 5000 * Math.pow(2, Math.min(_tickConsecutiveFailures - 1, 5)));
       if (_tickTimeout) clearTimeout(_tickTimeout);
@@ -5248,7 +4917,7 @@ function main() {
     // 304 fast-path: server confirmed nothing changed. Just heartbeat the
     // status indicators (so "Live" doesn't drift to "Offline") and reschedule.
     // Skip the full draw + sidebar re-render: same data → same pixels.
-    if (_lastStateWasNotModified) {
+    if (window.__stateSync.wasNotModified()) {
       _pbLastServerResponseMs = Date.now();
       _tickConsecutiveFailures = 0;
       const statusElLive = document.getElementById("statusText");
@@ -5258,7 +4927,7 @@ function main() {
         statusElLive.classList.add("live");
       }
       _tickInFlight = false;
-      const pollMs = _sseConnected ? POLL_MS_SSE : POLL_MS;
+      const pollMs = window.__stateSync.isSSEConnected() ? POLL_MS_SSE : POLL_MS;
       if (_tickTimeout) clearTimeout(_tickTimeout);
       _tickTimeout = setTimeout(tick, pollMs);
       return;
@@ -5423,9 +5092,9 @@ function main() {
       _tickInFlight = false;
       // Always reschedule. Use server-provided timing if available, else fallback.
       // When SSE is connected, use a long safety-net interval (SSE drives timely updates).
-      var basePollMs = _sseConnected ? POLL_MS_SSE : POLL_MS;
+      var basePollMs = window.__stateSync.isSSEConnected() ? POLL_MS_SSE : POLL_MS;
       const clientPollS = Number(window.__lastState?.meta?.client_poll_in_s);
-      const nextMs = _sseConnected ? basePollMs
+      const nextMs = window.__stateSync.isSSEConnected() ? basePollMs
         : (isFinite(clientPollS) && clientPollS > 0) ? clientPollS * 1000 : basePollMs;
       if (_tickTimeout) clearTimeout(_tickTimeout);
       _tickTimeout = setTimeout(tick, nextMs);
