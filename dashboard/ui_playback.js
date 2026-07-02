@@ -514,12 +514,12 @@
       }
       if (pbSpeedEl) pbSpeedEl.value = String(map.getPlaybackSpeed() || 1.0);
 
-      // Two independent signals (live view only; historical snapshots are
-      // deliberate time travel and show neither):
+      // Two signals (live view only; historical snapshots are deliberate time
+      // travel and show neither):
       //
-      // ◀◀ REW badge — POSITION indicator: visible whenever the playhead is
-      // LEFT of the live zone (behind the leading-edge sync window), playing
-      // or paused. You are watching the past.
+      // ◀◀ REW badge — you are behind the live zone and NOT playing forward:
+      // paused in the past, or actively rewinding toward it. Playing forward
+      // (catching up to live) is not rewinding, so no badge then.
       //
       // Dim shade — PAUSE indicator: visible while playback is frozen. A
       // paused playhead can only exist behind the window (the no-pause-at-
@@ -530,11 +530,14 @@
       const _behindLive = !map._historicalMode && hasBounds
         && tMs != null && isFinite(tMs)
         && tMs < _dataEdgeMs - _syncEpsMs;
+      const _playingForward = (map.getPlaybackPlaying() || map._playbackLiveFollow)
+        && !pb._pbIsRewinding
+        && pb._pbVelocity >= -_pbVelocityThreshold;
       const _pausedStill = !!map.playbackMode && !map._historicalMode && hasBounds
         && !map.getPlaybackPlaying() && !map._playbackLiveFollow
         && !pb._pbScrubbing
         && Math.abs(pb._pbVelocity) <= _pbVelocityThreshold;
-      if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !_behindLive);
+      if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !(_behindLive && !_playingForward));
       if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !_pausedStill);
     };
 

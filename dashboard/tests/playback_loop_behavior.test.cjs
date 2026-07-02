@@ -263,15 +263,26 @@ describe("an idle playhead at the edge GOES LIVE (never freezes)", () => {
 });
 
 describe("REW badge = position indicator; dim = pause indicator", () => {
-  it("badge shows while PLAYING behind the live zone (no dim)", () => {
+  it("NO badge while PLAYING FORWARD behind the live zone (REW = rewind, not catch-up)", () => {
     const h = makeHarness();
     h.map.setPlaybackPlaying(true);
+    h.pb._pbVelocity = 5;                        // catching up forward
     h.map.setPlaybackTimeMs(h.map._playbackMaxMs - h.syncEps() - 3600_000);
     h.playback.updatePlaybackUi();
-    assert.ok(!h.badge.classList.contains("hidden"), "badge visible while replaying the past");
+    assert.ok(h.badge.classList.contains("hidden"), "no REW badge while playing forward");
     assert.ok(h.shade.classList.contains("hidden"), "no dim while playing");
     assert.equal(h.btn.textContent, "Pause", "transport shows Pause while playing behind the edge");
     assert.ok(!h.btn.classList.contains("isLive"), "not lit behind the edge");
+  });
+
+  it("badge shows while REWINDING behind the live zone", () => {
+    const h = makeHarness();
+    h.map.setPlaybackPlaying(true);
+    h.pb._pbIsRewinding = true;
+    h.pb._pbVelocity = -20;                       // tape-reel rewind
+    h.map.setPlaybackTimeMs(h.map._playbackMaxMs - h.syncEps() - 3600_000);
+    h.playback.updatePlaybackUi();
+    assert.ok(!h.badge.classList.contains("hidden"), "badge visible while rewinding");
   });
 
   it("badge AND dim show while PAUSED behind the live zone", () => {
