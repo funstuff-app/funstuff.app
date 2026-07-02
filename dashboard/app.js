@@ -751,137 +751,8 @@ function main() {
   const pbScrubEl = document.getElementById("pbScrub");
   const pbSpeedEl = document.getElementById("pbSpeed");
   const pbDebugEl = document.getElementById("pbDebugPath");
-  const pbLeftEl = document.getElementById("pbLeft");
-  const pbNowEl = document.getElementById("pbNow");
-  const pbRightEl = document.getElementById("pbRight");
   const pbPagePrevEl = document.getElementById("pbPagePrev");
   const pbPageNextEl = document.getElementById("pbPageNext");
-
-  // ── A/B Barrel Jog Wheel ────────────────────────────────────────────────
-  const pbJogWheelEl    = document.getElementById("pbJogWheel");
-  const pbJogBarrelEl   = document.getElementById("pbJogBarrel");
-  const pbBarrelClipEl  = document.getElementById("pbBarrelClip");
-  const pbBarrelCanvas  = document.getElementById("pbBarrelCanvas");
-  const pbBarrelToggle  = document.getElementById("pbBarrelToggle");
-  let _jogWheel = null;          // JogWheel instance (created on first enable)
-  let _barrelMode = false;       // current A/B state
-  const _BARREL_STORAGE_KEY = "mobileair.barrelJogWheel";
-
-  function _setBarrelMode(on) {
-    return; // SHUNT: barrel feature bypassed — restore by removing this line
-    _barrelMode = on;
-    if (pbJogWheelEl) pbJogWheelEl.classList.toggle("hidden", on);
-    if (pbJogBarrelEl) pbJogBarrelEl.classList.toggle("hidden", !on);
-    if (pbBarrelToggle) pbBarrelToggle.checked = on;
-    try { localStorage.setItem(_BARREL_STORAGE_KEY, on ? "1" : "0"); } catch {}
-
-    if (on && !_jogWheel && pbJogBarrelEl && pbBarrelClipEl && pbBarrelCanvas && typeof JogWheel !== "undefined") {
-      _jogWheel = JogWheel.create({
-        wrapEl: pbJogBarrelEl,
-        clipEl: pbBarrelClipEl,
-        canvasEl: pbBarrelCanvas,
-        onWheel(delta) {
-          // Same physics as classic wheel handler on pbScrubEl
-          pb._pbAtEndSincePerf = null;
-          pb._pbArrivedAtEndViaPlayback = false;
-          pb._pbIsRewinding = false;
-          pb._pbPageAutoFollow = true;
-          map.setPlaybackPlaying(false);
-          map._playbackLiveFollow = false;
-          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-          pb._pbIsWheelCoasting = true;
-          pb._pbCommitLoopStartOnCoastEnd = true;
-          if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
-            const pr = _pbGetPageRange();
-            pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
-          }
-          const b = map.getPlaybackBounds();
-          const durMs = (b.maxMs - b.minMs) || 1;
-          const nudgeDur = Math.min(durMs, 21600000); // cap at 6h so scroll speed is consistent
-          const nudge = (delta / 1000) * (nudgeDur / 480);
-          const prevDir = Math.sign(pb._pbVelocity);
-          pb._pbVelocity -= nudge;
-          if (prevDir !== 0 && Math.sign(pb._pbVelocity) !== 0 && Math.sign(pb._pbVelocity) !== prevDir) {
-            _pbSnapWindowToPlayhead();
-            updatePlaybackUi();
-          }
-          if (!pb._pbRAF) {
-            pb._pbLastPerf = performance.now();
-            pb._pbRAF = requestAnimationFrame(playbackLoop);
-          }
-        },
-        onDragStart() {
-          // Same cancel-all-physics as classic pointerdown
-          pb._pbVelocity = 0;
-          pb._pbWheelAccum = 0;
-          pb._pbAtEndSincePerf = null;
-          pb._pbArrivedAtEndViaPlayback = false;
-          pb._pbIsRewinding = false;
-          pb._pbEaseStartPerf = null;
-          pb._pbIsWheelCoasting = false;
-          pb._pbScrubbing = true;
-          map._scrubbing = true;
-          pb._pbDidDrag = false;
-          map.setPlaybackPlaying(false);
-          map._playbackLiveFollow = false;
-          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-          _resetLiveTracking();
-          if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
-            const pr = _pbGetPageRange();
-            pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
-          }
-          updatePlaybackUi();
-        },
-        onPositionChange(deltaFrac) {
-          // deltaFrac is already gear-reduced (dx / (width*8))
-          // Map to timeline ms and apply
-          pb._pbDidDrag = true;
-          const b = map.getPlaybackBounds();
-          const pr = _pbPagingActive() ? _pbGetPageRange() : b;
-          const durMs = (pr.maxMs - pr.minMs) || 1;
-          const tMs = map.getPlaybackTimeMs() || pr.minMs;
-          const newT = clamp(tMs + deltaFrac * durMs, pr.minMs, pr.maxMs);
-          map.setPlaybackTimeMs(newT);
-          map.setPlaybackPlaying(false);
-          // Coalesce render
-          if (!_scrubRAF) {
-            _scrubRAF = requestAnimationFrame(() => {
-              _scrubRAF = 0;
-              map.drawOverlay(map.lastState);
-              updatePlaybackUi();
-            });
-          }
-        },
-        onDragEnd(vel) {
-          _pbSnapWindowToPlayhead();
-          pb._pbScrubbing = false;
-          map._scrubbing = false;
-          // Convert barrel velocity to timeline velocity for inertial coasting
-          const b = map.getPlaybackBounds();
-          const pr = _pbPagingActive() ? _pbGetPageRange() : b;
-          const durMs = (pr.maxMs - pr.minMs) || 1;
-          pb._pbVelocity = (vel * durMs) / 16;
-          pb._pbIsWheelCoasting = false;
-          pb._pbPageAutoFollow = true;
-          map.setPlaybackPlaying(true);
-          pb._pbLastPerf = performance.now();
-          if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-        }
-      });
-    }
-  }
-
-  // Restore saved preference
-  {
-    const saved = localStorage.getItem(_BARREL_STORAGE_KEY);
-    if (saved === "1") _setBarrelMode(true);
-  }
-
-  if (pbBarrelToggle) {
-    pbBarrelToggle.addEventListener("change", () => {
-      _setBarrelMode(pbBarrelToggle.checked);
-    });
-  }
 
   const pb = {
     _pbRAF: null,
@@ -920,6 +791,71 @@ function main() {
   let _pbLastScrubPos = 0;
   let _pbLastScrubTime = 0;
 
+  // Extracted to ui_playback.js (PlaybackUI). The module owns the playback DOM
+  // labels/page-arrow refs + barrel jog, the physics/paging constants, and the
+  // scalars used only by the moved functions (_barrelMode, _jogWheel,
+  // _scrubRAF). The shared `pb` object (A4a) is passed BY REFERENCE so the
+  // scrub/click/speed/visibility handlers that stay in main() keep mutating it.
+  // deps.* are lazy getters/callbacks into shared state and helpers that stay
+  // in main() (screensaver flag, sidebar/selection, camera-fit cluster, legend
+  // sync). One-line delegates below preserve the original call sites.
+  const playback = PlaybackUI.create({
+    map,
+    document,
+    pb,
+    deps: {
+      getScreensaverActive: () => _screensaverActive,
+      getSidebarOpen: () => sidebarOpen,
+      getSelectedId: () => selectedId,
+      performCameraFit: (opts) => _performCameraFit(opts),
+      animateFitBoundsLatLon: (bb, opts) => _animateFitBoundsLatLon(bb, opts),
+      animateToStoredView: (ms) => _animateToStoredView(ms),
+      syncMapPollutant: () => _syncMapPollutant(),
+      syncLegendToMapSelection: () => syncLegendToMapSelection(),
+      updateSidebarPlaybackValues: () => updateSidebarPlaybackValues(),
+    },
+  });
+  // Thin delegates keep every original call site in main() untouched.
+  function _resetLiveTracking() { playback._resetLiveTracking(); }
+  function _pbAllVehiclesReachedPlaybackEnd(state) { return playback._pbAllVehiclesReachedPlaybackEnd(state); }
+  function _pbPageCount() { return playback._pbPageCount(); }
+  function _pbGetPageRange() { return playback._pbGetPageRange(); }
+  function _pbSetPage(idx) { return playback._pbSetPage(idx); }
+  function _pbPageForTime(tMs) { return playback._pbPageForTime(tMs); }
+  function _pbSnapWindowToPlayhead() { return playback._pbSnapWindowToPlayhead(); }
+  function _pbPagingActive() { return playback._pbPagingActive(); }
+  const fmtTime = (ms) => playback.fmtTime(ms);
+  const updatePlaybackUi = () => playback.updatePlaybackUi();
+  const playbackLoop = () => playback.playbackLoop();
+  function _setBarrelMode(on) { return playback._setBarrelMode(on); }
+  function setMapLoadingShade(on) { return playback.setMapLoadingShade(on); }
+  const applyScrub = () => playback.applyScrub();
+  function _pbStartEdgeJog() { return playback._pbStartEdgeJog(); }
+  function _pbStopEdgeJog() { return playback._pbStopEdgeJog(); }
+  function _pbEdgeJogTick(now) { return playback._pbEdgeJogTick(now); }
+  // Playback DOM refs the module owns but staying handlers reference.
+  const pbLeftEl = playback.pbLeftEl;
+  const pbNowEl = playback.pbNowEl;
+  const pbRightEl = playback.pbRightEl;
+  // Shared coalescing rAF flag (the scrub pointer/touch listeners below use it).
+  const _getScrubRAF = () => playback.getScrubRAF();
+  const _setScrubRAF = (v) => playback.setScrubRAF(v);
+  // Cross-module wiring (consumed by engine_camera_gestures.js / engine_playback_engine.js).
+  map._resetLiveTracking = playback._resetLiveTracking;
+
+  // playback_state.js (PlaybackState) — single source of truth for runway /
+  // LIVE-mode calculations.  Wired in here (script tag added to index.html) so
+  // it is no longer dead code.  The duplicated runway/live-window math in
+  // updatePlaybackUi, the playbackLoop live-window block, and the pbPlay /
+  // pbSpeed / visibilitychange handlers is the "exact-correspondence" set this
+  // object DRYs up; those call sites are NOT rewritten in this story because
+  // PlaybackState._metaPollSec (isFinite fallback) is not byte-identical to the
+  // inline `?? … ?? 600` math (they differ when both meta poll fields are
+  // absent → NaN vs 600), so substituting would change behavior. The consolidation
+  // is left to a follow-up; instantiating here keeps the module live/available.
+  const playbackState = new PlaybackState(map);
+  window.__playbackState = playbackState;
+
   // ─────────────────────────────────────────────────────────────────────────────
   // PHYSICS-BASED PLAYBACK: Everything is driven by velocity and forces.
   // No state flags for "rewind" - just physics simulation.
@@ -947,18 +883,9 @@ function main() {
   // LIVE BUFFER: Track wall-clock time since app started to know how much data we have.
   // Buffer = time since first data arrival. Playback replays this accumulated buffer.
   // ─────────────────────────────────────────────────────────────────────────────
-  const _pbLiveStallThreshold = 3;      // stalls before auto-rewind in LIVE mode
-  
-  // Helper to reset LIVE tracking (call when exiting LIVE mode)
-  // Exposed on map object so class methods can call it
-  function _resetLiveTracking() {
-    pb._pbLiveStartWallMs = null;
-    pb._pbLiveStartDataMs = null;
-    pb._pbLiveStallCount = 0;
-    pb._deferredCameraFit = null;
-  }
-  map._resetLiveTracking = _resetLiveTracking;
-  
+  // _resetLiveTracking moved to ui_playback.js (delegate above); map._resetLiveTracking
+  // is assigned there too (consumed by engine modules).
+
   // LIVE camera follow: smooth pan/zoom to fit moving vehicles
   const _pbLiveFollowDurationMs = 2000; // animation duration for camera follow (slow, smooth)
   const _pbLiveFollowPadding = 0.15;    // extra padding around bounds (15%)
@@ -1481,42 +1408,8 @@ function main() {
   const _pbVehicleDoneEpsM = 1.0;
   const _pbVehicleDoneVelEpsMps = 0.05;
 
-  function _pbAllVehiclesReachedPlaybackEnd(state) {
-    try {
-      const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
-      let considered = 0;
-      for (const m of mobiles) {
-        if (!m || m.ghosted) continue;
-        const id = (m.id != null) ? String(m.id) : "";
-        if (!id) continue;
+  // _pbAllVehiclesReachedPlaybackEnd moved to ui_playback.js (delegate above).
 
-        const pts = (map && map._playbackPtsById) ? map._playbackPtsById.get(id) : null;
-        if (!pts || pts.length < 1) continue;
-
-        // Single-point paths are trivially "done".
-        if (pts.length === 1) {
-          considered++;
-          continue;
-        }
-
-        const distInfo = (typeof map?._getPathDistances === "function") ? map._getPathDistances(id, pts) : null;
-        const totalDist = distInfo && isFinite(distInfo.totalDist) ? distInfo.totalDist : 0;
-        const phys = (typeof map?._getPhysicsState === "function") ? map._getPhysicsState(id) : null;
-        const d = phys && isFinite(phys.d) ? phys.d : 0;
-        const v = phys && isFinite(phys.v) ? phys.v : 0;
-
-        considered++;
-        if (!(d >= (totalDist - _pbVehicleDoneEpsM) && v <= _pbVehicleDoneVelEpsMps)) {
-          return false;
-        }
-      }
-      // If we had no vehicles to consider, don't stall.
-      return true;
-    } catch {
-      return true;
-    }
-  }
-  
   // Scroll wheel nudge (iPod-style momentum)
   const _pbWheelImpulse = 1.0;        // velocity added per wheel tick
   const _pbWheelDecay = 0.8;          // wheel accumulator decay per frame
@@ -1533,658 +1426,9 @@ function main() {
   // Sliding window: when set, overrides index-based paging for click-drag scrubbing.
   // The window is centered on this timestamp instead of a fixed page boundary.
 
-  /** Compute total page count for current bounds.
-   *  Uses floor so the last page absorbs any remainder < pageSize,
-   *  keeping scrub resolution reasonable instead of creating a tiny final page. */
-  function _pbPageCount() {
-    const b = map.getPlaybackBounds();
-    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return 0;
-    return Math.max(1, Math.floor((b.maxMs - b.minMs) / _pbPageSizeMs));
-  }
-
-  /** Get the time range for the current page (or full range if paging disabled).
-   *  When pb._pbSlidingWindowCenter is set, the window is centered on that point
-   *  instead of using index-based page boundaries. */
-  function _pbGetPageRange() {
-    const b = map.getPlaybackBounds();
-    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return b;
-    if (pb._pbPageIndex < 0) return b; // "all" mode
-
-    // Sliding window mode: center window on pb._pbSlidingWindowCenter
-    if (pb._pbSlidingWindowCenter != null) {
-      const half = _pbPageSizeMs / 2;
-      let wMin = pb._pbSlidingWindowCenter - half;
-      let wMax = pb._pbSlidingWindowCenter + half;
-      // Clamp to global bounds, preserving window size when possible
-      if (wMin < b.minMs) { wMin = b.minMs; wMax = Math.min(b.maxMs, wMin + _pbPageSizeMs); }
-      if (wMax > b.maxMs) { wMax = b.maxMs; wMin = Math.max(b.minMs, wMax - _pbPageSizeMs); }
-      return { minMs: wMin, maxMs: wMax };
-    }
-
-    const total = _pbPageCount();
-    const idx = clamp(pb._pbPageIndex, 0, total - 1);
-    const pageStart = b.minMs + idx * _pbPageSizeMs;
-    // Last page extends to cover all remaining time (no short final page)
-    const pageEnd = (idx === total - 1) ? b.maxMs : pageStart + _pbPageSizeMs;
-    return { minMs: pageStart, maxMs: pageEnd };
-  }
-
-  /** Navigate to a specific page index, clamping to valid range. */
-  function _pbSetPage(idx) {
-    const total = _pbPageCount();
-    if (total <= 0) { pb._pbPageIndex = -1; return; }
-    pb._pbPageIndex = clamp(idx, 0, total - 1);
-    pb._pbSlidingWindowCenter = null; // exit sliding window, use index-based page
-    pb._pbPageAutoFollow = false; // user explicitly chose a page
-    updatePlaybackUi();
-  }
-
-  /** Enable paging and jump to the page containing the given time. */
-  function _pbPageForTime(tMs) {
-    const b = map.getPlaybackBounds();
-    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;
-    const total = _pbPageCount();
-    if (total <= 0) return;
-    const idx = Math.floor((tMs - b.minMs) / _pbPageSizeMs);
-    pb._pbPageIndex = clamp(idx, 0, total - 1);
-  }
-
-  /** After user stops scrubbing, re-center the sliding window so the playhead
-   *  sits at 15% (if user was dragging left) or 85% (if dragging right). */
-  function _pbSnapWindowToPlayhead() {
-    if (!_pbPagingActive() || pb._pbSlidingWindowCenter == null) return;
-    const b = map.getPlaybackBounds();
-    const tMs = map.getPlaybackTimeMs();
-    if (tMs == null || !isFinite(tMs)) return;
-    const pr = _pbGetPageRange();
-    // Determine which edge the playhead is near
-    const fracInPage = (pr.maxMs > pr.minMs) ? (tMs - pr.minMs) / (pr.maxMs - pr.minMs) : 0.5;
-    // If near left edge (<25%), snap playhead to 15%; if near right (>75%), snap to 85%
-    const targetFrac = (fracInPage < 0.25) ? 0.15 : (fracInPage > 0.75) ? 0.85 : fracInPage;
-    pb._pbSlidingWindowCenter = tMs - targetFrac * _pbPageSizeMs + _pbPageSizeMs / 2;
-    const half = _pbPageSizeMs / 2;
-    pb._pbSlidingWindowCenter = clamp(pb._pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
-  }
-
-  /** Check if paging should be active based on data duration. */
-  function _pbPagingActive() {
-    const b = map.getPlaybackBounds();
-    if (!isFinite(b.minMs) || !isFinite(b.maxMs)) return false;
-    return (b.maxMs - b.minMs) >= _pbPageMinDurationMs;
-  }
-
-  const fmtTime = (ms) => {
-    if (ms == null || !isFinite(ms)) return "—";
-    try { return new Date(ms).toLocaleTimeString(); } catch { return "—"; }
-  };
-
-  const updatePlaybackUi = () => {
-    const b = map.getPlaybackBounds();
-    const tMs = map.getPlaybackTimeMs();
-    const paging = _pbPagingActive();
-
-    // Auto-enable paging when duration crosses threshold.
-    // Initialize page index to the page containing the playhead.
-    if (paging && pb._pbPageIndex < 0) {
-      const t = (tMs != null && isFinite(tMs)) ? tMs : b.maxMs;
-      _pbPageForTime(t);
-      pb._pbPageAutoFollow = true; // started automatically, follow playhead
-    } else if (!paging) {
-      pb._pbPageIndex = -1; // disable paging when duration shrinks
-      pb._pbSlidingWindowCenter = null;
-    }
-
-    // Auto-advance page to follow playhead during normal playback (not scrubbing/coasting)
-    if (paging && pb._pbPageAutoFollow && tMs != null && isFinite(tMs) && !pb._pbScrubbing) {
-      const pr = _pbGetPageRange();
-      if (tMs >= pr.maxMs || tMs < pr.minMs) {
-        if (pb._pbSlidingWindowCenter != null) {
-          // Shift window just enough so playhead is inside, giving room in the direction of travel
-          const frac = (tMs >= pr.maxMs) ? 0.85 : 0.15;
-          pb._pbSlidingWindowCenter = tMs - frac * _pbPageSizeMs + _pbPageSizeMs / 2;
-          const half = _pbPageSizeMs / 2;
-          pb._pbSlidingWindowCenter = clamp(pb._pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
-        } else {
-          _pbPageForTime(tMs);
-        }
-      }
-      pb._pbPageAutoFollow = true; // keep following
-    }
-
-    // Use page range for slider when paging is active
-    const pr = paging ? _pbGetPageRange() : b;
-    const sliderMinMs = pr.minMs;
-    const sliderMaxMs = pr.maxMs;
-
-    if (pbLeftEl) pbLeftEl.textContent = fmtTime(sliderMinMs);
-    if (pbRightEl) pbRightEl.textContent = fmtTime(sliderMaxMs);
-    if (pbNowEl) pbNowEl.textContent = fmtTime(tMs);
-
-    if (pbScrubEl && isFinite(sliderMinMs) && isFinite(sliderMaxMs) && sliderMaxMs > sliderMinMs) {
-      const durMs = Math.max(1, sliderMaxMs - sliderMinMs);
-      const tRelMs = (tMs != null && isFinite(tMs)) ? (tMs - sliderMinMs) : durMs;
-      pbScrubEl.min = "0";
-      pbScrubEl.max = String(durMs);
-      pbScrubEl.step = "100"; // 100ms steps for smoother scrubbing
-      pbScrubEl.disabled = false;
-      if (!pb._pbScrubbing) {
-        pbScrubEl.value = String(clamp(tRelMs, 0, durMs));
-      }
-      // Update progress fill for browsers without accent-color range support
-      const pct = (clamp(Number(pbScrubEl.value), 0, durMs) / durMs) * 100;
-      pbScrubEl.style.setProperty("--pct", pct + "%");
-    } else if (pbScrubEl) {
-      pbScrubEl.disabled = true;
-      pbScrubEl.min = "0";
-      pbScrubEl.max = "1";
-      pbScrubEl.value = "0";
-      pbScrubEl.style.setProperty("--pct", "0%");
-    }
-
-    // Page arrow visibility & disabled state
-    if (pbPagePrevEl) {
-      pbPagePrevEl.classList.toggle("hidden", !paging);
-      pbPagePrevEl.disabled = pb._pbPageIndex <= 0;
-    }
-    if (pbPageNextEl) {
-      pbPageNextEl.classList.toggle("hidden", !paging);
-      pbPageNextEl.disabled = pb._pbPageIndex >= _pbPageCount() - 1;
-    }
-
-    const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
-    const atEnd = !hasBounds || map.isPlaybackAtEnd(200);
-    // Live window: playhead is close enough to maxMs that continuing playback
-    // would naturally reach the end before the next server update.
-    // Only applies at 1x and 5x; higher speeds don't get the buffer.
-    const _speed = map.getPlaybackSpeed() || 1.0;
-    const _nextInS = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-    const _wallElapsed2 = (Date.now() - pb._pbLastServerResponseMs) / 1000;
-    const _remS2 = Math.max(0, _nextInS - _wallElapsed2);
-    const _liveWindowMs = (_speed <= 5) ? _remS2 * 1000 * _speed : 0;
-    const inLiveWindow = !hasBounds || atEnd || (
-      _liveWindowMs > 0 && tMs != null && isFinite(tMs) && tMs >= b.maxMs - _liveWindowMs
-    );
-    // LIVE mode is based on the flag, not position - we're replaying the buffer
-    const followingLive = map._playbackLiveFollow;
-
-    if (pbPlayEl) {
-      // "Live" shows at the live edge: LIT only when actively live-following at
-      // 1x; UNLIT when following at >1x, or when in the live window but not yet
-      // following (clicking the unlit button enters live-follow — at any speed,
-      // handled in the click listener). Otherwise a plain Pause/Play transport.
-      const _liveFollowing = followingLive && !map._historicalMode;
-      const _inLiveWin = inLiveWindow && !map._historicalMode;
-      if (_liveFollowing) {
-        pbPlayEl.textContent = "Live";
-        pbPlayEl.classList.toggle("isLive", _speed === 1);
-      } else if (_inLiveWin) {
-        pbPlayEl.textContent = "Live";
-        pbPlayEl.classList.remove("isLive");
-      } else if (map.getPlaybackPlaying()) {
-        pbPlayEl.textContent = "Pause";
-        pbPlayEl.classList.remove("isLive");
-      } else {
-        pbPlayEl.textContent = "Play";
-        pbPlayEl.classList.remove("isLive");
-      }
-    }
-    if (pbSpeedEl) pbSpeedEl.value = String(map.getPlaybackSpeed() || 1.0);
-  };
-
-  const playbackLoop = () => {
-    pb._pbRAF = null;
-    // Allow loop to run in DVR mode OR LIVE mode (both need playback time updates)
-    if (!map.playbackMode && !map._playbackLiveFollow) return;
-    
-    try {
-    const now = performance.now();
-    const dt = (pb._pbLastPerf > 0) ? (now - pb._pbLastPerf) : 0;
-    pb._pbLastPerf = now;
-
-    const b = map.getPlaybackBounds();
-    let tMs = map.getPlaybackTimeMs();
-    const tMsBefore = tMs; // snapshot before advancement, for edge-crossing detection
-    const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
-    const durMs = hasBounds ? (b.maxMs - b.minMs) : 1;
-    const prevKnownMaxMs = pb._pbLastKnownMaxMs;
-    
-    // Playhead initialization is handled in tick() when data arrives
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // DETECT DATA CHANGES (new data arrived, or data trimmed)
-    // ─────────────────────────────────────────────────────────────────────────
-    let newDataArrived = false;
-    let forceCameraFit = false;
-    
-    if (hasBounds) {
-      if (pb._pbLastKnownMaxMs != null && b.maxMs > pb._pbLastKnownMaxMs + 100) {
-        newDataArrived = true;
-        // Record the update window for future forced camera fits.
-        if (typeof prevKnownMaxMs === "number" && isFinite(prevKnownMaxMs)) {
-          _pbLastDataUpdateWindowStartMs = prevKnownMaxMs;
-          _pbLastDataUpdateWindowEndMs = b.maxMs;
-        }
-        // Reset stall counter when fresh data arrives
-        pb._pbLiveStallCount = 0;
-      }
-      pb._pbLastKnownMinMs = b.minMs;
-      pb._pbLastKnownMaxMs = b.maxMs;
-      
-      // If playhead is now outside bounds (data trimmed or server restarted), handle it
-      if (tMs != null && isFinite(tMs)) {
-        if (tMs < b.minMs) {
-          // Data trimmed past the playhead: clamp to the new start and keep
-          // playing. Never jump to the live edge — new server data must not
-          // move the playhead; playback simply continues into it.
-          tMs = b.minMs;
-          map.setPlaybackTimeMs(tMs);
-        }
-        if (tMs > b.maxMs) {
-          tMs = b.maxMs;
-          map.setPlaybackTimeMs(tMs);
-        }
-      }
-    }
-
-    // Forced refresh: treat as a new-data event even if bounds didn't move.
-    // This is used by the terminal TUI to request a camera fit/zoom in the web UI.
-    try {
-      const state = map.lastState;
-      const seq = state?.meta?.force_refresh_seq;
-      if (typeof seq === "number" && isFinite(seq)) {
-        if (pb._pbLastForceRefreshSeq == null) {
-          // If the server seq is already >0 when playback starts (e.g. TUI refresh happened first),
-          // treat it as a one-time forced camera fit.
-          if (seq > 0) {
-            newDataArrived = true;
-            forceCameraFit = true;
-            pb._pbLiveStallCount = 0;
-          }
-        } else if (seq !== pb._pbLastForceRefreshSeq) {
-          newDataArrived = true;
-          forceCameraFit = true;
-          pb._pbLiveStallCount = 0;
-        }
-        pb._pbLastForceRefreshSeq = seq;
-      }
-    } catch {
-      // ignore
-    }
-
-    // When new data arrives in LIVE mode and playback is paused at the end,
-    // resume playing so the new segment animates. Don't rewind the playhead —
-    // let normal forward playback consume the new data naturally.
-    if (hasBounds && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && !map.getPlaybackPlaying()) {
-      const speed = map.getPlaybackSpeed() || 1.0;
-      pb._pbVelocity = _pbPlaybackSpeed * speed;
-      map.setPlaybackPlaying(true);
-      pb._pbLastPerf = 0;
-      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-    }
-    
-    // ─────────────────────────────────────────────────────────────────────────
-    // LIVE BUFFER CALCULATION
-    // Buffer = wall-clock time since LIVE started (how much data we've accumulated).
-    // Playback consumes this buffer at playbackSpeed rate.
-    // ─────────────────────────────────────────────────────────────────────────
-    let liveBufferMs = 0;
-    
-    if (hasBounds && map._playbackLiveFollow) {
-      // Initialize playhead if not set (handled above, but keep for safety)
-      if (tMs == null || !isFinite(tMs)) {
-        const meta = map.lastState?.meta;
-        const nextInS = Number(meta?.polling_next_update_in_s) ?? Number(meta?.polling_predicted_interval_s) ?? 600;
-        const speed = map.getPlaybackSpeed() || 1.0;
-        const offsetMs = nextInS * 1000 * speed;
-        tMs = Math.max(b.minMs, b.maxMs - offsetMs);
-        map.setPlaybackTimeMs(tMs);
-      }
-      
-      // Initialize LIVE tracking on first entry
-      if (pb._pbLiveStartWallMs == null) {
-        pb._pbLiveStartWallMs = now;
-        pb._pbLiveStartDataMs = b.maxMs;
-      }
-      
-      // Buffer = wall-clock time since we started LIVE mode
-      // This is how much new data has accumulated since we began
-      const wallElapsed = now - pb._pbLiveStartWallMs;
-      liveBufferMs = wallElapsed;
-      
-      // Target = newest data minus the buffer (stay behind the live edge)
-      // The buffer grows in real-time, so we always have runway
-      pb._pbLiveTargetMs = b.maxMs - liveBufferMs;
-      
-      // Clamp: if rewind outpaces buffer accumulation, just use minMs
-      if (pb._pbLiveTargetMs < b.minMs) {
-        pb._pbLiveTargetMs = b.minMs;
-      }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // LIVE CAMERA FOLLOW: Frame where vehicles currently are, their visible
-    // trails, and nearby fixed sensors. Uses median-based outlier trimming so
-    // a distant long-route vehicle doesn't drag the camera to city scale.
-    // ─────────────────────────────────────────────────────────────────────────
-    {
-      if (_screensaverActive && (newDataArrived || forceCameraFit) && map._playbackLiveFollow) {
-        _performCameraFit({ force: true });
-      }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // DEFERRED CAMERA FIT: If a live camera fit was blocked by user interaction,
-    // replay it now that the interaction + easing has settled.
-    // ─────────────────────────────────────────────────────────────────────────
-    if (pb._deferredCameraFit && map._playbackLiveFollow
-        && typeof map._canRunAutoCamera === "function" && map._canRunAutoCamera()) {
-      const d = pb._deferredCameraFit;
-      pb._deferredCameraFit = null;
-      if (d.type === "bounds" && d.bb) {
-        _animateFitBoundsLatLon(d.bb, { durationMs: d.durationMs || _pbLiveFollowDurationMs });
-      } else if (d.type === "storedView") {
-        _animateToStoredView(d.durationMs || _pbLiveFollowDurationMs);
-      }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // PHYSICS SIMULATION
-    // ─────────────────────────────────────────────────────────────────────────
-    let didAdvanceTime = false;
-    const didMarkerInertia = (typeof map._stepPbMarkerInertia === "function")
-      ? !!map._stepPbMarkerInertia(now, dt)
-      : false;
-
-    if (didMarkerInertia) {
-      didAdvanceTime = true;
-      tMs = map.getPlaybackTimeMs();
-      pb._pbAtEndSincePerf = null; // user interaction resets end timer
-    } else if (!pb._pbScrubbing && hasBounds && tMs != null && isFinite(tMs) && dt > 0) {
-      // Apply wheel nudge to velocity
-      if (Math.abs(pb._pbWheelAccum) > 0.1) {
-        pb._pbVelocity += pb._pbWheelAccum * _pbWheelImpulse;
-        pb._pbWheelAccum *= _pbWheelDecay;
-        if (Math.abs(pb._pbWheelAccum) < 0.1) pb._pbWheelAccum = 0;
-        pb._pbAtEndSincePerf = null; // wheel interaction resets end timer
-      }
-
-      // Determine velocity based on state
-      const atEnd = (tMs >= b.maxMs - 1);
-      const speedMult = map.getPlaybackSpeed() || 1.0;
-
-      // Resolve loop start within current bounds.
-      const loopStartMsRaw = (pb._pbLoopStartMs != null) ? Number(pb._pbLoopStartMs) : null;
-      const loopStartMs = (isFinite(loopStartMsRaw)) ? clamp(loopStartMsRaw, b.minMs, b.maxMs) : b.minMs;
-      
-      if (pb._pbIsRewinding) {
-        // Tape-reel rewind: ramp up, cruise, ease into start
-        const totalDist = Math.max(1, b.maxMs - loopStartMs);
-        const distFromStart = tMs - loopStartMs;
-        const progress = 1 - (distFromStart / totalDist); // 0 at end, 1 at loop start
-        
-        // Base cruise speed: complete full rewind in ~4 seconds
-        const cruiseSpeed = -totalDist / 4000;
-        const playbackSpeed = _pbPlaybackSpeed * speedMult;
-        
-        // Ease duration in wall time
-        const easeDurationMs = 1500;
-        
-        // Ease zone: last 15% of the recording (position-based trigger)
-        // This is independent of speed - we ease over the final portion of the timeline
-        const easeDistanceMs = totalDist * 0.15;
-        
-        const inEasePhase = pb._pbEaseStartPerf != null;
-        const shouldStartEase = !inEasePhase && distFromStart <= easeDistanceMs;
-        
-        if (progress < 0.15 && !inEasePhase) {
-          // Ramp up phase: accelerate from 0.3 to 1.0 of cruise speed
-          const speedFactor = 0.3 + (progress / 0.15) * 0.7;
-          pb._pbVelocity = cruiseSpeed * speedFactor;
-        } else if (inEasePhase || shouldStartEase) {
-          // NEWTONIAN PHYSICS: constant acceleration to reach playbackSpeed at loopStartMs
-          if (pb._pbEaseStartPerf == null) {
-            pb._pbEaseStartPerf = now;
-            pb._pbEaseStartPos = tMs;
-            pb._pbEaseStartVelocity = pb._pbVelocity;
-          }
-          
-          // We want to go from v₀ (negative) to playbackSpeed (positive) over distance d
-          // Average velocity = (v₀ + v_final) / 2
-          // Time = d / |avg_v|
-          // Acceleration = (v_final - v₀) / t
-          const v0 = pb._pbEaseStartVelocity;
-          const vFinal = playbackSpeed;
-          const d = pb._pbEaseStartPos - loopStartMs;
-          
-          const avgVel = (v0 + vFinal) / 2;
-          // Avoid division by zero
-          const accel = Math.abs(avgVel) > 0.1 ? (vFinal - v0) / (d / Math.abs(avgVel)) : 0.01;
-          
-          // Apply acceleration
-          pb._pbVelocity = pb._pbVelocity + accel * dt;
-          
-          // Clamp to not overshoot target velocity
-          if (pb._pbVelocity >= vFinal) {
-            pb._pbVelocity = vFinal;
-          }
-          
-          // End ease when we reach start or velocity reaches target
-          if (tMs <= loopStartMs + 10 || pb._pbVelocity >= vFinal) {
-            pb._pbIsRewinding = false;
-            pb._pbEaseStartPerf = null;
-            pb._pbVelocity = playbackSpeed;
-          }
-        } else {
-          // Cruise phase: full speed
-          pb._pbVelocity = cruiseSpeed;
-        }
-      } else if (map._playbackLiveFollow) {
-        // ─────────────────────────────────────────────────────────────────────
-        // LIVE MODE: Play forward until we hit maxMs, then stall waiting for
-        // new data. When new data arrives, resume playing.
-        // ─────────────────────────────────────────────────────────────────────
-        if (atEnd) {
-          // At live edge, waiting for new data - just hold position
-          pb._pbVelocity = 0;
-        } else {
-          // Have data ahead - play toward live edge at user-selected speed
-          pb._pbVelocity = _pbPlaybackSpeed * speedMult;
-        }
-      } else if (map.getPlaybackPlaying()) {
-        // Normal forward playback
-        if (atEnd) {
-          // At end — velocity zeroed; the Live-mode switch below will activate.
-          pb._pbVelocity = 0;
-        } else {
-          // Normal forward - maintain playback speed
-          pb._pbVelocity = _pbPlaybackSpeed * speedMult;
-          pb._pbAtEndSincePerf = null;
-        }
-      } else if (!map.getPlaybackPlaying() && Math.abs(pb._pbVelocity) > _pbVelocityThreshold) {
-        // Coasting after wheel - apply friction
-        const friction = pb._pbIsWheelCoasting ? _pbWheelFriction : _pbFriction;
-        const frictionFactor = Math.pow(friction, dt);
-        pb._pbVelocity *= frictionFactor;
-        
-        // When velocity decays to playback speed, resume playback
-        const playbackSpeed = _pbPlaybackSpeed * speedMult;
-        if (pb._pbVelocity > 0 && pb._pbVelocity <= playbackSpeed) {
-          // Forward coasting reached playback speed - resume
-          pb._pbIsWheelCoasting = false;
-          _pbSnapWindowToPlayhead();
-          if (pb._pbCommitLoopStartOnCoastEnd) {
-            pb._pbLoopStartMs = tMs;
-            pb._pbCommitLoopStartOnCoastEnd = false;
-          }
-          pb._pbVelocity = playbackSpeed;
-          map.setPlaybackPlaying(true);
-          updatePlaybackUi();
-        } else if (pb._pbVelocity < 0 && Math.abs(pb._pbVelocity) < _pbVelocityThreshold) {
-          // Backward coasting stopped - resume forward playback
-          pb._pbIsWheelCoasting = false;
-          _pbSnapWindowToPlayhead();
-          if (pb._pbCommitLoopStartOnCoastEnd) {
-            pb._pbLoopStartMs = tMs;
-            pb._pbCommitLoopStartOnCoastEnd = false;
-          }
-          pb._pbVelocity = playbackSpeed;
-          map.setPlaybackPlaying(true);
-          updatePlaybackUi();
-        }
-      }
-      
-      // Note: No additional easing here - forward playback runs at constant speed
-      // Rewind easing is handled inside the pb._pbIsRewinding block above
-      
-      // Snap to zero if very slow
-      if (Math.abs(pb._pbVelocity) < _pbVelocityThreshold && pb._pbVelocity !== 0) {
-        pb._pbVelocity = 0;
-        // Final UI update so time labels reflect where the playhead landed
-        if (!map.getPlaybackPlaying()) {
-          updatePlaybackUi();
-        }
-      }
-      
-      // Move playhead
-      if (Math.abs(pb._pbVelocity) > 0) {
-        let nextMs = tMs + pb._pbVelocity * dt;
-
-        // Clamp to bounds; during auto-rewind, clamp to loopStartMs instead of the global min.
-        const rewindMinMs = (pb._pbIsRewinding && loopStartMs != null && isFinite(loopStartMs)) ? loopStartMs : b.minMs;
-        nextMs = clamp(nextMs, rewindMinMs, b.maxMs);
-        
-        // If we hit a bound, zero velocity (unless in active ease - let ease control it)
-        if (nextMs <= rewindMinMs && pb._pbVelocity < 0 && pb._pbEaseStartPerf == null) {
-          pb._pbVelocity = 0;
-          pb._pbIsRewinding = false; // rewind complete
-          nextMs = rewindMinMs;
-        }
-        if (nextMs >= b.maxMs && pb._pbVelocity > 0) {
-          pb._pbVelocity = 0;
-          nextMs = b.maxMs;
-        }
-        
-        if (nextMs !== tMs) {
-          map.setPlaybackTimeMs(nextMs);
-          tMs = nextMs;
-          didAdvanceTime = true;
-
-          // Force slider to update immediately during coasting
-          if (!map.getPlaybackPlaying()) {
-            updatePlaybackUi();
-          }
-        }
-        
-        // When AUTO-REWIND arrives at start, reset for forward playback
-        // But NOT when user is manually coasting backward
-        if (tMs <= b.minMs + 1 && pb._pbVelocity === 0 && pb._pbIsRewinding) {
-          // We've hit the start from auto-rewind - start playing forward
-          pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-          pb._pbAtEndSincePerf = null;
-          pb._pbIsRewinding = false;
-          if (!map.getPlaybackPlaying()) {
-            map.setPlaybackPlaying(true);
-          }
-          updatePlaybackUi();
-        }
-      }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // FOVEATED ROAD MATCHING: Progressive snapping during playback
-    // Only run when playing (not scrubbing) and time is advancing
-    // ─────────────────────────────────────────────────────────────────────────
-    if (map._historicalMode && map.getPlaybackPlaying() && !pb._pbScrubbing && !pb._pbIsRewinding) {
-      map._requestFoveatedRoadMatching();
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // RENDER
-    // ─────────────────────────────────────────────────────────────────────────
-    if (didAdvanceTime) {
-      map._compositePaFieldOnTiles(map.lastState);
-      map.drawOverlay(map.lastState, { cacheUnderlay: true });
-    }
-
-    // When playback enters the live buffer window, stop and show Live button.
-    // Buffer window = predictedInterval * speed, at every speed.
-    {
-      const _spd2 = map.getPlaybackSpeed() || 1.0;
-      const _nextInS2 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-      const _wallElapsed3 = (Date.now() - pb._pbLastServerResponseMs) / 1000;
-      const _remS3 = Math.max(0, _nextInS2 - _wallElapsed3);
-      const _lwMs2 = _remS3 * 1000 * _spd2;
-      const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
-      var _inLiveWindow2 = hasBounds && tMs != null && isFinite(tMs) && tMs >= bufferEdge;
-      // Only trigger if we CROSSED into the window this frame (were below, now at/above).
-      // If the user scrubbed into the window, let playback continue to maxMs.
-      var _crossedIntoLiveWindow = _inLiveWindow2 && isFinite(tMsBefore) && tMsBefore < bufferEdge;
-    }
-    if (!pb._pbIsRewinding &&
-        !_screensaverActive &&
-        map.getPlaybackPlaying() &&
-        !map._playbackLiveFollow &&
-        !pb._pbIsWheelCoasting &&
-        didAdvanceTime && pb._pbVelocity >= 0 &&
-        _crossedIntoLiveWindow) {
-      // Don't auto-activate Live mode — just stop playback at the buffer edge.
-      // The button will show "Live" (not highlighted) so the user can opt in.
-      // map._playbackLiveFollow = true;
-      // pb._pbPageAutoFollow = true;
-      // try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-      pb._pbVelocity = 0;
-      pb._pbAtEndSincePerf = null;
-      pb._pbIsRewinding = false;
-      map.setPlaybackPlaying(false);
-      updatePlaybackUi();
-    }
-
-    // UI updates
-    const isActive = Math.abs(pb._pbVelocity) > _pbVelocityThreshold || Math.abs(pb._pbWheelAccum) > 0.1;
-    const uiMinDt = isActive ? 16 : 250;
-    if ((didAdvanceTime || isActive) && (now - pb._pbLastUiPerf) >= uiMinDt) {
-      updatePlaybackUi();
-      if (sidebarOpen) updateSidebarPlaybackValues();
-      pb._pbLastUiPerf = now;
-    }
-
-    // Sync legend + field only when not scrubbing with a sensor selected.
-    // Legend title/bars and PA field update when scrubbing stops or vehicle resumes.
-    if (!(pb._pbScrubbing || pb._pbIsWheelCoasting) || !selectedId) {
-      _syncMapPollutant();
-      syncLegendToMapSelection();
-    }
-
-    // ── Barrel jog wheel: sync position & render ──
-    if (_barrelMode && _jogWheel) {
-      const b2 = map.getPlaybackBounds();
-      const t2 = map.getPlaybackTimeMs();
-      if (isFinite(b2.minMs) && isFinite(b2.maxMs) && b2.maxMs > b2.minMs && isFinite(t2)) {
-        const frac = (t2 - b2.minMs) / (b2.maxMs - b2.minMs);
-        if (!_jogWheel.isScrubbing()) _jogWheel.setPosition(frac);
-      }
-      _jogWheel.render();
-    }
-
-    // Keep loop running if there's any motion or pending state
-    const markerInertiaActive = (typeof map._hasPbMarkerInertia === "function") ? !!map._hasPbMarkerInertia() : false;
-    const hasMotion = Math.abs(pb._pbVelocity) > _pbVelocityThreshold;
-    const hasWheelMomentum = Math.abs(pb._pbWheelAccum) > 0.1;
-    const waitingToRewind = pb._pbAtEndSincePerf != null;
-    const inLiveMode = map._playbackLiveFollow;  // LIVE mode always keeps loop running
-    
-    if (map.getPlaybackPlaying() || markerInertiaActive || hasMotion || hasWheelMomentum || waitingToRewind || inLiveMode) {
-      pb._pbRAF = requestAnimationFrame(playbackLoop);
-    } else {
-      pb._pbLastPerf = 0;
-    }
-    
-    } catch (e) {
-      // Don't let errors kill the playback loop
-      console.error("playbackLoop error:", e);
-      pb._pbRAF = requestAnimationFrame(playbackLoop);
-    }
-  };
+  // _pbPageCount / _pbGetPageRange / _pbSetPage / _pbPageForTime /
+  // _pbSnapWindowToPlayhead / _pbPagingActive / fmtTime / updatePlaybackUi /
+  // playbackLoop moved to ui_playback.js (delegates above).
 
   // Allow MapView to restart the loop after a drag release.
   window.__ensurePlaybackLoop = () => {
@@ -2451,11 +1695,8 @@ function main() {
   let _isLoadingData = false;
 
   // Shade over the map (not the UI) while data is loading
-  function setMapLoadingShade(on) {
-    const shade = document.getElementById("mapLoadingShade");
-    if (shade) shade.classList.toggle("hidden", !on);
-  }
-  
+  // setMapLoadingShade moved to ui_playback.js (delegate above).
+
   // Track current selected day for menu display
   let _selectedDayValue = "live";
   
@@ -3338,101 +2579,9 @@ function main() {
   });
 
   if (pbScrubEl) {
-    const applyScrub = () => {
-      const b = map.getPlaybackBounds();
-      if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
-      // When paging is active, slider is relative to the page range
-      const pr = _pbPagingActive() ? _pbGetPageRange() : b;
-      const relMs = Number(pbScrubEl.value);
-      if (!isFinite(relMs)) return;
-      const tMs = pr.minMs + relMs;
-      const clampedT = clamp(tMs, b.minMs, b.maxMs);
-
-      map.setPlaybackTimeMs(clampedT);
-
-      // Don't auto-enable LIVE mode when dragging - user must click the Live button.
-      // Just track where the user left the playhead as replay point A.
-      pb._pbLoopStartMs = clampedT;
-
-      updatePlaybackUi();
-      map._compositePaFieldOnTiles(map.lastState);
-      map.drawOverlay(map.lastState);
-
-      // Start or stop edge-jog during drag
-      if (pb._pbScrubbing && pb._pbSlidingWindowCenter != null) {
-        _pbStartEdgeJog();
-      }
-    };
-
-    // Edge-jog: when the slider thumb is in the outer 10% during a drag,
-    // continuously shift the sliding window in that direction.
-    const _pbEdgeThreshold = 0.10; // outer 10% of slider triggers jog
-    function _pbStartEdgeJog() {
-      if (pb._pbJogRAF) return; // already running
-      pb._pbJogLastPerf = performance.now();
-      pb._pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
-    }
-    function _pbStopEdgeJog() {
-      if (pb._pbJogRAF) { cancelAnimationFrame(pb._pbJogRAF); pb._pbJogRAF = null; }
-    }
-    function _pbEdgeJogTick(now) {
-      pb._pbJogRAF = null;
-      if (!pb._pbScrubbing || pb._pbSlidingWindowCenter == null) return;
-
-      const maxVal = Number(pbScrubEl.max);
-      const curVal = Number(pbScrubEl.value);
-      if (!maxVal) return;
-      const frac = curVal / maxVal; // 0..1 position within window
-
-      // Determine jog direction and intensity
-      let jogDir = 0;
-      let intensity = 0;
-      if (frac >= 1 - _pbEdgeThreshold) {
-        jogDir = 1; // jog forward
-        intensity = (frac - (1 - _pbEdgeThreshold)) / _pbEdgeThreshold; // 0..1
-      } else if (frac <= _pbEdgeThreshold) {
-        jogDir = -1; // jog backward
-        intensity = (_pbEdgeThreshold - frac) / _pbEdgeThreshold; // 0..1
-      }
-
-      if (jogDir !== 0) {
-        const dt = now - pb._pbJogLastPerf;
-        // Jog speed: up to 1 page-width per second at full intensity
-        const jogSpeed = _pbPageSizeMs * intensity * 1.0;
-        const shift = jogDir * jogSpeed * (dt / 1000);
-
-        const gb = map.getPlaybackBounds();
-        const prevCenter = pb._pbSlidingWindowCenter;
-        pb._pbSlidingWindowCenter = clamp(
-          pb._pbSlidingWindowCenter + shift,
-          gb.minMs + _pbPageSizeMs / 2,
-          gb.maxMs - _pbPageSizeMs / 2
-        );
-
-        // Re-apply scrub with the new window position — the absolute time
-        // the thumb maps to changes as the window shifts under it.
-        const pr = _pbGetPageRange();
-        const relMs = Number(pbScrubEl.value);
-        const tMs = clamp(pr.minMs + relMs, gb.minMs, gb.maxMs);
-        map.setPlaybackTimeMs(tMs);
-        pb._pbLoopStartMs = tMs;
-
-        // Always update timestamp display during jog, even if window is
-        // clamped to the data boundary (so the user sees the time isn't moving).
-        updatePlaybackUi();
-        map.drawOverlay(map.lastState);
-      } else {
-        // Not in the jog zone — still update the timestamp so it's never stale
-        // after the user drags out of the edge zone.
-        updatePlaybackUi();
-      }
-
-      pb._pbJogLastPerf = now;
-      // Keep ticking while dragging
-      if (pb._pbScrubbing) {
-        pb._pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
-      }
-    }
+    // applyScrub / _pbStartEdgeJog / _pbStopEdgeJog / _pbEdgeJogTick moved to
+    // ui_playback.js (file-scope delegates above); the scrub listeners below
+    // call them through those delegates.
 
     // ─── Mouse/pen track-drag: jogger sensitivity for clicks outside the nub ──
     let _scrubPointerOnTrack = false;
@@ -3498,11 +2647,11 @@ function main() {
       pb._pbDidDrag = true;
       _pbLastScrubPos = newVal;
       _pbLastScrubTime = performance.now();
-      if (!_scrubRAF) {
-        _scrubRAF = requestAnimationFrame(() => {
-          _scrubRAF = 0;
+      if (!_getScrubRAF()) {
+        _setScrubRAF(requestAnimationFrame(() => {
+          _setScrubRAF(0);
           applyScrub();
-        });
+        }));
       }
     });
     pbScrubEl.addEventListener("pointerup", () => {
@@ -3553,7 +2702,6 @@ function main() {
       applyScrub();
 
     });
-    var _scrubRAF = 0;
     pbScrubEl.addEventListener("input", () => {
       if (_scrubPointerOnTrack) return; // track drag handled by pointermove
       const now = performance.now();
@@ -3567,11 +2715,11 @@ function main() {
       map.setPlaybackPlaying(false);
       // Coalesce rapid input events into a single rAF to avoid
       // overwhelming iPad Safari with drawOverlay() calls
-      if (!_scrubRAF) {
-        _scrubRAF = requestAnimationFrame(() => {
-          _scrubRAF = 0;
+      if (!_getScrubRAF()) {
+        _setScrubRAF(requestAnimationFrame(() => {
+          _setScrubRAF(0);
           applyScrub();
-        });
+        }));
       }
     });
     pbScrubEl.addEventListener("change", () => {
@@ -3711,11 +2859,11 @@ function main() {
       pb._pbDidDrag = true;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
-      if (!_scrubRAF) {
-        _scrubRAF = requestAnimationFrame(() => {
-          _scrubRAF = 0;
+      if (!_getScrubRAF()) {
+        _setScrubRAF(requestAnimationFrame(() => {
+          _setScrubRAF(0);
           applyScrub();
-        });
+        }));
       }
     }, { passive: false });
 
@@ -3726,7 +2874,7 @@ function main() {
       _scrubTouchRawTarget = null;
       _scrubTouchOnThumb = false;
       // Cancel any pending applyScrub rAF so it doesn't overwrite page-back
-      if (_scrubRAF) { cancelAnimationFrame(_scrubRAF); _scrubRAF = 0; }
+      if (_getScrubRAF()) { cancelAnimationFrame(_getScrubRAF()); _setScrubRAF(0); }
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
       pb._pbScrubbing = false;
