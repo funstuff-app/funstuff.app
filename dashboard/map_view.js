@@ -87,13 +87,12 @@ class MapView {
     // Trace mode: animate the emoji along its own breadcrumb trail.
     this.traceMode = false;
     this._traceRAF = null;
-    this._traceLastFrameTs = 0;
-    this._traceTargetFPS = 30; // reduce CPU while staying smooth
-    this._backgroundedFPS = 15; // throttle when tab is hidden
+    // _traceLastFrameTs, _traceTargetFPS, _backgroundedFPS moved into
+    // PlaybackEngine (S10; subsystem-private).
     this._backgrounded = document.visibilityState === "hidden";
 
     this._followRAF = null;
-    this._followLastFrameTs = 0;
+    // _followLastFrameTs moved into PlaybackEngine (S10; subsystem-private).
     this._followSuppressUntilMs = 0;
     this._followTargetLat = null;
     this._followTargetLon = null;
@@ -191,17 +190,11 @@ class MapView {
     // CameraGestures; the warp map is shared with OverlayRenderer/PlaybackEngine.
     this._traceSelectionWarpById = new Map(); // id -> { t0Ms, fromLat, fromLon, homeLat, homeLon, fadeMs, durationMs }
 
-    // Trace playback tuning (kept as fields so you can tweak later).
-    // - We still base movement on GPS timestamps/distances, but we normalize to a
-    //   human-watchable speed (otherwise real-world sparse updates look like crawling).
-    this._traceTargetMedianSpeedMps = 7.0; // ~15.7 mph (playback median)
-    this._traceMaxSpeedMps = 18.0; // ~40 mph (playback cap)
-    this._traceRealMaxSpeedMps = 20.0; // ~45 mph (badge cap; filters GPS jumps)
-    this._traceSpeedSmoothingTauS = 1.6; // smaller = snappier accel/brake
-    this._traceStopSpeedMps = 0.25; // below this, treat as stop/dwell
-    this._traceStopMinMs = 350;
-    this._traceStopMaxMs = 3500;
-    this._traceDwellTimeCompression = 12.0; // higher = shorter dwells
+    // Trace playback tuning (kept as fields so you can tweak later) moved into
+    // PlaybackEngine (S10; subsystem-private): _traceTargetMedianSpeedMps,
+    // _traceMaxSpeedMps, _traceRealMaxSpeedMps, _traceSpeedSmoothingTauS,
+    // _traceStopSpeedMps, _traceStopMinMs, _traceStopMaxMs,
+    // _traceDwellTimeCompression.
 
     // Persist trails on-screen across server history dropouts.
     // This is *not* a short tail cache or a faded fallback; it is the last known full
@@ -213,15 +206,15 @@ class MapView {
     // Basemap tile cache (LRU bounded). Without eviction this grows unbounded as you pan/zoom.
     // Lower limit on mobile/tablet for memory constraints; detect via coarse heuristic.
     this.tileCache = new Map(); // key -> {img, ok}
-    this._tileCacheMax = _isMobileDevice ? 180 : 420;
+    // _tileCacheMax moved into TileRenderer (S10; subsystem-private).
 
     // Touch pan/pinch state (iPad, iOS, Android).
     // _touchState is owned by CameraGestures; _touchActive is shared (read by
     // TileRenderer/PlaybackEngine).
     this._touchActive = false; // true while any touch is in progress (for skipping expensive ops)
 
-    // Debounce tile-load redraws to avoid cascading redraws when multiple tiles load at once
-    this._tileLoadRedrawTimer = null;
+    // Debounce tile-load redraws to avoid cascading redraws when multiple tiles load at once.
+    // _tileLoadRedrawTimer moved into TileRenderer (S10; subsystem-private).
     // Snapshot of the last rendered basemap frame to avoid flicker while tiles load.
     this._tilesSnapshotCanvas = null; // offscreen canvas
     this._tilesSnapshotMeta = null; // { zoom, centerLat, centerLon }

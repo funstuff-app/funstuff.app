@@ -7,13 +7,15 @@
  * exposes it via `this.view`. MapView's own drawTiles/drawTile/etc. become
  * one-line delegates to `this.tiles.<method>()`.
  *
+ * Subsystem-private state (owned by TileRenderer, moved out of MapView in S10;
+ * verified by grep as referenced only here): _tileCacheMax, _tileLoadRedrawTimer.
+ *
  * Shared MapView fields read/written here (kept on MapView, not moved,
  * because non-moved code — constructor, setTheme, onTouchEnd, zoomBy, resize —
- * also touches them): tctx, _cssW, _cssH, _dpr, center, zoom, themeKey,
- * tileTemplate, tileSubdomains, _pinchZooming, _touchActive, tilesCanvas,
- * _zoomMin, _zoomMax, tileCache, _tileCacheMax, _tileEpoch,
- * _tileLoadRedrawTimer, _tileRedrawPending, _tilesSnapshotCanvas,
- * _tilesSnapshotMeta.
+ * or another controller (CameraGestures) also touches them): tctx, _cssW,
+ * _cssH, _dpr, center, zoom, themeKey, tileTemplate, tileSubdomains,
+ * _pinchZooming, _touchActive, tilesCanvas, _zoomMin, _zoomMax, tileCache,
+ * _tileEpoch, _tileRedrawPending, _tilesSnapshotCanvas, _tilesSnapshotMeta.
  */
 (function (root, factory) {
   if (typeof module === "object" && typeof module.exports === "object") {
@@ -29,12 +31,25 @@
   // have no browser globals).
   var g = (typeof window !== "undefined") ? window : globalThis;
 
+  // Mirror of map_view.js's file-scope _isMobileDevice, computed lazily so the
+  // module factory stays browser-global-free (node tests have no navigator).
+  function _isMobileDevice() {
+    var nav = (typeof navigator !== "undefined") ? navigator : null;
+    if (!nav) return false;
+    return /iPad|iPhone|iPod|Android/i.test(nav.userAgent) || (nav.maxTouchPoints > 1);
+  }
+
   /**
    * @param {object} view — MapView instance (owns shared canvas/center/zoom/
    *   theme/cache state; see file header for the full shared-field list).
    */
   function TileRenderer(view) {
     this.view = view;
+
+    // Subsystem-private state (owned by TileRenderer; not shared with any
+    // unmoved MapView code or other module — verified by grep in S10).
+    this._tileCacheMax = _isMobileDevice() ? 180 : 420;
+    this._tileLoadRedrawTimer = null;
   }
 
   TileRenderer.prototype.drawTiles = function () {
@@ -174,8 +189,8 @@
     if (!view.tileCache || !key) return;
     if (view.tileCache.has(key)) view.tileCache.delete(key);
     view.tileCache.set(key, value);
-    const max = (typeof view._tileCacheMax === "number" && isFinite(view._tileCacheMax) && view._tileCacheMax > 0)
-      ? Math.floor(view._tileCacheMax)
+    const max = (typeof this._tileCacheMax === "number" && isFinite(this._tileCacheMax) && this._tileCacheMax > 0)
+      ? Math.floor(this._tileCacheMax)
       : 420;
     while (view.tileCache.size > max) {
       const oldestKey = view.tileCache.keys().next().value;
@@ -260,9 +275,9 @@
       view._tileRedrawPending = true;
       return;
     }
-    if (view._tileLoadRedrawTimer) return; // already scheduled
-    view._tileLoadRedrawTimer = setTimeout(() => {
-      view._tileLoadRedrawTimer = null;
+    if (this._tileLoadRedrawTimer) return; // already scheduled
+    this._tileLoadRedrawTimer = setTimeout(() => {
+      this._tileLoadRedrawTimer = null;
       this.drawTiles();
     }, 50);
   };

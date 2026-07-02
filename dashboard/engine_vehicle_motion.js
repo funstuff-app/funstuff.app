@@ -14,7 +14,11 @@
  * Shared MapView fields read/written here (kept on MapView, not moved,
  * because non-moved code also touches them): _vehiclePhysicsCache,
  * _physicsStateById, _vehiclePathById, _smoothPathCache, _pathDistCache,
- * _playbackPtsKey, _playbackSpeed.
+ * _playbackPtsKey, _playbackSpeed. The S10 ownership sweep re-classified
+ * every one of these by grep: all remain genuinely shared (OverlayRenderer
+ * draws from the physics/path caches, PlaybackEngine samples them, RoadMatcher
+ * reads _physicsStateById/_playbackPtsKey), so nothing moved into this
+ * controller — it correctly owns only behavior over shared subsystem state.
  *
  * Physics/waypoint tuning constants (CRUISE_SPEED, WAYPOINT_*, JITTER_*,
  * etc.) remain `static` on the MapView class itself (unit tests in

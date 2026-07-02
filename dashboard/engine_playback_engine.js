@@ -16,7 +16,17 @@
  * MapView's own playback methods become one-line delegates to
  * `this.playbackEngine.<method>()`.
  *
- * Shared MapView fields read/written here (kept on MapView, not moved):
+ * Subsystem-private state (owned by PlaybackEngine, moved out of MapView in
+ * S10; verified by grep as referenced only within this module): the trace/
+ * follow frame-rate throttles _traceLastFrameTs, _traceTargetFPS,
+ * _backgroundedFPS, _followLastFrameTs, _followIdleFrames, and the trace
+ * playback tuning constants _traceTargetMedianSpeedMps, _traceMaxSpeedMps,
+ * _traceRealMaxSpeedMps, _traceSpeedSmoothingTauS, _traceStopSpeedMps,
+ * _traceStopMinMs, _traceStopMaxMs, _traceDwellTimeCompression.
+ *
+ * Shared MapView fields read/written here (kept on MapView, not moved, because
+ * unmoved MapView code — constructor handlers, setTraceMode, setPlaybackMode,
+ * draw, getPlaybackBounds — or another controller also touches them):
  *   _playbackNewestSegmentStartMs, _playbackLastMaxMs, _playbackPtsById,
  *   _playbackPtsKey, _playbackNowMs, _playbackMinMs, _playbackMaxMs,
  *   _playbackSpeed, _playbackLiveFollow, _historicalMode, _historicalDateStr,
@@ -25,12 +35,8 @@
  *   _curveLookaheadCache, _screenHeadingCache, _tracePtsById, _tracePtsKey,
  *   _traceActiveRouteById, _tracePendingRouteById, _traceCycleStartMsById,
  *   _traceAngleById, _traceAngleLastMsById, _traceLastSideById,
- *   _traceSelectionWarpById, _traceRealMaxSpeedMps, _traceMaxSpeedMps,
- *   _traceTargetMedianSpeedMps, _traceSpeedSmoothingTauS, _traceStopSpeedMps,
- *   _traceDwellTimeCompression, _traceStopMinMs, _traceStopMaxMs, _traceRAF,
- *   _traceLastFrameTs, _traceTargetFPS, _followRAF, _followLastFrameTs,
- *   _followTargetLat, _followTargetLon, _followSuppressUntilMs,
- *   _followIdleFrames, _backgrounded, _backgroundedFPS, _touchActive,
+ *   _traceSelectionWarpById, _traceRAF, _followRAF, _followTargetLat,
+ *   _followTargetLon, _followSuppressUntilMs, _backgrounded, _touchActive,
  *   _mouseDragging, _pinchZooming, _vehiclePathById, _vehicleActualPathById,
  *   traceMode, playbackMode, selectedId, lastState, center, zoom, overlayCanvas.
  *
@@ -64,6 +70,25 @@
    */
   function PlaybackEngine(view) {
     this.view = view;
+
+    // Subsystem-private state (owned by PlaybackEngine, moved out of MapView in
+    // S10; verified by grep as referenced only within this module). Trace/follow
+    // frame-rate throttles and trace playback tuning constants.
+    this._traceLastFrameTs = 0;
+    this._traceTargetFPS = 30; // reduce CPU while staying smooth
+    this._backgroundedFPS = 15; // throttle when tab is hidden
+    this._followLastFrameTs = 0;
+    // Trace playback tuning (kept as fields so you can tweak later).
+    // - We still base movement on GPS timestamps/distances, but we normalize to a
+    //   human-watchable speed (otherwise real-world sparse updates look like crawling).
+    this._traceTargetMedianSpeedMps = 7.0; // ~15.7 mph (playback median)
+    this._traceMaxSpeedMps = 18.0; // ~40 mph (playback cap)
+    this._traceRealMaxSpeedMps = 20.0; // ~45 mph (badge cap; filters GPS jumps)
+    this._traceSpeedSmoothingTauS = 1.6; // smaller = snappier accel/brake
+    this._traceStopSpeedMps = 0.25; // below this, treat as stop/dwell
+    this._traceStopMinMs = 350;
+    this._traceStopMaxMs = 3500;
+    this._traceDwellTimeCompression = 12.0; // higher = shorter dwells
   }
 
   PlaybackEngine.prototype._playbackMarkNewestSegmentFromBounds = function (prevMaxMs, nextMaxMs) {
@@ -250,13 +275,13 @@
     // Basemap is static; only redraw overlays.
     // Throttle to reduce CPU while remaining smooth.
     const now = performance.now();
-    const fps = this.view._backgrounded ? (this.view._backgroundedFPS || 15) : (this.view._traceTargetFPS || 30);
+    const fps = this.view._backgrounded ? (this._backgroundedFPS || 15) : (this._traceTargetFPS || 30);
     const minDt = 1000 / fps;
-    if (this.view._traceLastFrameTs > 0 && (now - this.view._traceLastFrameTs) < (minDt - 0.5)) {
+    if (this._traceLastFrameTs > 0 && (now - this._traceLastFrameTs) < (minDt - 0.5)) {
       this.view._traceRAF = requestAnimationFrame(() => this._traceTick());
       return;
     }
-    this.view._traceLastFrameTs = now;
+    this._traceLastFrameTs = now;
     this.view.drawOverlay(this.view.lastState, { nowMs: now, fromTraceTick: true });
     this.view._traceRAF = requestAnimationFrame(() => this._traceTick());
   };
@@ -273,12 +298,12 @@
     }
     // Throttle follow updates when tab is backgrounded
     if (this.view._backgrounded) {
-      const minDt = 1000 / (this.view._backgroundedFPS || 15);
-      if (this.view._followLastFrameTs > 0 && (now - this.view._followLastFrameTs) < (minDt - 0.5)) {
+      const minDt = 1000 / (this._backgroundedFPS || 15);
+      if (this._followLastFrameTs > 0 && (now - this._followLastFrameTs) < (minDt - 0.5)) {
         this.view._followRAF = requestAnimationFrame(() => this._followTick());
         return;
       }
-      this.view._followLastFrameTs = now;
+      this._followLastFrameTs = now;
     }
     // Always use the rendered marker position (interpolated), not raw GPS.
     let tLat = this.view._followTargetLat;
@@ -303,15 +328,15 @@
     if (moved) {
       this.view.center = { lat: this.view.center.lat + dLat * 0.03, lon: this.view.center.lon + dLon * 0.03 };
       this.view._redrawViewOnly();
-      this.view._followIdleFrames = 0;
+      this._followIdleFrames = 0;
       this.view._followRAF = requestAnimationFrame(() => this._followTick());
     } else {
       // Drop from 60 Hz to ~6 Hz once the target has been stationary for a
       // beat. Camera-recovery latency after a user pan stays well under a
       // frame the user notices, but idle CPU stops burning watching a
       // parked bus.
-      this.view._followIdleFrames = (this.view._followIdleFrames || 0) + 1;
-      const idleDelayMs = this.view._followIdleFrames > 15 ? 160 : 0;
+      this._followIdleFrames = (this._followIdleFrames || 0) + 1;
+      const idleDelayMs = this._followIdleFrames > 15 ? 160 : 0;
       if (idleDelayMs > 0) {
         setTimeout(() => {
           if (this.view._followTargetLat === null || !this.view.selectedId) return;
@@ -452,7 +477,7 @@
       lon = endPt.lon + (lsLon - endPt.lon) * uu;
       const distM = g.haversineMeters(endPt.lat, endPt.lon, lsLat, lsLon);
       const v = distM / Math.max(0.001, (returnMs || 1) / 1000);
-      speedMps = g.clamp(v, 0, Number(this.view._traceRealMaxSpeedMps) || 20.0);
+      speedMps = g.clamp(v, 0, Number(this._traceRealMaxSpeedMps) || 20.0);
 
       // Seamless fade on loop return:
       // - fade out over first 0.5s of return
@@ -1440,14 +1465,14 @@
         // - Low-pass filter speeds so accel/brake is gradual
         // - Add dwell time for stop-like segments
         const pauseMs = 5000;
-        const vmax = Number(this.view._traceMaxSpeedMps) || 18;
-        const realVmax = Number(this.view._traceRealMaxSpeedMps) || 20.0;
-        const targetMedian = Number(this.view._traceTargetMedianSpeedMps) || 7.0;
-        const tau = Number(this.view._traceSpeedSmoothingTauS) || 1.6;
-        const stopV = Number(this.view._traceStopSpeedMps) || 0.25;
-        const dwellCompress = Number(this.view._traceDwellTimeCompression) || 12.0;
-        const stopMinMs = Number(this.view._traceStopMinMs) || 350;
-        const stopMaxMs = Number(this.view._traceStopMaxMs) || 3500;
+        const vmax = Number(this._traceMaxSpeedMps) || 18;
+        const realVmax = Number(this._traceRealMaxSpeedMps) || 20.0;
+        const targetMedian = Number(this._traceTargetMedianSpeedMps) || 7.0;
+        const tau = Number(this._traceSpeedSmoothingTauS) || 1.6;
+        const stopV = Number(this._traceStopSpeedMps) || 0.25;
+        const dwellCompress = Number(this._traceDwellTimeCompression) || 12.0;
+        const stopMinMs = Number(this._traceStopMinMs) || 350;
+        const stopMaxMs = Number(this._traceStopMaxMs) || 3500;
 
         // First pass: derive raw speeds from GPS timing.
         const rawV = [];
