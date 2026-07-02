@@ -134,21 +134,6 @@ function main() {
   const map = new MapView(tiles, paField, overlay);
   window.__map = map;  // Expose for updateSidebarPlaybackValues
 
-  // Screensaver mode flag (set by hot-corner code below, read by camera follow)
-  let _screensaverActive = false;
-  let _ssSnapshot = null;       // state snapshot taken on screensaver enter
-  let _ssLoopInterval = null;   // poll interval that detects end-of-playback
-  let _ssLoopTimer = null;      // 10s pause timer between loops
-  let _ssEndMaxMs = null;       // maxMs when we started the 10s pause
-  // Hoisted handle for the screensaver-enter function, assigned inside the
-  // hot-corner block below so that ?demo=1 can trigger it on page load.
-  let _demoTriggerSS = null;
-  // Tracks whether the current screensaver session was entered via ?demo=1
-  // (as opposed to the bottom-left hot corner). On exit, demo-origin sessions
-  // use mode-appropriate defaults instead of restoring the stale entry-time
-  // snapshot — in live mode the captured `timeMs` can be tens of minutes old.
-  let _enteredViaDemo = false;
-
   // Lite mode: hide all chrome (sidebar, controls, legend, menu button)
   const _liteParam = new URLSearchParams(window.location.search).get('lite') === '1';
   if (_liteParam) {
@@ -804,7 +789,7 @@ function main() {
     document,
     pb,
     deps: {
-      getScreensaverActive: () => _screensaverActive,
+      getScreensaverActive: () => _getScreensaverActive(),
       getSidebarOpen: () => sidebarOpen,
       getSelectedId: () => selectedId,
       performCameraFit: (opts) => _performCameraFit(opts),
@@ -2608,176 +2593,29 @@ function main() {
   }
 
   // ── Screensaver mode (bottom-left hot corner → hide all UI) ──
-  // Park the mouse in the bottom-left ~40px corner for 3 s to activate.
-  // Uses a generous inset (not pixel 0,0) to avoid conflicting with OS hot corners.
-  // Activating adds body.screensaver which fades all chrome, and triggers pb-hidden
-  // on the playback bar so everything disappears together.
-  {
-    const SS_DELAY_MS = 3000;
-    const SS_CORNER_PX = 40; // px from left edge and bottom edge
-    let _ssTimer = null;
-    let _ssActive = false;
-
-    const _ssEnter = () => {
-      if (_ssActive) return;
-      _ssActive = true;
-      _screensaverActive = true;
-      document.body.classList.add("screensaver");
-      var pb = document.getElementById("playbackBar");
-      if (pb) pb.classList.add("pb-ss-hidden");
-
-      // Snapshot current state for restoration on exit
-      var sb = map.getPlaybackBounds();
-      _ssSnapshot = {
-        centerLat: map.center.lat, centerLon: map.center.lon, zoom: map.zoom,
-        timeMs: map.getPlaybackTimeMs(), speed: map.getPlaybackSpeed(),
-        playing: map.getPlaybackPlaying(), liveFollow: map._playbackLiveFollow,
-      };
-
-      // Configure: 60x from start
-      map._playbackLiveFollow = false;
-      map.setPlaybackSpeed(60);
-      if (pbSpeedEl) pbSpeedEl.value = "60";
-      if (isFinite(sb.minMs)) map.setPlaybackTimeMs(sb.minMs);
-      pb._pbVelocity = _pbPlaybackSpeed * 60;
-      map.setPlaybackPlaying(true);
-      pb._pbLastPerf = 0;
-      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-
-      // Poll for end-of-playback to trigger 10s pause then loop
-      _ssLoopInterval = setInterval(() => {
-        if (!_screensaverActive) return;
-        // While waiting in the 10s pause, check if new data arrived
-        if (_ssLoopTimer != null) {
-          var sb2 = map.getPlaybackBounds();
-          if (isFinite(sb2.maxMs) && _ssEndMaxMs != null && sb2.maxMs > _ssEndMaxMs + 100) {
-            clearTimeout(_ssLoopTimer); _ssLoopTimer = null;
-            // Jump to where the new data begins and resume playing
-            map.setPlaybackTimeMs(_ssEndMaxMs);
-            _ssEndMaxMs = null;
-            pb._pbVelocity = _pbPlaybackSpeed * 60;
-            map.setPlaybackPlaying(true);
-            pb._pbLastPerf = 0;
-            if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-          }
-          return;
-        }
-        // Detect playback stalled at end (velocity zeroed by physics loop)
-        if (map.isPlaybackAtEnd(200) && Math.abs(pb._pbVelocity) < 0.1) {
-          var sb3 = map.getPlaybackBounds();
-          _ssEndMaxMs = isFinite(sb3.maxMs) ? sb3.maxMs : null;
-          _ssLoopTimer = setTimeout(() => {
-            _ssLoopTimer = null; _ssEndMaxMs = null;
-            if (!_screensaverActive) return;
-            if (pbPlayEl) pbPlayEl.click();
-          }, 10000);
-        }
-      }, 500);
-
-      // Force camera follow on enter
-      _performCameraFit({ force: true });
-    };
-
-    // Expose to the URL-param handler in loadConfig().then() so ?demo=1
-    // can enter the screensaver once initial state is ready. Wrap so we can
-    // tag this session as demo-origin for the exit path.
-    _demoTriggerSS = () => { _enteredViaDemo = true; _ssEnter(); };
-
-    const _ssExit = () => {
-      clearTimeout(_ssTimer);
-      _ssTimer = null;
-      if (!_ssActive) return;
-      _ssActive = false;
-      _screensaverActive = false;
-      if (_ssLoopInterval) { clearInterval(_ssLoopInterval); _ssLoopInterval = null; }
-      if (_ssLoopTimer) { clearTimeout(_ssLoopTimer); _ssLoopTimer = null; }
-      _ssEndMaxMs = null;
-      document.body.classList.remove("screensaver");
-      var pb = document.getElementById("playbackBar");
-      if (pb) pb.classList.remove("pb-ss-hidden");
-
-      // Restore pre-screensaver state.
-      // Demo-origin sessions (?demo=1) skip the _ssSnapshot.timeMs restoration:
-      // in live mode that captured time is the latest-sample timestamp at
-      // entry — often tens of minutes behind real time and unchanged across
-      // tick() arrivals during the demo run — so restoring it leaves the
-      // playback bar stuck in the past until the user scrubs. Center/zoom/
-      // speed from the snapshot are still sound (they reflect app defaults
-      // captured on page load) and are restored.
-      if (_enteredViaDemo && _ssSnapshot) {
-        _enteredViaDemo = false;
-        map.center.lat = _ssSnapshot.centerLat;
-        map.center.lon = _ssSnapshot.centerLon;
-        map.zoom = _ssSnapshot.zoom;
-        map.setPlaybackSpeed(_ssSnapshot.speed);
-        if (pbSpeedEl) pbSpeedEl.value = String(_ssSnapshot.speed);
-        map.setPlaybackPlaying(false);
-        pb._pbVelocity = 0;
-        if (pb._pbRAF) { cancelAnimationFrame(pb._pbRAF); pb._pbRAF = null; }
-        // Discriminate live vs snapshot mode via _historicalState, not
-        // map.playbackMode (which is true for both once canvas playback is
-        // initialized).
-        if (window._historicalState) {
-          // Snapshot mode (from ?date=...): live-follow stays off; leave the
-          // playhead where the demo left it so the user sees a coherent frame.
-          map._playbackLiveFollow = false;
-        } else {
-          // Live mode: re-engage live follow and snap to latest data so the
-          // playback bar reflects true "now" instead of the stale entry time.
-          // Next tick() keeps it synced.
-          map._playbackLiveFollow = true;
-          var _sb = map.getPlaybackBounds();
-          if (_sb && isFinite(_sb.maxMs)) map.setPlaybackTimeMs(_sb.maxMs);
-        }
-        _ssSnapshot = null;
-        pb._pbLastPerf = 0;
-        updatePlaybackUi();
-        map.drawOverlay(map.lastState, { cacheUnderlay: false });
-      } else if (_ssSnapshot) {
-        map.center.lat = _ssSnapshot.centerLat;
-        map.center.lon = _ssSnapshot.centerLon;
-        map.zoom = _ssSnapshot.zoom;
-        map.setPlaybackSpeed(_ssSnapshot.speed);
-        if (pbSpeedEl) pbSpeedEl.value = String(_ssSnapshot.speed);
-        map.setPlaybackTimeMs(_ssSnapshot.timeMs);
-        map.setPlaybackPlaying(_ssSnapshot.playing);
-        map._playbackLiveFollow = _ssSnapshot.liveFollow;
-        pb._pbVelocity = _ssSnapshot.playing ? _pbPlaybackSpeed * (_ssSnapshot.speed || 1) : 0;
-        pb._pbLastPerf = 0;
-        if (_ssSnapshot.playing && !pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-        _ssSnapshot = null;
-        updatePlaybackUi();
-        map.drawOverlay(map.lastState, { cacheUnderlay: false });
-      }
-    };
-
-    const _ssCheck = (x, y) => {
-      const inCorner = x <= SS_CORNER_PX &&
-        y >= window.innerHeight - SS_CORNER_PX;
-      const inBottomStrip = y >= window.innerHeight - SS_CORNER_PX;
-      if (inCorner && !_ssActive && !_ssTimer) {
-        _ssTimer = setTimeout(_ssEnter, SS_DELAY_MS);
-      } else if (!inCorner && !_ssActive) {
-        if (_ssTimer) { clearTimeout(_ssTimer); _ssTimer = null; }
-      } else if (_ssActive && !inBottomStrip) {
-        _ssExit();
-      }
-    };
-
-    document.addEventListener("mousemove", (e) => {
-      _ssCheck(e.clientX, e.clientY);
-    });
-
-    document.addEventListener("touchstart", (e) => {
-      var t = e.touches[0];
-      if (t) _ssCheck(t.clientX, t.clientY);
-    }, { passive: true });
-
-    // Any key press exits screensaver
-    document.addEventListener("keydown", () => {
-      if (_ssActive) _ssExit();
-    });
-  }
+  // Extracted to ui_screensaver.js (ScreensaverUI). The module owns the
+  // screensaver activation state, the ?demo=1 auto-enter retry loop, and the
+  // hot-corner mousemove/touchstart/keydown listeners internally. `map`, `pb`,
+  // `pbSpeedEl`, `pbPlayEl`, `_performCameraFit`, `updatePlaybackUi`, and
+  // `playbackLoop` are shared with unmoved main() code and passed via deps.
+  // `getScreensaverActive` preserves the original call site used by
+  // PlaybackUI's deps (see the `playback` construction above).
+  const screensaver = new ScreensaverUI({
+    map,
+    document,
+    pb,
+    deps: {
+      pbSpeedEl,
+      pbPlayEl,
+      performCameraFit: (opts) => _performCameraFit(opts),
+      updatePlaybackUi: () => updatePlaybackUi(),
+      playbackLoop: () => playbackLoop(),
+      getDemoParam: () => _demoParam,
+    },
+  });
+  // Thin delegates keep every original call site in main() untouched.
+  function _demoEnterWhenReady() { return screensaver._demoEnterWhenReady(); }
+  function _getScreensaverActive() { return screensaver.getScreensaverActive(); }
 
   // Load server config before starting data polling
   // This allows the server to control CDN/caching behavior
@@ -2795,31 +2633,6 @@ function main() {
     const _urlDate = _urlParams.get('date');
     console.log("[EmbedParam] search:", window.location.search, "date:", _urlDate);
 
-    // Defer screensaver entry until the map has a meaningful playback-bounds
-    // span. Finite bounds alone aren't enough: the first tick() may produce
-    // minMs≈maxMs (a single datapoint), so _ssEnter's "rewind to start" lands
-    // right at the end and nothing animates. Require at least MIN_DEMO_SPAN_MS
-    // before firing. Polls on a 100ms interval, giving up after ~10s so we
-    // still enter even on a sparse/slow-loading day.
-    const MIN_DEMO_SPAN_MS = 60 * 1000; // at least 60s of playback data
-    const _demoEnterWhenReady = () => {
-      if (!_demoParam || !_demoTriggerSS) return;
-      let attempts = 0;
-      const tryEnter = () => {
-        if (!_demoTriggerSS) return; // already fired or unavailable
-        const sb = map.getPlaybackBounds();
-        const hasSpan = sb && isFinite(sb.minMs) && isFinite(sb.maxMs)
-          && (sb.maxMs - sb.minMs) >= MIN_DEMO_SPAN_MS;
-        if (hasSpan || attempts++ > 100) {
-          const fn = _demoTriggerSS;
-          _demoTriggerSS = null; // fire exactly once
-          try { fn(); } catch (e) { console.warn("[demo] _ssEnter failed:", e); }
-        } else {
-          setTimeout(tryEnter, 100);
-        }
-      };
-      tryEnter();
-    };
     if (_urlDate && /^\d{4}-\d{2}-\d{2}$/.test(_urlDate)) {
       console.log("[EmbedParam] Valid date, calling loadSnapshotByDate:", _urlDate);
       try {
