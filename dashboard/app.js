@@ -1690,457 +1690,77 @@ function main() {
   // DAY SELECTOR: Load historical data for past days
   // ─────────────────────────────────────────────────────────────────────────────
   window._historicalState = null;  // Cached historical data when not "live"
-  
-  // Loading state tracking - shared between historical and snapshot loading
-  let _isLoadingData = false;
-
-  // Shade over the map (not the UI) while data is loading
-  // setMapLoadingShade moved to ui_playback.js (delegate above).
-
-  // Track current selected day for menu display
-  let _selectedDayValue = "live";
-  
-  // validateStateSchema moved to ui_state_sync.js (StateSync.validateStateSchema)
-  const validateStateSchema = StateSync.validateStateSchema;
-
-  /**
-   * Check if we have valid data that can be saved.
-   */
-  function canSaveSnapshot() {
-    if (_isLoadingData) return false;
-    const state = map._historicalMode ? window._historicalState : window.__lastState;
-    if (!state) return false;
-    if (!validateStateSchema(state)) return false;
-    // Must have at least some data
-    const mobileCount = Array.isArray(state.mobile) ? state.mobile.length : 0;
-    const fixedCount = Array.isArray(state.fixed) ? state.fixed.length : 0;
-    return (mobileCount > 0 || fixedCount > 0);
-  }
-
-  function updateSaveButtonState() {
-    // No-op: old button removed, menu handles state dynamically
-  }
-  
-  async function loadHistoricalDay(dateStr) {
-    if (dateStr === "live") {
-      window._historicalState = null;
-      map._historicalMode = false;
-      map._historicalDateStr = null;
-      // Clear all per-vehicle caches from historical viewing
-      map.clearVehicleCaches();
-      map._playbackPtsById = new Map();
-      map._playbackPtsKey = null;
-      map._playbackNowMs = null;
-      map._playbackInitialized = false;
-      map._playbackLiveFollow = true;
-      // Clear historical wind — live fetch will repopulate
-      map._windSnapshots = null;
-      map._windSnapshotKeys = [];
-      map._windField = null;
-      map._windFieldEtag = null;
-      map._windFieldLastFetch = 0;
-      // Restore live state to the map immediately
-      const liveSt = window.__lastState || { mobile: [], fixed: [] };
-      map.lastState = liveSt;
-      map._ensurePlaybackPoints(liveSt);
-      map.drawOverlay(liveSt);
-      renderLists(liveSt, selectedId);
-      renderDetails(liveSt, selectedId);
-      // Update status bar
-      const statusEl = document.getElementById("statusText");
-      if (statusEl) {
-        statusEl.textContent = "Live";
-        statusEl.classList.add("live");
-        statusEl.classList.remove("offline");
-      }
-      updateSaveButtonState();
-      // Trigger an immediate live poll to get fresh data
-      setTimeout(tick, 100);
-      return;
-    }
-    
-    const statusEl = document.getElementById("statusText");
-    if (statusEl) {
-      statusEl.textContent = "Loading...";
-      statusEl.classList.remove("live");
-    }
-    
-    // Disable save while loading
-    _isLoadingData = true;
-    setMapLoadingShade(true);
-    updateSaveButtonState();
-    
-    try {
-      // Load from local snapshots — we already store all data (mobile, fixed,
-      // purpleair, etc.) so there's no need to fetch from upstream history servers.
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`, { headers: { "X-App-Token": APP_TOKEN } });
-      if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.error || `No snapshot for ${dateStr}`);
-      }
-      const loadedState = await resp.json();
-
-      // Validate the loaded data before using it
-      if (!validateStateSchema(loadedState)) {
-        throw new Error("Invalid data structure in snapshot");
-      }
-      
-      _mapImmobileToParked(loadedState);
-      window._historicalState = loadedState;
-
-      // Cache raw GPS coordinates only if debug mode is enabled
-      // (Deep copying all trails is expensive and only needed for debug visualization)
-      if (map._pbDebugPath) {
-        map._rawGpsById = new Map();
-        const mobs = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
-        for (const m of mobs) {
-          if (m?.id && Array.isArray(m.trail)) {
-            const rawTrail = m.trail.map(pt => ({...pt}));
-            map._rawGpsById.set(String(m.id), rawTrail);
-          }
-        }
-      }
-      
-      // Release accumulated live-polling state — not needed during history
-      // and can be very large (unbounded trail concatenation).
-      window.__stateSync.resetAccumulated();
-
-      // Reset ALL playback state and per-vehicle caches for fresh historical data.
-      // Without this, smooth-path, physics, and trace caches from prior snapshots
-      // accumulate and progressively slow the render loop.
-      map.clearVehicleCaches();
-      map._historicalMode = true;
-      map._historicalDateStr = dateStr;
-      map._playbackPtsById = new Map();
-      map._playbackPtsKey = null;
-      map._persistedTrailById = new Map();  // Clear persisted trails
-      map._playbackNowMs = null;  // Reset playback time
-      pb._pbPageIndex = -1;  // Reset paging for new data
-      pb._pbPageAutoFollow = true;
-      pb._pbSlidingWindowCenter = null;
-
-      // Enable DVR/playback mode for historical data
-      // NOTE: setPlaybackMode(true) sets _playbackLiveFollow=true and draws overlay,
-      // so we must disable live follow AFTER and avoid the internal draw.
-      map.playbackMode = true;  // Set directly to avoid immediate draw
-      map._playbackLiveFollow = false;  // Historical always starts at beginning, not live tail
-      if (traceEl) traceEl.checked = true;
-      if (pbBarEl) pbBarEl.classList.remove("hidden");
-      
-      // Build playback points; start the playhead at the earliest data.
-      map._ensurePlaybackPoints(window._historicalState);
-      const b = map.getPlaybackBounds();
-      if (isFinite(b.minMs)) map.setPlaybackTimeMs(b.minMs);
-      
-      // Store state, render sidebar, draw ONLY tiles (no overlay yet)
-      map.lastState = window._historicalState;
-      map.drawTiles();
-      renderLists(window._historicalState, selectedId);
-      
-      if (statusEl) {
-        statusEl.textContent = `Snapshot: ${dateStr}`;
-        statusEl.classList.remove("live");
-      }
-      
-      updatePlaybackUi();
-      
-      // Draw overlay NOW with playback time already set
-      map.drawOverlay(window._historicalState);
-      
-      // Fetch road edges for debug visualization if enabled
-      if (map._pbDebugPath && map._pbDebugRoadLines) {
-        map._fetchRoadEdgesForViewport();
-      }
-      
-      // Start playback loop (auto-play)
-      pb._pbLastPerf = 0;
-      pb._pbLastUiPerf = 0;
-      pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-      map.setPlaybackPlaying(true);
-      updatePlaybackUi();
-      pb._pbRAF = requestAnimationFrame(playbackLoop);
-    } catch (e) {
-      console.error("Failed to load historical data:", e);
-      if (statusEl) {
-        statusEl.textContent = e.message || "Error loading history";
-        statusEl.classList.add("offline");
-      }
-      // Show alert for user visibility
-      alert(`Failed to load historical data:\n${e.message}`);
-    } finally {
-      _isLoadingData = false;
-      setMapLoadingShade(false);
-      updateSaveButtonState();
-    }
-  }
-  
-  // ─────────────────────────────────────────────────────────────────────────────
-  // SAVE/LOAD: Persist and restore daily snapshots
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  function getSnapshotDateStr() {
-    // Determine the date to use for saving based on the data being viewed
-    // 1. If viewing a historical day via the menu, use that date
-    if (_selectedDayValue && _selectedDayValue !== "live") {
-      return _selectedDayValue;  // Already in YYYY-MM-DD format
-    }
-    
-    // 2. Otherwise, derive from the newest reading timestamp in the current state
-    const state = map._historicalMode ? window._historicalState : window.__lastState;
-    const newestMs = newestReadingMsFromState(state);
-    if (newestMs != null && isFinite(newestMs)) {
-      const d = new Date(newestMs);
-      return d.toISOString().split("T")[0];
-    }
-    
-    // 3. Fallback to today
-    return new Date().toISOString().split("T")[0];
-  }
-
-  async function saveSnapshot() {
-    if (map._historicalMode) {
-      console.warn("Cannot save: viewing historical snapshot");
-      return;
-    }
-    const statusEl = document.getElementById("statusText");
-    const dateStr = getSnapshotDateStr();
-    
-    try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
-        method: "POST",
-        headers: { "Content-Length": "0", "X-App-Token": APP_TOKEN },
-        credentials: "same-origin",
-      });
-      if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.error || `HTTP ${resp.status}`);
-      }
-      const result = await resp.json();
-      
-      if (statusEl) {
-        const prevText = statusEl.textContent;
-        statusEl.textContent = `Saved ${dateStr}`;
-        setTimeout(() => {
-          if (statusEl.textContent === `Saved ${dateStr}`) {
-            statusEl.textContent = prevText;
-          }
-        }, 2000);
-      }
-      console.log("Snapshot saved:", result);
-    } catch (e) {
-      console.error("Failed to save snapshot:", e);
-      if (statusEl) {
-        statusEl.textContent = "Save failed";
-        statusEl.classList.add("offline");
-      }
-    } finally {
-      updateSaveButtonState();
-    }
-  }
-
-  async function showLoadModal() {
-    // Fetch available snapshots
-    let snapshots = [];
-    try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`, { headers: { "X-App-Token": APP_TOKEN } });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json();
-      snapshots = data.snapshots || [];
-    } catch (e) {
-      console.error("Failed to list snapshots:", e);
-      return;
-    }
-
-    // Create modal
-    const modal = document.createElement("div");
-    modal.className = "snapshotModal";
-    
-    const content = document.createElement("div");
-    content.className = "snapshotModalContent";
-    
-    const title = document.createElement("h3");
-    title.textContent = "Load Saved Day";
-    content.appendChild(title);
-    
-    const list = document.createElement("div");
-    list.className = "snapshotList";
-    
-    if (snapshots.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "snapshotEmpty";
-      empty.textContent = "No saved snapshots found";
-      list.appendChild(empty);
-    } else {
-      for (const snap of snapshots) {
-        const item = document.createElement("div");
-        item.className = "snapshotItem";
-        
-        const dateSpan = document.createElement("span");
-        dateSpan.className = "date";
-        // Format date nicely
-        const d = new Date(snap.date + "T12:00:00");
-        const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
-        const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-        dateSpan.textContent = `${dayName} ${monthDay}`;
-        
-        const sizeSpan = document.createElement("span");
-        sizeSpan.className = "size";
-        const sizeMB = (snap.size_bytes / (1024 * 1024)).toFixed(1);
-        sizeSpan.textContent = `${sizeMB} MB`;
-        
-        item.appendChild(dateSpan);
-        item.appendChild(sizeSpan);
-        
-        item.addEventListener("click", async () => {
-          modal.remove();
-          await loadSnapshotByDate(snap.date);
-        });
-        
-        list.appendChild(item);
-      }
-    }
-    content.appendChild(list);
-    
-    const closeBtn = document.createElement("button");
-    closeBtn.className = "snapshotModalClose";
-    closeBtn.textContent = "Cancel";
-    closeBtn.addEventListener("click", () => modal.remove());
-    content.appendChild(closeBtn);
-    
-    modal.appendChild(content);
-    modal.addEventListener("click", (e) => {
-      if (e.target === modal) modal.remove();
-    });
-    
-    document.body.appendChild(modal);
-  }
-
-  async function loadSnapshotByDate(dateStr, extraParams = "") {
-    const statusEl = document.getElementById("statusText");
-    if (statusEl) {
-      statusEl.textContent = "Loading...";
-      statusEl.classList.remove("live");
-    }
-    
-    // Disable save while loading
-    _isLoadingData = true;
-    setMapLoadingShade(true);
-    updateSaveButtonState();
-    
-    try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}`, { headers: { "X-App-Token": APP_TOKEN } });
-      if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.error || `HTTP ${resp.status}`);
-      }
-      const loadedState = await resp.json();
-      
-      // Validate the loaded data before using it
-      if (!validateStateSchema(loadedState)) {
-        throw new Error("Invalid data structure in snapshot");
-      }
-      
-      _mapImmobileToParked(loadedState);
-      window._historicalState = loadedState;
-
-      // Load wind snapshots from the historical snapshot if present
-      if (!window.WIND_LOADING_DISABLED && loadedState.wind_snapshots && typeof loadedState.wind_snapshots === "object") {
-        map._windSnapshots = loadedState.wind_snapshots;
-        map._windSnapshotKeys = Object.keys(loadedState.wind_snapshots).sort();
-        if (map._windSnapshotKeys.length > 0) {
-          const latest = map._windSnapshotKeys[map._windSnapshotKeys.length - 1];
-          map._windField = loadedState.wind_snapshots[latest];
-        }
-      } else {
-        map._windSnapshots = null;
-        map._windSnapshotKeys = [];
-        map._windField = null;
-      }
-
-      // Cache raw GPS coordinates only if debug mode is enabled
-      if (map._pbDebugPath) {
-        map._rawGpsById = new Map();
-        const mobs = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
-        for (const m of mobs) {
-          if (m?.id && Array.isArray(m.trail)) {
-            const rawTrail = m.trail.map(pt => ({...pt}));
-            map._rawGpsById.set(String(m.id), rawTrail);
-          }
-        }
-      }
-      
-      // Reset ALL playback state for fresh historical data
-      map._historicalMode = true;
-      map._historicalDateStr = dateStr;
-      map._playbackPtsById = new Map();
-      map._playbackPtsKey = null;
-      map._persistedTrailById = new Map();
-      map._playbackNowMs = null;
-      pb._pbPageIndex = -1;  // Reset paging for new data
-      pb._pbPageAutoFollow = true;
-      pb._pbSlidingWindowCenter = null;
-
-      // Enable DVR/playback mode
-      map.playbackMode = true;
-      map._playbackLiveFollow = false;
-      if (traceEl) traceEl.checked = true;
-      if (pbBarEl) pbBarEl.classList.remove("hidden");
-      
-      // Build playback points; start the playhead at the earliest data.
-      map._ensurePlaybackPoints(window._historicalState);
-      const b = map.getPlaybackBounds();
-      if (isFinite(b.minMs)) {
-        map.setPlaybackTimeMs(b.minMs);
-      }
-      
-      // Store state, render sidebar, draw
-      map.lastState = window._historicalState;
-      map.drawTiles();
-      renderLists(window._historicalState, selectedId);
-      
-      if (statusEl) {
-        statusEl.textContent = `Snapshot: ${dateStr}`;
-        statusEl.classList.remove("live");
-      }
-      
-      updatePlaybackUi();
-      map.drawOverlay(window._historicalState);
-      
-      // Start playback loop (auto-play)
-      pb._pbLastPerf = 0;
-      pb._pbLastUiPerf = 0;
-      pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-      map.setPlaybackPlaying(true);
-      updatePlaybackUi();
-      pb._pbRAF = requestAnimationFrame(playbackLoop);
-    } catch (e) {
-      console.error("Failed to load snapshot:", e);
-      if (statusEl) {
-        statusEl.textContent = "Load failed";
-        statusEl.classList.add("offline");
-      }
-    } finally {
-      _isLoadingData = false;
-      setMapLoadingShade(false);
-      updateSaveButtonState();
-    }
-  }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // PLAYBACK MENU: Dropup menu for save/load/days
+  // SAVE/LOAD, DAY SELECTOR, PLAYBACK MENU: Extracted to ui_snapshots_menus.js
+  // (SnapshotsMenusUI). The module owns the menu/submenu DOM refs, the menu-
+  // close and submenu show/hide debounce timers, and (as instance properties,
+  // not privately) the two mutable scalars also read/written by unmoved
+  // main() code: `_isLoadingData` (StateSync's isLoadingData() getter below,
+  // and tick()'s historical-mode skip check) and `_selectedDayValue` (the
+  // embed ?date= URL-param handler further down). `traceEl`/`pbBarEl` are
+  // DOM refs already looked up above; `tick` is defined later in main() but
+  // only invoked (not called) at construction time, so forward reference via
+  // a lazy wrapper is safe. `deps.dimEl`/`satEl`/`themeEl` are ThemeUI's refs.
   // ─────────────────────────────────────────────────────────────────────────────
-  const pbMenuBtn = document.getElementById("pbMenuBtn");
-  const pbMenu = document.getElementById("pbMenu");
-  const pbDaysSubmenu = document.getElementById("pbDaysSubmenu");
+  const snapshotsMenus = new SnapshotsMenusUI({
+    map,
+    document,
+    pb,
+    deps: {
+      getSelectedId: () => selectedId,
+      traceEl,
+      pbBarEl,
+      validateStateSchema: StateSync.validateStateSchema,
+      newestReadingMsFromState,
+      mapImmobileToParked: (state) => StateSync._mapImmobileToParked(state),
+      renderLists,
+      renderDetails,
+      updatePlaybackUi: () => updatePlaybackUi(),
+      playbackLoop: () => playbackLoop(),
+      setMapLoadingShade: (on) => setMapLoadingShade(on),
+      tick: () => tick(),
+      getAutoCameraEnabled: () => _autoCameraEnabled,
+      getCurrentThemeKey: () => _currentThemeKey,
+      setCurrentThemeKey: (k) => { _currentThemeKey = k; },
+      themeEl, dimEl, satEl,
+      applyThemeAndFilters,
+      loadDimForTheme,
+      loadSatForTheme,
+      saveThemeForMode,
+    },
+  });
+  // Thin delegates keep every original call site in main() untouched.
+  function canSaveSnapshot() { return snapshotsMenus.canSaveSnapshot(); }
+  function updateSaveButtonState() { return snapshotsMenus.updateSaveButtonState(); }
+  function loadHistoricalDay(dateStr) { return snapshotsMenus.loadHistoricalDay(dateStr); }
+  function getSnapshotDateStr() { return snapshotsMenus.getSnapshotDateStr(); }
+  function saveSnapshot() { return snapshotsMenus.saveSnapshot(); }
+  function showLoadModal() { return snapshotsMenus.showLoadModal(); }
+  function loadSnapshotByDate(dateStr, extraParams = "") { return snapshotsMenus.loadSnapshotByDate(dateStr, extraParams); }
+  function _updateAutoCameraBtn() { return snapshotsMenus._updateAutoCameraBtn(); }
+  function closePlaybackMenuImmediate() { return snapshotsMenus.closePlaybackMenuImmediate(); }
+  function closePlaybackMenu() { return snapshotsMenus.closePlaybackMenu(); }
+  function cancelMenuHide() { return snapshotsMenus.cancelMenuHide(); }
+  function openPlaybackMenu() { return snapshotsMenus.openPlaybackMenu(); }
+  function togglePlaybackMenu() { return snapshotsMenus.togglePlaybackMenu(); }
+  function showSubmenuDebounced(submenuEl, parentEl, onShow) { return snapshotsMenus.showSubmenuDebounced(submenuEl, parentEl, onShow); }
+  function hideSubmenuDebounced(submenuEl, parentEl, e) { return snapshotsMenus.hideSubmenuDebounced(submenuEl, parentEl, e); }
+  function updateDaysSubmenu() { return snapshotsMenus.updateDaysSubmenu(); }
+  function updateThemeSubmenu() { return snapshotsMenus.updateThemeSubmenu(); }
+  function showAboutModal() { return snapshotsMenus.showAboutModal(); }
+  function handleMenuAction(action) { return snapshotsMenus.handleMenuAction(action); }
+  function syncDisplaySliders() { return snapshotsMenus.syncDisplaySliders(); }
+
+  // Playback menu DOM refs main() still reads/writes directly (share button,
+  // auto-camera click listener, days/theme submenu hover wiring below).
+  const pbMenuBtn = snapshotsMenus.pbMenuBtn;
+  const pbMenu = snapshotsMenus.pbMenu;
+  const pbDaysSubmenu = snapshotsMenus.pbDaysSubmenu;
+  const pbThemeSubmenu = snapshotsMenus.pbThemeSubmenu;
   const shareBtn = document.getElementById("shareBtn");
   const autoCameraBtn = document.getElementById("autoCameraBtn");
 
-  function _updateAutoCameraBtn() {
-    if (!autoCameraBtn) return;
-    autoCameraBtn.classList.toggle("active", _autoCameraEnabled);
-    autoCameraBtn.title = `Auto-center camera: ${_autoCameraEnabled ? "on" : "off"}`;
-    autoCameraBtn.setAttribute("aria-label", `Toggle auto-center camera (currently ${_autoCameraEnabled ? "on" : "off"})`);
-  }
   _updateAutoCameraBtn();
 
   if (autoCameraBtn) {
@@ -2151,113 +1771,7 @@ function main() {
       if (_autoCameraEnabled) _performCameraFit({ force: true });
     });
   }
-  
-  // Menu close delay for better UX
-  let _menuHideTimer = null;
-  const MENU_HIDE_DELAY = 150; // ms before hiding main menu
-  
-  function closePlaybackMenuImmediate() {
-    if (_menuHideTimer) {
-      clearTimeout(_menuHideTimer);
-      _menuHideTimer = null;
-    }
-    if (pbMenu) {
-      pbMenu.classList.remove("visible");
-      pbMenu.classList.add("hidden");
-    }
-    if (pbMenuBtn) pbMenuBtn.classList.remove("open");
-    // Also hide submenus
-    if (pbDaysSubmenu) pbDaysSubmenu.classList.remove("visible");
-    const pbThemeSubmenuEl = document.getElementById("pbThemeSubmenu");
-    if (pbThemeSubmenuEl) pbThemeSubmenuEl.classList.remove("visible");
-    const pbDisplaySubmenuEl = document.getElementById("pbDisplaySubmenu");
-    if (pbDisplaySubmenuEl) pbDisplaySubmenuEl.classList.remove("visible");
-  }
-  
-  function closePlaybackMenu() {
-    closePlaybackMenuImmediate();
-  }
-  
-  function cancelMenuHide() {
-    if (_menuHideTimer) {
-      clearTimeout(_menuHideTimer);
-      _menuHideTimer = null;
-    }
-  }
-  
-  function openPlaybackMenu() {
-    if (!pbMenu) return;
-    cancelMenuHide();
-    pbMenu.classList.remove("hidden");
-    pbMenu.classList.add("visible");
-    if (pbMenuBtn) pbMenuBtn.classList.add("open");
-    updateDaysSubmenu();
-  }
-  
-  function togglePlaybackMenu() {
-    if (!pbMenu) return;
-    const isOpen = pbMenu.classList.contains("visible");
-    if (isOpen) {
-      closePlaybackMenu();
-    } else {
-      openPlaybackMenu();;
-    }
-  }
-  
-  // Centralized submenu show/hide with debouncing
-  const SUBMENU_SHOW_DELAY = 80; // ms before showing a different submenu
-  const SUBMENU_HIDE_DELAY = 200; // ms before hiding submenu
-  let _submenuShowTimer = null;
-  let _submenuHideTimer = null;
-  let _currentSubmenu = null; // track which submenu is open
-  
-  function showSubmenuDebounced(submenuEl, parentEl, onShow) {
-    // Cancel any pending hide
-    if (_submenuHideTimer) {
-      clearTimeout(_submenuHideTimer);
-      _submenuHideTimer = null;
-    }
-    // If this submenu is already open, no delay needed
-    if (_currentSubmenu === submenuEl) {
-      if (_submenuShowTimer) clearTimeout(_submenuShowTimer);
-      _submenuShowTimer = null;
-      return;
-    }
-    // Cancel any pending show of a different submenu
-    if (_submenuShowTimer) clearTimeout(_submenuShowTimer);
-    _submenuShowTimer = setTimeout(() => {
-      _submenuShowTimer = null;
-      // Hide all submenus
-      const pbThemeSubmenu = document.getElementById("pbThemeSubmenu");
-      if (pbThemeSubmenu) pbThemeSubmenu.classList.remove("visible");
-      const pbDisplaySubmenu = document.getElementById("pbDisplaySubmenu");
-      if (pbDisplaySubmenu) pbDisplaySubmenu.classList.remove("visible");
-      if (pbDaysSubmenu) pbDaysSubmenu.classList.remove("visible");
-      // Show requested submenu
-      if (onShow) onShow();
-      submenuEl.classList.add("visible");
-      _currentSubmenu = submenuEl;
-    }, SUBMENU_SHOW_DELAY);
-  }
-  
-  function hideSubmenuDebounced(submenuEl, parentEl, e) {
-    // Don't hide if moving to parent menu item or submenu itself
-    if (e && e.relatedTarget && (parentEl.contains(e.relatedTarget) || submenuEl.contains(e.relatedTarget))) {
-      return;
-    }
-    // Cancel pending show
-    if (_submenuShowTimer) {
-      clearTimeout(_submenuShowTimer);
-      _submenuShowTimer = null;
-    }
-    if (_submenuHideTimer) clearTimeout(_submenuHideTimer);
-    _submenuHideTimer = setTimeout(() => {
-      submenuEl.classList.remove("visible");
-      if (_currentSubmenu === submenuEl) _currentSubmenu = null;
-      _submenuHideTimer = null;
-    }, SUBMENU_HIDE_DELAY);
-  }
-  
+
   // Wire up Days submenu
   const pbMenuSubEl = document.querySelector(".pbMenuSub[data-submenu='days']");
   if (pbMenuSubEl && pbDaysSubmenu) {
@@ -2266,85 +1780,10 @@ function main() {
     pbDaysSubmenu.addEventListener("mouseenter", () => showSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, null));
     pbDaysSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, e));
   }
-  
-  function updateDaysSubmenu() {
-    if (!pbDaysSubmenu) return;
-    pbDaysSubmenu.innerHTML = "";
 
-    // Always show Today (Live) first
-    const liveItem = document.createElement("div");
-    liveItem.className = "pbSubmenuItem" + (_selectedDayValue === "live" ? " active" : "");
-    liveItem.textContent = "🔮 Today (Live)";
-    liveItem.addEventListener("click", (e) => {
-      e.stopPropagation();
-      _selectedDayValue = "live";
-      loadHistoricalDay("live");
-      closePlaybackMenu();
-    });
-    pbDaysSubmenu.appendChild(liveItem);
-
-    // Show the past 7 days, built purely from the local calendar — no network.
-    // Whether a snapshot actually exists is discovered when the user clicks
-    // (snapshot/load returns an error for missing days).
-    const now = new Date();
-    for (let i = 1; i <= 7; i++) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
-      const yyyy = d.getFullYear();
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      const dateStr = `${yyyy}-${mm}-${dd}`;
-      const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
-      const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-      const item = document.createElement("div");
-      item.className = "pbSubmenuItem";
-      item.textContent = `${dayName} ${monthDay}`;
-      if (_selectedDayValue === dateStr) item.classList.add("active");
-      item.addEventListener("click", (e) => {
-        e.stopPropagation();
-        _selectedDayValue = dateStr;
-        loadHistoricalDay(dateStr);
-        closePlaybackMenu();
-      });
-      pbDaysSubmenu.appendChild(item);
-    }
-  }
-  
-  // Theme submenu
-  const pbThemeSubmenu = document.getElementById("pbThemeSubmenu");
-  
-  function updateThemeSubmenu() {
-    if (!pbThemeSubmenu) return;
-    pbThemeSubmenu.innerHTML = "";
-    
-    const keys = Object.keys(TILE_THEMES);
-    for (const k of keys) {
-      const item = document.createElement("div");
-      item.className = "pbSubmenuItem";
-      if (k === _currentThemeKey) {
-        item.classList.add("active");
-      }
-      item.textContent = TILE_THEMES[k].label || k;
-      item.dataset.value = k;
-      item.addEventListener("click", (e) => {
-        e.stopPropagation();
-        _currentThemeKey = k;
-        saveThemeForMode(k);
-        if (themeEl) themeEl.value = k;
-        const dim = loadDimForTheme(k);
-        if (dimEl) dimEl.value = String(dim);
-        const sat = loadSatForTheme(k);
-        if (satEl) satEl.value = String(sat);
-        applyThemeAndFilters(k, dim, sat);
-        updateThemeSubmenu();
-        // Keep menu open so user can easily try different themes
-      });
-      pbThemeSubmenu.appendChild(item);
-    }
-  }
   // Register for use by applyTheme (defined earlier)
   window._updateThemeSubmenu = updateThemeSubmenu;
-  
+
   // Wire up Theme submenu hover (uses centralized debounce)
   const pbThemeSubEl = document.querySelector(".pbMenuSub[data-submenu='theme']");
   if (pbThemeSubEl && pbThemeSubmenu) {
@@ -2353,102 +1792,7 @@ function main() {
     pbThemeSubmenu.addEventListener("mouseenter", () => showSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, updateThemeSubmenu));
     pbThemeSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, e));
   }
-  
-  // ── Owner token secret tap state ──
-  let _aboutTapCount = 0;
-  let _aboutTapTimer = null;
 
-  function showAboutModal() {
-    const modal = document.getElementById("aboutModal");
-    if (!modal) return;
-    modal.classList.remove("hidden");
-
-    // Reset token section visibility each time modal opens
-    const tokenSection = document.getElementById("ownerTokenSection");
-    const tokenInput = document.getElementById("ownerTokenInput");
-    const tokenSaveBtn = document.getElementById("ownerTokenSave");
-    const tokenStatus = document.getElementById("ownerTokenStatus");
-    if (tokenSection) tokenSection.classList.add("hidden");
-    _aboutTapCount = 0;
-
-    // Tap version label 5 times to reveal token input
-    const versionEl = modal.querySelector(".aboutVersion");
-    if (versionEl) {
-      versionEl.style.cursor = "default";
-      versionEl.onclick = () => {
-        _aboutTapCount++;
-        clearTimeout(_aboutTapTimer);
-        _aboutTapTimer = setTimeout(() => { _aboutTapCount = 0; }, 2000);
-        if (_aboutTapCount >= 5) {
-          _aboutTapCount = 0;
-          if (tokenSection) {
-            tokenSection.classList.remove("hidden");
-            if (tokenInput) tokenInput.value = localStorage.getItem("dusty_owner_tok") || "";
-            if (tokenStatus) tokenStatus.textContent = "";
-          }
-        }
-      };
-    }
-
-    // Save token button
-    if (tokenSaveBtn && tokenInput) {
-      tokenSaveBtn.onclick = async () => {
-        const val = (tokenInput.value || "").trim();
-        if (val) {
-          localStorage.setItem("dusty_owner_tok", val);
-          // Exchange for HttpOnly cookie immediately
-          try {
-            const res = await fetch("/api/auth", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", "X-App-Token": APP_TOKEN },
-              body: JSON.stringify({ token: val }),
-              credentials: "same-origin",
-            });
-            if (tokenStatus) tokenStatus.textContent = res.ok ? "Saved & authenticated. Reload to apply." : "Saved but auth failed — check token.";
-          } catch (_) {
-            if (tokenStatus) tokenStatus.textContent = "Saved. Reload to apply.";
-          }
-        } else {
-          localStorage.removeItem("dusty_owner_tok");
-          // Clear the auth cookie
-          try { await fetch("/api/auth", { method: "DELETE", headers: { "X-App-Token": APP_TOKEN }, credentials: "same-origin" }); } catch (_) {}
-          if (tokenStatus) tokenStatus.textContent = "Cleared.";
-        }
-      };
-    }
-
-    const closeBtn = modal.querySelector(".aboutModalClose");
-    const onClose = () => {
-      modal.classList.add("hidden");
-      closeBtn.removeEventListener("click", onClose);
-    };
-    closeBtn.addEventListener("click", onClose);
-    modal.addEventListener("click", function handler(e) {
-      if (e.target === modal || e.target.classList.contains("aboutModalX")) {
-        onClose();
-        modal.removeEventListener("click", handler);
-      }
-    });
-  }
-
-  function handleMenuAction(action) {
-    switch (action) {
-      case "save":
-        saveSnapshot();
-        break;
-      case "load":
-        showLoadModal();
-        break;
-      case "about":
-        showAboutModal();
-        break;
-      case "debug":
-        if (window._fdToggle) window._fdToggle();
-        break;
-    }
-    closePlaybackMenu();
-  }
-  
   if (pbMenuBtn) {
     pbMenuBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -2499,18 +1843,9 @@ function main() {
   }
 
   // Wire up Display submenu hover (uses centralized debounce)
+  // syncDisplaySliders moved to ui_snapshots_menus.js (file-scope delegate above).
   const pbDisplaySubEl = document.querySelector(".pbMenuSub[data-submenu='display']");
   if (pbDisplaySubEl && pbDisplaySubmenu) {
-    function syncDisplaySliders() {
-      if (menuDimEl && dimEl) menuDimEl.value = dimEl.value;
-      if (menuSatEl && satEl) menuSatEl.value = satEl.value;
-      if (menuAlphaEl) {
-        const raw = localStorage.getItem(PA_ALPHA_STORAGE_KEY);
-        const v = raw != null ? Number(raw) : 27;
-        menuAlphaEl.value = Math.max(0, Math.min(100, isFinite(v) ? v : 27));
-      }
-    }
-    
     pbDisplaySubEl.addEventListener("mouseenter", () => showSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, syncDisplaySliders));
     pbDisplaySubEl.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, e));
     pbDisplaySubmenu.addEventListener("mouseenter", () => showSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, syncDisplaySliders));
@@ -2975,7 +2310,7 @@ function main() {
     apiBaseUrl: appConfig.apiBaseUrl,
     getMap: () => map,
     getSelectedId: () => selectedId,
-    isLoadingData: () => _isLoadingData,
+    isLoadingData: () => snapshotsMenus._isLoadingData,
     getClientId: () => _clientId,
     rescheduleTick: (delayMs) => {
       if (_tickTimeout) clearTimeout(_tickTimeout);
@@ -3006,7 +2341,7 @@ function main() {
     
     // Skip live data fetching when viewing historical data OR while loading it
     // Playback loop handles all drawing in historical mode
-    if (window._historicalState || _isLoadingData) {
+    if (window._historicalState || snapshotsMenus._isLoadingData) {
       if (_tickTimeout) clearTimeout(_tickTimeout);
       _tickTimeout = setTimeout(tick, POLL_MS);
       return;
@@ -3497,7 +2832,7 @@ function main() {
         }
         await loadSnapshotByDate(_urlDate, _extraParams);
         console.log("[EmbedParam] loadSnapshotByDate resolved. _historicalState:", !!window._historicalState, "playbackMode:", map.playbackMode);
-        _selectedDayValue = _urlDate;
+        snapshotsMenus._selectedDayValue = _urlDate;
 
         // Override playhead: start hour + playhead offset in minutes
         if (isFinite(_urlStart) && _urlStart >= 0 && _urlStart <= 23) {
