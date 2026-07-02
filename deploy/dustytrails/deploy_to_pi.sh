@@ -295,30 +295,18 @@ build_staging() {
         cp "$f" "$STAGING_DIR/mobileair/"
     done
     
-    # Copy dashboard static files (no tests)
+    # Copy dashboard static files (no tests, no proto_* prototypes).
+    # ALL top-level .js is staged by glob — the modularized front-end is many
+    # files (engine_*, ui_*, workers, support modules) and an explicit list
+    # silently drops new ones, shipping an index.html that references
+    # scripts missing from the Pi.
     log_info "Copying dashboard static files..."
+    cp "$REPO_ROOT/dashboard/"*.js "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/index.html" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/app.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/camera_fit_logic.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/map_nav_engine.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/config.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/projections.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/colors.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/aqi.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/format_utils.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/data_utils.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/advection_solver.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/map_view.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/sidebar_ui.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/styles.css" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/tui.html" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/tui.css" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/tui.js" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/manifest.json" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/pa_advection_worker.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/pa_field_worker.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/jog_wheel.js" "$STAGING_DIR/dashboard/"
-    cp "$REPO_ROOT/dashboard/playback_state.js" "$STAGING_DIR/dashboard/"
     
     # Patch dashboard files for subpath deployment
     # The reverse proxy uses handle_path which strips /dustytrails prefix,
