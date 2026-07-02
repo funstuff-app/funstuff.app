@@ -39,23 +39,21 @@
    * Pure transport-button state derivation — the single place the
    * Live/Play/Pause semantics live:
    *
-   *   live view, active, at the wall edge, 1x   → "Live"  (lit)
-   *   live view, active, at the wall edge, >1x  → "Pause" (lit — in sync with
-   *                                                the server, but faster than
-   *                                                real time isn't "Live")
+   *   live view, active, at the wall-clock edge → "Live" (lit) at ANY speed —
+   *       at the edge every speed rides wall rate, so it is live regardless
+   *       of the speed setting (the setting only matters behind the edge,
+   *       where only 1x is functionally real-time)
    *   active anywhere behind the edge           → "Pause" (unlit)
    *   paused                                    → "Play"  (unlit)
    *   historical snapshots                      → plain Play/Pause, never lit
    *
    * "active" means playing OR live-following (riding the edge counts).
-   * `lit` is the .isLive glow — it hints "keeping up with the server".
+   * `lit` is the .isLive glow.
    */
-  PlaybackUI.computeButtonState = function ({ historical, playing, liveFollow, atEnd, speed }) {
+  PlaybackUI.computeButtonState = function ({ historical, playing, liveFollow, atEnd }) {
     const active = !!playing || !!liveFollow;
     if (historical) return { label: active ? "Pause" : "Play", lit: false };
-    if (active && atEnd) {
-      return (speed === 1) ? { label: "Live", lit: true } : { label: "Pause", lit: true };
-    }
+    if (active && atEnd) return { label: "Live", lit: true };
     if (active) return { label: "Pause", lit: false };
     return { label: "Play", lit: false };
   };
@@ -187,7 +185,12 @@
             const pr = _pbPagingActive() ? _pbGetPageRange() : b;
             const durMs = (pr.maxMs - pr.minMs) || 1;
             const tMs = map.getPlaybackTimeMs() || pr.minMs;
-            const newT = clamp(tMs + deltaFrac * durMs, pr.minMs, pr.maxMs);
+            // Live view: drags clamp to the DATA edge — no parking in the
+            // dataless wall-extension zone (same rule as applyScrub).
+            const jogEdge = (!map._historicalMode
+              && map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+              ? Math.min(pr.maxMs, map._playbackMaxMs) : pr.maxMs;
+            const newT = clamp(tMs + deltaFrac * durMs, pr.minMs, jogEdge);
             map.setPlaybackTimeMs(newT);
             map.setPlaybackPlaying(false);
             // Coalesce render
@@ -511,24 +514,28 @@
       }
       if (pbSpeedEl) pbSpeedEl.value = String(map.getPlaybackSpeed() || 1.0);
 
-      // Paused-and-REWOUND signal (live view only): a frozen real-time app
-      // must look frozen — dim the map and show the ◀◀ REW badge, but only
-      // when the playhead is genuinely BEHIND the leading-edge sync window.
-      // Paused inside the window is not a state: the playbackLoop invariant
-      // steps such a pause back behind the window on the next frame, so this
-      // condition goes true immediately after. Historical snapshots are
-      // deliberate time travel; nothing shows there.
+      // Two independent signals (live view only; historical snapshots are
+      // deliberate time travel and show neither):
+      //
+      // ◀◀ REW badge — POSITION indicator: visible whenever the playhead is
+      // LEFT of the live zone (behind the leading-edge sync window), playing
+      // or paused. You are watching the past.
+      //
+      // Dim shade — PAUSE indicator: visible while playback is frozen. A
+      // paused playhead can only exist behind the window (the no-pause-at-
+      // the-edge invariant), so the dim always coincides with the badge.
+      const _dataEdgeMs = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+        ? map._playbackMaxMs : b.maxMs;
+      const _syncEpsMs = Math.max(15000, (hasBounds ? (b.maxMs - b.minMs) : 0) * 0.005);
+      const _behindLive = !map._historicalMode && hasBounds
+        && tMs != null && isFinite(tMs)
+        && tMs < _dataEdgeMs - _syncEpsMs;
       const _pausedStill = !!map.playbackMode && !map._historicalMode && hasBounds
         && !map.getPlaybackPlaying() && !map._playbackLiveFollow
         && !pb._pbScrubbing
         && Math.abs(pb._pbVelocity) <= _pbVelocityThreshold;
-      const _dataEdgeMs = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
-        ? map._playbackMaxMs : b.maxMs;
-      const _syncEpsMs = Math.max(15000, (hasBounds ? (b.maxMs - b.minMs) : 0) * 0.005);
-      const _rewound = _pausedStill && tMs != null && isFinite(tMs)
-        && tMs < _dataEdgeMs - _syncEpsMs;
-      if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !_rewound);
-      if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !_rewound);
+      if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !_behindLive);
+      if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !_pausedStill);
     };
 
     // ── INVARIANT: paused-at-the-edge is not a state ─────────────────────────
@@ -922,6 +929,25 @@
           if (nextMs >= b.maxMs && pb._pbVelocity > 0) {
             pb._pbVelocity = 0;
             nextMs = b.maxMs;
+            // Forward momentum into the end (wheel accumulator, barrel-jog
+            // fling, coasting) is the drag-into-the-live-edge gesture: GO
+            // LIVE. Without this, the momentum paths parked here with
+            // playing=false and _pbIsWheelCoasting=true — the ride block and
+            // the pause invariant both skip coasting, the loop died, and the
+            // playhead froze at the wall edge (the "finger scroll to the end
+            // stops the wall clock" bug). Historical keeps the old parking.
+            if (!map._historicalMode) {
+              pb._pbIsWheelCoasting = false;
+              pb._pbWheelAccum = 0;
+              pb._pbAtEndSincePerf = null;
+              if (!map.getPlaybackPlaying()) map.setPlaybackPlaying(true);
+              if (!map._playbackLiveFollow) {
+                map._playbackLiveFollow = true;
+                pb._pbPageAutoFollow = true;
+                try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+              }
+              updatePlaybackUi();
+            }
           }
 
           if (nextMs !== tMs) {
