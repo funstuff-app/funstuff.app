@@ -294,6 +294,24 @@ test("index.html scripts load in order and register all module globals", () => {
       assert.ok(map[c] != null, `MapView.${c} controller is wired`);
       assert.equal(map[c].view, map, `MapView.${c}.view back-references the MapView`);
     }
+
+    // ── Wall-clock leading edge (playback rework, 2026-07) ──
+    // Live view: getPlaybackBounds().maxMs always ticks with wall time, so a
+    // playhead riding the edge keeps moving between server polls. Historical
+    // snapshots keep their fixed data range. (Regression guard: this contract
+    // existed in commit 1892d2b, was silently lost, and froze the UI whenever
+    // the playhead sat at the end.)
+    map._playbackMinMs = 1000;
+    map._playbackMaxMs = Date.now() - 60_000; // stale data edge, 1 min old
+    map._historicalMode = false;
+    const liveBounds = map.getPlaybackBounds();
+    assert.ok(liveBounds.maxMs >= Date.now() - 1000,
+      "live-view maxMs extends to wall clock, not the stale data edge");
+    map._historicalMode = true;
+    const histBounds = map.getPlaybackBounds();
+    assert.equal(histBounds.maxMs, map._playbackMaxMs,
+      "historical maxMs stays at the snapshot's data edge");
+    map._historicalMode = false;
   } finally {
     teardown();
     process.removeListener("unhandledRejection", swallowRejection);

@@ -629,7 +629,16 @@ class MapView {
   }
 
   getPlaybackBounds() {
-    return { minMs: this._playbackMinMs, maxMs: this._playbackMaxMs };
+    let maxMs = this._playbackMaxMs;
+    // Live view: the leading edge ALWAYS ticks with wall time, regardless of
+    // server-poll cadence — a playhead riding the edge keeps moving (cache
+    // keys advance, the UI never freezes waiting for data). Historical
+    // snapshots keep their fixed data range. This is the wallEdge contract
+    // playback_state.js documents (and its tests stub) for live mode.
+    if (!this._historicalMode && maxMs != null && isFinite(maxMs)) {
+      maxMs = Math.max(maxMs, Date.now());
+    }
+    return { minMs: this._playbackMinMs, maxMs };
   }
 
   getPlaybackTimeMs() {

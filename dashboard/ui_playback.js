@@ -36,6 +36,31 @@
   const PlaybackUI = {};
 
   /**
+   * Pure transport-button state derivation — the single place the
+   * Live/Play/Pause semantics live:
+   *
+   *   live view, active, at the wall edge, 1x   → "Live"  (lit)
+   *   live view, active, at the wall edge, >1x  → "Pause" (lit — in sync with
+   *                                                the server, but faster than
+   *                                                real time isn't "Live")
+   *   active anywhere behind the edge           → "Pause" (unlit)
+   *   paused                                    → "Play"  (unlit)
+   *   historical snapshots                      → plain Play/Pause, never lit
+   *
+   * "active" means playing OR live-following (riding the edge counts).
+   * `lit` is the .isLive glow — it hints "keeping up with the server".
+   */
+  PlaybackUI.computeButtonState = function ({ historical, playing, liveFollow, atEnd, speed }) {
+    const active = !!playing || !!liveFollow;
+    if (historical) return { label: active ? "Pause" : "Play", lit: false };
+    if (active && atEnd) {
+      return (speed === 1) ? { label: "Live", lit: true } : { label: "Pause", lit: true };
+    }
+    if (active) return { label: "Pause", lit: false };
+    return { label: "Play", lit: false };
+  };
+
+  /**
    * @param {object} cfg
    *   map        — MapView instance
    *   document   — DOM document
@@ -72,6 +97,8 @@
     const pbRightEl = document.getElementById("pbRight");
     const pbPagePrevEl = document.getElementById("pbPagePrev");
     const pbPageNextEl = document.getElementById("pbPageNext");
+    const pbPausedShadeEl = document.getElementById("pbPausedShade");
+    const pbRewBadgeEl = document.getElementById("pbRewBadge");
 
     // ── A/B Barrel Jog Wheel ────────────────────────────────────────────────
     const pbJogWheelEl    = document.getElementById("pbJogWheel");
@@ -437,13 +464,16 @@
       if (pbScrubEl && isFinite(sliderMinMs) && isFinite(sliderMaxMs) && sliderMaxMs > sliderMinMs) {
         const durMs = Math.max(1, sliderMaxMs - sliderMinMs);
         const tRelMs = (tMs != null && isFinite(tMs)) ? (tMs - sliderMinMs) : durMs;
-        pbScrubEl.min = "0";
-        pbScrubEl.max = String(durMs);
-        pbScrubEl.step = "100"; // 100ms steps for smoother scrubbing
-        pbScrubEl.disabled = false;
+        // Freeze the slider's range while the user is scrubbing: the live
+        // edge ticks with wall time, and re-basing max under the finger makes
+        // the value→time mapping jitter against the drag (forward-swipe race).
         if (!pb._pbScrubbing) {
+          pbScrubEl.min = "0";
+          pbScrubEl.max = String(durMs);
+          pbScrubEl.step = "100"; // 100ms steps for smoother scrubbing
           pbScrubEl.value = String(clamp(tRelMs, 0, durMs));
         }
+        pbScrubEl.disabled = false;
         // Update progress fill for browsers without accent-color range support
         const pct = (clamp(Number(pbScrubEl.value), 0, durMs) / durMs) * 100;
         pbScrubEl.style.setProperty("--pct", pct + "%");
@@ -466,43 +496,39 @@
       }
 
       const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
-      const atEnd = !hasBounds || map.isPlaybackAtEnd(200);
-      // Live window: playhead is close enough to maxMs that continuing playback
-      // would naturally reach the end before the next server update.
-      // Only applies at 1x and 5x; higher speeds don't get the buffer.
-      const _speed = map.getPlaybackSpeed() || 1.0;
-      const _nextInS = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-      const _wallElapsed2 = (Date.now() - pb._pbLastServerResponseMs) / 1000;
-      const _remS2 = Math.max(0, _nextInS - _wallElapsed2);
-      const _liveWindowMs = (_speed <= 5) ? _remS2 * 1000 * _speed : 0;
-      const inLiveWindow = !hasBounds || atEnd || (
-        _liveWindowMs > 0 && tMs != null && isFinite(tMs) && tMs >= b.maxMs - _liveWindowMs
-      );
-      // LIVE mode is based on the flag, not position - we're replaying the buffer
-      const followingLive = map._playbackLiveFollow;
+      const atEnd = !hasBounds || map.isPlaybackAtEnd(1500);
 
       if (pbPlayEl) {
-        // "Live" shows at the live edge: LIT only when actively live-following at
-        // 1x; UNLIT when following at >1x, or when in the live window but not yet
-        // following (clicking the unlit button enters live-follow — at any speed,
-        // handled in the click listener). Otherwise a plain Pause/Play transport.
-        const _liveFollowing = followingLive && !map._historicalMode;
-        const _inLiveWin = inLiveWindow && !map._historicalMode;
-        if (_liveFollowing) {
-          pbPlayEl.textContent = "Live";
-          pbPlayEl.classList.toggle("isLive", _speed === 1);
-        } else if (_inLiveWin) {
-          pbPlayEl.textContent = "Live";
-          pbPlayEl.classList.remove("isLive");
-        } else if (map.getPlaybackPlaying()) {
-          pbPlayEl.textContent = "Pause";
-          pbPlayEl.classList.remove("isLive");
-        } else {
-          pbPlayEl.textContent = "Play";
-          pbPlayEl.classList.remove("isLive");
-        }
+        const st = PlaybackUI.computeButtonState({
+          historical: !!map._historicalMode,
+          playing: map.getPlaybackPlaying(),
+          liveFollow: !!map._playbackLiveFollow,
+          atEnd,
+          speed: map.getPlaybackSpeed() || 1.0,
+        });
+        pbPlayEl.textContent = st.label;
+        pbPlayEl.classList.toggle("isLive", st.lit);
       }
       if (pbSpeedEl) pbSpeedEl.value = String(map.getPlaybackSpeed() || 1.0);
+
+      // Paused-and-REWOUND signal (live view only): a frozen real-time app
+      // must look frozen — dim the map and show the ◀◀ REW badge. But only
+      // when the playhead is genuinely BEHIND the leading-edge sync window:
+      // paused at/near the data edge is still "roughly now" and gets neither
+      // (it self-resolves — wall time walks the edge away and the badge
+      // appears once the view is actually stale). Historical snapshots are
+      // deliberate time travel; nothing shows there.
+      const _pausedStill = !!map.playbackMode && !map._historicalMode && hasBounds
+        && !map.getPlaybackPlaying() && !map._playbackLiveFollow
+        && !pb._pbScrubbing
+        && Math.abs(pb._pbVelocity) <= _pbVelocityThreshold;
+      const _dataEdgeMs = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+        ? map._playbackMaxMs : b.maxMs;
+      const _syncEpsMs = Math.max(15000, (hasBounds ? (b.maxMs - b.minMs) : 0) * 0.005);
+      const _rewound = _pausedStill && tMs != null && isFinite(tMs)
+        && tMs < _dataEdgeMs - _syncEpsMs;
+      if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !_rewound);
+      if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !_rewound);
     };
 
     const playbackLoop = () => {
@@ -517,7 +543,6 @@
 
       const b = map.getPlaybackBounds();
       let tMs = map.getPlaybackTimeMs();
-      const tMsBefore = tMs; // snapshot before advancement, for edge-crossing detection
       const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
       const durMs = hasBounds ? (b.maxMs - b.minMs) : 1;
       const prevKnownMaxMs = pb._pbLastKnownMaxMs;
@@ -689,11 +714,42 @@
         const atEnd = (tMs >= b.maxMs - 1);
         const speedMult = map.getPlaybackSpeed() || 1.0;
 
+        // ── RIDE THE LIVE EDGE ────────────────────────────────────────────
+        // In live view the edge is wall-clock (getPlaybackBounds extends
+        // maxMs to Date.now()), so a playhead that reaches it is pinned to
+        // it and keeps moving with wall time — time never stops at the end,
+        // cache keys keep advancing, and when the server update lands the
+        // playhead is already there and playback continues seamlessly.
+        // Pin at ~4 Hz (250 ms) rather than every frame: smooth enough for
+        // clock labels and staleness fades, 15× cheaper than 60 fps.
+        // A wheel nudge or negative velocity escapes the ride naturally.
+        // Riding triggers on reaching EITHER edge: the wall-clock max, or the
+        // data edge (there is no data between them — sweeping or chasing that
+        // empty zone at playback speed is pointless; a 1x playhead behind a
+        // lagging server would chase the wall edge forever). Arrival jumps
+        // straight onto the ticking wall edge.
+        const _dataEdgeRideMs = (!map._historicalMode
+          && map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+          ? map._playbackMaxMs : b.maxMs;
+        const _riding = !map._historicalMode
+          && (map.getPlaybackPlaying() || map._playbackLiveFollow)
+          && !pb._pbIsRewinding && !pb._pbIsWheelCoasting
+          && Math.abs(pb._pbWheelAccum) <= 0.1
+          && pb._pbVelocity >= 0
+          && (tMs >= b.maxMs - 1000 || tMs >= _dataEdgeRideMs - 250);
         // Resolve loop start within current bounds.
         const loopStartMsRaw = (pb._pbLoopStartMs != null) ? Number(pb._pbLoopStartMs) : null;
         const loopStartMs = (isFinite(loopStartMsRaw)) ? clamp(loopStartMsRaw, b.minMs, b.maxMs) : b.minMs;
 
-        if (pb._pbIsRewinding) {
+        if (_riding) {
+          if (b.maxMs - tMs >= 250) {
+            map.setPlaybackTimeMs(b.maxMs);
+            tMs = b.maxMs;
+            didAdvanceTime = true;
+          }
+          pb._pbVelocity = 0;
+          pb._pbAtEndSincePerf = null;
+        } else if (pb._pbIsRewinding) {
           // Tape-reel rewind: ramp up, cruise, ease into start
           const totalDist = Math.max(1, b.maxMs - loopStartMs);
           const distFromStart = tMs - loopStartMs;
@@ -755,25 +811,14 @@
             // Cruise phase: full speed
             pb._pbVelocity = cruiseSpeed;
           }
-        } else if (map._playbackLiveFollow) {
-          // ─────────────────────────────────────────────────────────────────────
-          // LIVE MODE: Play forward until we hit maxMs, then stall waiting for
-          // new data. When new data arrives, resume playing.
-          // ─────────────────────────────────────────────────────────────────────
+        } else if (map._playbackLiveFollow || map.getPlaybackPlaying()) {
+          // Forward playback toward the edge at the selected speed. In live
+          // view, arriving at the wall-clock edge hands off to the RIDE block
+          // above — playback never stops there. Historical snapshots park at
+          // their fixed end (velocity 0).
           if (atEnd) {
-            // At live edge, waiting for new data - just hold position
             pb._pbVelocity = 0;
           } else {
-            // Have data ahead - play toward live edge at user-selected speed
-            pb._pbVelocity = _pbPlaybackSpeed * speedMult;
-          }
-        } else if (map.getPlaybackPlaying()) {
-          // Normal forward playback
-          if (atEnd) {
-            // At end — velocity zeroed; the Live-mode switch below will activate.
-            pb._pbVelocity = 0;
-          } else {
-            // Normal forward - maintain playback speed
             pb._pbVelocity = _pbPlaybackSpeed * speedMult;
             pb._pbAtEndSincePerf = null;
           }
@@ -883,38 +928,12 @@
         map.drawOverlay(map.lastState, { cacheUnderlay: true });
       }
 
-      // When playback enters the live buffer window, stop and show Live button.
-      // Buffer window = predictedInterval * speed, at every speed.
-      {
-        const _spd2 = map.getPlaybackSpeed() || 1.0;
-        const _nextInS2 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-        const _wallElapsed3 = (Date.now() - pb._pbLastServerResponseMs) / 1000;
-        const _remS3 = Math.max(0, _nextInS2 - _wallElapsed3);
-        const _lwMs2 = _remS3 * 1000 * _spd2;
-        const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
-        var _inLiveWindow2 = hasBounds && tMs != null && isFinite(tMs) && tMs >= bufferEdge;
-        // Only trigger if we CROSSED into the window this frame (were below, now at/above).
-        // If the user scrubbed into the window, let playback continue to maxMs.
-        var _crossedIntoLiveWindow = _inLiveWindow2 && isFinite(tMsBefore) && tMsBefore < bufferEdge;
-      }
-      if (!pb._pbIsRewinding &&
-          !_getScreensaverActive() &&
-          map.getPlaybackPlaying() &&
-          !map._playbackLiveFollow &&
-          !pb._pbIsWheelCoasting &&
-          didAdvanceTime && pb._pbVelocity >= 0 &&
-          _crossedIntoLiveWindow) {
-        // Don't auto-activate Live mode — just stop playback at the buffer edge.
-        // The button will show "Live" (not highlighted) so the user can opt in.
-        // map._playbackLiveFollow = true;
-        // pb._pbPageAutoFollow = true;
-        // try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-        pb._pbVelocity = 0;
-        pb._pbAtEndSincePerf = null;
-        pb._pbIsRewinding = false;
-        map.setPlaybackPlaying(false);
-        updatePlaybackUi();
-      }
+      // (The old "stop at the live buffer window and wait for a Live click"
+      // gate is gone: playback that reaches the wall-clock edge now rides it
+      // — see the RIDE block — so the catch-up lands on the end and simply
+      // keeps going when the server update arrives. Stopping here was the
+      // frozen-playhead bug: playback died at the buffer edge and the
+      // new-data resume path required a live-follow flag that was never set.)
 
       // UI updates
       const isActive = Math.abs(pb._pbVelocity) > _pbVelocityThreshold || Math.abs(pb._pbWheelAccum) > 0.1;
@@ -977,7 +996,15 @@
       const relMs = Number(pbScrubEl.value);
       if (!isFinite(relMs)) return;
       const tMs = pr.minMs + relMs;
-      const clampedT = clamp(tMs, b.minMs, b.maxMs);
+      // Live view: the timeline's leading edge is wall-clock, but there is no
+      // DATA past the server's newest point. Scrubbing clamps to the data
+      // edge so the playhead can't be parked in the empty wall-extension
+      // zone — only RIDING (playing at the edge) lives there. This kills the
+      // forward-swipe flicker of rendering a dataless instant.
+      const scrubEdge = (!map._historicalMode
+        && map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+        ? Math.min(b.maxMs, map._playbackMaxMs) : b.maxMs;
+      const clampedT = clamp(tMs, b.minMs, scrubEdge);
 
       map.setPlaybackTimeMs(clampedT);
 

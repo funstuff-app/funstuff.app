@@ -744,6 +744,7 @@ function main() {
     _pbLastPerf: 0,
     _pbLastUiPerf: 0,
     _pbScrubbing: false,  // true when pointer is down on scrub bar
+    _pbResumeAfterScrub: false,  // was playback active when the scrub began
     _pbVelocity: 0,
     _pbAtEndSincePerf: null,  // performance.now() when we started waiting at end
     _pbArrivedAtEndViaPlayback: false,  // true only if we PLAYED to the end (not scrolled)
@@ -1490,87 +1491,34 @@ function main() {
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
-      const atEnd = map.isPlaybackAtEnd(100);
-      // Buffer snap target and Live window: all speeds.
-      const _spd = map.getPlaybackSpeed() || 1.0;
-      const _nextInS3 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-      const _wallElapsed = (Date.now() - pb._pbLastServerResponseMs) / 1000;
-      const _remS = Math.max(0, _nextInS3 - _wallElapsed);
-      const _snapMs = _remS * 1000 * _spd;
-      const _lwMs = _snapMs;
-      const curMs = map.getPlaybackTimeMs();
-      const inLiveWindow = atEnd || (
-        _lwMs > 0 && curMs != null && isFinite(curMs) && curMs >= b.maxMs - _lwMs
-      );
-      
-      // If in LIVE mode, clicking turns OFF live camera follow (but keeps playback running).
-      // This allows the user to stay at the end receiving new data, but without the camera auto-following.
-      if (map._playbackLiveFollow) {
+      // The button is a plain play/pause toggle. "Live" is a DISPLAY state
+      // (riding the wall-clock edge at 1x), not a separate button mode —
+      // updatePlaybackUi derives the label/glow from position + speed.
+      const active = map.getPlaybackPlaying() || map._playbackLiveFollow;
+
+      if (active) {
+        // PAUSE: freeze the playhead and leave the live edge. There is no
+        // paused-yet-pinned-to-edge state — the edge keeps ticking with wall
+        // time and the paused view falls behind it. updatePlaybackUi dims
+        // the map and shows the ◀◀ REW badge in live view.
         map._playbackLiveFollow = false;
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
         if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
-        // Set loop start to current position so rewind doesn't go to beginning of time
-        const curMs = map.getPlaybackTimeMs();
-        if (curMs != null && isFinite(curMs)) {
-          pb._pbLoopStartMs = curMs;
-        }
-        // Keep playback running (or start it if paused)
-        if (!map.getPlaybackPlaying()) {
-          pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-          map.setPlaybackPlaying(true);
-          pb._pbLastPerf = 0;
-          if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-        }
-        updatePlaybackUi();
-        return;
-      }
-
-      // If in live window, enable LIVE mode at any speed (not for historical replays)
-      if (inLiveWindow && !map._playbackLiveFollow && !map._historicalMode) {
-        map._playbackLiveFollow = true;
-        pb._pbPageAutoFollow = true; // resume page tracking in LIVE mode
-        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-        // Snap playhead to leading edge of buffer
-        if (_snapMs > 0) {
-          const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
-          map.setPlaybackTimeMs(bufferStart);
-        }
-        pb._pbVelocity = 0;
-        pb._pbAtEndSincePerf = null;
-        pb._pbIsRewinding = false;
-        map.setPlaybackPlaying(true);
-        pb._pbLastPerf = 0;
-        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
-        return;
-      }
-
-      // >5x at end: snap to buffer position and play (no Live mode)
-      if (atEnd && _spd > 5 && _snapMs > 0) {
-        const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
-        map.setPlaybackTimeMs(bufferStart);
-        pb._pbVelocity = _pbPlaybackSpeed * _spd;
-        pb._pbAtEndSincePerf = null;
-        pb._pbIsRewinding = false;
-        map.setPlaybackPlaying(true);
-        pb._pbLastPerf = 0;
-        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
-        return;
-      }
-
-      // If currently playing (not LIVE mode), pause
-      if (map.getPlaybackPlaying()) {
         map.setPlaybackPlaying(false);
         pb._pbVelocity = 0;
         pb._pbWheelAccum = 0;
         pb._pbAtEndSincePerf = null;
         pb._pbIsRewinding = false;
+        // Remember where the user paused as replay point A.
+        const curMs = map.getPlaybackTimeMs();
+        if (curMs != null && isFinite(curMs)) pb._pbLoopStartMs = curMs;
         updatePlaybackUi();
         return;
       }
 
-      // Paused - just play from current position
+      // PLAY from the current position at the selected speed. If the playhead
+      // is at the wall-clock edge, playing from here IS going live — the RIDE
+      // block keeps it pinned to the ticking edge (Live at 1x, lit Pause above).
       pb._pbAtEndSincePerf = null;
       pb._pbWheelAccum = 0;
       pb._pbIsRewinding = false;
@@ -1578,6 +1526,17 @@ function main() {
       if (pb._pbLoopStartMs == null || !isFinite(Number(pb._pbLoopStartMs))) {
         const cur = map.getPlaybackTimeMs();
         pb._pbLoopStartMs = (cur != null && isFinite(Number(cur))) ? Number(cur) : b.minMs;
+      }
+      // Playing from the data edge IS going live (measured against the data
+      // edge — the wall extension can run a full poll interval ahead of it).
+      const _playDataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+        ? map._playbackMaxMs : b.maxMs;
+      const _playCur = map.getPlaybackTimeMs();
+      if (!map._historicalMode && _playCur != null && isFinite(_playCur)
+          && _playCur >= _playDataEdge - 1500) {
+        map._playbackLiveFollow = true;
+        pb._pbPageAutoFollow = true;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
       }
       pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
       map.setPlaybackPlaying(true);
@@ -1588,6 +1547,48 @@ function main() {
       updatePlaybackUi();
     });
   }
+
+  // ── Scrub-release resume ──────────────────────────────────────────────────
+  // Edge proximity for the drag-to-live gesture: generous enough to hit at
+  // slider pixel granularity (~0.5% of the visible range, 15 s minimum).
+  const _pbEdgeSnapEpsMs = () => {
+    const b = map.getPlaybackBounds();
+    const dur = (isFinite(b.minMs) && isFinite(b.maxMs)) ? (b.maxMs - b.minMs) : 0;
+    return Math.max(15000, dur * 0.005);
+  };
+  // Shared release handler for scrub gestures: commit the slider position,
+  // then restore what the user was doing before grabbing it. Released at the
+  // wall-clock edge → go Live (the "drag into the live edge" gesture).
+  // Otherwise resume playing only if playback was active when the drag
+  // started — a scrub while paused stays paused (button keeps "Play").
+  const _pbResumeFromScrub = (resetPerfToNow) => {
+    applyScrub();
+    const wasActive = !!pb._pbResumeAfterScrub;
+    pb._pbResumeAfterScrub = false;
+    // "Released at the edge" is measured against the DATA edge, not the
+    // wall-clock max — scrubs are clamped to the data edge (applyScrub), and
+    // the wall extension can run up to a full poll interval ahead of it.
+    const _dataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+      ? map._playbackMaxMs : map.getPlaybackBounds().maxMs;
+    const _cur = map.getPlaybackTimeMs();
+    const goLive = !map._historicalMode && _cur != null && isFinite(_cur)
+      && _cur >= _dataEdge - _pbEdgeSnapEpsMs();
+    if (goLive) {
+      map._playbackLiveFollow = true;
+      pb._pbPageAutoFollow = true;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+      const bb = map.getPlaybackBounds();
+      if (isFinite(bb.maxMs)) map.setPlaybackTimeMs(bb.maxMs);
+    }
+    if (goLive || wasActive) {
+      map.setPlaybackPlaying(true);
+      pb._pbLastPerf = resetPerfToNow ? performance.now() : 0;
+      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
+    } else {
+      map.setPlaybackPlaying(false);
+    }
+    updatePlaybackUi();
+  };
 
   if (pbSpeedEl) {
     // Restore saved speed
@@ -1600,45 +1601,11 @@ function main() {
       }
     }
     pbSpeedEl.addEventListener("change", () => {
-      const prevSpeed = map.getPlaybackSpeed() || 1.0;
       map.setPlaybackSpeed(pbSpeedEl.value);
       localStorage.setItem("mobileair.playbackSpeed", pbSpeedEl.value);
-      const newSpeed = map.getPlaybackSpeed() || 1.0;
-
-      // If in LIVE mode, recalculate buffer position when speed changes.
-      // LIVE mode is supported at every speed.
-      if (map._playbackLiveFollow) {
-        {
-          // Recalculate buffer start for the new speed.
-          // Larger speed = larger buffer window = playhead must move back.
-          // Smaller speed = smaller buffer window = playhead should move forward
-          //   (otherwise it's behind the new buffer start and Live button state
-          //   becomes inconsistent — the user expects to be "caught up").
-          const b = map.getPlaybackBounds();
-          if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
-            const meta = map.lastState?.meta || {};
-            const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
-            const wallElapsed = (Date.now() - pb._pbLastServerResponseMs) / 1000;
-            const remS = Math.max(0, nextInS - wallElapsed);
-            const snapMs = remS * 1000 * newSpeed;
-            if (snapMs > 0) {
-              const bufferStart = Math.max(b.minMs, b.maxMs - snapMs);
-              const curMs = map.getPlaybackTimeMs();
-              if (curMs != null && isFinite(curMs)) {
-                // Speed increased: snap back if ahead of new (larger) buffer start
-                // Speed decreased: snap forward if behind new (smaller) buffer start
-                if (curMs > bufferStart || curMs < bufferStart) {
-                  map.setPlaybackTimeMs(bufferStart);
-                  // Reset LIVE tracking so buffer accumulation restarts from here
-                  pb._pbLiveStartWallMs = performance.now();
-                  pb._pbLiveStartDataMs = b.maxMs;
-                }
-              }
-            }
-          }
-        }
-      }
-
+      // Speed changes never move the playhead. Riding the wall-clock edge is
+      // position-based, so the only visible effect there is the button label
+      // flipping between "Live" (1x) and lit "Pause" (>1x) via updatePlaybackUi.
       updatePlaybackUi();
     });
   }
@@ -1653,22 +1620,14 @@ function main() {
     if (!map._playbackLiveFollow) return; // only applies in LIVE mode
     const b = map.getPlaybackBounds();
     if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;
-    const speed = map.getPlaybackSpeed() || 1.0;
-    const meta = map.lastState?.meta || {};
-    const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
-    const wallElapsed = (Date.now() - pb._pbLastServerResponseMs) / 1000;
-    const remS = Math.max(0, nextInS - wallElapsed);
-    const bufferMs = remS * 1000 * speed;
-    if (bufferMs > 0) {
-      const bufferStart = Math.max(b.minMs, b.maxMs - bufferMs);
-      map.setPlaybackTimeMs(bufferStart);
-      // Restart LIVE tracking from current position
-      pb._pbLiveStartWallMs = performance.now();
-      pb._pbLiveStartDataMs = b.maxMs;
-      // Reset the frame timer so dt doesn't include backgrounded time
-      pb._pbLastPerf = 0;
-      updatePlaybackUi();
-    }
+    // Snap straight to the wall-clock edge — that is where "live" is now.
+    map.setPlaybackTimeMs(b.maxMs);
+    // Restart LIVE tracking from current position
+    pb._pbLiveStartWallMs = performance.now();
+    pb._pbLiveStartDataMs = b.maxMs;
+    // Reset the frame timer so dt doesn't include backgrounded time
+    pb._pbLastPerf = 0;
+    updatePlaybackUi();
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1938,6 +1897,9 @@ function main() {
       pb._pbDidDrag = false; // track if user actually dragged
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
+      // Remember whether playback was active so release can restore it —
+      // a scrub started while paused stays paused (button keeps "Play").
+      pb._pbResumeAfterScrub = map.getPlaybackPlaying() || map._playbackLiveFollow;
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false; // exit live mode when user grabs slider
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
@@ -2015,11 +1977,7 @@ function main() {
         }
       }
 
-      // Don't auto-enable LIVE mode when released at end - user must click Live button.
-      map.setPlaybackPlaying(true);
-      pb._pbLastPerf = performance.now();
-      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-      applyScrub();
+      _pbResumeFromScrub(true);
 
     });
     pbScrubEl.addEventListener("input", () => {
@@ -2049,14 +2007,11 @@ function main() {
         // Drag was handled by pointerup - do nothing here
         return;
       }
-      // For clicks on the track (not drags), just resume playing
+      // For clicks on the track (not drags): commit and restore prior state
       pb._pbScrubbing = false;
       map._scrubbing = false;
       pb._pbVelocity = 0; // no inertia for clicks
-      map.setPlaybackPlaying(true);
-      pb._pbLastPerf = 0;
-      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-      applyScrub();
+      _pbResumeFromScrub(false);
     });
 
     // Scroll wheel on the scrub bar adds momentum (iPod-style)
@@ -2153,6 +2108,7 @@ function main() {
       pb._pbDidDrag = false;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
+      pb._pbResumeAfterScrub = map.getPlaybackPlaying() || map._playbackLiveFollow;
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false;
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
@@ -2226,10 +2182,7 @@ function main() {
         }
       }
 
-      map.setPlaybackPlaying(true);
-      pb._pbLastPerf = performance.now();
-      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-      applyScrub();
+      _pbResumeFromScrub(true);
     });
   }
 

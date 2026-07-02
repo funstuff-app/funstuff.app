@@ -367,6 +367,41 @@ aside, section { min-height: 0; }
   pointer-events: none;
 }
 
+/* Paused shade: dims the map (not the UI) while live-view playback is paused.
+   pointer-events pass through so the map stays interactive. */
+#pbPausedShade {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+#pbPausedShade.hidden { display: none; }
+
+/* ◀◀ REW badge: small pill above the playback bar while paused */
+#pbRewBadge {
+  position: absolute;
+  left: 50%;
+  bottom: 132px;
+  transform: translateX(-50%);
+  z-index: 5;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(20, 22, 28, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  pointer-events: none;
+  animation: pbRewPulse 1.6s ease-in-out infinite;
+}
+#pbRewBadge.hidden { display: none; }
+@keyframes pbRewPulse {
+  0%, 100% { opacity: 0.9; }
+  50% { opacity: 0.45; }
+}
+
 /* DVR playback controls (bottom center) */
 .playbackBar {
   position: absolute;
