@@ -538,12 +538,32 @@
       if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !_pausedStill);
     };
 
-    // ── INVARIANT: paused-at-the-edge is not a state ─────────────────────────
-    // Time must never appear to stop at the end. A pause that lands inside
-    // the leading-edge sync window steps the playhead back to just behind the
-    // window, where the dim + ◀◀ REW badge make the frozen view honest.
-    // Riding (playing) is the only way to sit at the wall-clock edge.
-    // Returns true if it moved the playhead.
+    // Establish the riding / live state (idempotent). Reaching the leading
+    // edge in live view is ALWAYS live, however we arrived — play, coast,
+    // barrel fling, or a finger-scroll to the end. Clears any coasting so the
+    // loop's ride pin (below) takes over and the wall clock keeps ticking.
+    const _pbGoLive = () => {
+      pb._pbIsWheelCoasting = false;
+      pb._pbWheelAccum = 0;
+      pb._pbAtEndSincePerf = null;
+      pb._pbIsRewinding = false;
+      pb._pbEaseStartPerf = null;
+      if (!map.getPlaybackPlaying()) map.setPlaybackPlaying(true);
+      if (!map._playbackLiveFollow) {
+        map._playbackLiveFollow = true;
+        pb._pbPageAutoFollow = true;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+      }
+    };
+
+    // ── EXPLICIT-PAUSE step-back ─────────────────────────────────────────────
+    // Pausing while at/near the leading edge must not freeze time at the end.
+    // An explicit pause (the pbPlay button) calls this SYNCHRONOUSLY to move
+    // the playhead just behind the sync window, into the rewound state where
+    // the dim + ◀◀ REW badge make the frozen view honest. This is the ONLY
+    // path that steps back: forward motion that reaches the edge goes live
+    // (see _pbGoLive / the ride block) — the loop must never yank a
+    // finger-scroll-to-end backward. Returns true if it moved the playhead.
     const _pbEnforceNoPauseAtEdge = () => {
       if (map._historicalMode) return false;
       if (map.getPlaybackPlaying() || map._playbackLiveFollow) return false;
@@ -624,14 +644,10 @@
         }
       }
 
-      // ── INVARIANT: paused-at-the-edge is not a state ─────────────────────
-      // Runs in the loop (not just the button) so every pause path — button,
-      // trace toggle, screensaver exit — is covered while frames are alive.
-      // The pause transitions themselves also call this synchronously (rAF
-      // does not fire in hidden tabs).
-      if (_pbEnforceNoPauseAtEdge()) {
-        tMs = map.getPlaybackTimeMs();
-      }
+      // (No pause-step-back here. The loop's job at the edge is to GO LIVE,
+      // not to yank the playhead back — a finger-scroll that coasts to a rest
+      // at the end must ride, not freeze. Explicit pause is the only step-back
+      // and it happens synchronously in the button handler.)
 
       // Forced refresh: treat as a new-data event even if bounds didn't move.
       // This is used by the terminal TUI to request a camera fit/zoom in the web UI.
@@ -767,33 +783,37 @@
         // playhead is already there and playback continues seamlessly.
         // Pin at ~4 Hz (250 ms) rather than every frame: smooth enough for
         // clock labels and staleness fades, 15× cheaper than 60 fps.
-        // A wheel nudge or negative velocity escapes the ride naturally.
-        // Riding triggers on reaching EITHER edge: the wall-clock max, or the
-        // data edge (there is no data between them — sweeping or chasing that
-        // empty zone at playback speed is pointless; a 1x playhead behind a
-        // lagging server would chase the wall edge forever). Arrival jumps
-        // straight onto the ticking wall edge.
+        // ── RIDE / GO LIVE AT THE LEADING EDGE ────────────────────────────
+        // Reaching the leading edge in live view is ALWAYS live, however we
+        // got here: play, coast, barrel fling, or a finger-scroll to the end.
+        // The edge is EITHER the data edge or the wall-clock max (no data
+        // between them). We ride whenever the playhead is at/past that edge
+        // and not actively moving BACKWARD (a backward fling escapes). Only
+        // an explicit pause parks behind the edge, and it moves the playhead
+        // there itself — so observing tMs at the edge always means forward
+        // intent. Going live pins to the ticking wall edge at ~4 Hz, so the
+        // wall clock never stops.
         const _dataEdgeRideMs = (!map._historicalMode
           && map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
           ? map._playbackMaxMs : b.maxMs;
-        const _riding = !map._historicalMode
-          && (map.getPlaybackPlaying() || map._playbackLiveFollow)
-          && !pb._pbIsRewinding && !pb._pbIsWheelCoasting
-          && Math.abs(pb._pbWheelAccum) <= 0.1
-          && pb._pbVelocity >= 0
-          && (tMs >= b.maxMs - 1000 || tMs >= _dataEdgeRideMs - 250);
+        const _rideSyncEps = Math.max(15000, (b.maxMs - b.minMs) * 0.005);
+        const _atLeadingEdge = !map._historicalMode
+          && !pb._pbScrubbing
+          && !pb._pbIsRewinding
+          && pb._pbVelocity >= -_pbVelocityThreshold
+          && (tMs >= b.maxMs - 1000 || tMs >= _dataEdgeRideMs - _rideSyncEps);
         // Resolve loop start within current bounds.
         const loopStartMsRaw = (pb._pbLoopStartMs != null) ? Number(pb._pbLoopStartMs) : null;
         const loopStartMs = (isFinite(loopStartMsRaw)) ? clamp(loopStartMsRaw, b.minMs, b.maxMs) : b.minMs;
 
-        if (_riding) {
+        if (_atLeadingEdge) {
+          _pbGoLive();
           if (b.maxMs - tMs >= 250) {
             map.setPlaybackTimeMs(b.maxMs);
             tMs = b.maxMs;
             didAdvanceTime = true;
           }
           pb._pbVelocity = 0;
-          pb._pbAtEndSincePerf = null;
         } else if (pb._pbIsRewinding) {
           // Tape-reel rewind: ramp up, cruise, ease into start
           const totalDist = Math.max(1, b.maxMs - loopStartMs);
@@ -930,22 +950,11 @@
             pb._pbVelocity = 0;
             nextMs = b.maxMs;
             // Forward momentum into the end (wheel accumulator, barrel-jog
-            // fling, coasting) is the drag-into-the-live-edge gesture: GO
-            // LIVE. Without this, the momentum paths parked here with
-            // playing=false and _pbIsWheelCoasting=true — the ride block and
-            // the pause invariant both skip coasting, the loop died, and the
-            // playhead froze at the wall edge (the "finger scroll to the end
-            // stops the wall clock" bug). Historical keeps the old parking.
+            // fling, coasting, finger-scroll) is the drag-into-the-live-edge
+            // gesture: GO LIVE this same frame so it never parks frozen at the
+            // wall edge. Historical keeps the old parking.
             if (!map._historicalMode) {
-              pb._pbIsWheelCoasting = false;
-              pb._pbWheelAccum = 0;
-              pb._pbAtEndSincePerf = null;
-              if (!map.getPlaybackPlaying()) map.setPlaybackPlaying(true);
-              if (!map._playbackLiveFollow) {
-                map._playbackLiveFollow = true;
-                pb._pbPageAutoFollow = true;
-                try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-              }
+              _pbGoLive();
               updatePlaybackUi();
             }
           }

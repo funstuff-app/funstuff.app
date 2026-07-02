@@ -214,35 +214,51 @@ describe("forward momentum into the end goes LIVE (finger-scroll freeze bug)", (
   });
 });
 
-describe("paused-at-the-edge is not a state", () => {
-  it("a pause landing at the wall edge is stepped back behind the sync window", () => {
+describe("an idle playhead at the edge GOES LIVE (never freezes)", () => {
+  it("a finger-scroll that coasts to rest AT the edge starts riding, not frozen", () => {
     const h = makeHarness();
-    // riding first
-    h.map.setPlaybackPlaying(true);
-    h.map.setPlaybackTimeMs(h.map.getPlaybackBounds().maxMs - 50);
+    // The wheel/finger-scroll end state: NOT playing, NOT live, a small
+    // forward coast decaying to rest right at the data edge. The old loop
+    // yanked this backward (frozen); the new loop must GO LIVE.
+    h.map.setPlaybackPlaying(false);
+    h.map._playbackLiveFollow = false;
+    h.pb._pbIsWheelCoasting = true;
+    h.pb._pbVelocity = 0.5;                      // slow forward coast, loop alive
+    h.map.setPlaybackTimeMs(h.map._playbackMaxMs); // resting at the data edge
     h.startLoop();
-    h.step(300);
-    // arbitrary pause path (not the button): flags only, then one loop frame
+    h.step(16);
+    assert.equal(h.map.getPlaybackPlaying(), true, "went live (playing) at the edge");
+    assert.equal(h.map._playbackLiveFollow, true, "live-follow engaged");
+    // and it keeps ticking with wall time — the wall clock does NOT stop
+    const t1 = h.map.getPlaybackTimeMs();
+    for (let i = 0; i < 8; i++) assert.ok(h.step(300), `loop alive frame ${i}`);
+    assert.ok(h.map.getPlaybackTimeMs() > t1, "playhead advanced with wall time");
+    h.playback.updatePlaybackUi();
+    assert.equal(h.btn.textContent, "Live");
+    assert.ok(h.badge.classList.contains("hidden"), "no REW badge while live at the edge");
+    assert.ok(h.shade.classList.contains("hidden"), "no dim while live");
+  });
+
+  it("only the EXPLICIT pause step-back parks behind the window (button path)", () => {
+    const h = makeHarness();
+    // explicit pause sequence, as the pbPlay button does it: clear active
+    // flags + velocity, then call the synchronous step-back.
     h.map.setPlaybackPlaying(false);
     h.map._playbackLiveFollow = false;
     h.pb._pbVelocity = 0;
-    h.step(16);
-    const t = h.map.getPlaybackTimeMs();
-    assert.ok(t <= h.map._playbackMaxMs - h.syncEps(),
-      `playhead stepped behind the sync window (t=${t}, dataEdge=${h.map._playbackMaxMs})`);
+    h.map.setPlaybackTimeMs(h.map.getPlaybackBounds().maxMs); // at wall edge
+    const moved = h.playback._pbEnforceNoPauseAtEdge();
+    assert.equal(moved, true, "step-back reports relocation");
+    assert.ok(h.map.getPlaybackTimeMs() <= h.map._playbackMaxMs - h.syncEps(),
+      "playhead parked behind the sync window (no rAF needed — works in hidden tabs)");
+    h.playback.updatePlaybackUi();
     assert.ok(!h.badge.classList.contains("hidden"), "REW badge visible (behind live)");
     assert.ok(!h.shade.classList.contains("hidden"), "dim shade visible (paused)");
-  });
-
-  it("the exported synchronous enforcement works with no frames at all (hidden tab)", () => {
-    const h = makeHarness();
-    h.map.setPlaybackPlaying(false);
-    h.map._playbackLiveFollow = false;
-    h.map.setPlaybackTimeMs(h.map.getPlaybackBounds().maxMs); // parked at wall edge
-    const moved = h.playback._pbEnforceNoPauseAtEdge();
-    assert.equal(moved, true, "enforcement reports relocation");
-    assert.ok(h.map.getPlaybackTimeMs() <= h.map._playbackMaxMs - h.syncEps(),
-      "playhead behind the sync window without any rAF");
+    // and the loop does NOT re-ride it (it is behind the window now)
+    h.startLoop();
+    h.step(16);
+    assert.equal(h.map.getPlaybackPlaying(), false, "stays paused behind the window");
+    assert.equal(h.map._playbackLiveFollow, false, "stays out of live-follow");
   });
 });
 
