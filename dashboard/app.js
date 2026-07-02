@@ -782,60 +782,60 @@ function main() {
         canvasEl: pbBarrelCanvas,
         onWheel(delta) {
           // Same physics as classic wheel handler on pbScrubEl
-          _pbAtEndSincePerf = null;
-          _pbArrivedAtEndViaPlayback = false;
-          _pbIsRewinding = false;
-          _pbPageAutoFollow = true;
+          pb._pbAtEndSincePerf = null;
+          pb._pbArrivedAtEndViaPlayback = false;
+          pb._pbIsRewinding = false;
+          pb._pbPageAutoFollow = true;
           map.setPlaybackPlaying(false);
           map._playbackLiveFollow = false;
           try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-          _pbIsWheelCoasting = true;
-          _pbCommitLoopStartOnCoastEnd = true;
-          if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+          pb._pbIsWheelCoasting = true;
+          pb._pbCommitLoopStartOnCoastEnd = true;
+          if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
             const pr = _pbGetPageRange();
-            _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+            pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
           }
           const b = map.getPlaybackBounds();
           const durMs = (b.maxMs - b.minMs) || 1;
           const nudgeDur = Math.min(durMs, 21600000); // cap at 6h so scroll speed is consistent
           const nudge = (delta / 1000) * (nudgeDur / 480);
-          const prevDir = Math.sign(_pbVelocity);
-          _pbVelocity -= nudge;
-          if (prevDir !== 0 && Math.sign(_pbVelocity) !== 0 && Math.sign(_pbVelocity) !== prevDir) {
+          const prevDir = Math.sign(pb._pbVelocity);
+          pb._pbVelocity -= nudge;
+          if (prevDir !== 0 && Math.sign(pb._pbVelocity) !== 0 && Math.sign(pb._pbVelocity) !== prevDir) {
             _pbSnapWindowToPlayhead();
             updatePlaybackUi();
           }
-          if (!_pbRAF) {
-            _pbLastPerf = performance.now();
-            _pbRAF = requestAnimationFrame(playbackLoop);
+          if (!pb._pbRAF) {
+            pb._pbLastPerf = performance.now();
+            pb._pbRAF = requestAnimationFrame(playbackLoop);
           }
         },
         onDragStart() {
           // Same cancel-all-physics as classic pointerdown
-          _pbVelocity = 0;
-          _pbWheelAccum = 0;
-          _pbAtEndSincePerf = null;
-          _pbArrivedAtEndViaPlayback = false;
-          _pbIsRewinding = false;
-          _pbEaseStartPerf = null;
-          _pbIsWheelCoasting = false;
-          _pbScrubbing = true;
+          pb._pbVelocity = 0;
+          pb._pbWheelAccum = 0;
+          pb._pbAtEndSincePerf = null;
+          pb._pbArrivedAtEndViaPlayback = false;
+          pb._pbIsRewinding = false;
+          pb._pbEaseStartPerf = null;
+          pb._pbIsWheelCoasting = false;
+          pb._pbScrubbing = true;
           map._scrubbing = true;
-          _pbDidDrag = false;
+          pb._pbDidDrag = false;
           map.setPlaybackPlaying(false);
           map._playbackLiveFollow = false;
           try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
           _resetLiveTracking();
-          if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+          if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
             const pr = _pbGetPageRange();
-            _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+            pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
           }
           updatePlaybackUi();
         },
         onPositionChange(deltaFrac) {
           // deltaFrac is already gear-reduced (dx / (width*8))
           // Map to timeline ms and apply
-          _pbDidDrag = true;
+          pb._pbDidDrag = true;
           const b = map.getPlaybackBounds();
           const pr = _pbPagingActive() ? _pbGetPageRange() : b;
           const durMs = (pr.maxMs - pr.minMs) || 1;
@@ -854,18 +854,18 @@ function main() {
         },
         onDragEnd(vel) {
           _pbSnapWindowToPlayhead();
-          _pbScrubbing = false;
+          pb._pbScrubbing = false;
           map._scrubbing = false;
           // Convert barrel velocity to timeline velocity for inertial coasting
           const b = map.getPlaybackBounds();
           const pr = _pbPagingActive() ? _pbGetPageRange() : b;
           const durMs = (pr.maxMs - pr.minMs) || 1;
-          _pbVelocity = (vel * durMs) / 16;
-          _pbIsWheelCoasting = false;
-          _pbPageAutoFollow = true;
+          pb._pbVelocity = (vel * durMs) / 16;
+          pb._pbIsWheelCoasting = false;
+          pb._pbPageAutoFollow = true;
           map.setPlaybackPlaying(true);
-          _pbLastPerf = performance.now();
-          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          pb._pbLastPerf = performance.now();
+          if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
         }
       });
     }
@@ -883,10 +883,40 @@ function main() {
     });
   }
 
-  let _pbRAF = null;
-  let _pbLastPerf = 0;
-  let _pbLastUiPerf = 0;
-  let _pbScrubbing = false;      // true when pointer is down on scrub bar
+  const pb = {
+    _pbRAF: null,
+    _pbLastPerf: 0,
+    _pbLastUiPerf: 0,
+    _pbScrubbing: false,  // true when pointer is down on scrub bar
+    _pbVelocity: 0,
+    _pbAtEndSincePerf: null,  // performance.now() when we started waiting at end
+    _pbArrivedAtEndViaPlayback: false,  // true only if we PLAYED to the end (not scrolled)
+    _pbEaseStartPerf: null,
+    _pbEaseStartVelocity: 0,
+    _pbEaseStartPos: 0,  // playhead position when ease began
+    _pbIsRewinding: false,
+    _pbLoopStartMs: null,
+    _pbLastKnownMinMs: null,
+    _pbLastKnownMaxMs: null,
+    _pbLastServerResponseMs: Date.now(),
+    _pbLastForceRefreshSeq: null,
+    _pbLiveStartWallMs: null,  // wall-clock time (perf.now) when LIVE mode started
+    _pbLiveStartDataMs: null,  // data time (maxMs) when LIVE mode started
+    _pbLiveTargetMs: null,  // where playback should aim in LIVE mode
+    _pbLiveStallCount: 0,  // how many times we've hit end waiting for data
+    _deferredCameraFit: null,  // { type: "bounds", bb, durationMs } | { type: "storedView", durationMs }
+    _pbWheelAccum: 0,  // accumulated wheel delta
+    _pbDidDrag: false,  // did the user actually drag (vs click)?
+    _pbIsWheelCoasting: false,  // is current coast from wheel scroll?
+    _pbCommitLoopStartOnCoastEnd: false,
+    _pbMwAccum: 0,
+    _pbMwLastTs: 0,  // mouse-wheel velocity accumulator for scrub bar
+    _pbPageIndex: -1,  // -1 = "all" (no paging), 0..N = page index
+    _pbPageAutoFollow: true,  // auto-advance page to follow playhead
+    _pbSlidingWindowCenter: null,  // null = use index-based paging
+    _pbJogRAF: null,  // rAF ID for edge-jog during drag
+    _pbJogLastPerf: 0,  // last rAF timestamp for jog dt
+  };
   let _pbLastScrubPos = 0;
   let _pbLastScrubTime = 0;
 
@@ -896,52 +926,36 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   
   // Velocity in "playback ms per wall ms" (1.0 = real-time forward, -15 = fast rewind)
-  let _pbVelocity = 0;
   
   // Track when we hit the end and are waiting for vehicles to physically reach the
   // end of their paths (no fixed pause; rewind triggers when vehicles are done).
-  let _pbAtEndSincePerf = null;   // performance.now() when we started waiting at end
-  let _pbArrivedAtEndViaPlayback = false; // true only if we PLAYED to the end (not scrolled)
   
   // Track when ease-in phase started (for wall-time-based easing)
-  let _pbEaseStartPerf = null;
-  let _pbEaseStartVelocity = 0;
-  let _pbEaseStartPos = 0;  // playhead position when ease began
   
   // Flag to track active rewind (not based on velocity)
-  let _pbIsRewinding = false;
 
   // Replay loop start ("point A"): where playback started / where the user last left the playhead.
   // Auto-rewind returns here instead of rewinding to the global min bound.
-  let _pbLoopStartMs = null;
   
   // Track data bounds to detect new data / trimmed data
-  let _pbLastKnownMinMs = null;
-  let _pbLastKnownMaxMs = null;
 
   // Wall-clock ms (Date.now) when last server response arrived
-  let _pbLastServerResponseMs = Date.now();
 
   // Server can bump this to force LIVE camera follow even if data timestamps are unchanged.
-  let _pbLastForceRefreshSeq = null;
   
   // ─────────────────────────────────────────────────────────────────────────────
   // LIVE BUFFER: Track wall-clock time since app started to know how much data we have.
   // Buffer = time since first data arrival. Playback replays this accumulated buffer.
   // ─────────────────────────────────────────────────────────────────────────────
-  let _pbLiveStartWallMs = null;        // wall-clock time (perf.now) when LIVE mode started
-  let _pbLiveStartDataMs = null;        // data time (maxMs) when LIVE mode started
   const _pbLiveStallThreshold = 3;      // stalls before auto-rewind in LIVE mode
-  let _pbLiveTargetMs = null;           // where playback should aim in LIVE mode
-  let _pbLiveStallCount = 0;            // how many times we've hit end waiting for data
   
   // Helper to reset LIVE tracking (call when exiting LIVE mode)
   // Exposed on map object so class methods can call it
   function _resetLiveTracking() {
-    _pbLiveStartWallMs = null;
-    _pbLiveStartDataMs = null;
-    _pbLiveStallCount = 0;
-    _deferredCameraFit = null;
+    pb._pbLiveStartWallMs = null;
+    pb._pbLiveStartDataMs = null;
+    pb._pbLiveStallCount = 0;
+    pb._deferredCameraFit = null;
   }
   map._resetLiveTracking = _resetLiveTracking;
   
@@ -952,7 +966,6 @@ function main() {
   // Deferred camera fit: when new data arrives while the user is panning/zooming
   // (or during post-interaction easing), we stash the intended camera fit here.
   // The playback loop drains it once _canRunAutoCamera() returns true.
-  let _deferredCameraFit = null; // { type: "bounds", bb, durationMs } | { type: "storedView", durationMs }
 
   // Minimum geographic extent (in degrees) for bounds to be considered "meaningful" movement.
   // ~0.002° lat ≈ 220m. Below this the vehicles are just jittering in place (depot, parking lot).
@@ -1101,7 +1114,7 @@ function main() {
     if (!map || typeof map._canRunAutoCamera !== "function") return;
     if (!map._canRunAutoCamera()) {
       // User is interacting — defer until interaction + easing finishes.
-      _deferredCameraFit = { type: "storedView", durationMs: durationMs || _pbLiveFollowDurationMs };
+      pb._deferredCameraFit = { type: "storedView", durationMs: durationMs || _pbLiveFollowDurationMs };
       return;
     }
     try {
@@ -1135,7 +1148,7 @@ function main() {
     // Exception: force=true (explicit user button click) overrides the cooldown.
     if (!force && map && typeof map._canRunAutoCamera === "function" && !map._canRunAutoCamera()) {
       // Defer: replay this fit once the user stops interacting.
-      _deferredCameraFit = { type: "bounds", bb: { minLat, minLon, maxLat, maxLon }, durationMs };
+      pb._deferredCameraFit = { type: "bounds", bb: { minLat, minLon, maxLat, maxLon }, durationMs };
       return;
     }
 
@@ -1505,15 +1518,10 @@ function main() {
   }
   
   // Scroll wheel nudge (iPod-style momentum)
-  let _pbWheelAccum = 0;              // accumulated wheel delta
   const _pbWheelImpulse = 1.0;        // velocity added per wheel tick
   const _pbWheelDecay = 0.8;          // wheel accumulator decay per frame
 
   // Drag tracking
-  let _pbDidDrag = false;             // did the user actually drag (vs click)?
-  let _pbIsWheelCoasting = false;     // is current coast from wheel scroll?
-  let _pbCommitLoopStartOnCoastEnd = false;
-  let _pbMwAccum = 0, _pbMwLastTs = 0; // mouse-wheel velocity accumulator for scrub bar
 
   // ─────────────────────────────────────────────────────────────────────────────
   // PAGING: Slider maps to an 8-hour page instead of the full day.
@@ -1521,14 +1529,9 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   const _pbPageSizeMs = 14400000;         // 4 hours in ms
   const _pbPageMinDurationMs = 0;          // paging always active
-  let _pbPageIndex = -1;                  // -1 = "all" (no paging), 0..N = page index
-  let _pbPageAutoFollow = true;           // auto-advance page to follow playhead
 
   // Sliding window: when set, overrides index-based paging for click-drag scrubbing.
   // The window is centered on this timestamp instead of a fixed page boundary.
-  let _pbSlidingWindowCenter = null;      // null = use index-based paging
-  let _pbJogRAF = null;                   // rAF ID for edge-jog during drag
-  let _pbJogLastPerf = 0;                 // last rAF timestamp for jog dt
 
   /** Compute total page count for current bounds.
    *  Uses floor so the last page absorbs any remainder < pageSize,
@@ -1540,18 +1543,18 @@ function main() {
   }
 
   /** Get the time range for the current page (or full range if paging disabled).
-   *  When _pbSlidingWindowCenter is set, the window is centered on that point
+   *  When pb._pbSlidingWindowCenter is set, the window is centered on that point
    *  instead of using index-based page boundaries. */
   function _pbGetPageRange() {
     const b = map.getPlaybackBounds();
     if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return b;
-    if (_pbPageIndex < 0) return b; // "all" mode
+    if (pb._pbPageIndex < 0) return b; // "all" mode
 
-    // Sliding window mode: center window on _pbSlidingWindowCenter
-    if (_pbSlidingWindowCenter != null) {
+    // Sliding window mode: center window on pb._pbSlidingWindowCenter
+    if (pb._pbSlidingWindowCenter != null) {
       const half = _pbPageSizeMs / 2;
-      let wMin = _pbSlidingWindowCenter - half;
-      let wMax = _pbSlidingWindowCenter + half;
+      let wMin = pb._pbSlidingWindowCenter - half;
+      let wMax = pb._pbSlidingWindowCenter + half;
       // Clamp to global bounds, preserving window size when possible
       if (wMin < b.minMs) { wMin = b.minMs; wMax = Math.min(b.maxMs, wMin + _pbPageSizeMs); }
       if (wMax > b.maxMs) { wMax = b.maxMs; wMin = Math.max(b.minMs, wMax - _pbPageSizeMs); }
@@ -1559,7 +1562,7 @@ function main() {
     }
 
     const total = _pbPageCount();
-    const idx = clamp(_pbPageIndex, 0, total - 1);
+    const idx = clamp(pb._pbPageIndex, 0, total - 1);
     const pageStart = b.minMs + idx * _pbPageSizeMs;
     // Last page extends to cover all remaining time (no short final page)
     const pageEnd = (idx === total - 1) ? b.maxMs : pageStart + _pbPageSizeMs;
@@ -1569,10 +1572,10 @@ function main() {
   /** Navigate to a specific page index, clamping to valid range. */
   function _pbSetPage(idx) {
     const total = _pbPageCount();
-    if (total <= 0) { _pbPageIndex = -1; return; }
-    _pbPageIndex = clamp(idx, 0, total - 1);
-    _pbSlidingWindowCenter = null; // exit sliding window, use index-based page
-    _pbPageAutoFollow = false; // user explicitly chose a page
+    if (total <= 0) { pb._pbPageIndex = -1; return; }
+    pb._pbPageIndex = clamp(idx, 0, total - 1);
+    pb._pbSlidingWindowCenter = null; // exit sliding window, use index-based page
+    pb._pbPageAutoFollow = false; // user explicitly chose a page
     updatePlaybackUi();
   }
 
@@ -1583,13 +1586,13 @@ function main() {
     const total = _pbPageCount();
     if (total <= 0) return;
     const idx = Math.floor((tMs - b.minMs) / _pbPageSizeMs);
-    _pbPageIndex = clamp(idx, 0, total - 1);
+    pb._pbPageIndex = clamp(idx, 0, total - 1);
   }
 
   /** After user stops scrubbing, re-center the sliding window so the playhead
    *  sits at 15% (if user was dragging left) or 85% (if dragging right). */
   function _pbSnapWindowToPlayhead() {
-    if (!_pbPagingActive() || _pbSlidingWindowCenter == null) return;
+    if (!_pbPagingActive() || pb._pbSlidingWindowCenter == null) return;
     const b = map.getPlaybackBounds();
     const tMs = map.getPlaybackTimeMs();
     if (tMs == null || !isFinite(tMs)) return;
@@ -1598,9 +1601,9 @@ function main() {
     const fracInPage = (pr.maxMs > pr.minMs) ? (tMs - pr.minMs) / (pr.maxMs - pr.minMs) : 0.5;
     // If near left edge (<25%), snap playhead to 15%; if near right (>75%), snap to 85%
     const targetFrac = (fracInPage < 0.25) ? 0.15 : (fracInPage > 0.75) ? 0.85 : fracInPage;
-    _pbSlidingWindowCenter = tMs - targetFrac * _pbPageSizeMs + _pbPageSizeMs / 2;
+    pb._pbSlidingWindowCenter = tMs - targetFrac * _pbPageSizeMs + _pbPageSizeMs / 2;
     const half = _pbPageSizeMs / 2;
-    _pbSlidingWindowCenter = clamp(_pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
+    pb._pbSlidingWindowCenter = clamp(pb._pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
   }
 
   /** Check if paging should be active based on data duration. */
@@ -1622,30 +1625,30 @@ function main() {
 
     // Auto-enable paging when duration crosses threshold.
     // Initialize page index to the page containing the playhead.
-    if (paging && _pbPageIndex < 0) {
+    if (paging && pb._pbPageIndex < 0) {
       const t = (tMs != null && isFinite(tMs)) ? tMs : b.maxMs;
       _pbPageForTime(t);
-      _pbPageAutoFollow = true; // started automatically, follow playhead
+      pb._pbPageAutoFollow = true; // started automatically, follow playhead
     } else if (!paging) {
-      _pbPageIndex = -1; // disable paging when duration shrinks
-      _pbSlidingWindowCenter = null;
+      pb._pbPageIndex = -1; // disable paging when duration shrinks
+      pb._pbSlidingWindowCenter = null;
     }
 
     // Auto-advance page to follow playhead during normal playback (not scrubbing/coasting)
-    if (paging && _pbPageAutoFollow && tMs != null && isFinite(tMs) && !_pbScrubbing) {
+    if (paging && pb._pbPageAutoFollow && tMs != null && isFinite(tMs) && !pb._pbScrubbing) {
       const pr = _pbGetPageRange();
       if (tMs >= pr.maxMs || tMs < pr.minMs) {
-        if (_pbSlidingWindowCenter != null) {
+        if (pb._pbSlidingWindowCenter != null) {
           // Shift window just enough so playhead is inside, giving room in the direction of travel
           const frac = (tMs >= pr.maxMs) ? 0.85 : 0.15;
-          _pbSlidingWindowCenter = tMs - frac * _pbPageSizeMs + _pbPageSizeMs / 2;
+          pb._pbSlidingWindowCenter = tMs - frac * _pbPageSizeMs + _pbPageSizeMs / 2;
           const half = _pbPageSizeMs / 2;
-          _pbSlidingWindowCenter = clamp(_pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
+          pb._pbSlidingWindowCenter = clamp(pb._pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
         } else {
           _pbPageForTime(tMs);
         }
       }
-      _pbPageAutoFollow = true; // keep following
+      pb._pbPageAutoFollow = true; // keep following
     }
 
     // Use page range for slider when paging is active
@@ -1664,7 +1667,7 @@ function main() {
       pbScrubEl.max = String(durMs);
       pbScrubEl.step = "100"; // 100ms steps for smoother scrubbing
       pbScrubEl.disabled = false;
-      if (!_pbScrubbing) {
+      if (!pb._pbScrubbing) {
         pbScrubEl.value = String(clamp(tRelMs, 0, durMs));
       }
       // Update progress fill for browsers without accent-color range support
@@ -1681,11 +1684,11 @@ function main() {
     // Page arrow visibility & disabled state
     if (pbPagePrevEl) {
       pbPagePrevEl.classList.toggle("hidden", !paging);
-      pbPagePrevEl.disabled = _pbPageIndex <= 0;
+      pbPagePrevEl.disabled = pb._pbPageIndex <= 0;
     }
     if (pbPageNextEl) {
       pbPageNextEl.classList.toggle("hidden", !paging);
-      pbPageNextEl.disabled = _pbPageIndex >= _pbPageCount() - 1;
+      pbPageNextEl.disabled = pb._pbPageIndex >= _pbPageCount() - 1;
     }
 
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
@@ -1695,7 +1698,7 @@ function main() {
     // Only applies at 1x and 5x; higher speeds don't get the buffer.
     const _speed = map.getPlaybackSpeed() || 1.0;
     const _nextInS = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-    const _wallElapsed2 = (Date.now() - _pbLastServerResponseMs) / 1000;
+    const _wallElapsed2 = (Date.now() - pb._pbLastServerResponseMs) / 1000;
     const _remS2 = Math.max(0, _nextInS - _wallElapsed2);
     const _liveWindowMs = (_speed <= 5) ? _remS2 * 1000 * _speed : 0;
     const inLiveWindow = !hasBounds || atEnd || (
@@ -1729,21 +1732,21 @@ function main() {
   };
 
   const playbackLoop = () => {
-    _pbRAF = null;
+    pb._pbRAF = null;
     // Allow loop to run in DVR mode OR LIVE mode (both need playback time updates)
     if (!map.playbackMode && !map._playbackLiveFollow) return;
     
     try {
     const now = performance.now();
-    const dt = (_pbLastPerf > 0) ? (now - _pbLastPerf) : 0;
-    _pbLastPerf = now;
+    const dt = (pb._pbLastPerf > 0) ? (now - pb._pbLastPerf) : 0;
+    pb._pbLastPerf = now;
 
     const b = map.getPlaybackBounds();
     let tMs = map.getPlaybackTimeMs();
     const tMsBefore = tMs; // snapshot before advancement, for edge-crossing detection
     const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
     const durMs = hasBounds ? (b.maxMs - b.minMs) : 1;
-    const prevKnownMaxMs = _pbLastKnownMaxMs;
+    const prevKnownMaxMs = pb._pbLastKnownMaxMs;
     
     // Playhead initialization is handled in tick() when data arrives
 
@@ -1754,7 +1757,7 @@ function main() {
     let forceCameraFit = false;
     
     if (hasBounds) {
-      if (_pbLastKnownMaxMs != null && b.maxMs > _pbLastKnownMaxMs + 100) {
+      if (pb._pbLastKnownMaxMs != null && b.maxMs > pb._pbLastKnownMaxMs + 100) {
         newDataArrived = true;
         // Record the update window for future forced camera fits.
         if (typeof prevKnownMaxMs === "number" && isFinite(prevKnownMaxMs)) {
@@ -1762,10 +1765,10 @@ function main() {
           _pbLastDataUpdateWindowEndMs = b.maxMs;
         }
         // Reset stall counter when fresh data arrives
-        _pbLiveStallCount = 0;
+        pb._pbLiveStallCount = 0;
       }
-      _pbLastKnownMinMs = b.minMs;
-      _pbLastKnownMaxMs = b.maxMs;
+      pb._pbLastKnownMinMs = b.minMs;
+      pb._pbLastKnownMaxMs = b.maxMs;
       
       // If playhead is now outside bounds (data trimmed or server restarted), handle it
       if (tMs != null && isFinite(tMs)) {
@@ -1789,20 +1792,20 @@ function main() {
       const state = map.lastState;
       const seq = state?.meta?.force_refresh_seq;
       if (typeof seq === "number" && isFinite(seq)) {
-        if (_pbLastForceRefreshSeq == null) {
+        if (pb._pbLastForceRefreshSeq == null) {
           // If the server seq is already >0 when playback starts (e.g. TUI refresh happened first),
           // treat it as a one-time forced camera fit.
           if (seq > 0) {
             newDataArrived = true;
             forceCameraFit = true;
-            _pbLiveStallCount = 0;
+            pb._pbLiveStallCount = 0;
           }
-        } else if (seq !== _pbLastForceRefreshSeq) {
+        } else if (seq !== pb._pbLastForceRefreshSeq) {
           newDataArrived = true;
           forceCameraFit = true;
-          _pbLiveStallCount = 0;
+          pb._pbLiveStallCount = 0;
         }
-        _pbLastForceRefreshSeq = seq;
+        pb._pbLastForceRefreshSeq = seq;
       }
     } catch {
       // ignore
@@ -1813,10 +1816,10 @@ function main() {
     // let normal forward playback consume the new data naturally.
     if (hasBounds && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && !map.getPlaybackPlaying()) {
       const speed = map.getPlaybackSpeed() || 1.0;
-      _pbVelocity = _pbPlaybackSpeed * speed;
+      pb._pbVelocity = _pbPlaybackSpeed * speed;
       map.setPlaybackPlaying(true);
-      _pbLastPerf = 0;
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbLastPerf = 0;
+      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
     }
     
     // ─────────────────────────────────────────────────────────────────────────
@@ -1838,23 +1841,23 @@ function main() {
       }
       
       // Initialize LIVE tracking on first entry
-      if (_pbLiveStartWallMs == null) {
-        _pbLiveStartWallMs = now;
-        _pbLiveStartDataMs = b.maxMs;
+      if (pb._pbLiveStartWallMs == null) {
+        pb._pbLiveStartWallMs = now;
+        pb._pbLiveStartDataMs = b.maxMs;
       }
       
       // Buffer = wall-clock time since we started LIVE mode
       // This is how much new data has accumulated since we began
-      const wallElapsed = now - _pbLiveStartWallMs;
+      const wallElapsed = now - pb._pbLiveStartWallMs;
       liveBufferMs = wallElapsed;
       
       // Target = newest data minus the buffer (stay behind the live edge)
       // The buffer grows in real-time, so we always have runway
-      _pbLiveTargetMs = b.maxMs - liveBufferMs;
+      pb._pbLiveTargetMs = b.maxMs - liveBufferMs;
       
       // Clamp: if rewind outpaces buffer accumulation, just use minMs
-      if (_pbLiveTargetMs < b.minMs) {
-        _pbLiveTargetMs = b.minMs;
+      if (pb._pbLiveTargetMs < b.minMs) {
+        pb._pbLiveTargetMs = b.minMs;
       }
     }
 
@@ -1873,10 +1876,10 @@ function main() {
     // DEFERRED CAMERA FIT: If a live camera fit was blocked by user interaction,
     // replay it now that the interaction + easing has settled.
     // ─────────────────────────────────────────────────────────────────────────
-    if (_deferredCameraFit && map._playbackLiveFollow
+    if (pb._deferredCameraFit && map._playbackLiveFollow
         && typeof map._canRunAutoCamera === "function" && map._canRunAutoCamera()) {
-      const d = _deferredCameraFit;
-      _deferredCameraFit = null;
+      const d = pb._deferredCameraFit;
+      pb._deferredCameraFit = null;
       if (d.type === "bounds" && d.bb) {
         _animateFitBoundsLatLon(d.bb, { durationMs: d.durationMs || _pbLiveFollowDurationMs });
       } else if (d.type === "storedView") {
@@ -1895,14 +1898,14 @@ function main() {
     if (didMarkerInertia) {
       didAdvanceTime = true;
       tMs = map.getPlaybackTimeMs();
-      _pbAtEndSincePerf = null; // user interaction resets end timer
-    } else if (!_pbScrubbing && hasBounds && tMs != null && isFinite(tMs) && dt > 0) {
+      pb._pbAtEndSincePerf = null; // user interaction resets end timer
+    } else if (!pb._pbScrubbing && hasBounds && tMs != null && isFinite(tMs) && dt > 0) {
       // Apply wheel nudge to velocity
-      if (Math.abs(_pbWheelAccum) > 0.1) {
-        _pbVelocity += _pbWheelAccum * _pbWheelImpulse;
-        _pbWheelAccum *= _pbWheelDecay;
-        if (Math.abs(_pbWheelAccum) < 0.1) _pbWheelAccum = 0;
-        _pbAtEndSincePerf = null; // wheel interaction resets end timer
+      if (Math.abs(pb._pbWheelAccum) > 0.1) {
+        pb._pbVelocity += pb._pbWheelAccum * _pbWheelImpulse;
+        pb._pbWheelAccum *= _pbWheelDecay;
+        if (Math.abs(pb._pbWheelAccum) < 0.1) pb._pbWheelAccum = 0;
+        pb._pbAtEndSincePerf = null; // wheel interaction resets end timer
       }
 
       // Determine velocity based on state
@@ -1910,10 +1913,10 @@ function main() {
       const speedMult = map.getPlaybackSpeed() || 1.0;
 
       // Resolve loop start within current bounds.
-      const loopStartMsRaw = (_pbLoopStartMs != null) ? Number(_pbLoopStartMs) : null;
+      const loopStartMsRaw = (pb._pbLoopStartMs != null) ? Number(pb._pbLoopStartMs) : null;
       const loopStartMs = (isFinite(loopStartMsRaw)) ? clamp(loopStartMsRaw, b.minMs, b.maxMs) : b.minMs;
       
-      if (_pbIsRewinding) {
+      if (pb._pbIsRewinding) {
         // Tape-reel rewind: ramp up, cruise, ease into start
         const totalDist = Math.max(1, b.maxMs - loopStartMs);
         const distFromStart = tMs - loopStartMs;
@@ -1930,50 +1933,50 @@ function main() {
         // This is independent of speed - we ease over the final portion of the timeline
         const easeDistanceMs = totalDist * 0.15;
         
-        const inEasePhase = _pbEaseStartPerf != null;
+        const inEasePhase = pb._pbEaseStartPerf != null;
         const shouldStartEase = !inEasePhase && distFromStart <= easeDistanceMs;
         
         if (progress < 0.15 && !inEasePhase) {
           // Ramp up phase: accelerate from 0.3 to 1.0 of cruise speed
           const speedFactor = 0.3 + (progress / 0.15) * 0.7;
-          _pbVelocity = cruiseSpeed * speedFactor;
+          pb._pbVelocity = cruiseSpeed * speedFactor;
         } else if (inEasePhase || shouldStartEase) {
           // NEWTONIAN PHYSICS: constant acceleration to reach playbackSpeed at loopStartMs
-          if (_pbEaseStartPerf == null) {
-            _pbEaseStartPerf = now;
-            _pbEaseStartPos = tMs;
-            _pbEaseStartVelocity = _pbVelocity;
+          if (pb._pbEaseStartPerf == null) {
+            pb._pbEaseStartPerf = now;
+            pb._pbEaseStartPos = tMs;
+            pb._pbEaseStartVelocity = pb._pbVelocity;
           }
           
           // We want to go from v₀ (negative) to playbackSpeed (positive) over distance d
           // Average velocity = (v₀ + v_final) / 2
           // Time = d / |avg_v|
           // Acceleration = (v_final - v₀) / t
-          const v0 = _pbEaseStartVelocity;
+          const v0 = pb._pbEaseStartVelocity;
           const vFinal = playbackSpeed;
-          const d = _pbEaseStartPos - loopStartMs;
+          const d = pb._pbEaseStartPos - loopStartMs;
           
           const avgVel = (v0 + vFinal) / 2;
           // Avoid division by zero
           const accel = Math.abs(avgVel) > 0.1 ? (vFinal - v0) / (d / Math.abs(avgVel)) : 0.01;
           
           // Apply acceleration
-          _pbVelocity = _pbVelocity + accel * dt;
+          pb._pbVelocity = pb._pbVelocity + accel * dt;
           
           // Clamp to not overshoot target velocity
-          if (_pbVelocity >= vFinal) {
-            _pbVelocity = vFinal;
+          if (pb._pbVelocity >= vFinal) {
+            pb._pbVelocity = vFinal;
           }
           
           // End ease when we reach start or velocity reaches target
-          if (tMs <= loopStartMs + 10 || _pbVelocity >= vFinal) {
-            _pbIsRewinding = false;
-            _pbEaseStartPerf = null;
-            _pbVelocity = playbackSpeed;
+          if (tMs <= loopStartMs + 10 || pb._pbVelocity >= vFinal) {
+            pb._pbIsRewinding = false;
+            pb._pbEaseStartPerf = null;
+            pb._pbVelocity = playbackSpeed;
           }
         } else {
           // Cruise phase: full speed
-          _pbVelocity = cruiseSpeed;
+          pb._pbVelocity = cruiseSpeed;
         }
       } else if (map._playbackLiveFollow) {
         // ─────────────────────────────────────────────────────────────────────
@@ -1982,60 +1985,60 @@ function main() {
         // ─────────────────────────────────────────────────────────────────────
         if (atEnd) {
           // At live edge, waiting for new data - just hold position
-          _pbVelocity = 0;
+          pb._pbVelocity = 0;
         } else {
           // Have data ahead - play toward live edge at user-selected speed
-          _pbVelocity = _pbPlaybackSpeed * speedMult;
+          pb._pbVelocity = _pbPlaybackSpeed * speedMult;
         }
       } else if (map.getPlaybackPlaying()) {
         // Normal forward playback
         if (atEnd) {
           // At end — velocity zeroed; the Live-mode switch below will activate.
-          _pbVelocity = 0;
+          pb._pbVelocity = 0;
         } else {
           // Normal forward - maintain playback speed
-          _pbVelocity = _pbPlaybackSpeed * speedMult;
-          _pbAtEndSincePerf = null;
+          pb._pbVelocity = _pbPlaybackSpeed * speedMult;
+          pb._pbAtEndSincePerf = null;
         }
-      } else if (!map.getPlaybackPlaying() && Math.abs(_pbVelocity) > _pbVelocityThreshold) {
+      } else if (!map.getPlaybackPlaying() && Math.abs(pb._pbVelocity) > _pbVelocityThreshold) {
         // Coasting after wheel - apply friction
-        const friction = _pbIsWheelCoasting ? _pbWheelFriction : _pbFriction;
+        const friction = pb._pbIsWheelCoasting ? _pbWheelFriction : _pbFriction;
         const frictionFactor = Math.pow(friction, dt);
-        _pbVelocity *= frictionFactor;
+        pb._pbVelocity *= frictionFactor;
         
         // When velocity decays to playback speed, resume playback
         const playbackSpeed = _pbPlaybackSpeed * speedMult;
-        if (_pbVelocity > 0 && _pbVelocity <= playbackSpeed) {
+        if (pb._pbVelocity > 0 && pb._pbVelocity <= playbackSpeed) {
           // Forward coasting reached playback speed - resume
-          _pbIsWheelCoasting = false;
+          pb._pbIsWheelCoasting = false;
           _pbSnapWindowToPlayhead();
-          if (_pbCommitLoopStartOnCoastEnd) {
-            _pbLoopStartMs = tMs;
-            _pbCommitLoopStartOnCoastEnd = false;
+          if (pb._pbCommitLoopStartOnCoastEnd) {
+            pb._pbLoopStartMs = tMs;
+            pb._pbCommitLoopStartOnCoastEnd = false;
           }
-          _pbVelocity = playbackSpeed;
+          pb._pbVelocity = playbackSpeed;
           map.setPlaybackPlaying(true);
           updatePlaybackUi();
-        } else if (_pbVelocity < 0 && Math.abs(_pbVelocity) < _pbVelocityThreshold) {
+        } else if (pb._pbVelocity < 0 && Math.abs(pb._pbVelocity) < _pbVelocityThreshold) {
           // Backward coasting stopped - resume forward playback
-          _pbIsWheelCoasting = false;
+          pb._pbIsWheelCoasting = false;
           _pbSnapWindowToPlayhead();
-          if (_pbCommitLoopStartOnCoastEnd) {
-            _pbLoopStartMs = tMs;
-            _pbCommitLoopStartOnCoastEnd = false;
+          if (pb._pbCommitLoopStartOnCoastEnd) {
+            pb._pbLoopStartMs = tMs;
+            pb._pbCommitLoopStartOnCoastEnd = false;
           }
-          _pbVelocity = playbackSpeed;
+          pb._pbVelocity = playbackSpeed;
           map.setPlaybackPlaying(true);
           updatePlaybackUi();
         }
       }
       
       // Note: No additional easing here - forward playback runs at constant speed
-      // Rewind easing is handled inside the _pbIsRewinding block above
+      // Rewind easing is handled inside the pb._pbIsRewinding block above
       
       // Snap to zero if very slow
-      if (Math.abs(_pbVelocity) < _pbVelocityThreshold && _pbVelocity !== 0) {
-        _pbVelocity = 0;
+      if (Math.abs(pb._pbVelocity) < _pbVelocityThreshold && pb._pbVelocity !== 0) {
+        pb._pbVelocity = 0;
         // Final UI update so time labels reflect where the playhead landed
         if (!map.getPlaybackPlaying()) {
           updatePlaybackUi();
@@ -2043,21 +2046,21 @@ function main() {
       }
       
       // Move playhead
-      if (Math.abs(_pbVelocity) > 0) {
-        let nextMs = tMs + _pbVelocity * dt;
+      if (Math.abs(pb._pbVelocity) > 0) {
+        let nextMs = tMs + pb._pbVelocity * dt;
 
         // Clamp to bounds; during auto-rewind, clamp to loopStartMs instead of the global min.
-        const rewindMinMs = (_pbIsRewinding && loopStartMs != null && isFinite(loopStartMs)) ? loopStartMs : b.minMs;
+        const rewindMinMs = (pb._pbIsRewinding && loopStartMs != null && isFinite(loopStartMs)) ? loopStartMs : b.minMs;
         nextMs = clamp(nextMs, rewindMinMs, b.maxMs);
         
         // If we hit a bound, zero velocity (unless in active ease - let ease control it)
-        if (nextMs <= rewindMinMs && _pbVelocity < 0 && _pbEaseStartPerf == null) {
-          _pbVelocity = 0;
-          _pbIsRewinding = false; // rewind complete
+        if (nextMs <= rewindMinMs && pb._pbVelocity < 0 && pb._pbEaseStartPerf == null) {
+          pb._pbVelocity = 0;
+          pb._pbIsRewinding = false; // rewind complete
           nextMs = rewindMinMs;
         }
-        if (nextMs >= b.maxMs && _pbVelocity > 0) {
-          _pbVelocity = 0;
+        if (nextMs >= b.maxMs && pb._pbVelocity > 0) {
+          pb._pbVelocity = 0;
           nextMs = b.maxMs;
         }
         
@@ -2074,11 +2077,11 @@ function main() {
         
         // When AUTO-REWIND arrives at start, reset for forward playback
         // But NOT when user is manually coasting backward
-        if (tMs <= b.minMs + 1 && _pbVelocity === 0 && _pbIsRewinding) {
+        if (tMs <= b.minMs + 1 && pb._pbVelocity === 0 && pb._pbIsRewinding) {
           // We've hit the start from auto-rewind - start playing forward
-          _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-          _pbAtEndSincePerf = null;
-          _pbIsRewinding = false;
+          pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+          pb._pbAtEndSincePerf = null;
+          pb._pbIsRewinding = false;
           if (!map.getPlaybackPlaying()) {
             map.setPlaybackPlaying(true);
           }
@@ -2091,7 +2094,7 @@ function main() {
     // FOVEATED ROAD MATCHING: Progressive snapping during playback
     // Only run when playing (not scrubbing) and time is advancing
     // ─────────────────────────────────────────────────────────────────────────
-    if (map._historicalMode && map.getPlaybackPlaying() && !_pbScrubbing && !_pbIsRewinding) {
+    if (map._historicalMode && map.getPlaybackPlaying() && !pb._pbScrubbing && !pb._pbIsRewinding) {
       map._requestFoveatedRoadMatching();
     }
 
@@ -2108,7 +2111,7 @@ function main() {
     {
       const _spd2 = map.getPlaybackSpeed() || 1.0;
       const _nextInS2 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-      const _wallElapsed3 = (Date.now() - _pbLastServerResponseMs) / 1000;
+      const _wallElapsed3 = (Date.now() - pb._pbLastServerResponseMs) / 1000;
       const _remS3 = Math.max(0, _nextInS2 - _wallElapsed3);
       const _lwMs2 = _remS3 * 1000 * _spd2;
       const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
@@ -2117,37 +2120,37 @@ function main() {
       // If the user scrubbed into the window, let playback continue to maxMs.
       var _crossedIntoLiveWindow = _inLiveWindow2 && isFinite(tMsBefore) && tMsBefore < bufferEdge;
     }
-    if (!_pbIsRewinding &&
+    if (!pb._pbIsRewinding &&
         !_screensaverActive &&
         map.getPlaybackPlaying() &&
         !map._playbackLiveFollow &&
-        !_pbIsWheelCoasting &&
-        didAdvanceTime && _pbVelocity >= 0 &&
+        !pb._pbIsWheelCoasting &&
+        didAdvanceTime && pb._pbVelocity >= 0 &&
         _crossedIntoLiveWindow) {
       // Don't auto-activate Live mode — just stop playback at the buffer edge.
       // The button will show "Live" (not highlighted) so the user can opt in.
       // map._playbackLiveFollow = true;
-      // _pbPageAutoFollow = true;
+      // pb._pbPageAutoFollow = true;
       // try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-      _pbVelocity = 0;
-      _pbAtEndSincePerf = null;
-      _pbIsRewinding = false;
+      pb._pbVelocity = 0;
+      pb._pbAtEndSincePerf = null;
+      pb._pbIsRewinding = false;
       map.setPlaybackPlaying(false);
       updatePlaybackUi();
     }
 
     // UI updates
-    const isActive = Math.abs(_pbVelocity) > _pbVelocityThreshold || Math.abs(_pbWheelAccum) > 0.1;
+    const isActive = Math.abs(pb._pbVelocity) > _pbVelocityThreshold || Math.abs(pb._pbWheelAccum) > 0.1;
     const uiMinDt = isActive ? 16 : 250;
-    if ((didAdvanceTime || isActive) && (now - _pbLastUiPerf) >= uiMinDt) {
+    if ((didAdvanceTime || isActive) && (now - pb._pbLastUiPerf) >= uiMinDt) {
       updatePlaybackUi();
       if (sidebarOpen) updateSidebarPlaybackValues();
-      _pbLastUiPerf = now;
+      pb._pbLastUiPerf = now;
     }
 
     // Sync legend + field only when not scrubbing with a sensor selected.
     // Legend title/bars and PA field update when scrubbing stops or vehicle resumes.
-    if (!(_pbScrubbing || _pbIsWheelCoasting) || !selectedId) {
+    if (!(pb._pbScrubbing || pb._pbIsWheelCoasting) || !selectedId) {
       _syncMapPollutant();
       syncLegendToMapSelection();
     }
@@ -2165,33 +2168,33 @@ function main() {
 
     // Keep loop running if there's any motion or pending state
     const markerInertiaActive = (typeof map._hasPbMarkerInertia === "function") ? !!map._hasPbMarkerInertia() : false;
-    const hasMotion = Math.abs(_pbVelocity) > _pbVelocityThreshold;
-    const hasWheelMomentum = Math.abs(_pbWheelAccum) > 0.1;
-    const waitingToRewind = _pbAtEndSincePerf != null;
+    const hasMotion = Math.abs(pb._pbVelocity) > _pbVelocityThreshold;
+    const hasWheelMomentum = Math.abs(pb._pbWheelAccum) > 0.1;
+    const waitingToRewind = pb._pbAtEndSincePerf != null;
     const inLiveMode = map._playbackLiveFollow;  // LIVE mode always keeps loop running
     
     if (map.getPlaybackPlaying() || markerInertiaActive || hasMotion || hasWheelMomentum || waitingToRewind || inLiveMode) {
-      _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbRAF = requestAnimationFrame(playbackLoop);
     } else {
-      _pbLastPerf = 0;
+      pb._pbLastPerf = 0;
     }
     
     } catch (e) {
       // Don't let errors kill the playback loop
       console.error("playbackLoop error:", e);
-      _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbRAF = requestAnimationFrame(playbackLoop);
     }
   };
 
   // Allow MapView to restart the loop after a drag release.
   window.__ensurePlaybackLoop = () => {
     if (!map.playbackMode) return;
-    if (_pbRAF) return;
-    _pbLastPerf = 0;
-    _pbLastUiPerf = 0;
-    _pbVelocity = 0;
-    _pbWheelAccum = 0;
-    _pbRAF = requestAnimationFrame(playbackLoop);
+    if (pb._pbRAF) return;
+    pb._pbLastPerf = 0;
+    pb._pbLastUiPerf = 0;
+    pb._pbVelocity = 0;
+    pb._pbWheelAccum = 0;
+    pb._pbRAF = requestAnimationFrame(playbackLoop);
   };
 
   if (traceEl) {
@@ -2205,15 +2208,15 @@ function main() {
       map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
       map.setPlaybackPlaying(false);
       updatePlaybackUi();
-      _pbLastPerf = 0;
-      _pbLastUiPerf = 0;
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbLastPerf = 0;
+      pb._pbLastUiPerf = 0;
+      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
     }
     traceEl.addEventListener("change", () => {
       localStorage.setItem(TRACE_STORAGE_KEY, traceEl.checked ? "1" : "0");
-      _pbVelocity = 0;
-      _pbWheelAccum = 0;
-      _pbAtEndSincePerf = null;
+      pb._pbVelocity = 0;
+      pb._pbWheelAccum = 0;
+      pb._pbAtEndSincePerf = null;
       map.setPlaybackMode(traceEl.checked);
       if (pbBarEl) pbBarEl.classList.toggle("hidden", !traceEl.checked);
       if (traceEl.checked) {
@@ -2221,13 +2224,13 @@ function main() {
         // Don't set playhead here - let the playback loop handle it
         map.setPlaybackPlaying(false);
         updatePlaybackUi();
-        _pbLastPerf = 0;
-        _pbLastUiPerf = 0;
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        pb._pbLastPerf = 0;
+        pb._pbLastUiPerf = 0;
+        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
       } else {
         map.setPlaybackPlaying(false);
-        _pbLastPerf = 0;
-        _pbLastUiPerf = 0;
+        pb._pbLastPerf = 0;
+        pb._pbLastUiPerf = 0;
       }
     });
   } else {
@@ -2238,9 +2241,9 @@ function main() {
     map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
     map.setPlaybackPlaying(false);
     updatePlaybackUi();
-    _pbLastPerf = 0;
-    _pbLastUiPerf = 0;
-    if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+    pb._pbLastPerf = 0;
+    pb._pbLastUiPerf = 0;
+    if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
   }
 
   if (pbPlayEl) {
@@ -2262,7 +2265,7 @@ function main() {
       // Buffer snap target and Live window: all speeds.
       const _spd = map.getPlaybackSpeed() || 1.0;
       const _nextInS3 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-      const _wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
+      const _wallElapsed = (Date.now() - pb._pbLastServerResponseMs) / 1000;
       const _remS = Math.max(0, _nextInS3 - _wallElapsed);
       const _snapMs = _remS * 1000 * _spd;
       const _lwMs = _snapMs;
@@ -2280,14 +2283,14 @@ function main() {
         // Set loop start to current position so rewind doesn't go to beginning of time
         const curMs = map.getPlaybackTimeMs();
         if (curMs != null && isFinite(curMs)) {
-          _pbLoopStartMs = curMs;
+          pb._pbLoopStartMs = curMs;
         }
         // Keep playback running (or start it if paused)
         if (!map.getPlaybackPlaying()) {
-          _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+          pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
           map.setPlaybackPlaying(true);
-          _pbLastPerf = 0;
-          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          pb._pbLastPerf = 0;
+          if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
         }
         updatePlaybackUi();
         return;
@@ -2296,19 +2299,19 @@ function main() {
       // If in live window, enable LIVE mode at any speed (not for historical replays)
       if (inLiveWindow && !map._playbackLiveFollow && !map._historicalMode) {
         map._playbackLiveFollow = true;
-        _pbPageAutoFollow = true; // resume page tracking in LIVE mode
+        pb._pbPageAutoFollow = true; // resume page tracking in LIVE mode
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
         // Snap playhead to leading edge of buffer
         if (_snapMs > 0) {
           const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
           map.setPlaybackTimeMs(bufferStart);
         }
-        _pbVelocity = 0;
-        _pbAtEndSincePerf = null;
-        _pbIsRewinding = false;
+        pb._pbVelocity = 0;
+        pb._pbAtEndSincePerf = null;
+        pb._pbIsRewinding = false;
         map.setPlaybackPlaying(true);
-        _pbLastPerf = 0;
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        pb._pbLastPerf = 0;
+        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
         updatePlaybackUi();
         return;
       }
@@ -2317,12 +2320,12 @@ function main() {
       if (atEnd && _spd > 5 && _snapMs > 0) {
         const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
         map.setPlaybackTimeMs(bufferStart);
-        _pbVelocity = _pbPlaybackSpeed * _spd;
-        _pbAtEndSincePerf = null;
-        _pbIsRewinding = false;
+        pb._pbVelocity = _pbPlaybackSpeed * _spd;
+        pb._pbAtEndSincePerf = null;
+        pb._pbIsRewinding = false;
         map.setPlaybackPlaying(true);
-        _pbLastPerf = 0;
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        pb._pbLastPerf = 0;
+        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
         updatePlaybackUi();
         return;
       }
@@ -2330,29 +2333,29 @@ function main() {
       // If currently playing (not LIVE mode), pause
       if (map.getPlaybackPlaying()) {
         map.setPlaybackPlaying(false);
-        _pbVelocity = 0;
-        _pbWheelAccum = 0;
-        _pbAtEndSincePerf = null;
-        _pbIsRewinding = false;
+        pb._pbVelocity = 0;
+        pb._pbWheelAccum = 0;
+        pb._pbAtEndSincePerf = null;
+        pb._pbIsRewinding = false;
         updatePlaybackUi();
         return;
       }
 
       // Paused - just play from current position
-      _pbAtEndSincePerf = null;
-      _pbWheelAccum = 0;
-      _pbIsRewinding = false;
+      pb._pbAtEndSincePerf = null;
+      pb._pbWheelAccum = 0;
+      pb._pbIsRewinding = false;
       // Capture replay point A if it hasn't been set via scrubbing.
-      if (_pbLoopStartMs == null || !isFinite(Number(_pbLoopStartMs))) {
+      if (pb._pbLoopStartMs == null || !isFinite(Number(pb._pbLoopStartMs))) {
         const cur = map.getPlaybackTimeMs();
-        _pbLoopStartMs = (cur != null && isFinite(Number(cur))) ? Number(cur) : b.minMs;
+        pb._pbLoopStartMs = (cur != null && isFinite(Number(cur))) ? Number(cur) : b.minMs;
       }
-      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
       map.setPlaybackPlaying(true);
-      _pbLastPerf = 0;
+      pb._pbLastPerf = 0;
       // Always restart the loop
-      if (_pbRAF) cancelAnimationFrame(_pbRAF);
-      _pbRAF = requestAnimationFrame(playbackLoop);
+      if (pb._pbRAF) cancelAnimationFrame(pb._pbRAF);
+      pb._pbRAF = requestAnimationFrame(playbackLoop);
       updatePlaybackUi();
     });
   }
@@ -2386,7 +2389,7 @@ function main() {
           if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
             const meta = map.lastState?.meta || {};
             const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
-            const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
+            const wallElapsed = (Date.now() - pb._pbLastServerResponseMs) / 1000;
             const remS = Math.max(0, nextInS - wallElapsed);
             const snapMs = remS * 1000 * newSpeed;
             if (snapMs > 0) {
@@ -2398,8 +2401,8 @@ function main() {
                 if (curMs > bufferStart || curMs < bufferStart) {
                   map.setPlaybackTimeMs(bufferStart);
                   // Reset LIVE tracking so buffer accumulation restarts from here
-                  _pbLiveStartWallMs = performance.now();
-                  _pbLiveStartDataMs = b.maxMs;
+                  pb._pbLiveStartWallMs = performance.now();
+                  pb._pbLiveStartDataMs = b.maxMs;
                 }
               }
             }
@@ -2424,17 +2427,17 @@ function main() {
     const speed = map.getPlaybackSpeed() || 1.0;
     const meta = map.lastState?.meta || {};
     const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
-    const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
+    const wallElapsed = (Date.now() - pb._pbLastServerResponseMs) / 1000;
     const remS = Math.max(0, nextInS - wallElapsed);
     const bufferMs = remS * 1000 * speed;
     if (bufferMs > 0) {
       const bufferStart = Math.max(b.minMs, b.maxMs - bufferMs);
       map.setPlaybackTimeMs(bufferStart);
       // Restart LIVE tracking from current position
-      _pbLiveStartWallMs = performance.now();
-      _pbLiveStartDataMs = b.maxMs;
+      pb._pbLiveStartWallMs = performance.now();
+      pb._pbLiveStartDataMs = b.maxMs;
       // Reset the frame timer so dt doesn't include backgrounded time
-      _pbLastPerf = 0;
+      pb._pbLastPerf = 0;
       updatePlaybackUi();
     }
   });
@@ -2571,9 +2574,9 @@ function main() {
       map._playbackPtsKey = null;
       map._persistedTrailById = new Map();  // Clear persisted trails
       map._playbackNowMs = null;  // Reset playback time
-      _pbPageIndex = -1;  // Reset paging for new data
-      _pbPageAutoFollow = true;
-      _pbSlidingWindowCenter = null;
+      pb._pbPageIndex = -1;  // Reset paging for new data
+      pb._pbPageAutoFollow = true;
+      pb._pbSlidingWindowCenter = null;
 
       // Enable DVR/playback mode for historical data
       // NOTE: setPlaybackMode(true) sets _playbackLiveFollow=true and draws overlay,
@@ -2609,12 +2612,12 @@ function main() {
       }
       
       // Start playback loop (auto-play)
-      _pbLastPerf = 0;
-      _pbLastUiPerf = 0;
-      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      pb._pbLastPerf = 0;
+      pb._pbLastUiPerf = 0;
+      pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
       map.setPlaybackPlaying(true);
       updatePlaybackUi();
-      _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbRAF = requestAnimationFrame(playbackLoop);
     } catch (e) {
       console.error("Failed to load historical data:", e);
       if (statusEl) {
@@ -2832,9 +2835,9 @@ function main() {
       map._playbackPtsKey = null;
       map._persistedTrailById = new Map();
       map._playbackNowMs = null;
-      _pbPageIndex = -1;  // Reset paging for new data
-      _pbPageAutoFollow = true;
-      _pbSlidingWindowCenter = null;
+      pb._pbPageIndex = -1;  // Reset paging for new data
+      pb._pbPageAutoFollow = true;
+      pb._pbSlidingWindowCenter = null;
 
       // Enable DVR/playback mode
       map.playbackMode = true;
@@ -2863,12 +2866,12 @@ function main() {
       map.drawOverlay(window._historicalState);
       
       // Start playback loop (auto-play)
-      _pbLastPerf = 0;
-      _pbLastUiPerf = 0;
-      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      pb._pbLastPerf = 0;
+      pb._pbLastUiPerf = 0;
+      pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
       map.setPlaybackPlaying(true);
       updatePlaybackUi();
-      _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbRAF = requestAnimationFrame(playbackLoop);
     } catch (e) {
       console.error("Failed to load snapshot:", e);
       if (statusEl) {
@@ -3349,14 +3352,14 @@ function main() {
 
       // Don't auto-enable LIVE mode when dragging - user must click the Live button.
       // Just track where the user left the playhead as replay point A.
-      _pbLoopStartMs = clampedT;
+      pb._pbLoopStartMs = clampedT;
 
       updatePlaybackUi();
       map._compositePaFieldOnTiles(map.lastState);
       map.drawOverlay(map.lastState);
 
       // Start or stop edge-jog during drag
-      if (_pbScrubbing && _pbSlidingWindowCenter != null) {
+      if (pb._pbScrubbing && pb._pbSlidingWindowCenter != null) {
         _pbStartEdgeJog();
       }
     };
@@ -3365,16 +3368,16 @@ function main() {
     // continuously shift the sliding window in that direction.
     const _pbEdgeThreshold = 0.10; // outer 10% of slider triggers jog
     function _pbStartEdgeJog() {
-      if (_pbJogRAF) return; // already running
-      _pbJogLastPerf = performance.now();
-      _pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
+      if (pb._pbJogRAF) return; // already running
+      pb._pbJogLastPerf = performance.now();
+      pb._pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
     }
     function _pbStopEdgeJog() {
-      if (_pbJogRAF) { cancelAnimationFrame(_pbJogRAF); _pbJogRAF = null; }
+      if (pb._pbJogRAF) { cancelAnimationFrame(pb._pbJogRAF); pb._pbJogRAF = null; }
     }
     function _pbEdgeJogTick(now) {
-      _pbJogRAF = null;
-      if (!_pbScrubbing || _pbSlidingWindowCenter == null) return;
+      pb._pbJogRAF = null;
+      if (!pb._pbScrubbing || pb._pbSlidingWindowCenter == null) return;
 
       const maxVal = Number(pbScrubEl.max);
       const curVal = Number(pbScrubEl.value);
@@ -3393,15 +3396,15 @@ function main() {
       }
 
       if (jogDir !== 0) {
-        const dt = now - _pbJogLastPerf;
+        const dt = now - pb._pbJogLastPerf;
         // Jog speed: up to 1 page-width per second at full intensity
         const jogSpeed = _pbPageSizeMs * intensity * 1.0;
         const shift = jogDir * jogSpeed * (dt / 1000);
 
         const gb = map.getPlaybackBounds();
-        const prevCenter = _pbSlidingWindowCenter;
-        _pbSlidingWindowCenter = clamp(
-          _pbSlidingWindowCenter + shift,
+        const prevCenter = pb._pbSlidingWindowCenter;
+        pb._pbSlidingWindowCenter = clamp(
+          pb._pbSlidingWindowCenter + shift,
           gb.minMs + _pbPageSizeMs / 2,
           gb.maxMs - _pbPageSizeMs / 2
         );
@@ -3412,7 +3415,7 @@ function main() {
         const relMs = Number(pbScrubEl.value);
         const tMs = clamp(pr.minMs + relMs, gb.minMs, gb.maxMs);
         map.setPlaybackTimeMs(tMs);
-        _pbLoopStartMs = tMs;
+        pb._pbLoopStartMs = tMs;
 
         // Always update timestamp display during jog, even if window is
         // clamped to the data boundary (so the user sees the time isn't moving).
@@ -3424,10 +3427,10 @@ function main() {
         updatePlaybackUi();
       }
 
-      _pbJogLastPerf = now;
+      pb._pbJogLastPerf = now;
       // Keep ticking while dragging
-      if (_pbScrubbing) {
-        _pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
+      if (pb._pbScrubbing) {
+        pb._pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
       }
     }
 
@@ -3454,16 +3457,16 @@ function main() {
         }
       }
       // Cancel ALL physics immediately - user is taking control
-      _pbVelocity = 0;
-      _pbWheelAccum = 0;
-      _pbAtEndSincePerf = null;
-      _pbArrivedAtEndViaPlayback = false; // user is scrubbing, not playing
-      _pbIsRewinding = false;
-      _pbEaseStartPerf = null;
-      _pbIsWheelCoasting = false;
-      _pbScrubbing = true;
+      pb._pbVelocity = 0;
+      pb._pbWheelAccum = 0;
+      pb._pbAtEndSincePerf = null;
+      pb._pbArrivedAtEndViaPlayback = false; // user is scrubbing, not playing
+      pb._pbIsRewinding = false;
+      pb._pbEaseStartPerf = null;
+      pb._pbIsWheelCoasting = false;
+      pb._pbScrubbing = true;
       map._scrubbing = true;
-      _pbDidDrag = false; // track if user actually dragged
+      pb._pbDidDrag = false; // track if user actually dragged
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
       map.setPlaybackPlaying(false);
@@ -3473,9 +3476,9 @@ function main() {
       // Activate sliding window: freeze the current window in place for the drag.
       // If already in sliding window mode, keep the existing center.
       // If in index-based mode, convert the current page center to a sliding window.
-      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+      if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
         const pr = _pbGetPageRange();
-        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+        pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
       }
       updatePlaybackUi();
     });
@@ -3485,14 +3488,14 @@ function main() {
     }, { capture: true });
     // Jogger-sensitivity drag when pointer started on the track
     pbScrubEl.addEventListener("pointermove", (e) => {
-      if (!_scrubPointerOnTrack || !_pbScrubbing) return;
+      if (!_scrubPointerOnTrack || !pb._pbScrubbing) return;
       const dx = e.clientX - _scrubPointerStartX;
       const rect = pbScrubEl.getBoundingClientRect();
       const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
       const delta = (dx / rect.width) * range * _scrubPointerSensitivity;
       const newVal = clamp(_scrubPointerStartVal + delta, Number(pbScrubEl.min), Number(pbScrubEl.max));
       pbScrubEl.value = String(newVal);
-      _pbDidDrag = true;
+      pb._pbDidDrag = true;
       _pbLastScrubPos = newVal;
       _pbLastScrubTime = performance.now();
       if (!_scrubRAF) {
@@ -3513,10 +3516,10 @@ function main() {
       _scrubPointerStartVal = null;
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
-      _pbScrubbing = false;
+      pb._pbScrubbing = false;
       map._scrubbing = false;
-      _pbVelocity = 0;
-      _pbPageAutoFollow = true; // resume auto-following after manual scrub
+      pb._pbVelocity = 0;
+      pb._pbPageAutoFollow = true; // resume auto-following after manual scrub
 
       // Page back if slider is near the left edge (1% threshold)
       if (_pbPagingActive() && Number(pbScrubEl.value) <= Number(pbScrubEl.max) * 0.01) {
@@ -3524,19 +3527,19 @@ function main() {
         const pr = _pbGetPageRange();
         if (pr.minMs > gb.minMs) {
           // Shift the sliding window left by one page
-          if (_pbSlidingWindowCenter != null) {
-            _pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, _pbSlidingWindowCenter - _pbPageSizeMs);
-          } else if (_pbPageIndex > 0) {
-            _pbSetPage(_pbPageIndex - 1);
+          if (pb._pbSlidingWindowCenter != null) {
+            pb._pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, pb._pbSlidingWindowCenter - _pbPageSizeMs);
+          } else if (pb._pbPageIndex > 0) {
+            _pbSetPage(pb._pbPageIndex - 1);
           }
           const prev = _pbGetPageRange();
           map.setPlaybackTimeMs(prev.maxMs);
-          _pbLoopStartMs = prev.maxMs;
+          pb._pbLoopStartMs = prev.maxMs;
           pbScrubEl.max = String(prev.maxMs - prev.minMs);
           pbScrubEl.value = pbScrubEl.max;
           map.setPlaybackPlaying(true);
-          _pbLastPerf = performance.now();
-          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          pb._pbLastPerf = performance.now();
+          if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
           updatePlaybackUi();
           map.drawOverlay(map.lastState);
           return;
@@ -3545,8 +3548,8 @@ function main() {
 
       // Don't auto-enable LIVE mode when released at end - user must click Live button.
       map.setPlaybackPlaying(true);
-      _pbLastPerf = performance.now();
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbLastPerf = performance.now();
+      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
       applyScrub();
 
     });
@@ -3557,7 +3560,7 @@ function main() {
       const pos = Number(pbScrubEl.value);
 
       // User is dragging
-      _pbDidDrag = true;
+      pb._pbDidDrag = true;
       _pbLastScrubPos = pos;
       _pbLastScrubTime = now;
 
@@ -3574,17 +3577,17 @@ function main() {
     pbScrubEl.addEventListener("change", () => {
       // 'change' fires on release - only handle clicks here
       // Drags with inertia are handled by pointerup
-      if (_pbDidDrag) {
+      if (pb._pbDidDrag) {
         // Drag was handled by pointerup - do nothing here
         return;
       }
       // For clicks on the track (not drags), just resume playing
-      _pbScrubbing = false;
+      pb._pbScrubbing = false;
       map._scrubbing = false;
-      _pbVelocity = 0; // no inertia for clicks
+      pb._pbVelocity = 0; // no inertia for clicks
       map.setPlaybackPlaying(true);
-      _pbLastPerf = 0;
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbLastPerf = 0;
+      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
       applyScrub();
     });
 
@@ -3592,20 +3595,20 @@ function main() {
     pbScrubEl.addEventListener("wheel", (e) => {
       e.preventDefault();
       // Cancel any pending rewind and stop normal playback
-      _pbAtEndSincePerf = null;
-      _pbArrivedAtEndViaPlayback = false; // user is scrolling, not playing
-      _pbIsRewinding = false;
-      _pbPageAutoFollow = true; // resume page tracking when scrolling
+      pb._pbAtEndSincePerf = null;
+      pb._pbArrivedAtEndViaPlayback = false; // user is scrolling, not playing
+      pb._pbIsRewinding = false;
+      pb._pbPageAutoFollow = true; // resume page tracking when scrolling
       map.setPlaybackPlaying(false); // Let wheel nudge control velocity
       // Exit LIVE mode on scroll
       map._playbackLiveFollow = false;
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-      _pbIsWheelCoasting = true;
-      _pbCommitLoopStartOnCoastEnd = true;
+      pb._pbIsWheelCoasting = true;
+      pb._pbCommitLoopStartOnCoastEnd = true;
       // Activate sliding window so the playhead isn't clamped to a fixed page boundary
-      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+      if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
         const pr = _pbGetPageRange();
-        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+        pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
       }
       // Two-finger swipe (deltaX) or vertical scroll wheel (deltaY): scrub through time.
       // deltaX > 0 = swipe right = backward; deltaY > 0 = scroll down = forward.
@@ -3623,10 +3626,10 @@ function main() {
       let mwBoost = 1;
       if (isMouseWheel && _isWin) {
         const now = performance.now();
-        if (now - _pbMwLastTs > 80) _pbMwAccum = 0;
-        _pbMwAccum += Math.abs(isHorizontal ? rawDx : rawDy);
-        _pbMwLastTs = now;
-        mwBoost = Math.max(0.55 * Math.sqrt(_pbMwAccum), 1);
+        if (now - pb._pbMwLastTs > 80) pb._pbMwAccum = 0;
+        pb._pbMwAccum += Math.abs(isHorizontal ? rawDx : rawDy);
+        pb._pbMwLastTs = now;
+        mwBoost = Math.max(0.55 * Math.sqrt(pb._pbMwAccum), 1);
         mwBoost = Math.min(mwBoost, 60);
       } else if (isMouseWheel && _isMac) {
         mwBoost = 1;
@@ -3634,17 +3637,17 @@ function main() {
       const delta = isHorizontal ? rawDx * mwBoost : (isMouseWheel ? rawDy * mwBoost : -rawDy) * 0.15;
       const nudgeDur = Math.min(durMs, 21600000); // cap at 6h so scroll speed is consistent
       const nudge = (delta / 1000) * (nudgeDur / 480);
-      const prevDir = Math.sign(_pbVelocity);
-      _pbVelocity -= nudge;
+      const prevDir = Math.sign(pb._pbVelocity);
+      pb._pbVelocity -= nudge;
       // On direction reversal, snap window so playhead stays just outside the jog zone
-      if (prevDir !== 0 && Math.sign(_pbVelocity) !== 0 && Math.sign(_pbVelocity) !== prevDir) {
+      if (prevDir !== 0 && Math.sign(pb._pbVelocity) !== 0 && Math.sign(pb._pbVelocity) !== prevDir) {
         _pbSnapWindowToPlayhead();
         updatePlaybackUi();
       }
       // Ensure loop is running
-      if (!_pbRAF) {
-        _pbLastPerf = performance.now(); // valid dt for next frame
-        _pbRAF = requestAnimationFrame(playbackLoop);
+      if (!pb._pbRAF) {
+        pb._pbLastPerf = performance.now(); // valid dt for next frame
+        pb._pbRAF = requestAnimationFrame(playbackLoop);
       }
     }, { passive: false });
 
@@ -3670,16 +3673,16 @@ function main() {
       const thumbX = rect.left + thumbFrac * rect.width;
       _scrubTouchOnThumb = Math.abs(touch.clientX - thumbX) < 24;
       // Run the same setup as pointerdown (which won't fire since we prevented default)
-      _pbVelocity = 0;
-      _pbWheelAccum = 0;
-      _pbAtEndSincePerf = null;
-      _pbArrivedAtEndViaPlayback = false;
-      _pbIsRewinding = false;
-      _pbEaseStartPerf = null;
-      _pbIsWheelCoasting = false;
-      _pbScrubbing = true;
+      pb._pbVelocity = 0;
+      pb._pbWheelAccum = 0;
+      pb._pbAtEndSincePerf = null;
+      pb._pbArrivedAtEndViaPlayback = false;
+      pb._pbIsRewinding = false;
+      pb._pbEaseStartPerf = null;
+      pb._pbIsWheelCoasting = false;
+      pb._pbScrubbing = true;
       map._scrubbing = true;
-      _pbDidDrag = false;
+      pb._pbDidDrag = false;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
       map.setPlaybackPlaying(false);
@@ -3687,9 +3690,9 @@ function main() {
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
       _resetLiveTracking();
       // Activate sliding window
-      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+      if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
         const pr = _pbGetPageRange();
-        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+        pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
       }
       updatePlaybackUi();
     }, { passive: false });
@@ -3705,7 +3708,7 @@ function main() {
       const delta = (dx / rect.width) * range * sens;
       _scrubTouchRawTarget = _scrubTouchStartVal + delta;
       pbScrubEl.value = String(clamp(_scrubTouchRawTarget, Number(pbScrubEl.min), Number(pbScrubEl.max)));
-      _pbDidDrag = true;
+      pb._pbDidDrag = true;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
       if (!_scrubRAF) {
@@ -3726,29 +3729,29 @@ function main() {
       if (_scrubRAF) { cancelAnimationFrame(_scrubRAF); _scrubRAF = 0; }
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
-      _pbScrubbing = false;
+      pb._pbScrubbing = false;
       map._scrubbing = false;
-      _pbVelocity = 0;
-      _pbPageAutoFollow = true;
+      pb._pbVelocity = 0;
+      pb._pbPageAutoFollow = true;
 
       // Page back if user dragged past the left edge
       if (_pbPagingActive() && rawTarget != null && rawTarget < 0) {
         const gb = map.getPlaybackBounds();
         const pr = _pbGetPageRange();
         if (pr.minMs > gb.minMs) {
-          if (_pbSlidingWindowCenter != null) {
-            _pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, _pbSlidingWindowCenter - _pbPageSizeMs);
-          } else if (_pbPageIndex > 0) {
-            _pbSetPage(_pbPageIndex - 1);
+          if (pb._pbSlidingWindowCenter != null) {
+            pb._pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, pb._pbSlidingWindowCenter - _pbPageSizeMs);
+          } else if (pb._pbPageIndex > 0) {
+            _pbSetPage(pb._pbPageIndex - 1);
           }
           const prev = _pbGetPageRange();
           map.setPlaybackTimeMs(prev.maxMs);
-          _pbLoopStartMs = prev.maxMs;
+          pb._pbLoopStartMs = prev.maxMs;
           pbScrubEl.max = String(prev.maxMs - prev.minMs);
           pbScrubEl.value = pbScrubEl.max;
           map.setPlaybackPlaying(true);
-          _pbLastPerf = performance.now();
-          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          pb._pbLastPerf = performance.now();
+          if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
           updatePlaybackUi();
           map.drawOverlay(map.lastState);
           return;
@@ -3756,8 +3759,8 @@ function main() {
       }
 
       map.setPlaybackPlaying(true);
-      _pbLastPerf = performance.now();
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbLastPerf = performance.now();
+      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
       applyScrub();
     });
   }
@@ -3783,24 +3786,24 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   if (pbPagePrevEl) {
     pbPagePrevEl.addEventListener("click", () => {
-      if (_pbPageIndex <= 0) return;
-      _pbSetPage(_pbPageIndex - 1);
+      if (pb._pbPageIndex <= 0) return;
+      _pbSetPage(pb._pbPageIndex - 1);
       // Jump playhead to start of new page
       const pr = _pbGetPageRange();
       map.setPlaybackTimeMs(pr.minMs);
-      _pbLoopStartMs = pr.minMs;
+      pb._pbLoopStartMs = pr.minMs;
       map.drawOverlay(map.lastState);
     });
   }
   if (pbPageNextEl) {
     pbPageNextEl.addEventListener("click", () => {
       const total = _pbPageCount();
-      if (_pbPageIndex >= total - 1) return;
-      _pbSetPage(_pbPageIndex + 1);
+      if (pb._pbPageIndex >= total - 1) return;
+      _pbSetPage(pb._pbPageIndex + 1);
       // Jump playhead to start of new page
       const pr = _pbGetPageRange();
       map.setPlaybackTimeMs(pr.minMs);
-      _pbLoopStartMs = pr.minMs;
+      pb._pbLoopStartMs = pr.minMs;
       map.drawOverlay(map.lastState);
     });
   }
@@ -3892,7 +3895,7 @@ function main() {
     // status indicators (so "Live" doesn't drift to "Offline") and reschedule.
     // Skip the full draw + sidebar re-render: same data → same pixels.
     if (window.__stateSync.wasNotModified()) {
-      _pbLastServerResponseMs = Date.now();
+      pb._pbLastServerResponseMs = Date.now();
       _tickConsecutiveFailures = 0;
       const statusElLive = document.getElementById("statusText");
       if (statusElLive && !statusElLive.classList.contains("live")) {
@@ -3914,7 +3917,7 @@ function main() {
     _mapImmobileToParked(st);
 
     window.__lastState = st;
-    _pbLastServerResponseMs = Date.now();
+    pb._pbLastServerResponseMs = Date.now();
     _tickConsecutiveFailures = 0; // reset backoff on success
 
     // Update save button now that we have data
@@ -4153,10 +4156,10 @@ function main() {
       map.setPlaybackSpeed(60);
       if (pbSpeedEl) pbSpeedEl.value = "60";
       if (isFinite(sb.minMs)) map.setPlaybackTimeMs(sb.minMs);
-      _pbVelocity = _pbPlaybackSpeed * 60;
+      pb._pbVelocity = _pbPlaybackSpeed * 60;
       map.setPlaybackPlaying(true);
-      _pbLastPerf = 0;
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbLastPerf = 0;
+      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
 
       // Poll for end-of-playback to trigger 10s pause then loop
       _ssLoopInterval = setInterval(() => {
@@ -4169,15 +4172,15 @@ function main() {
             // Jump to where the new data begins and resume playing
             map.setPlaybackTimeMs(_ssEndMaxMs);
             _ssEndMaxMs = null;
-            _pbVelocity = _pbPlaybackSpeed * 60;
+            pb._pbVelocity = _pbPlaybackSpeed * 60;
             map.setPlaybackPlaying(true);
-            _pbLastPerf = 0;
-            if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+            pb._pbLastPerf = 0;
+            if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
           }
           return;
         }
         // Detect playback stalled at end (velocity zeroed by physics loop)
-        if (map.isPlaybackAtEnd(200) && Math.abs(_pbVelocity) < 0.1) {
+        if (map.isPlaybackAtEnd(200) && Math.abs(pb._pbVelocity) < 0.1) {
           var sb3 = map.getPlaybackBounds();
           _ssEndMaxMs = isFinite(sb3.maxMs) ? sb3.maxMs : null;
           _ssLoopTimer = setTimeout(() => {
@@ -4226,8 +4229,8 @@ function main() {
         map.setPlaybackSpeed(_ssSnapshot.speed);
         if (pbSpeedEl) pbSpeedEl.value = String(_ssSnapshot.speed);
         map.setPlaybackPlaying(false);
-        _pbVelocity = 0;
-        if (_pbRAF) { cancelAnimationFrame(_pbRAF); _pbRAF = null; }
+        pb._pbVelocity = 0;
+        if (pb._pbRAF) { cancelAnimationFrame(pb._pbRAF); pb._pbRAF = null; }
         // Discriminate live vs snapshot mode via _historicalState, not
         // map.playbackMode (which is true for both once canvas playback is
         // initialized).
@@ -4244,7 +4247,7 @@ function main() {
           if (_sb && isFinite(_sb.maxMs)) map.setPlaybackTimeMs(_sb.maxMs);
         }
         _ssSnapshot = null;
-        _pbLastPerf = 0;
+        pb._pbLastPerf = 0;
         updatePlaybackUi();
         map.drawOverlay(map.lastState, { cacheUnderlay: false });
       } else if (_ssSnapshot) {
@@ -4256,9 +4259,9 @@ function main() {
         map.setPlaybackTimeMs(_ssSnapshot.timeMs);
         map.setPlaybackPlaying(_ssSnapshot.playing);
         map._playbackLiveFollow = _ssSnapshot.liveFollow;
-        _pbVelocity = _ssSnapshot.playing ? _pbPlaybackSpeed * (_ssSnapshot.speed || 1) : 0;
-        _pbLastPerf = 0;
-        if (_ssSnapshot.playing && !_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        pb._pbVelocity = _ssSnapshot.playing ? _pbPlaybackSpeed * (_ssSnapshot.speed || 1) : 0;
+        pb._pbLastPerf = 0;
+        if (_ssSnapshot.playing && !pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
         _ssSnapshot = null;
         updatePlaybackUi();
         map.drawOverlay(map.lastState, { cacheUnderlay: false });
