@@ -150,7 +150,7 @@ beforeEach(() => { _pendingFrame = null; });
 // ─────────────────────────────────────────────────────────────────────────────
 describe("riding the wall-clock edge (the wall clock NEVER stops at the end)", () => {
   for (const speed of [1, 5, 60]) {
-    it(`playing at the edge keeps up with wall time at ${speed}x and shows lit Live`, () => {
+    it(`playing at the edge keeps up with wall time at ${speed}x (lit; Live only at 1x)`, () => {
       const h = makeHarness();
       h.map.setPlaybackSpeed(speed);
       h.map.setPlaybackPlaying(true);
@@ -165,8 +165,9 @@ describe("riding the wall-clock edge (the wall clock NEVER stops at the end)", (
       assert.ok(b.maxMs - t <= 1000,
         `playhead rides within 1s of the wall edge (gap ${Math.round(b.maxMs - t)}ms)`);
       h.playback.updatePlaybackUi();
-      assert.equal(h.btn.textContent, "Live", `label is Live at ${speed}x at the edge`);
-      assert.ok(h.btn.classList.contains("isLive"), `button is lit at ${speed}x at the edge`);
+      const expectLabel = (speed === 1) ? "Live" : "Pause";
+      assert.equal(h.btn.textContent, expectLabel, `label at ${speed}x`);
+      assert.ok(h.btn.classList.contains("isLive"), `lit (server-sync) at ${speed}x`);
       assert.ok(h.badge.classList.contains("hidden"), "no REW badge while riding");
       assert.ok(h.shade.classList.contains("hidden"), "no dim shade while riding");
     });
@@ -195,7 +196,8 @@ describe("forward momentum into the end goes LIVE (finger-scroll freeze bug)", (
     assert.ok(b.maxMs - h.map.getPlaybackTimeMs() <= 1000,
       "playhead keeps up with the ticking wall edge after the fling");
     h.playback.updatePlaybackUi();
-    assert.equal(h.btn.textContent, "Live");
+    // harness default speed is 5x → lit "Pause" (server-sync, not real time)
+    assert.equal(h.btn.textContent, "Pause");
     assert.ok(h.btn.classList.contains("isLive"));
   });
 
@@ -234,7 +236,9 @@ describe("an idle playhead at the edge GOES LIVE (never freezes)", () => {
     for (let i = 0; i < 8; i++) assert.ok(h.step(300), `loop alive frame ${i}`);
     assert.ok(h.map.getPlaybackTimeMs() > t1, "playhead advanced with wall time");
     h.playback.updatePlaybackUi();
-    assert.equal(h.btn.textContent, "Live");
+    // harness default speed is 5x → lit "Pause" (server-sync)
+    assert.equal(h.btn.textContent, "Pause");
+    assert.ok(h.btn.classList.contains("isLive"), "lit (server-sync)");
     assert.ok(h.badge.classList.contains("hidden"), "no REW badge while live at the edge");
     assert.ok(h.shade.classList.contains("hidden"), "no dim while live");
   });
@@ -261,19 +265,17 @@ describe("an idle playhead at the edge GOES LIVE (never freezes)", () => {
   });
 });
 
-describe("computeClickAction — Live click re-syncs, never pauses at the edge", () => {
+describe("computeClickAction — server-sync click re-syncs, never pauses", () => {
   const click = PlaybackUI.computeClickAction;
-  it("clicking lit Live (active at the edge) → 'sync' (jump to runway)", () => {
-    assert.equal(click({ playing: true, liveFollow: true, atLiveEdge: true }), "sync");
-    assert.equal(click({ playing: false, liveFollow: true, atLiveEdge: true }), "sync");
-    assert.equal(click({ playing: true, liveFollow: false, atLiveEdge: true }), "sync");
+  it("in server-sync mode (lit) → 'sync' (jump to runway), never pause", () => {
+    assert.equal(click({ playing: true, liveFollow: true }), "sync");
+    assert.equal(click({ playing: false, liveFollow: true }), "sync");
   });
-  it("active behind the edge (catching up) → 'pause'", () => {
-    assert.equal(click({ playing: true, liveFollow: false, atLiveEdge: false }), "pause");
+  it("playing but not synced (in the past) → 'pause'", () => {
+    assert.equal(click({ playing: true, liveFollow: false }), "pause");
   });
   it("paused → 'play'", () => {
-    assert.equal(click({ playing: false, liveFollow: false, atLiveEdge: false }), "play");
-    assert.equal(click({ playing: false, liveFollow: false, atLiveEdge: true }), "play");
+    assert.equal(click({ playing: false, liveFollow: false }), "play");
   });
 });
 

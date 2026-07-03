@@ -1478,13 +1478,54 @@ function main() {
     if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
   }
 
+  // Enter/refresh SERVER-SYNC mode: jump to the server-polling runway point
+  // (data edge − predicted-seconds-to-next-poll × speed, corrected for wall
+  // time already elapsed) and play forward, so the playhead reaches the edge
+  // just as the next poll extends it. Called by the lit-button click AND by a
+  // speed change while already in server-sync mode (runway scales with speed).
+  // This is the ONLY path that snaps — new data and drift never do. Defined at
+  // main() scope so both the pbPlay and pbSpeed handlers can reach it.
+  function _pbSyncToRunway() {
+      const b = map.getPlaybackBounds();
+      if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
+      const dataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+        ? map._playbackMaxMs : b.maxMs;
+      const meta = map.lastState && map.lastState.meta ? map.lastState.meta : {};
+      let nextInS = Number(meta.polling_next_update_in_s);
+      if (!isFinite(nextInS)) nextInS = Number(meta.polling_predicted_interval_s);
+      if (!isFinite(nextInS)) nextInS = 600;
+      const elapsedS = isFinite(pb._pbLastServerResponseMs)
+        ? Math.max(0, (Date.now() - pb._pbLastServerResponseMs) / 1000) : 0;
+      const remS = Math.max(0, nextInS - elapsedS);
+      const target = PlaybackUI.computeRunwayTargetMs({
+        dataEdgeMs: dataEdge, minMs: b.minMs, remSec: remS,
+        speed: map.getPlaybackSpeed() || 1.0,
+      });
+      map._playbackLiveFollow = true;
+      pb._pbPageAutoFollow = true;
+      pb._pbPaused = false;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+      if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
+      map.setPlaybackTimeMs(target);
+      pb._pbLoopStartMs = target;
+      pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      pb._pbWheelAccum = 0;
+      pb._pbAtEndSincePerf = null;
+      pb._pbIsRewinding = false;
+      map.setPlaybackPlaying(true);
+      pb._pbLastPerf = 0;
+      if (pb._pbRAF) cancelAnimationFrame(pb._pbRAF);
+      pb._pbRAF = requestAnimationFrame(playbackLoop);
+      updatePlaybackUi();
+  }
+
   if (pbPlayEl) {
     // iOS fix: handle touchend to avoid 300ms delay and text click issues
     pbPlayEl.addEventListener("touchend", (e) => {
       e.preventDefault();
       pbPlayEl.click();
     }, { passive: false });
-    
+
     pbPlayEl.addEventListener("click", () => {
       // Enable playback mode if not already (e.g. historical data)
       if (!map.playbackMode) {
@@ -1493,53 +1534,15 @@ function main() {
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
-      // At the live edge (the lit "Live" state) clicking RE-SYNCS to the
-      // server-polling runway point; it never pauses there. Pause exists only
-      // behind the edge (catching up). Same edge test as the button label.
       const _curMs = map.getPlaybackTimeMs();
-      const _dataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
-        ? map._playbackMaxMs : b.maxMs;
-      const _atLiveEdge = !map._historicalMode && map.isPlaybackAtEnd(1500);
-
       const action = PlaybackUI.computeClickAction({
         playing: map.getPlaybackPlaying(),
         liveFollow: map._playbackLiveFollow,
-        atLiveEdge: _atLiveEdge,
       });
 
       if (action === "sync") {
-        // Clicking the lit Live button: jump to the server-polling runway
-        // point (data edge − predicted-seconds-to-next-poll × speed, corrected
-        // for wall time already elapsed) and play forward, so the playhead
-        // reaches the edge just as the next poll extends it. This is the ONLY
-        // path that snaps — new data arriving and drift catch-up never do.
-        const meta = map.lastState && map.lastState.meta ? map.lastState.meta : {};
-        let nextInS = Number(meta.polling_next_update_in_s);
-        if (!isFinite(nextInS)) nextInS = Number(meta.polling_predicted_interval_s);
-        if (!isFinite(nextInS)) nextInS = 600;
-        const elapsedS = isFinite(pb._pbLastServerResponseMs)
-          ? Math.max(0, (Date.now() - pb._pbLastServerResponseMs) / 1000) : 0;
-        const remS = Math.max(0, nextInS - elapsedS);
-        const target = PlaybackUI.computeRunwayTargetMs({
-          dataEdgeMs: _dataEdge, minMs: b.minMs, remSec: remS,
-          speed: map.getPlaybackSpeed() || 1.0,
-        });
-        map._playbackLiveFollow = true;
-        pb._pbPageAutoFollow = true;
-        pb._pbPaused = false;
-        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-        if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
-        map.setPlaybackTimeMs(target);
-        pb._pbLoopStartMs = target;
-        pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-        pb._pbWheelAccum = 0;
-        pb._pbAtEndSincePerf = null;
-        pb._pbIsRewinding = false;
-        map.setPlaybackPlaying(true);
-        pb._pbLastPerf = 0;
-        if (pb._pbRAF) cancelAnimationFrame(pb._pbRAF);
-        pb._pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
+        // Clicking the lit (server-sync) button re-syncs to the runway point.
+        _pbSyncToRunway();
         return;
       }
 
@@ -1649,10 +1652,15 @@ function main() {
     pbSpeedEl.addEventListener("change", () => {
       map.setPlaybackSpeed(pbSpeedEl.value);
       localStorage.setItem("mobileair.playbackSpeed", pbSpeedEl.value);
-      // Speed changes never move the playhead. Riding the wall-clock edge is
-      // position-based, so the only visible effect there is the button label
-      // flipping between "Live" (1x) and lit "Pause" (>1x) via updatePlaybackUi.
-      updatePlaybackUi();
+      // In server-sync mode the runway scales with speed, so re-snap to the
+      // new runway point (a faster speed needs more runway to still be playing
+      // when the next poll lands). Outside server-sync mode, speed only flips
+      // the button label, no playhead move.
+      if (map._playbackLiveFollow && !map._historicalMode) {
+        _pbSyncToRunway();
+      } else {
+        updatePlaybackUi();
+      }
     });
   }
 

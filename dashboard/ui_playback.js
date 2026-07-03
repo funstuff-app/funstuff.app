@@ -51,19 +51,17 @@
    * `lit` is the .isLive glow.
    */
   /**
-   * What a click on the transport button does. There is NO pause at the live
-   * edge: clicking the lit "Live" button re-syncs to the server-polling
-   * runway point (see computeRunwayTargetMs) so playback flows forward and
-   * reaches the edge just as the next poll lands — it never pauses there.
-   *   active + at the live edge (lit Live) → "sync"   (jump to runway point)
-   *   active + behind it (catching up)     → "pause"
-   *   not active (paused)                  → "play"
-   * "active" = playing OR live-following.
+   * What a click on the transport button does. In server-sync mode (the lit
+   * button — liveFollow) clicking RE-SYNCS to the server-polling runway point
+   * (see computeRunwayTargetMs); it never pauses there. Outside that mode it
+   * is a plain play/pause.
+   *   liveFollow (server-sync, lit) → "sync"   (jump to runway point)
+   *   playing, not synced (past)    → "pause"
+   *   paused                        → "play"
    */
-  PlaybackUI.computeClickAction = function ({ playing, liveFollow, atLiveEdge }) {
-    const active = !!playing || !!liveFollow;
-    if (active && atLiveEdge) return "sync";
-    if (active) return "pause";
+  PlaybackUI.computeClickAction = function ({ playing, liveFollow }) {
+    if (liveFollow) return "sync";
+    if (playing) return "pause";
     return "play";
   };
 
@@ -84,11 +82,15 @@
     return (isFinite(minMs) && target < minMs) ? minMs : target;
   };
 
-  PlaybackUI.computeButtonState = function ({ historical, playing, liveFollow, atEnd }) {
+  PlaybackUI.computeButtonState = function ({ historical, playing, liveFollow, speed }) {
     const active = !!playing || !!liveFollow;
     if (historical) return { label: active ? "Pause" : "Play", lit: false };
-    if (active && atEnd) return { label: "Live", lit: true };
-    if (active) return { label: "Pause", lit: false };
+    // Server-sync mode (liveFollow): LIT — tracking the live edge / server
+    // cadence, at any speed. Labelled "Live" only at 1x (functionally real
+    // time); above 1x it is a lit "Pause" (keeping up with the server, but
+    // faster than real time is not "Live").
+    if (liveFollow) return (speed === 1) ? { label: "Live", lit: true } : { label: "Pause", lit: true };
+    if (active) return { label: "Pause", lit: false };   // playing in the past, not synced
     return { label: "Play", lit: false };
   };
 
@@ -535,14 +537,12 @@
       }
 
       const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
-      const atEnd = !hasBounds || map.isPlaybackAtEnd(1500);
 
       if (pbPlayEl) {
         const st = PlaybackUI.computeButtonState({
           historical: !!map._historicalMode,
           playing: map.getPlaybackPlaying(),
           liveFollow: !!map._playbackLiveFollow,
-          atEnd,
           speed: map.getPlaybackSpeed() || 1.0,
         });
         pbPlayEl.textContent = st.label;
