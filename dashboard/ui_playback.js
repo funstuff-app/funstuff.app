@@ -50,6 +50,22 @@
    * "active" means playing OR live-following (riding the edge counts).
    * `lit` is the .isLive glow.
    */
+  /**
+   * What a click on the transport button does. There is NO pause inside the
+   * live sync window: at/near the wall-clock edge it is Live and stays Live
+   * (the only way out is to scrub back). Pause exists only OUTSIDE the window.
+   *   active + inside the live window  → "none"  (stay Live)
+   *   active + outside (playing past)  → "pause"
+   *   not active (paused)              → "play"
+   * "active" = playing OR live-following.
+   */
+  PlaybackUI.computeClickAction = function ({ playing, liveFollow, inLiveWindow }) {
+    const active = !!playing || !!liveFollow;
+    if (active && inLiveWindow) return "none";
+    if (active) return "pause";
+    return "play";
+  };
+
   PlaybackUI.computeButtonState = function ({ historical, playing, liveFollow, atEnd }) {
     const active = !!playing || !!liveFollow;
     if (historical) return { label: active ? "Pause" : "Play", lit: false };

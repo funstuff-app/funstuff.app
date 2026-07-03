@@ -239,31 +239,41 @@ describe("an idle playhead at the edge GOES LIVE (never freezes)", () => {
     assert.ok(h.shade.classList.contains("hidden"), "no dim while live");
   });
 
-  it("an explicit pause at the wall edge FREEZES IN PLACE — no skip-back", () => {
+  it("a pause OUTSIDE the live window freezes in place (no skip-back), dim + REW", () => {
     const h = makeHarness();
-    // Ride the edge, then pause exactly as the pbPlay button does: clear the
-    // active flags, zero velocity, and SET the paused hold. The playhead must
-    // NOT jump backward, and the loop must not re-ride it.
-    h.map.setPlaybackPlaying(true);
-    h.map.setPlaybackTimeMs(h.map.getPlaybackBounds().maxMs - 50);
-    h.startLoop();
-    h.step(300);
-    const atEdge = h.map.getPlaybackTimeMs();
-    // pause
+    // Pausing only happens in the past. Freeze exactly where the playhead is.
+    const inPast = h.map._playbackMaxMs - h.syncEps() - 3600_000;
+    h.map.setPlaybackTimeMs(inPast);
     h.map._playbackLiveFollow = false;
     h.map.setPlaybackPlaying(false);
     h.pb._pbPaused = true;
     h.pb._pbVelocity = 0;
     h.playback.updatePlaybackUi();
-    assert.ok(Math.abs(h.map.getPlaybackTimeMs() - atEdge) < 1000,
-      "playhead frozen in place (no minutes-long skip-back)");
-    assert.ok(!h.shade.classList.contains("hidden"), "dim shows immediately on pause, even at the edge");
-    // the loop leaves it paused (the paused hold suppresses go-live)
+    assert.equal(h.map.getPlaybackTimeMs(), inPast, "playhead frozen exactly in place");
+    assert.ok(!h.shade.classList.contains("hidden"), "dim shows (paused)");
+    assert.ok(!h.badge.classList.contains("hidden"), "REW shows (behind live)");
+    // a loop frame leaves it paused (not at the edge, and _pbPaused holds it)
     h.startLoop();
     h.step(16);
     assert.equal(h.map.getPlaybackPlaying(), false, "stays paused");
-    assert.equal(h.map._playbackLiveFollow, false, "does not re-ride");
-    assert.ok(Math.abs(h.map.getPlaybackTimeMs() - atEdge) < 1000, "still in place after a loop frame");
+    assert.equal(h.map._playbackLiveFollow, false, "does not go live");
+    assert.equal(h.map.getPlaybackTimeMs(), inPast, "still exactly in place");
+  });
+});
+
+describe("computeClickAction — no pause inside the live sync window", () => {
+  const click = PlaybackUI.computeClickAction;
+  it("Live inside the window → 'none' (stays Live, cannot pause here)", () => {
+    assert.equal(click({ playing: true, liveFollow: true, inLiveWindow: true }), "none");
+    assert.equal(click({ playing: false, liveFollow: true, inLiveWindow: true }), "none");
+    assert.equal(click({ playing: true, liveFollow: false, inLiveWindow: true }), "none");
+  });
+  it("playing OUTSIDE the window (in the past) → 'pause'", () => {
+    assert.equal(click({ playing: true, liveFollow: false, inLiveWindow: false }), "pause");
+  });
+  it("paused → 'play'", () => {
+    assert.equal(click({ playing: false, liveFollow: false, inLiveWindow: false }), "play");
+    assert.equal(click({ playing: false, liveFollow: false, inLiveWindow: true }), "play");
   });
 });
 

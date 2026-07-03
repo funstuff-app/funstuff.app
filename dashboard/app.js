@@ -1493,17 +1493,31 @@ function main() {
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
-      // The button is a plain play/pause toggle. "Live" is a DISPLAY state
-      // (riding the wall-clock edge at 1x), not a separate button mode —
-      // updatePlaybackUi derives the label/glow from position + speed.
-      const active = map.getPlaybackPlaying() || map._playbackLiveFollow;
+      // Is the playhead inside the live sync window (at/near the wall-clock
+      // edge)? Inside it there is NO pause — it is Live and stays Live; the
+      // only way out is to scrub back. Pause exists only OUTSIDE the window.
+      const _curMs = map.getPlaybackTimeMs();
+      const _dataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+        ? map._playbackMaxMs : b.maxMs;
+      const _syncEps = Math.max(15000, (b.maxMs - b.minMs) * 0.005);
+      const _inLiveWindow = !map._historicalMode
+        && _curMs != null && isFinite(_curMs) && _curMs >= _dataEdge - _syncEps;
 
-      if (active) {
-        // PAUSE: freeze the playhead exactly where it is (no skip-back). The
-        // _pbPaused flag holds it there — it suppresses the loop's go-live so
-        // a pause at the wall edge isn't immediately re-ridden. The dim shade
-        // shows at once (stopped in live view); ◀◀ REW appears once wall time
-        // carries the ticking edge past the frozen playhead.
+      const action = PlaybackUI.computeClickAction({
+        playing: map.getPlaybackPlaying(),
+        liveFollow: map._playbackLiveFollow,
+        inLiveWindow: _inLiveWindow,
+      });
+
+      if (action === "none") {
+        // Live within the sync window: clicking does nothing. Stay live.
+        return;
+      }
+
+      if (action === "pause") {
+        // PAUSE — only reachable OUTSIDE the live window (playing in the past).
+        // Freeze the playhead exactly where it is: it is already behind the
+        // live zone, so the dim shade + ◀◀ REW show without any skip-back.
         map._playbackLiveFollow = false;
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
         if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
@@ -1513,9 +1527,7 @@ function main() {
         pb._pbWheelAccum = 0;
         pb._pbAtEndSincePerf = null;
         pb._pbIsRewinding = false;
-        // Remember where the user paused as replay point A.
-        const curMs = map.getPlaybackTimeMs();
-        if (curMs != null && isFinite(curMs)) pb._pbLoopStartMs = curMs;
+        if (_curMs != null && isFinite(_curMs)) pb._pbLoopStartMs = _curMs;
         updatePlaybackUi();
         return;
       }
