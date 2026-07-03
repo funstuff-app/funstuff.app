@@ -32,7 +32,7 @@
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260702d" />
+  <link rel="stylesheet" href="/styles.css?v=20260702e" />
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -126,9 +126,10 @@
           <!-- Loading shade: covers the map (not the UI) while data loads -->
           <div id="mapLoadingShade" class="hidden">LOADING...</div>
 
-          <!-- Paused shade + badge: a frozen real-time view must look frozen.
-               Shown while playback is paused in live view (ui_playback.js). -->
-          <div id="pbPausedShade" class="hidden"></div>
+          <!-- Paused shade: dims the map and shows PAUSED while playback is
+               paused in live view (same code path as the loading shade). The
+               REW badge is kept but hidden for now. -->
+          <div id="pbPausedShade" class="hidden">PAUSED</div>
           <div id="pbRewBadge" class="hidden">&#9664;&#9664; REW</div>
 
           <!-- Legend panel (top-right, overlays map) -->
@@ -337,7 +338,7 @@
   <script defer src="ui_legend.js?v=20260701a"></script>
   <script defer src="ui_theme.js?v=20260701a"></script>
   <script defer src="playback_state.js?v=20260701a"></script>
-  <script defer src="ui_playback.js?v=20260702l"></script>
+  <script defer src="ui_playback.js?v=20260702m"></script>
   <script defer src="ui_snapshots_menus.js?v=20260701a"></script>
   <script defer src="ui_screensaver.js?v=20260701a"></script>
   <script defer src="app.js?v=20260702h"></script>

@@ -531,27 +531,14 @@
       }
       if (pbSpeedEl) pbSpeedEl.value = String(map.getPlaybackSpeed() || 1.0);
 
-      // ◀◀ REW badge + dim shade (live view only; historical snapshots show
-      // neither). Direction is the signed distance the playhead LAST MOVED
-      // (pb._pbMoveDeltaMs, recorded wherever the playhead actually moves —
-      // the loop's physics commit and applyScrub), so play, scrub, rewind and
-      // wheel are all judged by which way they actually went.
-      //   REW badge : behind the live zone AND not advancing (moving backward
-      //               or fully stopped). Any forward motion clears it.
-      //   Dim shade : stopped (paused) in live view — position-independent, so
-      //               it shows the instant you pause, even at the edge (pause
-      //               freezes in place, no skip-back).
-      const _dataEdgeMs = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
-        ? map._playbackMaxMs : b.maxMs;
-      const _syncEpsMs = Math.max(15000, (hasBounds ? (b.maxMs - b.minMs) : 0) * 0.005);
-      const _behindLive = !map._historicalMode && hasBounds
-        && tMs != null && isFinite(tMs)
-        && tMs < _dataEdgeMs - _syncEpsMs;
+      // PAUSED shade: dims the map and shows the word PAUSED (same code path
+      // as the loading shade) whenever live-view playback is stopped. Pausing
+      // only happens outside the live sync window (see computeClickAction), so
+      // "stopped in live view" is a genuine pause. (The ◀◀ REW badge is kept
+      // in the DOM but hidden for now.)
       const _stopped = !!map.playbackMode && !map._historicalMode
         && !map.getPlaybackPlaying() && !map._playbackLiveFollow
         && !pb._pbScrubbing && Math.abs(pb._pbVelocity) <= _pbVelocityThreshold;
-      const _advancing = !_stopped && pb._pbMoveDeltaMs > 1;
-      if (pbRewBadgeEl) pbRewBadgeEl.classList.toggle("hidden", !(_behindLive && !_advancing));
       if (pbPausedShadeEl) pbPausedShadeEl.classList.toggle("hidden", !_stopped);
     };
 

@@ -250,8 +250,8 @@ describe("an idle playhead at the edge GOES LIVE (never freezes)", () => {
     h.pb._pbVelocity = 0;
     h.playback.updatePlaybackUi();
     assert.equal(h.map.getPlaybackTimeMs(), inPast, "playhead frozen exactly in place");
-    assert.ok(!h.shade.classList.contains("hidden"), "dim shows (paused)");
-    assert.ok(!h.badge.classList.contains("hidden"), "REW shows (behind live)");
+    assert.ok(!h.shade.classList.contains("hidden"), "PAUSED shade shows");
+    assert.ok(h.badge.classList.contains("hidden"), "REW badge stays hidden");
     // a loop frame leaves it paused (not at the edge, and _pbPaused holds it)
     h.startLoop();
     h.step(16);
@@ -277,77 +277,46 @@ describe("computeClickAction — no pause inside the live sync window", () => {
   });
 });
 
-describe("REW badge follows the PLAYHEAD MOVEMENT DELTA (direction), not flags", () => {
-  // `behind` sits well behind the live zone so _behindLive holds throughout.
+describe("PAUSED shade = pause indicator; REW badge stays hidden", () => {
   const behind = (h) => h.map._playbackMaxMs - h.syncEps() - 3600_000;
 
-  // Pin the OLDEST page (all of it is behind the live zone) and drive
-  // applyScrub with page-relative slider values, exactly as a real drag does.
-  const scrubTo = (h, absMs) => {
-    h.pb._pbPageAutoFollow = false;
-    h.pb._pbPageIndex = 0;
-    h.pb._pbSlidingWindowCenter = null;
-    const pr = h.playback._pbGetPageRange();
-    h.doc.getElementById("pbScrub").value = String(absMs - pr.minMs);
-    h.playback.applyScrub();                       // real move → sets move delta
-  };
-
-  it("NO badge while SCRUBBING FORWARD (positive move delta), even repeatedly", () => {
-    // The exact reported bug: dragging the playhead forward must not show REW.
-    const h = makeHarness();
-    h.pb._pbScrubbing = true;
-    const base = h.map._playbackMinMs;
-    scrubTo(h, base + 0.25 * 3600_000);            // seed position inside the page
-    for (const hrs of [0.5, 1.0, 1.5, 2.0]) {      // then drag FORWARD
-      scrubTo(h, base + hrs * 3600_000);
-      assert.ok(h.map._playbackMaxMs - h.map.getPlaybackTimeMs() > h.syncEps(),
-        "still behind the live zone");
-      assert.ok(h.badge.classList.contains("hidden"), `no REW at +${hrs}h`);
-      assert.ok(h.shade.classList.contains("hidden"), `no dim at +${hrs}h`);
-    }
-  });
-
-  it("NO badge while PLAYING FORWARD (loop advances the playhead)", () => {
-    const h = makeHarness();
-    h.map.setPlaybackPlaying(true);
-    h.map.setPlaybackTimeMs(behind(h));
-    h.startLoop();
-    for (let i = 0; i < 6; i++) h.step(200);      // real forward playback
-    assert.ok(h.map._playbackMaxMs - h.map.getPlaybackTimeMs() > h.syncEps(),
-      "still behind the live zone");
-    assert.ok(h.badge.classList.contains("hidden"), "no REW while playing forward");
-    assert.ok(h.shade.classList.contains("hidden"), "no dim while playing forward");
-  });
-
-  it("badge, no dim, while SCRUBBING BACKWARD (negative move delta)", () => {
-    const h = makeHarness();
-    h.pb._pbScrubbing = true;
-    const base = h.map._playbackMinMs;
-    scrubTo(h, base + 2.0 * 3600_000);            // start forward
-    for (const hrs of [1.5, 1.0, 0.5]) scrubTo(h, base + hrs * 3600_000); // then BACK
-    assert.ok(!h.badge.classList.contains("hidden"), "REW visible while scrubbing back");
-    assert.ok(h.shade.classList.contains("hidden"), "no dim while moving");
-  });
-
-  it("badge AND dim while STOPPED (paused) behind the live zone", () => {
+  it("shade shows only when PAUSED (stopped) in live view; badge never shows", () => {
     const h = makeHarness();
     h.map.setPlaybackPlaying(false);
     h.map._playbackLiveFollow = false;
     h.pb._pbVelocity = 0;
     h.map.setPlaybackTimeMs(behind(h));
     h.playback.updatePlaybackUi();
-    assert.ok(!h.badge.classList.contains("hidden"), "badge visible (stopped, behind live)");
-    assert.ok(!h.shade.classList.contains("hidden"), "dim visible (paused)");
-    assert.equal(h.btn.textContent, "Play");
+    assert.ok(!h.shade.classList.contains("hidden"), "PAUSED shade visible when paused");
+    assert.ok(h.badge.classList.contains("hidden"), "REW badge stays hidden");
   });
 
-  it("neither shows in historical snapshots", () => {
+  it("no shade while PLAYING FORWARD (loop advances the playhead)", () => {
+    const h = makeHarness();
+    h.map.setPlaybackPlaying(true);
+    h.map.setPlaybackTimeMs(behind(h));
+    h.startLoop();
+    for (let i = 0; i < 6; i++) h.step(200);
+    assert.ok(h.shade.classList.contains("hidden"), "no shade while playing");
+    assert.ok(h.badge.classList.contains("hidden"), "no badge");
+  });
+
+  it("no shade while SCRUBBING (interacting, not paused)", () => {
+    const h = makeHarness();
+    h.pb._pbScrubbing = true;
+    h.map.setPlaybackTimeMs(behind(h));
+    h.playback.updatePlaybackUi();
+    assert.ok(h.shade.classList.contains("hidden"), "no shade while scrubbing");
+    assert.ok(h.badge.classList.contains("hidden"), "no badge");
+  });
+
+  it("no shade in historical snapshots (deliberate time travel)", () => {
     const h = makeHarness();
     h.map._historicalMode = true;
     h.map.setPlaybackPlaying(false);
     h.map.setPlaybackTimeMs(h.map._playbackMinMs + 1000);
     h.playback.updatePlaybackUi();
-    assert.ok(h.badge.classList.contains("hidden"));
     assert.ok(h.shade.classList.contains("hidden"));
+    assert.ok(h.badge.classList.contains("hidden"));
   });
 });
