@@ -353,11 +353,13 @@ aside, section { min-height: 0; }
 }
 
 /* Loading shade: covers map canvases only; UI panels (z-index >= 12) stay above */
-#mapLoadingShade {
+/* Map shades: a dim overlay with a centered word, over the map (not the UI).
+   #mapLoadingShade shows LOADING; #pbPausedShade shows PAUSED — same code path.
+   pointer-events pass through so the map stays interactive. */
+#mapLoadingShade,
+#pbPausedShade {
   position: absolute;
   inset: 0;
-  z-index: 4;
-  background: rgba(0, 0, 0, 0.45);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -366,6 +368,13 @@ aside, section { min-height: 0; }
   letter-spacing: 0.3em;
   pointer-events: none;
 }
+#mapLoadingShade { z-index: 4; background: rgba(0, 0, 0, 0.45); }
+#pbPausedShade { z-index: 3; background: rgba(0, 0, 0, 0.35); transition: opacity 0.25s ease; }
+#mapLoadingShade.hidden,
+#pbPausedShade.hidden { display: none; }
+
+/* ◀◀ REW badge: hidden for now (kept for a later decision). */
+#pbRewBadge { display: none; }
 
 /* DVR playback controls (bottom center) */
 .playbackBar {

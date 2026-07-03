@@ -32,7 +32,7 @@
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
   
-  <link rel="stylesheet" href="/styles.css?v=20260611a" />
+  <link rel="stylesheet" href="/styles.css?v=20260702e" />
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -125,6 +125,12 @@
 
           <!-- Loading shade: covers the map (not the UI) while data loads -->
           <div id="mapLoadingShade" class="hidden">LOADING...</div>
+
+          <!-- Paused shade: dims the map and shows PAUSED while playback is
+               paused in live view (same code path as the loading shade). The
+               REW badge is kept but hidden for now. -->
+          <div id="pbPausedShade" class="hidden">PAUSED</div>
+          <div id="pbRewBadge" class="hidden">&#9664;&#9664; REW</div>
 
           <!-- Legend panel (top-right, overlays map) -->
           <aside id="legend" class="legendPanel hidden">
@@ -300,8 +306,8 @@
     </div>
 
     <footer id="appFooter">
-      <div class="footerRow1"><span class="footerContent">©2026 Funstuff.wtf</span> <a href="mailto:matt@funstuff.app" class="contactLink">Contact Me</a> <span class="footerDisclaimer">For visualization only.</span></div>
-      <div class="footerRow2"><span class="footerDisclaimer"><span class="footerSentence">Not for medical, regulatory, or emergency response use.</span> <span class="footerSentence">Data courtesy of Utah DAQ &amp; <a href="https://www.airnow.gov" target="_blank" class="contactLink">EPA AirNow</a>.</span> <span class="footerSentence">Community sensors powered by <a href="https://www.purpleair.com" target="_blank" class="contactLink">PurpleAir</a>.</span></span></div>
+      <div class="footerRow1"><span class="footerContent">©2026 Funstuff.wtf</span> <a href="mailto:matt@funstuff.app" class="contactLink">Contact Me</a> <span class="footerDisclaimer">Interactive art demo for entertainment only.</span></div>
+      <div class="footerRow2"><span class="footerDisclaimer"><span class="footerDisclaimer"><span class="footerSentence">Data courtesy of Utah DAQ &amp; <a href="https://www.airnow.gov" target="_blank" class="contactLink">EPA AirNow</a></span> <span class="footerSentence">Community sensors powered by <a href="https://www.purpleair.com" target="_blank" class="contactLink">PurpleAir</a></span> <span class="footerSentence">Not for medical, regulatory, or emergency use. Use at your own risk.</span></span></div>
     </footer>
   </div>
 
@@ -309,17 +315,33 @@
        aqi → format → data → MapView class → sidebar UI → main entry point -->
   <script defer src="map_nav_engine.js?v=20260224a"></script>
   <script defer src="camera_fit_logic.js?v=20260224a"></script>
-  <script defer src="config.js?v=20260409a"></script>
+  <script defer src="config.js?v=20260702a"></script>
   <script defer src="projections.js?v=20260224a"></script>
   <script defer src="colors.js?v=20260406a"></script>
   <script defer src="aqi.js?v=20260414a"></script>
   <script defer src="format_utils.js?v=20260224a"></script>
   <script defer src="data_utils.js?v=20260612c"></script>
   <script defer src="advection_solver.js?v=20260320a"></script>
-  <script defer src="map_view.js?v=20260621c"></script>
+  <script defer src="engine_field_sensors.js?v=20260701a"></script>
+  <script defer src="engine_tile_renderer.js?v=20260701a"></script>
+  <script defer src="engine_road_matcher.js?v=20260701a"></script>
+  <script defer src="engine_vehicle_motion.js?v=20260701a"></script>
+  <script defer src="engine_playback_engine.js?v=20260701a"></script>
+  <script defer src="engine_wind_advection.js?v=20260701a"></script>
+  <script defer src="engine_pa_field.js?v=20260701a"></script>
+  <script defer src="engine_overlay_renderer.js?v=20260701a"></script>
+  <script defer src="engine_camera_gestures.js?v=20260701a"></script>
+  <script defer src="map_view.js?v=20260702d"></script>
   <script defer src="sidebar_ui.js?v=20260415a"></script>
   <script defer src="jog_wheel.js?v=20260327j"></script>
-  <script defer src="app.js?v=20260620a"></script>
+  <script defer src="ui_state_sync.js?v=20260701a"></script>
+  <script defer src="ui_legend.js?v=20260701a"></script>
+  <script defer src="ui_theme.js?v=20260701a"></script>
+  <script defer src="playback_state.js?v=20260701a"></script>
+  <script defer src="ui_playback.js?v=20260702p"></script>
+  <script defer src="ui_snapshots_menus.js?v=20260701a"></script>
+  <script defer src="ui_screensaver.js?v=20260701a"></script>
+  <script defer src="app.js?v=20260702j"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">

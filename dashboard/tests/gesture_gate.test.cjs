@@ -4,6 +4,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const mapViewSrc = fs.readFileSync(path.join(__dirname, "..", "map_view.js"), "utf-8");
+// _compositePaFieldOnTiles and _ensurePaField moved to engine_pa_field.js (S7).
+const paFieldSrc = fs.readFileSync(path.join(__dirname, "..", "engine_pa_field.js"), "utf-8");
+// _isGesturing, _startPinchInertia, _stopPinchInertia, onWheel moved to
+// engine_camera_gestures.js (S9).
+const cameraSrc = fs.readFileSync(path.join(__dirname, "..", "engine_camera_gestures.js"), "utf-8");
 
 // ── Helper: extract a method body by name ──
 function extractMethod(src, name) {
@@ -40,7 +45,7 @@ function stripComments(s) {
 // ══════════════════════════════════════════════════════════════════════════
 
 test("_isGesturing includes _scrubbing flag", () => {
-  const body = extractMethod(mapViewSrc, "_isGesturing");
+  const body = extractMethod(cameraSrc, "_isGesturing");
   assert.ok(body, "_isGesturing method not found");
   const stripped = stripComments(body);
   assert.ok(
@@ -52,7 +57,7 @@ test("_isGesturing includes _scrubbing flag", () => {
 });
 
 test("_isGesturing includes all four original gesture flags", () => {
-  const body = extractMethod(mapViewSrc, "_isGesturing");
+  const body = extractMethod(cameraSrc, "_isGesturing");
   assert.ok(body, "_isGesturing method not found");
   const stripped = stripComments(body);
   for (const flag of ["_touchActive", "_mouseDragging", "_pinchZooming", "_wheelPanning"]) {
@@ -71,7 +76,7 @@ test("_isGesturing includes all four original gesture flags", () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 test("_compositePaFieldOnTiles fast-path checks _isTransientAnimating", () => {
-  const body = extractMethod(mapViewSrc, "_compositePaFieldOnTiles");
+  const body = extractMethod(paFieldSrc, "_compositePaFieldOnTiles");
   assert.ok(body, "_compositePaFieldOnTiles method not found");
   const stripped = stripComments(body);
   // The fast-path guard: if (_isTransientAnimating() && _paFieldCanvas && ...)
@@ -84,7 +89,7 @@ test("_compositePaFieldOnTiles fast-path checks _isTransientAnimating", () => {
 });
 
 test("_ensurePaField returns early when _isTransientAnimating", () => {
-  const body = extractMethod(mapViewSrc, "_ensurePaField");
+  const body = extractMethod(paFieldSrc, "_ensurePaField");
   assert.ok(body, "_ensurePaField method not found");
   const stripped = stripComments(body);
   assert.ok(
@@ -105,7 +110,7 @@ test("_ensurePaField returns early when _isTransientAnimating", () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 test("_startPinchInertia does not immediately clear _pinchZooming on low velocity", () => {
-  const body = extractMethod(mapViewSrc, "_startPinchInertia");
+  const body = extractMethod(cameraSrc, "_startPinchInertia");
   assert.ok(body, "_startPinchInertia method not found");
   const stripped = stripComments(body);
 
@@ -150,7 +155,7 @@ test("_startPinchInertia does not immediately clear _pinchZooming on low velocit
 });
 
 test("_stopPinchInertia cleans up deferred pinch-zoom-end timer", () => {
-  const body = extractMethod(mapViewSrc, "_stopPinchInertia");
+  const body = extractMethod(cameraSrc, "_stopPinchInertia");
   assert.ok(body, "_stopPinchInertia method not found");
   const stripped = stripComments(body);
   assert.ok(
@@ -168,7 +173,7 @@ test("_stopPinchInertia cleans up deferred pinch-zoom-end timer", () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 test("onWheel clears deferred pinch-zoom-end timer", () => {
-  const body = extractMethod(mapViewSrc, "onWheel");
+  const body = extractMethod(cameraSrc, "onWheel");
   assert.ok(body, "onWheel method not found");
   const stripped = stripComments(body);
   assert.ok(

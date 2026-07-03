@@ -117,146 +117,15 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", _syncViewToServer);
 
-// ETag for conditional polling — avoids re-downloading unchanged payloads.
-let _stateEtag = null;
-let _stateCached = null;
-
-// Delta delivery: track newest trail timestamp so subsequent polls
-// only receive new trail points (the server strips old ones via ?since_ms=).
-let _newestTrailMs = null;
-// Accumulated full state (trails grow across polls).
-let _accumulatedState = null;
-
-/** Extract the newest trail timestamp (epoch ms) from a state object. */
-function _extractNewestTrailMs(st) {
-  let best = null;
-  const mobiles = Array.isArray(st?.mobile) ? st.mobile : [];
-  for (const m of mobiles) {
-    const trail = Array.isArray(m?.trail) ? m.trail : [];
-    for (let i = trail.length - 1; i >= 0; i--) {
-      const t = trail[i]?.t;
-      if (typeof t === "string") {
-        const ms = parseUtcMs(t);
-        if (ms != null && (best == null || ms > best)) { best = ms; break; }
-      }
-    }
-  }
-  return best;
-}
-
-/** Merge a delta state into the accumulated state.
- *  - Mobile trails: append new points to existing vehicles.
- *  - Fixed sensors / meta: replace entirely (always current).
- */
-function _mergeStateDelta(acc, delta) {
-  // Replace top-level fields the server always sends in full.
-  acc.ts = delta.ts;
-  acc.meta = delta.meta;
-  acc.fixed = delta.fixed;
-
-  // Merge mobile trails.
-  const deltaM = Array.isArray(delta.mobile) ? delta.mobile : [];
-  const accById = new Map();
-  const accMobiles = Array.isArray(acc.mobile) ? acc.mobile : [];
-  for (const m of accMobiles) {
-    if (m && m.id != null) accById.set(String(m.id), m);
-  }
-
-  for (const dm of deltaM) {
-    if (!dm || dm.id == null) continue;
-    const id = String(dm.id);
-    const existing = accById.get(id);
-    if (!existing) {
-      // New vehicle — add as-is.
-      accMobiles.push(dm);
-      accById.set(id, dm);
-      continue;
-    }
-    // Append new trail points, capping to prevent unbounded growth.
-    const newPts = Array.isArray(dm.trail) ? dm.trail : [];
-    if (newPts.length > 0) {
-      const oldTrail = Array.isArray(existing.trail) ? existing.trail : [];
-      const merged = oldTrail.concat(newPts);
-      const cap = (typeof MAX_TRAIL_LEN === "number" && MAX_TRAIL_LEN > 0) ? MAX_TRAIL_LEN : 3000;
-      existing.trail = merged.length > cap ? merged.slice(merged.length - cap) : merged;
-    }
-    // Update non-trail fields (readings, ghosted, color, etc.)
-    for (const k of Object.keys(dm)) {
-      if (k !== "trail" && k !== "id") existing[k] = dm[k];
-    }
-  }
-
-  // Remove vehicles that disappeared from the server response.
-  const deltaIds = new Set(deltaM.map(m => m && m.id != null ? String(m.id) : null).filter(Boolean));
-  acc.mobile = accMobiles.filter(m => m && m.id != null && deltaIds.has(String(m.id)));
-
-  return acc;
-}
-
-let _lastStateWasNotModified = false;
-async function fetchState() {
-  _lastStateWasNotModified = false;
-  let url = `${appConfig.apiBaseUrl}/state`;
-  // Delta delivery: ask the server to strip trail points we already have.
-  if (_newestTrailMs != null) {
-    const sep = url.includes("?") ? "&" : "?";
-    url = `${url}${sep}since_ms=${_newestTrailMs}`;
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000); // 15s timeout
-  try {
-    const headers = { "X-App-Token": APP_TOKEN };
-    if (_stateEtag) headers["If-None-Match"] = _stateEtag;
-    const res = await fetch(url, { cache: "no-store", signal: controller.signal, headers, credentials: "same-origin" });
-    if (res.status === 304 && _accumulatedState) {
-      _lastStateWasNotModified = true;
-      return _accumulatedState;
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    _stateEtag = res.headers.get("ETag") || null;
-    const payload = await res.json();
-
-    // Merge or replace accumulated state.
-    if (payload.meta?.delta && _accumulatedState) {
-      _mergeStateDelta(_accumulatedState, payload);
-    } else {
-      // First fetch or full payload — replace entirely.
-      _accumulatedState = payload;
-    }
-
-    // Track newest trail timestamp for next delta request.
-    const nms = _extractNewestTrailMs(_accumulatedState);
-    if (nms != null) _newestTrailMs = nms;
-
-    _stateCached = _accumulatedState;
-    return _accumulatedState;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// injectCastleFixedMarker removed - Home sensor now provided by backend with real PM2.5 data
-
-function newestReadingMsFromState(st) {
-  // Prefer the most recent timestamp from any mobile breadcrumb point.
-  // Fixed sensors currently do not include timestamps in the normalized payload.
-  let bestMs = null;
-  const mobiles = Array.isArray(st?.mobile) ? st.mobile : [];
-  for (const m of mobiles) {
-    const trail = Array.isArray(m?.trail) ? m.trail : [];
-    const last = trail.length ? trail[trail.length - 1] : null;
-    const t = last && typeof last.t === "string" ? last.t : null;
-    const ms = t ? parseUtcMs(t) : null;
-    if (ms != null && (bestMs == null || ms > bestMs)) bestMs = ms;
-  }
-  if (bestMs != null) return bestMs;
-
-  // Fallbacks: server meta (seconds) or state ts.
-  const sec = (st && st.meta && typeof st.meta.last_position_change_ts === "number")
-    ? st.meta.last_position_change_ts
-    : (typeof st?.ts === "number" ? st.ts : null);
-  return (sec != null && isFinite(sec)) ? (sec * 1000) : null;
-}
+// ── State sync (fetchState/etag/delta-merge/SSE/analytics) ────────────────
+// Extracted to ui_state_sync.js (StateSync). Instantiated inside main() once
+// `map`/`selectedId` exist; the module owns etag/accumulated-state/SSE/
+// analytics fields internally. These top-level wrappers preserve the
+// original call sites (fetchState(), newestReadingMsFromState()); both
+// were only ever called from within main(), so they simply delegate to
+// the StateSync instance created there.
+function fetchState() { return window.__stateSync.fetchState(); }
+function newestReadingMsFromState(st) { return StateSync.newestReadingMsFromState(st); }
 
 function main() {
   const tiles = document.getElementById("tilesCanvas");
@@ -264,21 +133,6 @@ function main() {
   const overlay = document.getElementById("overlayCanvas");
   const map = new MapView(tiles, paField, overlay);
   window.__map = map;  // Expose for updateSidebarPlaybackValues
-
-  // Screensaver mode flag (set by hot-corner code below, read by camera follow)
-  let _screensaverActive = false;
-  let _ssSnapshot = null;       // state snapshot taken on screensaver enter
-  let _ssLoopInterval = null;   // poll interval that detects end-of-playback
-  let _ssLoopTimer = null;      // 10s pause timer between loops
-  let _ssEndMaxMs = null;       // maxMs when we started the 10s pause
-  // Hoisted handle for the screensaver-enter function, assigned inside the
-  // hot-corner block below so that ?demo=1 can trigger it on page load.
-  let _demoTriggerSS = null;
-  // Tracks whether the current screensaver session was entered via ?demo=1
-  // (as opposed to the bottom-left hot corner). On exit, demo-origin sessions
-  // use mode-appropriate defaults instead of restoring the stale entry-time
-  // snapshot — in live mode the captured `timeMs` can be tens of minutes old.
-  let _enteredViaDemo = false;
 
   // Lite mode: hide all chrome (sidebar, controls, legend, menu button)
   const _liteParam = new URLSearchParams(window.location.search).get('lite') === '1';
@@ -404,877 +258,31 @@ function main() {
   }
 
   // ── Color legend panel ──────────────────────────────────────────
-  const legendEl = document.getElementById("legend");
-  const legendCloseEl = document.getElementById("legendClose");
-  const legendCollapseEl = document.getElementById("legendCollapse");
-  const legendToggleEl = document.getElementById("legendToggle");
-  const legendBodyEl = document.getElementById("legendBody");
-  const legendUnitEl = document.getElementById("legendUnit");
-  const LEGEND_OPEN_KEY = "dusty_legend_open";
-  const LEGEND_TAB_KEY = "dusty_legend_tab";
-  const LEGEND_COLLAPSED_KEY = "dusty_legend_collapsed";
-  // If the legend would have started hidden (mobile default, or desktop
-  // without an explicit open preference), start it open-but-collapsed instead
-  // so the pollutant tabs remain visible at a glance.
-  const _legendStartsHidden = _isMobileWidth
-    ? true
-    : localStorage.getItem(LEGEND_OPEN_KEY) !== "true";
-  let legendOpen = true;
-  let legendCollapsed = _legendStartsHidden
-    ? true
-    : localStorage.getItem(LEGEND_COLLAPSED_KEY) === "true";
-  let legendTab = null;
-  let userLegendTab = null; // what the user manually chose (restored on deselect)
-  let legendUserOverride = false; // true when user manually changed tab while marker selected
-  let _wasAlreadyDeselected = true; // tracks if no sensor was selected on previous click
-  let _lastBuiltDisplayTab = undefined; // cache key for buildLegend fast-skip
-  let _lastSyncedPaTab = undefined; // cache key for _syncMapPollutant fast-skip
-  let _lastDimKey = undefined; // cache key for _applyLegendDimming
-  let _legendAutoOpenedOnce = legendOpen; // skip auto-open if user already kept legend open
+  // Extracted to ui_legend.js (LegendUI). Instantiated here with the deps
+  // it needs to reach into main()'s shared state (map, current selection,
+  // current state snapshot). The module owns all legend DOM refs, tab/open/
+  // collapsed state, row-tween caches, and the tab click/close/collapse/
+  // toggle event wiring internally. These local consts preserve the
+  // original call sites used elsewhere in main() (buildLegend(),
+  // updateLegendVisibility(), syncLegendToSensor(), syncLegendToMapSelection(),
+  // revertLegendTab(), _syncMapPollutant(), _syncLegendTabVisibility()).
+  const legend = new LegendUI({
+    map,
+    document,
+    getState: () => _currentState(),
+    getSelectedId: () => selectedId,
+    isMobileWidth: _isMobileWidth,
+  });
+  function buildLegend(animate = false) { legend.buildLegend(animate); }
+  function updateLegendVisibility() { legend.updateLegendVisibility(); }
+  function syncLegendToSensor(sensor) { legend.syncLegendToSensor(sensor); }
+  function syncLegendToMapSelection() { legend.syncLegendToMapSelection(); }
+  function revertLegendTab() { legend.revertLegendTab(); }
+  function _syncMapPollutant() { legend._syncMapPollutant(); }
+  function _syncLegendTabVisibility() { legend._syncLegendTabVisibility(); }
 
-  /** Map a pollutant key (PM25, PM10, OZNE, O3, etc.) to a legend tab id. */
-  function pollutantToLegendTab(key) {
-    if (!key) return null;
-    const k = key.toUpperCase();
-    if (k === "PM25" || k === "PM2.5") return "pm25";
-    if (k === "PM10") return "pm10";
-    if (k === "OZNE" || k === "OZONE" || k === "O3") return "o3";
-    if (k === "NO2") return "no2";
-    if (k === "CO") return "co";
-    return null;
-  }
-
-  /** Get the natural (highest-AQI) pollutant tab for the currently selected sensor at playback time. */
-  function _selectedSensorPollutantTab() {
-    if (!selectedId || !map) return null;
-    const key = map.getSelectedNaturalPollutantKey();
-    return pollutantToLegendTab(key);
-  }
-
-  /** The effective pollutant tab: explicit user choice wins, else auto-derived from selected sensor,
-   *  else auto-derived from highest-AQI pollutant visible in the viewport. */
-  function _displayTab() {
-    if (legendTab) return legendTab;
-    if (selectedId) return _selectedSensorPollutantTab();
-    return _viewportAutoTab || "pm25";
-  }
-
-  let _viewportAutoTab = null; // auto-derived from highest-AQI pollutant in viewport
-  let _lastViewportAutoKey = undefined; // cache key to avoid redundant rebuilds
-
-  /** Scan visible sensors and pick the pollutant with the highest center-weighted AQI. */
-  function _updateViewportAutoTab() {
-    if (!map || !legendOpen) return;
-    if (legendTab || selectedId) return;
-    const st = _currentState();
-    const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
-    const bounds = map.getViewportBounds();
-    if (!bounds) return;
-    const pbTimeMs = map.playbackMode ? map.getPlaybackTimeMs() : null;
-    const cLat = (bounds.minLat + bounds.maxLat) / 2;
-    const cLon = (bounds.minLon + bounds.maxLon) / 2;
-    const rLat = (bounds.maxLat - bounds.minLat) / 2;
-    const rLon = (bounds.maxLon - bounds.minLon) / 2;
-    let bestScore = -1;
-    let bestKey = null;
-    for (const s of all) {
-      if (s && s.outlier) continue;
-      if (!isFinite(s.lat) || !isFinite(s.lon)) continue;
-      // For mobile sensors in playback, skip the head-position viewport check
-      // because trail points have their own lat/lon checked individually below.
-      const isMobilePlayback = pbTimeMs != null && map && map._playbackPtsById
-                               && map._playbackPtsById.has(String(s.id));
-      if (!isMobilePlayback) {
-        if (s.lat < bounds.minLat || s.lat > bounds.maxLat
-            || s.lon < bounds.minLon || s.lon > bounds.maxLon) continue;
-      }
-      // Use interpolated readings during playback, live readings otherwise
-      if (pbTimeMs != null && fixedSensorHasHistoryTimes(s)) {
-        const dLat = rLat > 0 ? Math.abs(s.lat - cLat) / rLat : 0;
-        const dLon = rLon > 0 ? Math.abs(s.lon - cLon) / rLon : 0;
-        const dist = Math.min(1, Math.sqrt(dLat * dLat + dLon * dLon));
-        const weight = 1.0 - 0.5 * dist;
-        const r = interpolateFixedReadingsAtTime(s, pbTimeMs);
-        if (r) {
-          for (const k of Object.keys(r)) {
-            const rd = r[k];
-            if (!rd || rd.value == null || rd.outlier) continue;
-            const aqi = valueToAqi(k, rd.value);
-            if (aqi != null) {
-              const score = aqi * weight;
-              if (score > bestScore) { bestScore = score; bestKey = k; }
-            }
-          }
-        }
-      } else if (pbTimeMs != null && map && map._playbackPtsById
-                 && map._playbackPtsById.has(String(s.id))) {
-        // Mobile sensor in playback: use per-point lat/lon for viewport check
-        // and center-distance weighting, with decay gating.
-        const pts = map._playbackPtsById.get(String(s.id));
-        const windowMs = 45 * 60 * 1000;
-        const fadeStartMs = windowMs * 0.80;
-        const minT = pbTimeMs - windowMs;
-        for (let pi = pts.length - 1; pi >= 0; pi--) {
-          const pt = pts[pi];
-          if (pt.tMs > pbTimeMs) continue;
-          if (pt.tMs < minT) break;
-          const ageMs = pbTimeMs - pt.tMs;
-          let decay = 1.0;
-          if (ageMs > fadeStartMs) {
-            const u = (ageMs - fadeStartMs) / (windowMs - fadeStartMs);
-            decay = (1 - u) * (1 - u);
-            if (decay < 0.25) continue;
-          }
-          if (!isFinite(pt.lat) || !isFinite(pt.lon)) continue;
-          if (pt.lat < bounds.minLat || pt.lat > bounds.maxLat
-              || pt.lon < bounds.minLon || pt.lon > bounds.maxLon) continue;
-          const dLat = rLat > 0 ? Math.abs(pt.lat - cLat) / rLat : 0;
-          const dLon = rLon > 0 ? Math.abs(pt.lon - cLon) / rLon : 0;
-          const dist = Math.min(1, Math.sqrt(dLat * dLat + dLon * dLon));
-          const weight = (1.0 - 0.5 * dist) * decay;
-          const pr = pt.readings;
-          if (!pr) continue;
-          for (const k of Object.keys(pr)) {
-            const rd = pr[k];
-            if (!rd || rd.value == null || rd.outlier) continue;
-            const aqi = valueToAqi(k, rd.value);
-            if (aqi != null) {
-              const score = aqi * weight;
-              if (score > bestScore) { bestScore = score; bestKey = k; }
-            }
-          }
-        }
-      } else {
-        const dLat = rLat > 0 ? Math.abs(s.lat - cLat) / rLat : 0;
-        const dLon = rLon > 0 ? Math.abs(s.lon - cLon) / rLon : 0;
-        const dist = Math.min(1, Math.sqrt(dLat * dLat + dLon * dLon));
-        const weight = 1.0 - 0.5 * dist;
-        const r = s && s.readings;
-        if (r) {
-          for (const k of Object.keys(r)) {
-            const rd = r[k];
-            if (!rd || rd.value == null || rd.outlier) continue;
-            const aqi = valueToAqi(k, rd.value);
-            if (aqi != null) {
-              const score = aqi * weight;
-              if (score > bestScore) { bestScore = score; bestKey = k; }
-            }
-          }
-        }
-      }
-    }
-    const newTab = pollutantToLegendTab(bestKey);
-    const cacheKey = `${newTab}|${Math.round(bestScore)}`;
-    if (cacheKey === _lastViewportAutoKey) return;
-    _lastViewportAutoKey = cacheKey;
-    const tabChanged = _viewportAutoTab !== newTab;
-    _viewportAutoTab = newTab;
-    if (tabChanged) {
-      _lastBuiltDisplayTab = undefined;
-      _lastDimKey = undefined;
-      buildLegend(true);
-    } else {
-      _lastDimKey = undefined;
-      _applyLegendDimming();
-    }
-  }
-
-  /** Switch legend content to match a selected sensor's primary reading (without selecting the tab). */
-  function syncLegendToSensor(sensor) {
-    if (!sensor || legendTab != null) return;
-    buildLegend(true);
-    _syncMapPollutant();
-  }
-
-  /** Sync legend content to whatever pollutant the map is currently showing on the selected marker. */
-  function syncLegendToMapSelection() {
-    if (!map) return;
-    if (!legendOpen) return;
-    if (map._isTransientAnimating && map._isTransientAnimating()) return;
-    // Auto-detect highest-AQI pollutant in viewport when no explicit tab or sensor
-    if (!legendTab && !selectedId) { /* _updateViewportAutoTab(); */ _applyLegendDimming(); return; }
-    // Re-run dimming when a tab is active (viewport may have changed)
-    if (legendTab != null) { _applyLegendDimming(); if (!selectedId) return; }
-    if (!selectedId) return;
-    buildLegend(true);
-    _syncMapPollutant();
-  }
-
-  /** Revert legend tab to the user's manual choice. */
-  function revertLegendTab() {
-    if (legendTab !== userLegendTab && LEGEND_DATA[userLegendTab]) {
-      legendTab = userLegendTab;
-      buildLegend(true);
-      _syncMapPollutant();
-    }
-  }
-
-  const LEGEND_DATA = {
-    pm25: {
-      name: "Fine Particles",
-      unit: "\u00b5g/m\u00b3",
-      // EPA AQI standard – colors match server _get_aqi_color
-      // Sub-gradients within Good match Utah AQ API trail colors
-      // EPA 2024 PM2.5 (24-hr) breakpoints with clean sub-gradients within Good.
-      // Good: 0–9.0, Moderate: 9.1–35.4, USG: 35.5–55.4, Unhealthy: 55.5–125.4,
-      // V.Unhealthy: 125.5–225.4, Hazardous: 225.5+
-      entries: [
-        { color: "#00FFFF", lo: 0,   hi: 2,   w: 12 },
-        { color: "#00CCFF", lo: 2,   hi: 5,   w: 12 },
-        { color: "#00E400", lo: 5,   hi: 9,   w: 12,  label: "Good" },
-        { color: "#FFFF00", lo: 9,   hi: 35,  w: 18,  label: "Moderate" },
-        { color: "#FF7E00", lo: 35,  hi: 55,  w: 29,  label: "Sensitive Groups" },
-        { color: "#FF0000", lo: 55,  hi: 125, w: 65,  label: "Unhealthy" },
-        { color: "#8F3F97", lo: 125, hi: 225, w: 117, label: "Very Unhealthy" },
-        { color: "#7E0023", lo: 225, hi: null, w: 260, label: "Hazardous" },
-      ],
-    },
-    pm10: {
-      name: "Coarse Particles",
-      unit: "\u00b5g/m\u00b3",
-      // Pill widths proportional to concentration within PM10's own scale
-      // (~600 µg/m³ max, 260px). PM10 harm rises more steadily than PM2.5.
-      entries: [
-        { color: "#00FFFF", lo: 0,   hi: 15,  w: 12 },
-        { color: "#00CCFF", lo: 15,  hi: 30,  w: 13 },
-        { color: "#0099FF", lo: 30,  hi: 40,  w: 17 },
-        { color: "#00E400", lo: 40,  hi: 54,  w: 23,  label: "Good" },
-        { color: "#FFFF00", lo: 54,  hi: 154, w: 66,  label: "Moderate" },
-        { color: "#FF7E00", lo: 154, hi: 254, w: 110, label: "Sensitive Groups" },
-        { color: "#FF0000", lo: 254, hi: 354, w: 153, label: "Unhealthy" },
-        { color: "#8F3F97", lo: 354, hi: 424, w: 183, label: "Very Unhealthy" },
-        { color: "#7E0023", lo: 424, hi: null, w: 260, label: "Hazardous" },
-      ],
-    },
-    o3: {
-      name: "Ozone",
-      unit: "ppb",
-      entries: [
-        // Pill widths proportional to concentration within O3's own scale
-        // (~400 ppb max, 260px). Ozone climbs gradually then jumps.
-        { color: "#00CCFF", lo: 0,   hi: 15,  w: 12 },
-        { color: "#0099FF", lo: 15,  hi: 25,  w: 16 },
-        { color: "#009900", lo: 25,  hi: 35,  w: 23 },
-        { color: "#006600", lo: 35,  hi: 54,  w: 35,  label: "Good" },
-        { color: "#FFFF00", lo: 54,  hi: 70,  w: 46,  label: "Moderate" },
-        { color: "#FF7E00", lo: 70,  hi: 85,  w: 55,  label: "Sensitive Groups" },
-        { color: "#FF0000", lo: 85,  hi: 105, w: 68,  label: "Unhealthy" },
-        { color: "#8F3F97", lo: 105, hi: 200, w: 130, label: "Very Unhealthy" },
-        { color: "#7E0023", lo: 200, hi: null, w: 260, label: "Hazardous" },
-      ],
-    },
-    no2: {
-      name: "Nitrogen Dioxide",
-      unit: "ppb",
-      // EPA NO2 1-hour breakpoints (ppb).
-      // Good: 0–53, Moderate: 54–100, USG: 101–360, Unhealthy: 361–649,
-      // V.Unhealthy: 650–1249, Hazardous: 1250+
-      entries: [
-        { color: "#00CCFF", lo: 0,   hi: 20,  w: 12 },
-        { color: "#0099FF", lo: 20,  hi: 35,  w: 15 },
-        { color: "#00E400", lo: 35,  hi: 53,  w: 21,  label: "Good" },
-        { color: "#FFFF00", lo: 53,  hi: 100, w: 35,  label: "Moderate" },
-        { color: "#FF7E00", lo: 100, hi: 360, w: 75,  label: "Sensitive Groups" },
-        { color: "#FF0000", lo: 360, hi: 649, w: 130, label: "Unhealthy" },
-        { color: "#8F3F97", lo: 649, hi: 1249, w: 195, label: "Very Unhealthy" },
-        { color: "#7E0023", lo: 1249, hi: null, w: 260, label: "Hazardous" },
-      ],
-    },
-    co: {
-      name: "Carbon Monoxide",
-      unit: "ppm",
-      // EPA CO 8-hour breakpoints (ppm).
-      // Good: 0–4.4, Moderate: 4.5–9.4, USG: 9.5–12.4, Unhealthy: 12.5–15.4,
-      // V.Unhealthy: 15.5–30.4, Hazardous: 30.5+
-      entries: [
-        { color: "#00CCFF", lo: 0,    hi: 1.5,  w: 12 },
-        { color: "#0099FF", lo: 1.5,  hi: 3.0,  w: 15 },
-        { color: "#00E400", lo: 3.0,  hi: 4.4,  w: 21,  label: "Good" },
-        { color: "#FFFF00", lo: 4.4,  hi: 9.4,  w: 46,  label: "Moderate" },
-        { color: "#FF7E00", lo: 9.4,  hi: 12.4, w: 60,  label: "Sensitive Groups" },
-        { color: "#FF0000", lo: 12.4, hi: 15.4, w: 75,  label: "Unhealthy" },
-        { color: "#8F3F97", lo: 15.4, hi: 30.4, w: 148, label: "Very Unhealthy" },
-        { color: "#7E0023", lo: 30.4, hi: null,  w: 260, label: "Hazardous" },
-      ],
-    },
-  };
-
-  // Track live row DOM nodes for tweening between pollutant tabs.
-  let _legendRows = [];       // current row elements in the DOM
-  let _legendEntryCount = 0;  // how many entries the current legend has
-  const LEGEND_TWEEN_MS = 300;
-
-  function _buildBracketInfo(entries) {
-    const catAssign = new Array(entries.length).fill("");
-    let currentCat = "";
-    for (let i = entries.length - 1; i >= 0; i--) {
-      if (entries[i].label) currentCat = entries[i].label;
-      catAssign[i] = currentCat;
-    }
-    const dimGroups = [];
-    let groupStart = 0;
-    for (let i = 0; i < entries.length; i++) {
-      if (i === entries.length - 1 || catAssign[i] !== catAssign[i + 1]) {
-        if (catAssign[i]) dimGroups.push({ name: catAssign[i], startIdx: groupStart, endIdx: i });
-        groupStart = i + 1;
-      }
-    }
-    return { catAssign, dimGroups };
-  }
-
-  function _makeBracketHtml(i, dimGroups) {
-    const g = dimGroups.find(g => i >= g.startIdx && i <= g.endIdx);
-    if (!g) return `<div class="legendBracket"></div>`;
-    const isFirst = (i === g.startIdx), isLast = (i === g.endIdx), isOnly = (g.startIdx === g.endIdx);
-    let cls = "legendBracket";
-    if (isOnly) cls += " legendBracketOnly";
-    else if (isFirst) cls += " legendBracketTop";
-    else if (isLast) cls += " legendBracketBot";
-    else cls += " legendBracketMid";
-    const midIdx = Math.floor((g.startIdx + g.endIdx) / 2);
-    const lbl = (i === midIdx) ? `<span class="legendCatLabel">${g.name}</span>` : "";
-    return `<div class="${cls}">${lbl}</div>`;
-  }
-
-  // Subtle inner edge glow, colour-matched to the pill.
-  // Pill is 16 px tall (8 px radius). Spread ≤1 px keeps the glow confined
-  // to the perimeter; blur 3 px bleeds it gently inward without flooding the centre.
-  function _pillInnerShadow(color) {
-    const glow = hexToRgba(color, 0.30);  // ambient halo from all edges in pill hue
-    const rim  = hexToRgba(color, 0.18);  // softer top-rim in same hue
-    return `inset 0 0 3px 1px ${glow}, inset 0 1px 2px ${rim}`;
-  }
-
-  function _createLegendRow(entry, idx, dimGroups, useDecimal) {
-    const fmt = (v) => (useDecimal && v != null) ? Number(v).toFixed(1) : `${v}`;
-    const e = entry;
-    const loText = e.hi != null ? fmt(e.lo) : `${fmt(e.lo)}+`;
-    const hiText = e.hi != null ? fmt(e.hi) : "";
-    const row = document.createElement("div");
-    row.className = "legendRow";
-    const pillHtml = `<div class="legendPill" style="width:${e.w}px;background:${e.color};border-color:${darkenHex(e.color,0.55)};box-shadow:${_pillInnerShadow(e.color)}"></div>`;
-    const rangeInner = `<span class="legendLo">${loText}</span>` +
-      (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
-    const leftZone = `<div class="legendLeftZone">${pillHtml}</div><div class="legendRange"><div class="legendRangeBg">${rangeInner}</div></div>`;
-    row.innerHTML = leftZone + _makeBracketHtml(idx, dimGroups);
-    return row;
-  }
-
-  function _updateRowContent(row, entry, idx, dimGroups, useDecimal) {
-    const fmt = (v) => (useDecimal && v != null) ? Number(v).toFixed(1) : `${v}`;
-    const e = entry;
-    // Tween the pill bar (CSS transition handles the back-in curve)
-    const pill = row.querySelector(".legendPill");
-    if (pill) {
-      pill.style.width = `${e.w}px`;
-      pill.style.background = e.color;
-      pill.style.borderColor = darkenHex(e.color, 0.55);
-      pill.style.boxShadow = _pillInnerShadow(e.color);
-    }
-    // True crossfade for range text: ghost overlay inside oldBg fades out to reveal new content
-    const rangeEl = row.querySelector(".legendRange");
-    if (rangeEl) {
-      const oldBg = rangeEl.querySelector(".legendRangeBg");
-      if (oldBg) {
-        const loText = e.hi != null ? fmt(e.lo) : `${fmt(e.lo)}+`;
-        const hiText = e.hi != null ? fmt(e.hi) : "";
-        const newInner = `<span class="legendLo">${loText}</span>` +
-          (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
-        // Skip if text unchanged
-        if (oldBg.innerHTML !== newInner) {
-          // Clone old content as ghost inside oldBg (which gets position:relative)
-          const ghost = document.createElement("span");
-          ghost.innerHTML = oldBg.innerHTML;
-          ghost.style.cssText = "position:absolute;inset:0;display:inline-flex;align-items:center;opacity:1;transition:opacity 0.2s ease-out;pointer-events:none;";
-          oldBg.style.position = "relative";
-          oldBg.innerHTML = newInner;
-          oldBg.appendChild(ghost);
-          // Double-rAF: ghost fades out, new content is already visible underneath
-          requestAnimationFrame(() => { requestAnimationFrame(() => {
-            ghost.style.opacity = "0";
-          }); });
-          // Clean up ghost after transition
-          setTimeout(() => {
-            if (ghost.parentNode) ghost.parentNode.removeChild(ghost);
-            oldBg.removeAttribute("style");
-          }, 250);
-        }
-      }
-    }
-    // Crossfade bracket labels
-    const oldBracket = row.querySelector(".legendBracket");
-    if (oldBracket) {
-      const newHtml = _makeBracketHtml(idx, dimGroups);
-      const _tmp = document.createElement("div");
-      _tmp.innerHTML = newHtml;
-      const _ref = _tmp.firstChild;
-      if (oldBracket.className !== _ref.className || oldBracket.innerHTML !== _ref.innerHTML) {
-        // Clone old content as ghost inside the bracket (which has position:relative)
-        const ghost = document.createElement("span");
-        ghost.innerHTML = oldBracket.innerHTML;
-        ghost.style.cssText = "position:absolute;inset:0;display:flex;align-items:center;justify-content:flex-end;opacity:1;transition:opacity 0.2s ease-out;pointer-events:none;";
-        oldBracket.appendChild(ghost);
-        // Replace bracket content in-place
-        oldBracket.className = _ref.className;
-        // Set new label content (ghost covers it during crossfade)
-        const newLabel = _ref.innerHTML;
-        oldBracket.innerHTML = newLabel;
-        oldBracket.appendChild(ghost);
-        oldBracket.style.opacity = "1";
-        // Double-rAF crossfade
-        requestAnimationFrame(() => { requestAnimationFrame(() => {
-          ghost.style.opacity = "0";
-        }); });
-        setTimeout(() => {
-          if (ghost.parentNode) ghost.parentNode.removeChild(ghost);
-          oldBracket.removeAttribute("style");
-        }, 250);
-      }
-    }
-  }
-
-  /** Instant (no-transition) update of a legend row — sets properties directly, no ghosts. */
-  function _updateRowInstant(row, entry, idx, dimGroups, useDecimal) {
-    const fmt = (v) => (useDecimal && v != null) ? Number(v).toFixed(1) : `${v}`;
-    const e = entry;
-    const pill = row.querySelector(".legendPill");
-    if (pill) {
-      pill.style.width = `${e.w}px`;
-      pill.style.background = e.color;
-      pill.style.borderColor = darkenHex(e.color, 0.55);
-      pill.style.boxShadow = _pillInnerShadow(e.color);
-    }
-    const rangeEl = row.querySelector(".legendRange");
-    if (rangeEl) {
-      const bg = rangeEl.querySelector(".legendRangeBg");
-      if (bg) {
-        const loText = e.hi != null ? fmt(e.lo) : `${fmt(e.lo)}+`;
-        const hiText = e.hi != null ? fmt(e.hi) : "";
-        bg.innerHTML = `<span class="legendLo">${loText}</span>` +
-          (hiText ? `<span class="legendDash">\u2013</span><span class="legendHi">${hiText}</span>` : ``);
-        bg.removeAttribute("style");
-      }
-    }
-    const oldBracket = row.querySelector(".legendBracket");
-    if (oldBracket) {
-      const newHtml = _makeBracketHtml(idx, dimGroups);
-      const _tmp = document.createElement("div");
-      _tmp.innerHTML = newHtml;
-      const _ref = _tmp.firstChild;
-      if (oldBracket.className !== _ref.className || oldBracket.innerHTML !== _ref.innerHTML) {
-        oldBracket.outerHTML = newHtml;
-      } else {
-        oldBracket.removeAttribute("style");
-      }
-    }
-  }
-
-  /** Dim legend rows whose lo-bound exceeds the active sensor (or max-sensor) reading value. */
-  const _DIM_READING_KEYS = {
-    pm25: ["PM25", "PM2.5", "pm25", "pm2.5"],
-    pm10: ["PM10", "pm10"],
-    o3:   ["OZNE", "O3", "OZONE", "ozone", "o3"],
-    no2:  ["NO2", "no2"],
-    co:   ["CO", "co"],
-  };
-  function _applyLegendDimming() {
-    if (!_legendRows || _legendRows.length === 0) return;
-    const displayTab = _displayTab();
-    const tabKey = displayTab || "pm25";
-    const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
-    const entries = data.entries;
-    // Active value:
-    //   1. Selected sensor — its own reading for the displayed pollutant.
-    //   2. Otherwise — the rendered FIELD's max AQI, mapped through the
-    //      displayed tab's bracket scale. Sampled once in `_computePaFieldSync`
-    //      from the kernel-regressed field grid over the viewport — never
-    //      from raw trail readings.
-    let activeValue = null;
-    if (map && selectedId) {
-      const v = map.getSelectedPollutantValue();
-      if (v != null && isFinite(v)) activeValue = v;
-    } else if (map && map._paFieldMaxAqi != null && isFinite(map._paFieldMaxAqi)) {
-      activeValue = _fieldAqiToLegendValue(tabKey, map._paFieldMaxAqi);
-    }
-    // Only touch row DOM when the value crosses a bracket boundary. Tab
-    // colors depend on the selected sensor / per-pollutant data and must
-    // refresh whenever this function runs, even if the dim bracket is
-    // unchanged, so we update them ahead of the dim-row skip.
-    _applyLegendTabColors();
-    // Find the first row that would dim (lo > activeValue) — that index IS the bracket.
-    // When activeValue is null (no field data yet), keep the last bracket — never
-    // revert to showing all rows undimmed.
-    if (activeValue == null && _lastDimKey != null) return;
-    let bracket = -1;
-    if (activeValue != null) {
-      for (let i = 0; i < entries.length; i++) {
-        if (entries[i].lo > activeValue) { bracket = i; break; }
-      }
-      if (bracket === -1) bracket = entries.length; // above all brackets
-    }
-    const dimKey = `${tabKey}|${bracket}`;
-    if (dimKey === _lastDimKey) return;
-    _lastDimKey = dimKey;
-    for (let i = 0; i < _legendRows.length; i++) {
-      if (!entries[i]) continue;
-      _legendRows[i].classList.toggle("legendRow--dim", bracket >= 0 && i >= bracket);
-    }
-  }
-
-  function buildLegend(animate = false) {
-    if (!legendBodyEl) return;
-    // Explicit user action (tab click): always invalidate the dim cache so
-    // stale values from the previous pollutant never persist.
-    if (animate) _lastDimKey = undefined;
-    const displayTab = _displayTab();
-    // Fast-skip: nothing changed since last build.
-    // Include selectedId so sensor selection always refreshes tab highlighting.
-    const buildKey = `${legendTab}|${displayTab}|${selectedId || ""}`;
-    if (_legendEntryCount > 0 && buildKey === _lastBuiltDisplayTab) { _applyLegendDimming(); return; }
-    _lastBuiltDisplayTab = buildKey;
-    const data = (displayTab && LEGEND_DATA[displayTab]) || LEGEND_DATA.pm25;
-    const legendNameEl = document.getElementById("legendName");
-    if (legendNameEl) legendNameEl.textContent = displayTab ? data.name : "Show All";
-    if (legendUnitEl) legendUnitEl.textContent = data.unit;
-
-    const entries = data.entries;
-    const { dimGroups } = _buildBracketInfo(entries);
-    const useDecimal = entries.some(e =>
-      (e.lo != null && e.lo % 1 !== 0) || (e.hi != null && e.hi % 1 !== 0)
-    );
-
-    const oldCount = _legendEntryCount;
-    const newCount = entries.length;
-    const commonCount = Math.min(oldCount, newCount);
-
-    // First render: full build (no existing DOM to tween from)
-    if (oldCount === 0 || _legendRows.length === 0) {
-      legendBodyEl.innerHTML = "";
-      _legendRows = [];
-      for (let i = 0; i < newCount; i++) {
-        const row = _createLegendRow(entries[i], i, dimGroups, useDecimal);
-        legendBodyEl.appendChild(row);
-        _legendRows.push(row);
-      }
-      _legendEntryCount = newCount;
-      const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
-      const autoTabKey = legendTab == null ? displayTab : null;
-      for (const t of tabs) {
-        const k = t.dataset.legend;
-        t.classList.toggle("active", k === legendTab);
-        t.classList.toggle("auto-active", legendTab == null && k === autoTabKey);
-        t.classList.toggle("tab-dim", (legendTab != null ? k !== legendTab : autoTabKey != null && k !== autoTabKey));
-      }
-      _syncLegendTabVisibility();
-      _applyLegendDimming();
-      return;
-    }
-
-    // ── Update existing DOM in place (always — never tear down) ──
-
-    // When not animating, suppress CSS transitions so changes are instant
-    if (!animate) {
-      legendBodyEl.classList.add("legend-no-transition");
-    }
-
-    // Tween (or instant-set) existing rows: bar width/color + text
-    for (let i = 0; i < commonCount; i++) {
-      if (animate) {
-        _updateRowContent(_legendRows[i], entries[i], i, dimGroups, useDecimal);
-      } else {
-        // Instant: set properties directly, no crossfade ghosts
-        _updateRowInstant(_legendRows[i], entries[i], i, dimGroups, useDecimal);
-      }
-    }
-
-    // Remove excess rows
-    if (oldCount > newCount) {
-      for (let i = newCount; i < oldCount; i++) {
-        const row = _legendRows[i];
-        if (animate) {
-          row.classList.add("leaving");
-          setTimeout(() => { if (row.parentNode) row.parentNode.removeChild(row); }, LEGEND_TWEEN_MS);
-        } else {
-          if (row.parentNode) row.parentNode.removeChild(row);
-        }
-      }
-      _legendRows.length = newCount;
-    }
-
-    // Add new rows
-    if (newCount > oldCount) {
-      for (let i = oldCount; i < newCount; i++) {
-        const row = _createLegendRow(entries[i], i, dimGroups, useDecimal);
-        if (animate) row.classList.add("entering");
-        legendBodyEl.appendChild(row);
-        _legendRows.push(row);
-        if (animate) requestAnimationFrame(() => { row.classList.remove("entering"); });
-      }
-    }
-
-    _legendEntryCount = newCount;
-    const tabs = legendEl ? legendEl.querySelectorAll(".legendTab") : [];
-    const autoTabKey = legendTab == null ? displayTab : null;
-    for (const t of tabs) {
-      const k = t.dataset.legend;
-      t.classList.toggle("active", k === legendTab);
-      t.classList.toggle("auto-active", legendTab == null && k === autoTabKey);
-      t.classList.toggle("tab-dim", (legendTab != null ? k !== legendTab : autoTabKey != null && k !== autoTabKey));
-    }
-    _syncLegendTabVisibility();
-    _applyLegendDimming();
-
-    // Re-enable transitions after instant update completes
-    if (!animate) {
-      // Use rAF to ensure the browser has painted the instant values
-      // before re-enabling transitions
-      requestAnimationFrame(() => {
-        legendBodyEl.classList.remove("legend-no-transition");
-      });
-    }
-  }
-
-  /** Hide legend tabs for pollutants not present in any sensor's readings.
-   *  PM2.5 and O3 are always shown; others appear only when data exists. */
-  const _ALWAYS_VISIBLE_TABS = new Set(["pm25", "o3"]);
-  let _lastAvailableTabs = null;
-  function _syncLegendTabVisibility() {
-    if (!legendEl) return;
-    const st = _currentState();
-    const all = (Array.isArray(st.fixed) ? st.fixed : []).concat(Array.isArray(st.mobile) ? st.mobile : []);
-    const found = new Set();
-    for (const s of all) {
-      const r = s && s.readings;
-      if (!r) continue;
-      for (const k of Object.keys(r)) {
-        const tab = pollutantToLegendTab(k);
-        if (tab) found.add(tab);
-      }
-    }
-    // Build a stable key to skip DOM work when nothing changed
-    const availKey = Array.from(found).sort().join(",");
-    if (availKey === _lastAvailableTabs) return;
-    _lastAvailableTabs = availKey;
-
-    for (const t of legendEl.querySelectorAll(".legendTab")) {
-      const tab = t.dataset.legend;
-      const visible = _ALWAYS_VISIBLE_TABS.has(tab) || found.has(tab);
-      t.style.display = visible ? "" : "none";
-    }
-  }
-
-  function updateLegendVisibility() {
-    if (legendEl) {
-      legendEl.classList.toggle("hidden", !legendOpen);
-      legendEl.classList.toggle("legend--collapsed", legendOpen && legendCollapsed);
-    }
-    if (legendToggleEl) legendToggleEl.classList.toggle("active", legendOpen);
-    if (legendCollapseEl) {
-      const svg = legendCollapseEl.querySelector("svg");
-      if (svg) svg.style.transform = legendCollapsed ? "rotate(180deg)" : "";
-      legendCollapseEl.title = legendCollapsed ? "Expand legend" : "Collapse legend";
-    }
-    localStorage.setItem(LEGEND_OPEN_KEY, legendOpen ? "true" : "false");
-    localStorage.setItem(LEGEND_COLLAPSED_KEY, legendCollapsed ? "true" : "false");
-    if (legendOpen) _applyLegendTabColors();
-    else _clearLegendTabColors();
-  }
-
-  let _lastTabColorKey = undefined;
-  const _persistedTabColors = {}; // last-known color per tab key
-  /** aqi.js pollutant key per legend tab (for aqiToValue). */
-  const _TAB_AQI_KEY = { pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co" };
-  /** Convert a per-pollutant field AQI to the concentration unit the legend
-   *  brackets are authored in. O3 legend bands are in ppb but aqi.js works
-   *  in ppm, so scale that one pollutant. */
-  function _fieldAqiToLegendValue(tabKey, aqi) {
-    if (aqi == null || !isFinite(aqi)) return null;
-    const aqiKey = _TAB_AQI_KEY[tabKey] || "pm2.5";
-    let v = aqiToValue(aqiKey, aqi);
-    if (v == null || !isFinite(v)) return null;
-    if (tabKey === "o3") v *= 1000;
-    return v;
-  }
-  /** In collapsed mode, color each tab's text using the same AQI color logic as the bars.
-   *  Sources, in priority order:
-   *    1. Selected sensor — color each tab from that sensor's own readings.
-   *    2. Otherwise — sample the rendered FIELD's max AQI (one value, set
-   *       by `_computePaFieldSync` from the kernel-regressed grid) and map
-   *       it through each tab's bracket scale. The field is authoritative;
-   *       trails are not consulted directly. */
-  function _applyLegendTabColors() {
-    if (!legendEl) return;
-    const tabs = legendEl.querySelectorAll(".legendTab");
-
-    const selectedSensor = (map && selectedId)
-      ? (() => {
-          const st = _currentState();
-          const sel = parseKey(selectedId);
-          if (!sel) return null;
-          const list = sel.type === "mobile"
-            ? (Array.isArray(st.mobile) ? st.mobile : [])
-            : (Array.isArray(st.fixed) ? st.fixed : []);
-          return list.find(s => s && String(s.id) === String(sel.id)) || null;
-        })()
-      : null;
-
-    // Per-pollutant field maxes from the map — one AQI value per tab.
-    // Lazy getter: only computes when stale; reuses memoized bag otherwise.
-    // Keeps the field render path cheap when no one is reading legend colors.
-    const perPollField = (map && typeof map.getPerPollutantFieldMax === "function")
-      ? map.getPerPollutantFieldMax()
-      : null;
-
-    for (const tab of tabs) {
-      const tabKey = tab.dataset.legend;
-      if (!tabKey || !LEGEND_DATA[tabKey]) continue;
-      const data = LEGEND_DATA[tabKey];
-      const entries = data.entries;
-      let activeValue = null;
-      // Prefer the map's readings bag at the DISPLAYED time — same source as
-      // the marker label and legend bars. The state snapshot is live-only and
-      // diverges from the marker during playback (wrong title colors).
-      const selReadings = (selectedId && map && typeof map.getSelectedReadings === "function" && map.getSelectedReadings())
-        || (selectedSensor && selectedSensor.readings) || null;
-      if (selReadings) {
-        const keys = _DIM_READING_KEYS[tabKey] || [];
-        for (const rk of keys) {
-          let rd = selReadings[rk];
-          if (rd != null && typeof rd !== "object") rd = { value: rd };
-          if (rd && rd.value != null && isFinite(rd.value)) {
-            const n = parseFloat(rd.value);
-            if (isFinite(n)) { activeValue = n; break; }
-          }
-        }
-      }
-      if (activeValue == null && perPollField) {
-        activeValue = _fieldAqiToLegendValue(tabKey, perPollField[tabKey]);
-      }
-      let color = null;
-      if (activeValue != null) {
-        for (let i = entries.length - 1; i >= 0; i--) {
-          if (activeValue >= entries[i].lo) {
-            color = entries[i].color;
-            break;
-          }
-        }
-      }
-      if (color) {
-        _persistedTabColors[tabKey] = color;
-      } else {
-        color = _persistedTabColors[tabKey] || null;
-      }
-      if (color) {
-        tab.style.color = color;
-        tab.style.filter = "none";
-        tab.style.textShadow = `0 0 6px ${hexToRgba(color, 0.4)}`;
-        // Preserve the pre-color dim contrast: the active/auto-active tab
-        // reads full-strength, others read at reduced opacity so the
-        // selected pollutant pops without graying out the others.
-        const isPrimary = tab.classList.contains("active")
-          || tab.classList.contains("auto-active");
-        tab.style.opacity = isPrimary ? "" : "0.5";
-      } else {
-        tab.style.color = "";
-        tab.style.filter = "";
-        tab.style.textShadow = "";
-        tab.style.opacity = "";
-      }
-    }
-  }
-  function _clearLegendTabColors() {
-    if (!legendEl) return;
-    for (const tab of legendEl.querySelectorAll(".legendTab")) {
-      tab.style.color = "";
-      tab.style.filter = "";
-      tab.style.textShadow = "";
-    }
-  }
-
-  /** Sync PA field pollutant to match legend display (explicit tab or sensor-derived). */
-  /** Sync map-layer pollutant state (PA field + marker override) to match legend.
-   *  Only explicit tab clicks and sensor-derived tabs affect the map layers.
-   *  Viewport auto-tab only drives the legend panel UI. */
-  function _syncMapPollutant() {
-    if (!map) return;
-    const mapTab = legendTab || (selectedId ? _selectedSensorPollutantTab() : null);
-    const syncKey = `${legendTab}|${mapTab}`;
-    if (syncKey === _lastSyncedPaTab) return;
-    _lastSyncedPaTab = syncKey;
-    if (typeof map.setPaFieldPollutant === "function") map.setPaFieldPollutant(mapTab);
-    if (typeof map.setMarkerPollutantOverride === "function") map.setMarkerPollutantOverride(legendTab);
-  }
-
-  buildLegend();
-  updateLegendVisibility();
-
-  // Legend tab clicks + hover highlight
-  if (legendEl) {
-    const allTabs = legendEl.querySelectorAll(".legendTab");
-    for (const tab of allTabs) {
-      // Activate on mousedown (not click) for snappier perceived response.
-      // Button 0 only — ignore right/middle. preventDefault so a follow-up
-      // click event doesn't double-fire the toggle.
-      tab.addEventListener("mousedown", (ev) => {
-        if (ev.button !== 0) return;
-        ev.preventDefault();
-        const clicked = tab.dataset.legend || "pm25";
-        legendTab = (clicked === legendTab) ? null : clicked;
-        userLegendTab = legendTab;
-        legendUserOverride = !!selectedId;
-        if (legendTab) localStorage.setItem(LEGEND_TAB_KEY, legendTab);
-        else localStorage.removeItem(LEGEND_TAB_KEY);
-        _lastViewportAutoKey = undefined;
-        _syncMapPollutant();
-        buildLegend(true);
-      });
-      tab.addEventListener("mouseenter", () => {
-        if (legendTab != null) return; // user has a tab selected, don't interfere
-        const hovered = tab.dataset.legend || "pm25";
-        for (const t of allTabs) {
-          const k = t.dataset.legend;
-          t.classList.toggle("auto-active", k === hovered);
-          t.classList.toggle("tab-dim", k !== hovered);
-        }
-      });
-      tab.addEventListener("mouseleave", () => {
-        if (legendTab != null) return;
-        // Restore: re-derive from current state (selected sensor, or viewport auto)
-        const autoTabKey = selectedId ? _selectedSensorPollutantTab() : _viewportAutoTab;
-        for (const t of allTabs) {
-          const k = t.dataset.legend;
-          t.classList.toggle("auto-active", k === autoTabKey);
-          t.classList.toggle("tab-dim", autoTabKey != null && k !== autoTabKey);
-        }
-      });
-    }
-  }
-
-  if (legendCloseEl) {
-    legendCloseEl.addEventListener("click", () => {
-      legendOpen = false;
-      buildLegend();
-      updateLegendVisibility();
-    });
-  }
-  if (legendCollapseEl) {
-    legendCollapseEl.addEventListener("click", () => {
-      legendCollapsed = !legendCollapsed;
-      updateLegendVisibility();
-    });
-  }
-  if (legendToggleEl) {
-    legendToggleEl.addEventListener("click", () => {
-      legendOpen = !legendOpen;
-      updateLegendVisibility();
-      if (legendOpen) {
-        _lastViewportAutoKey = undefined;
-        // _updateViewportAutoTab();
-        _syncMapPollutant();
-        buildLegend(true);
-      }
-    });
-  }
+  legend.buildLegend();
+  legend.updateLegendVisibility();
 
   // ── Camera history replay (owner only) ──────────────────────────────────────
   // Fetches /api/view/clients, shows a picker of client IDs, and
@@ -1546,225 +554,45 @@ function main() {
     }
   }
 
-  // Theme + per-theme dimming/saturation sliders (persisted).
-  const themeEl = document.getElementById("mapTheme");
-  const dimEl = document.getElementById("mapDim");
-  const satEl = document.getElementById("mapSat");
-
   map.setMaxTrailLen(MAX_TRAIL_LEN);
 
-  function dimToBrightness(dim01) {
-    // dim01: 0..1 where 1 == brightest; map to a conservative brightness range.
-    // 0 -> 0.55, 1 -> 0.90
-    return 0.55 + dim01 * 0.35;
-  }
-
-  // Map theme variants to shared settings key (e.g., carto_dark_all and carto_dark_nolabels share settings)
-  function getThemeSettingsKey(themeKey) {
-    const k = String(themeKey);
-    if (k.startsWith("carto_dark")) return "carto_dark";
-    if (k.startsWith("carto_positron")) return "carto_positron";
-    return k; // osm, carto_voyager, etc. stay as-is
-  }
-
-  function loadDimForTheme(themeKey) {
-    const settingsKey = getThemeSettingsKey(themeKey);
-    const raw = localStorage.getItem(DIM_STORAGE_PREFIX + settingsKey);
-    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
-    const def = t.defaultDim ?? 50;
-    const v = raw == null ? def : Number(raw);
-    const dimMax = isThemeDark(themeKey) ? 150 : 100;
-    const clamped = Math.max(0, Math.min(dimMax, isFinite(v) ? v : def));
-    return clamped;
-  }
-
-  function loadSatForTheme(themeKey) {
-    const settingsKey = getThemeSettingsKey(themeKey);
-    const raw = localStorage.getItem(SAT_STORAGE_PREFIX + settingsKey);
-    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
-    const def = t.defaultSat ?? Math.round(100 * (t.filter?.saturate ?? 0.55));
-    const v = raw == null ? def : Number(raw);
-    const clamped = Math.max(0, Math.min(150, isFinite(v) ? v : def));
-    return clamped;
-  }
-
-  function applyThemeAndFilters(themeKey, dimVal0to100, satVal0to150) {
-    const t = TILE_THEMES[themeKey] || TILE_THEMES.carto_dark_all;
-    // Only call setTheme when the theme actually changes — it clears the tile
-    // cache and forces a full reload, which causes visible flashing when just
-    // adjusting dim/sat sliders.
-    if (map.themeKey !== themeKey) {
-      map.setTheme(themeKey);
-    }
-
-    const dim01 = (dimVal0to100 / 100);
-    const brightness = dimToBrightness(dim01);
-    const isDarkTheme = String(themeKey).includes("dark");
-    // For dark themes, use Sat slider as a "shadow lift" mix (only tiles, overlays unaffected).
-    // Saturation still applies, but we clamp it to avoid making dark basemaps neon.
-    const sat = isDarkTheme ? Math.min(1.0, (satVal0to150 / 100)) : (satVal0to150 / 100);
-    // Lift only kicks in above 100; 100..150 -> 0..0.28 opacity.
-    const shadowLift = isDarkTheme ? clamp((satVal0to150 - 100) / 50, 0, 1) * 0.28 : 0;
-    applyMapFilterVars({
-      saturate: sat,
-      brightness: brightness,
-      contrast: t.filter?.contrast ?? 1.12,
-      shadowLift,
-    });
-    // Set map background color to match theme (prevents flash while tiles load)
-    if (t.bgColor) {
-      document.documentElement.style.setProperty('--map-bg', t.bgColor);
-    }
-  }
-
-  // Detect system color scheme preference
-  function isSystemDarkMode() {
-    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-  }
-  
-  function isThemeDark(themeKey) {
-    return String(themeKey).includes("dark");
-  }
-  
-  function getThemeStorageKey() {
-    return isSystemDarkMode() ? THEME_STORAGE_KEY_DARK : THEME_STORAGE_KEY_LIGHT;
-  }
-  
-  function getDefaultThemeForMode() {
-    // Light themes disabled — always default to dark
-    return "carto_dark_all";
-    // return isSystemDarkMode() ? "carto_dark_all" : "carto_voyager";
-  }
-  
-  function getSavedThemeForCurrentMode() {
-    const key = getThemeStorageKey();
-    const saved = localStorage.getItem(key);
-    return (saved && TILE_THEMES[saved]) ? saved : getDefaultThemeForMode();
-  }
-  
-  function saveThemeForMode(themeKey) {
-    // Save to the appropriate key based on whether this is a dark or light theme
-    const isDark = isThemeDark(themeKey);
-    const key = isDark ? THEME_STORAGE_KEY_DARK : THEME_STORAGE_KEY_LIGHT;
-    localStorage.setItem(key, themeKey);
-    // Also save as the last-active theme so launch doesn't override user choice
-    localStorage.setItem("mobileair.mapTheme.last", themeKey);
-  }
-
-  function getInitialTheme() {
-    // On launch, prefer the last theme the user actively selected.
-    // Only fall back to system-mode default if user never chose a theme.
-    const last = localStorage.getItem("mobileair.mapTheme.last");
-    if (last && TILE_THEMES[last]) return last;
-    return getSavedThemeForCurrentMode();
-  }
-
-  // Track current theme for menu updates
-  let _currentThemeKey = getInitialTheme();
-
-  function applyTheme(themeKey, skipSubmenuUpdate) {
-    _currentThemeKey = themeKey;
-    if (themeEl) themeEl.value = themeKey;
-    const dim = loadDimForTheme(themeKey);
-    if (dimEl) dimEl.value = String(dim);
-    const sat = loadSatForTheme(themeKey);
-    if (satEl) satEl.value = String(sat);
-    applyThemeAndFilters(themeKey, dim, sat);
-    // updateThemeSubmenu is defined later, only call it when triggered by system theme change
-    if (!skipSubmenuUpdate && window._updateThemeSubmenu) window._updateThemeSubmenu();
-  }
-
-  if (themeEl) {
-    const keys = Object.keys(TILE_THEMES);
-    for (const k of keys) {
-      const opt = document.createElement("option");
-      opt.value = k;
-      opt.textContent = TILE_THEMES[k].label || k;
-      themeEl.appendChild(opt);
-    }
-
-    // Load saved theme (prefers last user selection over system mode)
-    const initialTheme = getInitialTheme();
-    applyTheme(initialTheme, true); // skip submenu update on init (not created yet)
-
-    themeEl.addEventListener("change", () => {
-      const k = themeEl.value;
-      _currentThemeKey = k;
-      saveThemeForMode(k);
-      const dim = loadDimForTheme(k);
-      if (dimEl) dimEl.value = String(dim);
-      const sat = loadSatForTheme(k);
-      if (satEl) satEl.value = String(sat);
-      applyThemeAndFilters(k, dim, sat);
-      updateThemeSubmenu();
-    });
-  } else {
-    // Fallback (no UI) - prefer last user selection
-    const fallbackTheme = getInitialTheme();
-    _currentThemeKey = fallbackTheme;
-    const fallbackT = TILE_THEMES[fallbackTheme];
-    applyThemeAndFilters(fallbackTheme, fallbackT.defaultDim ?? 70, Math.round(100 * (fallbackT.filter?.saturate ?? 1.30)));
-  }
-  
-  // System theme auto-switching disabled (light themes disabled)
-  // if (window.matchMedia) {
-  //   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-  //     const newTheme = getSavedThemeForCurrentMode();
-  //     applyTheme(newTheme);
-  //   });
-  // }
-
-  // // Re-check system theme when app returns to foreground (PWA / tab switch).
-  // // The matchMedia 'change' event may not fire while the app is backgrounded,
-  // // so the theme can get out of sync until the user interacts.
-  // {
-  //   let _lastKnownSystemDark = isSystemDarkMode();
-  //   document.addEventListener("visibilitychange", () => {
-  //     if (document.visibilityState !== "visible") return;
-  //     const nowDark = isSystemDarkMode();
-  //     if (nowDark !== _lastKnownSystemDark) {
-  //       _lastKnownSystemDark = nowDark;
-  //       const newTheme = getSavedThemeForCurrentMode();
-  //       // Only switch if the current theme's dark/light doesn't match system
-  //       if (isThemeDark(_currentThemeKey) !== nowDark) {
-  //         applyTheme(newTheme);
-  //       }
-  //     }
-  //   });
-  // }
+  // ── Theme + per-theme dimming/saturation sliders (persisted) ────────────
+  // Extracted to ui_theme.js (ThemeUI). Instantiated here with callbacks so
+  // it can read/write `_currentThemeKey`, which is also written by
+  // updateThemeSubmenu's click handler (still in main()) and read at the
+  // post-loadConfig re-apply below — it stays a main()-owned variable rather
+  // than moving into ThemeUI. These local consts/wrappers preserve the
+  // original call sites used elsewhere in main() (applyTheme,
+  // applyThemeAndFilters, and the DOM refs themeEl/dimEl/satEl used by
+  // updateThemeSubmenu). ThemeUI's constructor performs all of the original
+  // module-load-time wiring (option population, initial applyTheme call,
+  // change/input listeners) as a side effect of construction.
+  let _currentThemeKey;
+  const theme = new ThemeUI({
+    map,
+    document,
+    setCurrentThemeKey: (k) => { _currentThemeKey = k; },
+    getUpdateThemeSubmenu: () => window._updateThemeSubmenu,
+  });
+  const themeEl = theme.themeEl;
+  const dimEl = theme.dimEl;
+  const satEl = theme.satEl;
+  function dimToBrightness(dim01) { return theme.dimToBrightness(dim01); }
+  function getThemeSettingsKey(themeKey) { return theme.getThemeSettingsKey(themeKey); }
+  function loadDimForTheme(themeKey) { return theme.loadDimForTheme(themeKey); }
+  function loadSatForTheme(themeKey) { return theme.loadSatForTheme(themeKey); }
+  function applyThemeAndFilters(themeKey, dimVal0to100, satVal0to150) { return theme.applyThemeAndFilters(themeKey, dimVal0to100, satVal0to150); }
+  function isSystemDarkMode() { return theme.isSystemDarkMode(); }
+  function isThemeDark(themeKey) { return theme.isThemeDark(themeKey); }
+  function getThemeStorageKey() { return theme.getThemeStorageKey(); }
+  function getDefaultThemeForMode() { return theme.getDefaultThemeForMode(); }
+  function getSavedThemeForCurrentMode() { return theme.getSavedThemeForCurrentMode(); }
+  function saveThemeForMode(themeKey) { return theme.saveThemeForMode(themeKey); }
+  function getInitialTheme() { return theme.getInitialTheme(); }
+  function applyTheme(themeKey, skipSubmenuUpdate) { return theme.applyTheme(themeKey, skipSubmenuUpdate); }
 
   // Restore view after map is initialized (theme/filter doesn't affect center/zoom).
   restoreViewIfAny();
-
-  if (dimEl) {
-    dimEl.addEventListener("input", () => {
-      const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_dark_all";
-      const settingsKey = getThemeSettingsKey(themeKey);
-      const isDark = isThemeDark(themeKey);
-      const dimMax = isDark ? 150 : 100;
-      const v = Number(dimEl.value);
-      const clamped = Math.max(0, Math.min(dimMax, isFinite(v) ? v : 50));
-      localStorage.setItem(DIM_STORAGE_PREFIX + settingsKey, String(clamped));
-      const sat = satEl ? Number(satEl.value) : loadSatForTheme(themeKey);
-      const satClamped = Math.max(0, Math.min(150, isFinite(sat) ? sat : loadSatForTheme(themeKey)));
-      applyThemeAndFilters(themeKey, clamped, satClamped);
-    });
-  }
-
-  if (satEl) {
-    satEl.addEventListener("input", () => {
-      const themeKey = (themeEl && TILE_THEMES[themeEl.value]) ? themeEl.value : "carto_dark_all";
-      const settingsKey = getThemeSettingsKey(themeKey);
-      const isDark = isThemeDark(themeKey);
-      const dimMax = isDark ? 150 : 100;
-      const v = Number(satEl.value);
-      const clamped = Math.max(0, Math.min(150, isFinite(v) ? v : loadSatForTheme(themeKey)));
-      localStorage.setItem(SAT_STORAGE_PREFIX + settingsKey, String(clamped));
-      const dim = dimEl ? Number(dimEl.value) : loadDimForTheme(themeKey);
-      const dimClamped = Math.max(0, Math.min(dimMax, isFinite(dim) ? dim : loadDimForTheme(themeKey)));
-      applyThemeAndFilters(themeKey, dimClamped, clamped);
-    });
-  }
 
   /** Return the correct state object for the current mode (historical or live). */
   function _currentState() {
@@ -1779,7 +607,7 @@ function main() {
     // Toggle: clicking the selected sensor again deselects.
     if (id && selectedId === id) {
       selectedId = null;
-      legendUserOverride = false;
+      legend.legendUserOverride = false;
       _wasAlreadyDeselected = false;
       if (map && typeof map.cancelSelectionOrchestration === "function") map.cancelSelectionOrchestration();
       map.setSelected(null);
@@ -1793,13 +621,13 @@ function main() {
     selectedId = id || null;
     // Only reset legend override when on default (null);
     // if user has manually selected a pollutant, keep it.
-    if (legendTab == null) legendUserOverride = false;
+    if (legend.legendTab == null) legend.legendUserOverride = false;
     if (!selectedId) {
-      if (legendTab != null && _wasAlreadyDeselected) {
+      if (legend.legendTab != null && _wasAlreadyDeselected) {
         // Second background click: clear pollutant back to default
-        legendTab = null;
-        userLegendTab = null;
-        legendUserOverride = false;
+        legend.legendTab = null;
+        legend.userLegendTab = null;
+        legend.legendUserOverride = false;
       }
       // Track whether we were already deselected (for next click)
       _wasAlreadyDeselected = true;
@@ -1817,15 +645,15 @@ function main() {
 
     // Auto-open legend on first mobile/fixed selection this session (not PurpleAir)
     const isPurpleAir = item && item.purpleair;
-    if (selectedId && !_legendAutoOpenedOnce && !legendOpen && !isPurpleAir) {
-      _legendAutoOpenedOnce = true;
-      legendOpen = true;
+    if (selectedId && !legend._legendAutoOpenedOnce && !legend.legendOpen && !isPurpleAir) {
+      legend._legendAutoOpenedOnce = true;
+      legend.legendOpen = true;
       updateLegendVisibility();
     }
 
     // Sync legend tab to selected marker's displayed pollutant
     // Only when on the default PM2.5 tab — don't override a user's manual pollutant choice
-    if (legendTab == null) {
+    if (legend.legendTab == null) {
       // Defer sync: the map needs to render one frame with the new selection
       // so _selectedPollutantKey reflects the actual displayed reading
       // (which may differ from live data during playback).
@@ -1888,7 +716,7 @@ function main() {
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       selectedId = null;
-      legendUserOverride = false;
+      legend.legendUserOverride = false;
       _wasAlreadyDeselected = false;
       map.setSelected(null);
       buildLegend();
@@ -1908,144 +736,113 @@ function main() {
   const pbScrubEl = document.getElementById("pbScrub");
   const pbSpeedEl = document.getElementById("pbSpeed");
   const pbDebugEl = document.getElementById("pbDebugPath");
-  const pbLeftEl = document.getElementById("pbLeft");
-  const pbNowEl = document.getElementById("pbNow");
-  const pbRightEl = document.getElementById("pbRight");
   const pbPagePrevEl = document.getElementById("pbPagePrev");
   const pbPageNextEl = document.getElementById("pbPageNext");
 
-  // ── A/B Barrel Jog Wheel ────────────────────────────────────────────────
-  const pbJogWheelEl    = document.getElementById("pbJogWheel");
-  const pbJogBarrelEl   = document.getElementById("pbJogBarrel");
-  const pbBarrelClipEl  = document.getElementById("pbBarrelClip");
-  const pbBarrelCanvas  = document.getElementById("pbBarrelCanvas");
-  const pbBarrelToggle  = document.getElementById("pbBarrelToggle");
-  let _jogWheel = null;          // JogWheel instance (created on first enable)
-  let _barrelMode = false;       // current A/B state
-  const _BARREL_STORAGE_KEY = "mobileair.barrelJogWheel";
-
-  function _setBarrelMode(on) {
-    return; // SHUNT: barrel feature bypassed — restore by removing this line
-    _barrelMode = on;
-    if (pbJogWheelEl) pbJogWheelEl.classList.toggle("hidden", on);
-    if (pbJogBarrelEl) pbJogBarrelEl.classList.toggle("hidden", !on);
-    if (pbBarrelToggle) pbBarrelToggle.checked = on;
-    try { localStorage.setItem(_BARREL_STORAGE_KEY, on ? "1" : "0"); } catch {}
-
-    if (on && !_jogWheel && pbJogBarrelEl && pbBarrelClipEl && pbBarrelCanvas && typeof JogWheel !== "undefined") {
-      _jogWheel = JogWheel.create({
-        wrapEl: pbJogBarrelEl,
-        clipEl: pbBarrelClipEl,
-        canvasEl: pbBarrelCanvas,
-        onWheel(delta) {
-          // Same physics as classic wheel handler on pbScrubEl
-          _pbAtEndSincePerf = null;
-          _pbArrivedAtEndViaPlayback = false;
-          _pbIsRewinding = false;
-          _pbPageAutoFollow = true;
-          map.setPlaybackPlaying(false);
-          map._playbackLiveFollow = false;
-          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-          _pbIsWheelCoasting = true;
-          _pbCommitLoopStartOnCoastEnd = true;
-          if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
-            const pr = _pbGetPageRange();
-            _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
-          }
-          const b = map.getPlaybackBounds();
-          const durMs = (b.maxMs - b.minMs) || 1;
-          const nudgeDur = Math.min(durMs, 21600000); // cap at 6h so scroll speed is consistent
-          const nudge = (delta / 1000) * (nudgeDur / 480);
-          const prevDir = Math.sign(_pbVelocity);
-          _pbVelocity -= nudge;
-          if (prevDir !== 0 && Math.sign(_pbVelocity) !== 0 && Math.sign(_pbVelocity) !== prevDir) {
-            _pbSnapWindowToPlayhead();
-            updatePlaybackUi();
-          }
-          if (!_pbRAF) {
-            _pbLastPerf = performance.now();
-            _pbRAF = requestAnimationFrame(playbackLoop);
-          }
-        },
-        onDragStart() {
-          // Same cancel-all-physics as classic pointerdown
-          _pbVelocity = 0;
-          _pbWheelAccum = 0;
-          _pbAtEndSincePerf = null;
-          _pbArrivedAtEndViaPlayback = false;
-          _pbIsRewinding = false;
-          _pbEaseStartPerf = null;
-          _pbIsWheelCoasting = false;
-          _pbScrubbing = true;
-          map._scrubbing = true;
-          _pbDidDrag = false;
-          map.setPlaybackPlaying(false);
-          map._playbackLiveFollow = false;
-          try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-          _resetLiveTracking();
-          if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
-            const pr = _pbGetPageRange();
-            _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
-          }
-          updatePlaybackUi();
-        },
-        onPositionChange(deltaFrac) {
-          // deltaFrac is already gear-reduced (dx / (width*8))
-          // Map to timeline ms and apply
-          _pbDidDrag = true;
-          const b = map.getPlaybackBounds();
-          const pr = _pbPagingActive() ? _pbGetPageRange() : b;
-          const durMs = (pr.maxMs - pr.minMs) || 1;
-          const tMs = map.getPlaybackTimeMs() || pr.minMs;
-          const newT = clamp(tMs + deltaFrac * durMs, pr.minMs, pr.maxMs);
-          map.setPlaybackTimeMs(newT);
-          map.setPlaybackPlaying(false);
-          // Coalesce render
-          if (!_scrubRAF) {
-            _scrubRAF = requestAnimationFrame(() => {
-              _scrubRAF = 0;
-              map.drawOverlay(map.lastState);
-              updatePlaybackUi();
-            });
-          }
-        },
-        onDragEnd(vel) {
-          _pbSnapWindowToPlayhead();
-          _pbScrubbing = false;
-          map._scrubbing = false;
-          // Convert barrel velocity to timeline velocity for inertial coasting
-          const b = map.getPlaybackBounds();
-          const pr = _pbPagingActive() ? _pbGetPageRange() : b;
-          const durMs = (pr.maxMs - pr.minMs) || 1;
-          _pbVelocity = (vel * durMs) / 16;
-          _pbIsWheelCoasting = false;
-          _pbPageAutoFollow = true;
-          map.setPlaybackPlaying(true);
-          _pbLastPerf = performance.now();
-          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        }
-      });
-    }
-  }
-
-  // Restore saved preference
-  {
-    const saved = localStorage.getItem(_BARREL_STORAGE_KEY);
-    if (saved === "1") _setBarrelMode(true);
-  }
-
-  if (pbBarrelToggle) {
-    pbBarrelToggle.addEventListener("change", () => {
-      _setBarrelMode(pbBarrelToggle.checked);
-    });
-  }
-
-  let _pbRAF = null;
-  let _pbLastPerf = 0;
-  let _pbLastUiPerf = 0;
-  let _pbScrubbing = false;      // true when pointer is down on scrub bar
+  const pb = {
+    _pbRAF: null,
+    _pbLastPerf: 0,
+    _pbLastUiPerf: 0,
+    _pbScrubbing: false,  // true when pointer is down on scrub bar
+    _pbResumeAfterScrub: false,  // was playback active when the scrub began
+    _pbMoveDeltaMs: 0,  // signed ms the playhead last moved (REW direction)
+    _pbPaused: false,  // explicit pause hold — suppresses loop go-live at the edge
+    _pbVelocity: 0,
+    _pbAtEndSincePerf: null,  // performance.now() when we started waiting at end
+    _pbArrivedAtEndViaPlayback: false,  // true only if we PLAYED to the end (not scrolled)
+    _pbEaseStartPerf: null,
+    _pbEaseStartVelocity: 0,
+    _pbEaseStartPos: 0,  // playhead position when ease began
+    _pbIsRewinding: false,
+    _pbLoopStartMs: null,
+    _pbLastKnownMinMs: null,
+    _pbLastKnownMaxMs: null,
+    _pbLastServerResponseMs: Date.now(),
+    _pbLastForceRefreshSeq: null,
+    _pbLiveStartWallMs: null,  // wall-clock time (perf.now) when LIVE mode started
+    _pbLiveStartDataMs: null,  // data time (maxMs) when LIVE mode started
+    _pbLiveTargetMs: null,  // where playback should aim in LIVE mode
+    _pbLiveStallCount: 0,  // how many times we've hit end waiting for data
+    _deferredCameraFit: null,  // { type: "bounds", bb, durationMs } | { type: "storedView", durationMs }
+    _pbWheelAccum: 0,  // accumulated wheel delta
+    _pbDidDrag: false,  // did the user actually drag (vs click)?
+    _pbIsWheelCoasting: false,  // is current coast from wheel scroll?
+    _pbCommitLoopStartOnCoastEnd: false,
+    _pbMwAccum: 0,
+    _pbMwLastTs: 0,  // mouse-wheel velocity accumulator for scrub bar
+    _pbPageIndex: -1,  // -1 = "all" (no paging), 0..N = page index
+    _pbPageAutoFollow: true,  // auto-advance page to follow playhead
+    _pbSlidingWindowCenter: null,  // null = use index-based paging
+    _pbJogRAF: null,  // rAF ID for edge-jog during drag
+    _pbJogLastPerf: 0,  // last rAF timestamp for jog dt
+  };
   let _pbLastScrubPos = 0;
   let _pbLastScrubTime = 0;
+
+  // Extracted to ui_playback.js (PlaybackUI). The module owns the playback DOM
+  // labels/page-arrow refs + barrel jog, the physics/paging constants, and the
+  // scalars used only by the moved functions (_barrelMode, _jogWheel,
+  // _scrubRAF). The shared `pb` object (A4a) is passed BY REFERENCE so the
+  // scrub/click/speed/visibility handlers that stay in main() keep mutating it.
+  // deps.* are lazy getters/callbacks into shared state and helpers that stay
+  // in main() (screensaver flag, sidebar/selection, camera-fit cluster, legend
+  // sync). One-line delegates below preserve the original call sites.
+  const playback = PlaybackUI.create({
+    map,
+    document,
+    pb,
+    deps: {
+      getScreensaverActive: () => _getScreensaverActive(),
+      getSidebarOpen: () => sidebarOpen,
+      getSelectedId: () => selectedId,
+      performCameraFit: (opts) => _performCameraFit(opts),
+      animateFitBoundsLatLon: (bb, opts) => _animateFitBoundsLatLon(bb, opts),
+      animateToStoredView: (ms) => _animateToStoredView(ms),
+      syncMapPollutant: () => _syncMapPollutant(),
+      syncLegendToMapSelection: () => syncLegendToMapSelection(),
+      updateSidebarPlaybackValues: () => updateSidebarPlaybackValues(),
+    },
+  });
+  // Thin delegates keep every original call site in main() untouched.
+  function _resetLiveTracking() { playback._resetLiveTracking(); }
+  function _pbAllVehiclesReachedPlaybackEnd(state) { return playback._pbAllVehiclesReachedPlaybackEnd(state); }
+  function _pbPageCount() { return playback._pbPageCount(); }
+  function _pbGetPageRange() { return playback._pbGetPageRange(); }
+  function _pbSetPage(idx) { return playback._pbSetPage(idx); }
+  function _pbPageForTime(tMs) { return playback._pbPageForTime(tMs); }
+  function _pbSnapWindowToPlayhead() { return playback._pbSnapWindowToPlayhead(); }
+  function _pbPagingActive() { return playback._pbPagingActive(); }
+  const fmtTime = (ms) => playback.fmtTime(ms);
+  const updatePlaybackUi = () => playback.updatePlaybackUi();
+  const playbackLoop = () => playback.playbackLoop();
+  function _setBarrelMode(on) { return playback._setBarrelMode(on); }
+  function setMapLoadingShade(on) { return playback.setMapLoadingShade(on); }
+  const applyScrub = () => playback.applyScrub();
+  function _pbStartEdgeJog() { return playback._pbStartEdgeJog(); }
+  function _pbStopEdgeJog() { return playback._pbStopEdgeJog(); }
+  function _pbEdgeJogTick(now) { return playback._pbEdgeJogTick(now); }
+  // Playback DOM refs the module owns but staying handlers reference.
+  const pbLeftEl = playback.pbLeftEl;
+  const pbNowEl = playback.pbNowEl;
+  const pbRightEl = playback.pbRightEl;
+  // Shared coalescing rAF flag (the scrub pointer/touch listeners below use it).
+  const _getScrubRAF = () => playback.getScrubRAF();
+  const _setScrubRAF = (v) => playback.setScrubRAF(v);
+  // Cross-module wiring (consumed by engine_camera_gestures.js / engine_playback_engine.js).
+  map._resetLiveTracking = playback._resetLiveTracking;
+
+  // playback_state.js (PlaybackState) — single source of truth for runway /
+  // LIVE-mode calculations.  Wired in here (script tag added to index.html) so
+  // it is no longer dead code.  The duplicated runway/live-window math in
+  // updatePlaybackUi, the playbackLoop live-window block, and the pbPlay /
+  // pbSpeed / visibilitychange handlers is the "exact-correspondence" set this
+  // object DRYs up; those call sites are NOT rewritten in this story because
+  // PlaybackState._metaPollSec (isFinite fallback) is not byte-identical to the
+  // inline `?? … ?? 600` math (they differ when both meta poll fields are
+  // absent → NaN vs 600), so substituting would change behavior. The consolidation
+  // is left to a follow-up; instantiating here keeps the module live/available.
+  const playbackState = new PlaybackState(map);
+  window.__playbackState = playbackState;
 
   // ─────────────────────────────────────────────────────────────────────────────
   // PHYSICS-BASED PLAYBACK: Everything is driven by velocity and forces.
@@ -2053,55 +850,30 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   
   // Velocity in "playback ms per wall ms" (1.0 = real-time forward, -15 = fast rewind)
-  let _pbVelocity = 0;
   
   // Track when we hit the end and are waiting for vehicles to physically reach the
   // end of their paths (no fixed pause; rewind triggers when vehicles are done).
-  let _pbAtEndSincePerf = null;   // performance.now() when we started waiting at end
-  let _pbArrivedAtEndViaPlayback = false; // true only if we PLAYED to the end (not scrolled)
   
   // Track when ease-in phase started (for wall-time-based easing)
-  let _pbEaseStartPerf = null;
-  let _pbEaseStartVelocity = 0;
-  let _pbEaseStartPos = 0;  // playhead position when ease began
   
   // Flag to track active rewind (not based on velocity)
-  let _pbIsRewinding = false;
 
   // Replay loop start ("point A"): where playback started / where the user last left the playhead.
   // Auto-rewind returns here instead of rewinding to the global min bound.
-  let _pbLoopStartMs = null;
   
   // Track data bounds to detect new data / trimmed data
-  let _pbLastKnownMinMs = null;
-  let _pbLastKnownMaxMs = null;
 
   // Wall-clock ms (Date.now) when last server response arrived
-  let _pbLastServerResponseMs = Date.now();
 
   // Server can bump this to force LIVE camera follow even if data timestamps are unchanged.
-  let _pbLastForceRefreshSeq = null;
   
   // ─────────────────────────────────────────────────────────────────────────────
   // LIVE BUFFER: Track wall-clock time since app started to know how much data we have.
   // Buffer = time since first data arrival. Playback replays this accumulated buffer.
   // ─────────────────────────────────────────────────────────────────────────────
-  let _pbLiveStartWallMs = null;        // wall-clock time (perf.now) when LIVE mode started
-  let _pbLiveStartDataMs = null;        // data time (maxMs) when LIVE mode started
-  const _pbLiveStallThreshold = 3;      // stalls before auto-rewind in LIVE mode
-  let _pbLiveTargetMs = null;           // where playback should aim in LIVE mode
-  let _pbLiveStallCount = 0;            // how many times we've hit end waiting for data
-  
-  // Helper to reset LIVE tracking (call when exiting LIVE mode)
-  // Exposed on map object so class methods can call it
-  function _resetLiveTracking() {
-    _pbLiveStartWallMs = null;
-    _pbLiveStartDataMs = null;
-    _pbLiveStallCount = 0;
-    _deferredCameraFit = null;
-  }
-  map._resetLiveTracking = _resetLiveTracking;
-  
+  // _resetLiveTracking moved to ui_playback.js (delegate above); map._resetLiveTracking
+  // is assigned there too (consumed by engine modules).
+
   // LIVE camera follow: smooth pan/zoom to fit moving vehicles
   const _pbLiveFollowDurationMs = 2000; // animation duration for camera follow (slow, smooth)
   const _pbLiveFollowPadding = 0.15;    // extra padding around bounds (15%)
@@ -2109,7 +881,6 @@ function main() {
   // Deferred camera fit: when new data arrives while the user is panning/zooming
   // (or during post-interaction easing), we stash the intended camera fit here.
   // The playback loop drains it once _canRunAutoCamera() returns true.
-  let _deferredCameraFit = null; // { type: "bounds", bb, durationMs } | { type: "storedView", durationMs }
 
   // Minimum geographic extent (in degrees) for bounds to be considered "meaningful" movement.
   // ~0.002° lat ≈ 220m. Below this the vehicles are just jittering in place (depot, parking lot).
@@ -2258,7 +1029,7 @@ function main() {
     if (!map || typeof map._canRunAutoCamera !== "function") return;
     if (!map._canRunAutoCamera()) {
       // User is interacting — defer until interaction + easing finishes.
-      _deferredCameraFit = { type: "storedView", durationMs: durationMs || _pbLiveFollowDurationMs };
+      pb._deferredCameraFit = { type: "storedView", durationMs: durationMs || _pbLiveFollowDurationMs };
       return;
     }
     try {
@@ -2292,7 +1063,7 @@ function main() {
     // Exception: force=true (explicit user button click) overrides the cooldown.
     if (!force && map && typeof map._canRunAutoCamera === "function" && !map._canRunAutoCamera()) {
       // Defer: replay this fit once the user stops interacting.
-      _deferredCameraFit = { type: "bounds", bb: { minLat, minLon, maxLat, maxLon }, durationMs };
+      pb._deferredCameraFit = { type: "bounds", bb: { minLat, minLon, maxLat, maxLon }, durationMs };
       return;
     }
 
@@ -2625,52 +1396,13 @@ function main() {
   const _pbVehicleDoneEpsM = 1.0;
   const _pbVehicleDoneVelEpsMps = 0.05;
 
-  function _pbAllVehiclesReachedPlaybackEnd(state) {
-    try {
-      const mobiles = Array.isArray(state?.mobile) ? state.mobile : [];
-      let considered = 0;
-      for (const m of mobiles) {
-        if (!m || m.ghosted) continue;
-        const id = (m.id != null) ? String(m.id) : "";
-        if (!id) continue;
+  // _pbAllVehiclesReachedPlaybackEnd moved to ui_playback.js (delegate above).
 
-        const pts = (map && map._playbackPtsById) ? map._playbackPtsById.get(id) : null;
-        if (!pts || pts.length < 1) continue;
-
-        // Single-point paths are trivially "done".
-        if (pts.length === 1) {
-          considered++;
-          continue;
-        }
-
-        const distInfo = (typeof map?._getPathDistances === "function") ? map._getPathDistances(id, pts) : null;
-        const totalDist = distInfo && isFinite(distInfo.totalDist) ? distInfo.totalDist : 0;
-        const phys = (typeof map?._getPhysicsState === "function") ? map._getPhysicsState(id) : null;
-        const d = phys && isFinite(phys.d) ? phys.d : 0;
-        const v = phys && isFinite(phys.v) ? phys.v : 0;
-
-        considered++;
-        if (!(d >= (totalDist - _pbVehicleDoneEpsM) && v <= _pbVehicleDoneVelEpsMps)) {
-          return false;
-        }
-      }
-      // If we had no vehicles to consider, don't stall.
-      return true;
-    } catch {
-      return true;
-    }
-  }
-  
   // Scroll wheel nudge (iPod-style momentum)
-  let _pbWheelAccum = 0;              // accumulated wheel delta
   const _pbWheelImpulse = 1.0;        // velocity added per wheel tick
   const _pbWheelDecay = 0.8;          // wheel accumulator decay per frame
 
   // Drag tracking
-  let _pbDidDrag = false;             // did the user actually drag (vs click)?
-  let _pbIsWheelCoasting = false;     // is current coast from wheel scroll?
-  let _pbCommitLoopStartOnCoastEnd = false;
-  let _pbMwAccum = 0, _pbMwLastTs = 0; // mouse-wheel velocity accumulator for scrub bar
 
   // ─────────────────────────────────────────────────────────────────────────────
   // PAGING: Slider maps to an 8-hour page instead of the full day.
@@ -2678,677 +1410,23 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   const _pbPageSizeMs = 14400000;         // 4 hours in ms
   const _pbPageMinDurationMs = 0;          // paging always active
-  let _pbPageIndex = -1;                  // -1 = "all" (no paging), 0..N = page index
-  let _pbPageAutoFollow = true;           // auto-advance page to follow playhead
 
   // Sliding window: when set, overrides index-based paging for click-drag scrubbing.
   // The window is centered on this timestamp instead of a fixed page boundary.
-  let _pbSlidingWindowCenter = null;      // null = use index-based paging
-  let _pbJogRAF = null;                   // rAF ID for edge-jog during drag
-  let _pbJogLastPerf = 0;                 // last rAF timestamp for jog dt
 
-  /** Compute total page count for current bounds.
-   *  Uses floor so the last page absorbs any remainder < pageSize,
-   *  keeping scrub resolution reasonable instead of creating a tiny final page. */
-  function _pbPageCount() {
-    const b = map.getPlaybackBounds();
-    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return 0;
-    return Math.max(1, Math.floor((b.maxMs - b.minMs) / _pbPageSizeMs));
-  }
-
-  /** Get the time range for the current page (or full range if paging disabled).
-   *  When _pbSlidingWindowCenter is set, the window is centered on that point
-   *  instead of using index-based page boundaries. */
-  function _pbGetPageRange() {
-    const b = map.getPlaybackBounds();
-    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return b;
-    if (_pbPageIndex < 0) return b; // "all" mode
-
-    // Sliding window mode: center window on _pbSlidingWindowCenter
-    if (_pbSlidingWindowCenter != null) {
-      const half = _pbPageSizeMs / 2;
-      let wMin = _pbSlidingWindowCenter - half;
-      let wMax = _pbSlidingWindowCenter + half;
-      // Clamp to global bounds, preserving window size when possible
-      if (wMin < b.minMs) { wMin = b.minMs; wMax = Math.min(b.maxMs, wMin + _pbPageSizeMs); }
-      if (wMax > b.maxMs) { wMax = b.maxMs; wMin = Math.max(b.minMs, wMax - _pbPageSizeMs); }
-      return { minMs: wMin, maxMs: wMax };
-    }
-
-    const total = _pbPageCount();
-    const idx = clamp(_pbPageIndex, 0, total - 1);
-    const pageStart = b.minMs + idx * _pbPageSizeMs;
-    // Last page extends to cover all remaining time (no short final page)
-    const pageEnd = (idx === total - 1) ? b.maxMs : pageStart + _pbPageSizeMs;
-    return { minMs: pageStart, maxMs: pageEnd };
-  }
-
-  /** Navigate to a specific page index, clamping to valid range. */
-  function _pbSetPage(idx) {
-    const total = _pbPageCount();
-    if (total <= 0) { _pbPageIndex = -1; return; }
-    _pbPageIndex = clamp(idx, 0, total - 1);
-    _pbSlidingWindowCenter = null; // exit sliding window, use index-based page
-    _pbPageAutoFollow = false; // user explicitly chose a page
-    updatePlaybackUi();
-  }
-
-  /** Enable paging and jump to the page containing the given time. */
-  function _pbPageForTime(tMs) {
-    const b = map.getPlaybackBounds();
-    if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;
-    const total = _pbPageCount();
-    if (total <= 0) return;
-    const idx = Math.floor((tMs - b.minMs) / _pbPageSizeMs);
-    _pbPageIndex = clamp(idx, 0, total - 1);
-  }
-
-  /** After user stops scrubbing, re-center the sliding window so the playhead
-   *  sits at 15% (if user was dragging left) or 85% (if dragging right). */
-  function _pbSnapWindowToPlayhead() {
-    if (!_pbPagingActive() || _pbSlidingWindowCenter == null) return;
-    const b = map.getPlaybackBounds();
-    const tMs = map.getPlaybackTimeMs();
-    if (tMs == null || !isFinite(tMs)) return;
-    const pr = _pbGetPageRange();
-    // Determine which edge the playhead is near
-    const fracInPage = (pr.maxMs > pr.minMs) ? (tMs - pr.minMs) / (pr.maxMs - pr.minMs) : 0.5;
-    // If near left edge (<25%), snap playhead to 15%; if near right (>75%), snap to 85%
-    const targetFrac = (fracInPage < 0.25) ? 0.15 : (fracInPage > 0.75) ? 0.85 : fracInPage;
-    _pbSlidingWindowCenter = tMs - targetFrac * _pbPageSizeMs + _pbPageSizeMs / 2;
-    const half = _pbPageSizeMs / 2;
-    _pbSlidingWindowCenter = clamp(_pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
-  }
-
-  /** Check if paging should be active based on data duration. */
-  function _pbPagingActive() {
-    const b = map.getPlaybackBounds();
-    if (!isFinite(b.minMs) || !isFinite(b.maxMs)) return false;
-    return (b.maxMs - b.minMs) >= _pbPageMinDurationMs;
-  }
-
-  const fmtTime = (ms) => {
-    if (ms == null || !isFinite(ms)) return "—";
-    try { return new Date(ms).toLocaleTimeString(); } catch { return "—"; }
-  };
-
-  const updatePlaybackUi = () => {
-    const b = map.getPlaybackBounds();
-    const tMs = map.getPlaybackTimeMs();
-    const paging = _pbPagingActive();
-
-    // Auto-enable paging when duration crosses threshold.
-    // Initialize page index to the page containing the playhead.
-    if (paging && _pbPageIndex < 0) {
-      const t = (tMs != null && isFinite(tMs)) ? tMs : b.maxMs;
-      _pbPageForTime(t);
-      _pbPageAutoFollow = true; // started automatically, follow playhead
-    } else if (!paging) {
-      _pbPageIndex = -1; // disable paging when duration shrinks
-      _pbSlidingWindowCenter = null;
-    }
-
-    // Auto-advance page to follow playhead during normal playback (not scrubbing/coasting)
-    if (paging && _pbPageAutoFollow && tMs != null && isFinite(tMs) && !_pbScrubbing) {
-      const pr = _pbGetPageRange();
-      if (tMs >= pr.maxMs || tMs < pr.minMs) {
-        if (_pbSlidingWindowCenter != null) {
-          // Shift window just enough so playhead is inside, giving room in the direction of travel
-          const frac = (tMs >= pr.maxMs) ? 0.85 : 0.15;
-          _pbSlidingWindowCenter = tMs - frac * _pbPageSizeMs + _pbPageSizeMs / 2;
-          const half = _pbPageSizeMs / 2;
-          _pbSlidingWindowCenter = clamp(_pbSlidingWindowCenter, b.minMs + half, b.maxMs - half);
-        } else {
-          _pbPageForTime(tMs);
-        }
-      }
-      _pbPageAutoFollow = true; // keep following
-    }
-
-    // Use page range for slider when paging is active
-    const pr = paging ? _pbGetPageRange() : b;
-    const sliderMinMs = pr.minMs;
-    const sliderMaxMs = pr.maxMs;
-
-    if (pbLeftEl) pbLeftEl.textContent = fmtTime(sliderMinMs);
-    if (pbRightEl) pbRightEl.textContent = fmtTime(sliderMaxMs);
-    if (pbNowEl) pbNowEl.textContent = fmtTime(tMs);
-
-    if (pbScrubEl && isFinite(sliderMinMs) && isFinite(sliderMaxMs) && sliderMaxMs > sliderMinMs) {
-      const durMs = Math.max(1, sliderMaxMs - sliderMinMs);
-      const tRelMs = (tMs != null && isFinite(tMs)) ? (tMs - sliderMinMs) : durMs;
-      pbScrubEl.min = "0";
-      pbScrubEl.max = String(durMs);
-      pbScrubEl.step = "100"; // 100ms steps for smoother scrubbing
-      pbScrubEl.disabled = false;
-      if (!_pbScrubbing) {
-        pbScrubEl.value = String(clamp(tRelMs, 0, durMs));
-      }
-      // Update progress fill for browsers without accent-color range support
-      const pct = (clamp(Number(pbScrubEl.value), 0, durMs) / durMs) * 100;
-      pbScrubEl.style.setProperty("--pct", pct + "%");
-    } else if (pbScrubEl) {
-      pbScrubEl.disabled = true;
-      pbScrubEl.min = "0";
-      pbScrubEl.max = "1";
-      pbScrubEl.value = "0";
-      pbScrubEl.style.setProperty("--pct", "0%");
-    }
-
-    // Page arrow visibility & disabled state
-    if (pbPagePrevEl) {
-      pbPagePrevEl.classList.toggle("hidden", !paging);
-      pbPagePrevEl.disabled = _pbPageIndex <= 0;
-    }
-    if (pbPageNextEl) {
-      pbPageNextEl.classList.toggle("hidden", !paging);
-      pbPageNextEl.disabled = _pbPageIndex >= _pbPageCount() - 1;
-    }
-
-    const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
-    const atEnd = !hasBounds || map.isPlaybackAtEnd(200);
-    // Live window: playhead is close enough to maxMs that continuing playback
-    // would naturally reach the end before the next server update.
-    // Only applies at 1x and 5x; higher speeds don't get the buffer.
-    const _speed = map.getPlaybackSpeed() || 1.0;
-    const _nextInS = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-    const _wallElapsed2 = (Date.now() - _pbLastServerResponseMs) / 1000;
-    const _remS2 = Math.max(0, _nextInS - _wallElapsed2);
-    const _liveWindowMs = (_speed <= 5) ? _remS2 * 1000 * _speed : 0;
-    const inLiveWindow = !hasBounds || atEnd || (
-      _liveWindowMs > 0 && tMs != null && isFinite(tMs) && tMs >= b.maxMs - _liveWindowMs
-    );
-    // LIVE mode is based on the flag, not position - we're replaying the buffer
-    const followingLive = map._playbackLiveFollow;
-
-    if (pbPlayEl) {
-      // "Live" shows at the live edge: LIT only when actively live-following at
-      // 1x; UNLIT when following at >1x, or when in the live window but not yet
-      // following (clicking the unlit button enters live-follow — at any speed,
-      // handled in the click listener). Otherwise a plain Pause/Play transport.
-      const _liveFollowing = followingLive && !map._historicalMode;
-      const _inLiveWin = inLiveWindow && !map._historicalMode;
-      if (_liveFollowing) {
-        pbPlayEl.textContent = "Live";
-        pbPlayEl.classList.toggle("isLive", _speed === 1);
-      } else if (_inLiveWin) {
-        pbPlayEl.textContent = "Live";
-        pbPlayEl.classList.remove("isLive");
-      } else if (map.getPlaybackPlaying()) {
-        pbPlayEl.textContent = "Pause";
-        pbPlayEl.classList.remove("isLive");
-      } else {
-        pbPlayEl.textContent = "Play";
-        pbPlayEl.classList.remove("isLive");
-      }
-    }
-    if (pbSpeedEl) pbSpeedEl.value = String(map.getPlaybackSpeed() || 1.0);
-  };
-
-  const playbackLoop = () => {
-    _pbRAF = null;
-    // Allow loop to run in DVR mode OR LIVE mode (both need playback time updates)
-    if (!map.playbackMode && !map._playbackLiveFollow) return;
-    
-    try {
-    const now = performance.now();
-    const dt = (_pbLastPerf > 0) ? (now - _pbLastPerf) : 0;
-    _pbLastPerf = now;
-
-    const b = map.getPlaybackBounds();
-    let tMs = map.getPlaybackTimeMs();
-    const tMsBefore = tMs; // snapshot before advancement, for edge-crossing detection
-    const hasBounds = isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs;
-    const durMs = hasBounds ? (b.maxMs - b.minMs) : 1;
-    const prevKnownMaxMs = _pbLastKnownMaxMs;
-    
-    // Playhead initialization is handled in tick() when data arrives
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // DETECT DATA CHANGES (new data arrived, or data trimmed)
-    // ─────────────────────────────────────────────────────────────────────────
-    let newDataArrived = false;
-    let forceCameraFit = false;
-    
-    if (hasBounds) {
-      if (_pbLastKnownMaxMs != null && b.maxMs > _pbLastKnownMaxMs + 100) {
-        newDataArrived = true;
-        // Record the update window for future forced camera fits.
-        if (typeof prevKnownMaxMs === "number" && isFinite(prevKnownMaxMs)) {
-          _pbLastDataUpdateWindowStartMs = prevKnownMaxMs;
-          _pbLastDataUpdateWindowEndMs = b.maxMs;
-        }
-        // Reset stall counter when fresh data arrives
-        _pbLiveStallCount = 0;
-      }
-      _pbLastKnownMinMs = b.minMs;
-      _pbLastKnownMaxMs = b.maxMs;
-      
-      // If playhead is now outside bounds (data trimmed or server restarted), handle it
-      if (tMs != null && isFinite(tMs)) {
-        if (tMs < b.minMs) {
-          // Data trimmed past the playhead: clamp to the new start and keep
-          // playing. Never jump to the live edge — new server data must not
-          // move the playhead; playback simply continues into it.
-          tMs = b.minMs;
-          map.setPlaybackTimeMs(tMs);
-        }
-        if (tMs > b.maxMs) {
-          tMs = b.maxMs;
-          map.setPlaybackTimeMs(tMs);
-        }
-      }
-    }
-
-    // Forced refresh: treat as a new-data event even if bounds didn't move.
-    // This is used by the terminal TUI to request a camera fit/zoom in the web UI.
-    try {
-      const state = map.lastState;
-      const seq = state?.meta?.force_refresh_seq;
-      if (typeof seq === "number" && isFinite(seq)) {
-        if (_pbLastForceRefreshSeq == null) {
-          // If the server seq is already >0 when playback starts (e.g. TUI refresh happened first),
-          // treat it as a one-time forced camera fit.
-          if (seq > 0) {
-            newDataArrived = true;
-            forceCameraFit = true;
-            _pbLiveStallCount = 0;
-          }
-        } else if (seq !== _pbLastForceRefreshSeq) {
-          newDataArrived = true;
-          forceCameraFit = true;
-          _pbLiveStallCount = 0;
-        }
-        _pbLastForceRefreshSeq = seq;
-      }
-    } catch {
-      // ignore
-    }
-
-    // When new data arrives in LIVE mode and playback is paused at the end,
-    // resume playing so the new segment animates. Don't rewind the playhead —
-    // let normal forward playback consume the new data naturally.
-    if (hasBounds && (newDataArrived || forceCameraFit) && map._playbackLiveFollow && !map.getPlaybackPlaying()) {
-      const speed = map.getPlaybackSpeed() || 1.0;
-      _pbVelocity = _pbPlaybackSpeed * speed;
-      map.setPlaybackPlaying(true);
-      _pbLastPerf = 0;
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-    }
-    
-    // ─────────────────────────────────────────────────────────────────────────
-    // LIVE BUFFER CALCULATION
-    // Buffer = wall-clock time since LIVE started (how much data we've accumulated).
-    // Playback consumes this buffer at playbackSpeed rate.
-    // ─────────────────────────────────────────────────────────────────────────
-    let liveBufferMs = 0;
-    
-    if (hasBounds && map._playbackLiveFollow) {
-      // Initialize playhead if not set (handled above, but keep for safety)
-      if (tMs == null || !isFinite(tMs)) {
-        const meta = map.lastState?.meta;
-        const nextInS = Number(meta?.polling_next_update_in_s) ?? Number(meta?.polling_predicted_interval_s) ?? 600;
-        const speed = map.getPlaybackSpeed() || 1.0;
-        const offsetMs = nextInS * 1000 * speed;
-        tMs = Math.max(b.minMs, b.maxMs - offsetMs);
-        map.setPlaybackTimeMs(tMs);
-      }
-      
-      // Initialize LIVE tracking on first entry
-      if (_pbLiveStartWallMs == null) {
-        _pbLiveStartWallMs = now;
-        _pbLiveStartDataMs = b.maxMs;
-      }
-      
-      // Buffer = wall-clock time since we started LIVE mode
-      // This is how much new data has accumulated since we began
-      const wallElapsed = now - _pbLiveStartWallMs;
-      liveBufferMs = wallElapsed;
-      
-      // Target = newest data minus the buffer (stay behind the live edge)
-      // The buffer grows in real-time, so we always have runway
-      _pbLiveTargetMs = b.maxMs - liveBufferMs;
-      
-      // Clamp: if rewind outpaces buffer accumulation, just use minMs
-      if (_pbLiveTargetMs < b.minMs) {
-        _pbLiveTargetMs = b.minMs;
-      }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // LIVE CAMERA FOLLOW: Frame where vehicles currently are, their visible
-    // trails, and nearby fixed sensors. Uses median-based outlier trimming so
-    // a distant long-route vehicle doesn't drag the camera to city scale.
-    // ─────────────────────────────────────────────────────────────────────────
-    {
-      if (_screensaverActive && (newDataArrived || forceCameraFit) && map._playbackLiveFollow) {
-        _performCameraFit({ force: true });
-      }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // DEFERRED CAMERA FIT: If a live camera fit was blocked by user interaction,
-    // replay it now that the interaction + easing has settled.
-    // ─────────────────────────────────────────────────────────────────────────
-    if (_deferredCameraFit && map._playbackLiveFollow
-        && typeof map._canRunAutoCamera === "function" && map._canRunAutoCamera()) {
-      const d = _deferredCameraFit;
-      _deferredCameraFit = null;
-      if (d.type === "bounds" && d.bb) {
-        _animateFitBoundsLatLon(d.bb, { durationMs: d.durationMs || _pbLiveFollowDurationMs });
-      } else if (d.type === "storedView") {
-        _animateToStoredView(d.durationMs || _pbLiveFollowDurationMs);
-      }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // PHYSICS SIMULATION
-    // ─────────────────────────────────────────────────────────────────────────
-    let didAdvanceTime = false;
-    const didMarkerInertia = (typeof map._stepPbMarkerInertia === "function")
-      ? !!map._stepPbMarkerInertia(now, dt)
-      : false;
-
-    if (didMarkerInertia) {
-      didAdvanceTime = true;
-      tMs = map.getPlaybackTimeMs();
-      _pbAtEndSincePerf = null; // user interaction resets end timer
-    } else if (!_pbScrubbing && hasBounds && tMs != null && isFinite(tMs) && dt > 0) {
-      // Apply wheel nudge to velocity
-      if (Math.abs(_pbWheelAccum) > 0.1) {
-        _pbVelocity += _pbWheelAccum * _pbWheelImpulse;
-        _pbWheelAccum *= _pbWheelDecay;
-        if (Math.abs(_pbWheelAccum) < 0.1) _pbWheelAccum = 0;
-        _pbAtEndSincePerf = null; // wheel interaction resets end timer
-      }
-
-      // Determine velocity based on state
-      const atEnd = (tMs >= b.maxMs - 1);
-      const speedMult = map.getPlaybackSpeed() || 1.0;
-
-      // Resolve loop start within current bounds.
-      const loopStartMsRaw = (_pbLoopStartMs != null) ? Number(_pbLoopStartMs) : null;
-      const loopStartMs = (isFinite(loopStartMsRaw)) ? clamp(loopStartMsRaw, b.minMs, b.maxMs) : b.minMs;
-      
-      if (_pbIsRewinding) {
-        // Tape-reel rewind: ramp up, cruise, ease into start
-        const totalDist = Math.max(1, b.maxMs - loopStartMs);
-        const distFromStart = tMs - loopStartMs;
-        const progress = 1 - (distFromStart / totalDist); // 0 at end, 1 at loop start
-        
-        // Base cruise speed: complete full rewind in ~4 seconds
-        const cruiseSpeed = -totalDist / 4000;
-        const playbackSpeed = _pbPlaybackSpeed * speedMult;
-        
-        // Ease duration in wall time
-        const easeDurationMs = 1500;
-        
-        // Ease zone: last 15% of the recording (position-based trigger)
-        // This is independent of speed - we ease over the final portion of the timeline
-        const easeDistanceMs = totalDist * 0.15;
-        
-        const inEasePhase = _pbEaseStartPerf != null;
-        const shouldStartEase = !inEasePhase && distFromStart <= easeDistanceMs;
-        
-        if (progress < 0.15 && !inEasePhase) {
-          // Ramp up phase: accelerate from 0.3 to 1.0 of cruise speed
-          const speedFactor = 0.3 + (progress / 0.15) * 0.7;
-          _pbVelocity = cruiseSpeed * speedFactor;
-        } else if (inEasePhase || shouldStartEase) {
-          // NEWTONIAN PHYSICS: constant acceleration to reach playbackSpeed at loopStartMs
-          if (_pbEaseStartPerf == null) {
-            _pbEaseStartPerf = now;
-            _pbEaseStartPos = tMs;
-            _pbEaseStartVelocity = _pbVelocity;
-          }
-          
-          // We want to go from v₀ (negative) to playbackSpeed (positive) over distance d
-          // Average velocity = (v₀ + v_final) / 2
-          // Time = d / |avg_v|
-          // Acceleration = (v_final - v₀) / t
-          const v0 = _pbEaseStartVelocity;
-          const vFinal = playbackSpeed;
-          const d = _pbEaseStartPos - loopStartMs;
-          
-          const avgVel = (v0 + vFinal) / 2;
-          // Avoid division by zero
-          const accel = Math.abs(avgVel) > 0.1 ? (vFinal - v0) / (d / Math.abs(avgVel)) : 0.01;
-          
-          // Apply acceleration
-          _pbVelocity = _pbVelocity + accel * dt;
-          
-          // Clamp to not overshoot target velocity
-          if (_pbVelocity >= vFinal) {
-            _pbVelocity = vFinal;
-          }
-          
-          // End ease when we reach start or velocity reaches target
-          if (tMs <= loopStartMs + 10 || _pbVelocity >= vFinal) {
-            _pbIsRewinding = false;
-            _pbEaseStartPerf = null;
-            _pbVelocity = playbackSpeed;
-          }
-        } else {
-          // Cruise phase: full speed
-          _pbVelocity = cruiseSpeed;
-        }
-      } else if (map._playbackLiveFollow) {
-        // ─────────────────────────────────────────────────────────────────────
-        // LIVE MODE: Play forward until we hit maxMs, then stall waiting for
-        // new data. When new data arrives, resume playing.
-        // ─────────────────────────────────────────────────────────────────────
-        if (atEnd) {
-          // At live edge, waiting for new data - just hold position
-          _pbVelocity = 0;
-        } else {
-          // Have data ahead - play toward live edge at user-selected speed
-          _pbVelocity = _pbPlaybackSpeed * speedMult;
-        }
-      } else if (map.getPlaybackPlaying()) {
-        // Normal forward playback
-        if (atEnd) {
-          // At end — velocity zeroed; the Live-mode switch below will activate.
-          _pbVelocity = 0;
-        } else {
-          // Normal forward - maintain playback speed
-          _pbVelocity = _pbPlaybackSpeed * speedMult;
-          _pbAtEndSincePerf = null;
-        }
-      } else if (!map.getPlaybackPlaying() && Math.abs(_pbVelocity) > _pbVelocityThreshold) {
-        // Coasting after wheel - apply friction
-        const friction = _pbIsWheelCoasting ? _pbWheelFriction : _pbFriction;
-        const frictionFactor = Math.pow(friction, dt);
-        _pbVelocity *= frictionFactor;
-        
-        // When velocity decays to playback speed, resume playback
-        const playbackSpeed = _pbPlaybackSpeed * speedMult;
-        if (_pbVelocity > 0 && _pbVelocity <= playbackSpeed) {
-          // Forward coasting reached playback speed - resume
-          _pbIsWheelCoasting = false;
-          _pbSnapWindowToPlayhead();
-          if (_pbCommitLoopStartOnCoastEnd) {
-            _pbLoopStartMs = tMs;
-            _pbCommitLoopStartOnCoastEnd = false;
-          }
-          _pbVelocity = playbackSpeed;
-          map.setPlaybackPlaying(true);
-          updatePlaybackUi();
-        } else if (_pbVelocity < 0 && Math.abs(_pbVelocity) < _pbVelocityThreshold) {
-          // Backward coasting stopped - resume forward playback
-          _pbIsWheelCoasting = false;
-          _pbSnapWindowToPlayhead();
-          if (_pbCommitLoopStartOnCoastEnd) {
-            _pbLoopStartMs = tMs;
-            _pbCommitLoopStartOnCoastEnd = false;
-          }
-          _pbVelocity = playbackSpeed;
-          map.setPlaybackPlaying(true);
-          updatePlaybackUi();
-        }
-      }
-      
-      // Note: No additional easing here - forward playback runs at constant speed
-      // Rewind easing is handled inside the _pbIsRewinding block above
-      
-      // Snap to zero if very slow
-      if (Math.abs(_pbVelocity) < _pbVelocityThreshold && _pbVelocity !== 0) {
-        _pbVelocity = 0;
-        // Final UI update so time labels reflect where the playhead landed
-        if (!map.getPlaybackPlaying()) {
-          updatePlaybackUi();
-        }
-      }
-      
-      // Move playhead
-      if (Math.abs(_pbVelocity) > 0) {
-        let nextMs = tMs + _pbVelocity * dt;
-
-        // Clamp to bounds; during auto-rewind, clamp to loopStartMs instead of the global min.
-        const rewindMinMs = (_pbIsRewinding && loopStartMs != null && isFinite(loopStartMs)) ? loopStartMs : b.minMs;
-        nextMs = clamp(nextMs, rewindMinMs, b.maxMs);
-        
-        // If we hit a bound, zero velocity (unless in active ease - let ease control it)
-        if (nextMs <= rewindMinMs && _pbVelocity < 0 && _pbEaseStartPerf == null) {
-          _pbVelocity = 0;
-          _pbIsRewinding = false; // rewind complete
-          nextMs = rewindMinMs;
-        }
-        if (nextMs >= b.maxMs && _pbVelocity > 0) {
-          _pbVelocity = 0;
-          nextMs = b.maxMs;
-        }
-        
-        if (nextMs !== tMs) {
-          map.setPlaybackTimeMs(nextMs);
-          tMs = nextMs;
-          didAdvanceTime = true;
-
-          // Force slider to update immediately during coasting
-          if (!map.getPlaybackPlaying()) {
-            updatePlaybackUi();
-          }
-        }
-        
-        // When AUTO-REWIND arrives at start, reset for forward playback
-        // But NOT when user is manually coasting backward
-        if (tMs <= b.minMs + 1 && _pbVelocity === 0 && _pbIsRewinding) {
-          // We've hit the start from auto-rewind - start playing forward
-          _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-          _pbAtEndSincePerf = null;
-          _pbIsRewinding = false;
-          if (!map.getPlaybackPlaying()) {
-            map.setPlaybackPlaying(true);
-          }
-          updatePlaybackUi();
-        }
-      }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // FOVEATED ROAD MATCHING: Progressive snapping during playback
-    // Only run when playing (not scrubbing) and time is advancing
-    // ─────────────────────────────────────────────────────────────────────────
-    if (map._historicalMode && map.getPlaybackPlaying() && !_pbScrubbing && !_pbIsRewinding) {
-      map._requestFoveatedRoadMatching();
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // RENDER
-    // ─────────────────────────────────────────────────────────────────────────
-    if (didAdvanceTime) {
-      map._compositePaFieldOnTiles(map.lastState);
-      map.drawOverlay(map.lastState, { cacheUnderlay: true });
-    }
-
-    // When playback enters the live buffer window, stop and show Live button.
-    // Buffer window = predictedInterval * speed, at every speed.
-    {
-      const _spd2 = map.getPlaybackSpeed() || 1.0;
-      const _nextInS2 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-      const _wallElapsed3 = (Date.now() - _pbLastServerResponseMs) / 1000;
-      const _remS3 = Math.max(0, _nextInS2 - _wallElapsed3);
-      const _lwMs2 = _remS3 * 1000 * _spd2;
-      const bufferEdge = (_lwMs2 > 0) ? (b.maxMs - _lwMs2) : (b.maxMs - 1);
-      var _inLiveWindow2 = hasBounds && tMs != null && isFinite(tMs) && tMs >= bufferEdge;
-      // Only trigger if we CROSSED into the window this frame (were below, now at/above).
-      // If the user scrubbed into the window, let playback continue to maxMs.
-      var _crossedIntoLiveWindow = _inLiveWindow2 && isFinite(tMsBefore) && tMsBefore < bufferEdge;
-    }
-    if (!_pbIsRewinding &&
-        !_screensaverActive &&
-        map.getPlaybackPlaying() &&
-        !map._playbackLiveFollow &&
-        !_pbIsWheelCoasting &&
-        didAdvanceTime && _pbVelocity >= 0 &&
-        _crossedIntoLiveWindow) {
-      // Don't auto-activate Live mode — just stop playback at the buffer edge.
-      // The button will show "Live" (not highlighted) so the user can opt in.
-      // map._playbackLiveFollow = true;
-      // _pbPageAutoFollow = true;
-      // try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-      _pbVelocity = 0;
-      _pbAtEndSincePerf = null;
-      _pbIsRewinding = false;
-      map.setPlaybackPlaying(false);
-      updatePlaybackUi();
-    }
-
-    // UI updates
-    const isActive = Math.abs(_pbVelocity) > _pbVelocityThreshold || Math.abs(_pbWheelAccum) > 0.1;
-    const uiMinDt = isActive ? 16 : 250;
-    if ((didAdvanceTime || isActive) && (now - _pbLastUiPerf) >= uiMinDt) {
-      updatePlaybackUi();
-      if (sidebarOpen) updateSidebarPlaybackValues();
-      _pbLastUiPerf = now;
-    }
-
-    // Sync legend + field only when not scrubbing with a sensor selected.
-    // Legend title/bars and PA field update when scrubbing stops or vehicle resumes.
-    if (!(_pbScrubbing || _pbIsWheelCoasting) || !selectedId) {
-      _syncMapPollutant();
-      syncLegendToMapSelection();
-    }
-
-    // ── Barrel jog wheel: sync position & render ──
-    if (_barrelMode && _jogWheel) {
-      const b2 = map.getPlaybackBounds();
-      const t2 = map.getPlaybackTimeMs();
-      if (isFinite(b2.minMs) && isFinite(b2.maxMs) && b2.maxMs > b2.minMs && isFinite(t2)) {
-        const frac = (t2 - b2.minMs) / (b2.maxMs - b2.minMs);
-        if (!_jogWheel.isScrubbing()) _jogWheel.setPosition(frac);
-      }
-      _jogWheel.render();
-    }
-
-    // Keep loop running if there's any motion or pending state
-    const markerInertiaActive = (typeof map._hasPbMarkerInertia === "function") ? !!map._hasPbMarkerInertia() : false;
-    const hasMotion = Math.abs(_pbVelocity) > _pbVelocityThreshold;
-    const hasWheelMomentum = Math.abs(_pbWheelAccum) > 0.1;
-    const waitingToRewind = _pbAtEndSincePerf != null;
-    const inLiveMode = map._playbackLiveFollow;  // LIVE mode always keeps loop running
-    
-    if (map.getPlaybackPlaying() || markerInertiaActive || hasMotion || hasWheelMomentum || waitingToRewind || inLiveMode) {
-      _pbRAF = requestAnimationFrame(playbackLoop);
-    } else {
-      _pbLastPerf = 0;
-    }
-    
-    } catch (e) {
-      // Don't let errors kill the playback loop
-      console.error("playbackLoop error:", e);
-      _pbRAF = requestAnimationFrame(playbackLoop);
-    }
-  };
+  // _pbPageCount / _pbGetPageRange / _pbSetPage / _pbPageForTime /
+  // _pbSnapWindowToPlayhead / _pbPagingActive / fmtTime / updatePlaybackUi /
+  // playbackLoop moved to ui_playback.js (delegates above).
 
   // Allow MapView to restart the loop after a drag release.
   window.__ensurePlaybackLoop = () => {
     if (!map.playbackMode) return;
-    if (_pbRAF) return;
-    _pbLastPerf = 0;
-    _pbLastUiPerf = 0;
-    _pbVelocity = 0;
-    _pbWheelAccum = 0;
-    _pbRAF = requestAnimationFrame(playbackLoop);
+    if (pb._pbRAF) return;
+    pb._pbLastPerf = 0;
+    pb._pbLastUiPerf = 0;
+    pb._pbVelocity = 0;
+    pb._pbWheelAccum = 0;
+    pb._pbRAF = requestAnimationFrame(playbackLoop);
   };
 
   if (traceEl) {
@@ -3362,15 +1440,15 @@ function main() {
       map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
       map.setPlaybackPlaying(false);
       updatePlaybackUi();
-      _pbLastPerf = 0;
-      _pbLastUiPerf = 0;
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+      pb._pbLastPerf = 0;
+      pb._pbLastUiPerf = 0;
+      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
     }
     traceEl.addEventListener("change", () => {
       localStorage.setItem(TRACE_STORAGE_KEY, traceEl.checked ? "1" : "0");
-      _pbVelocity = 0;
-      _pbWheelAccum = 0;
-      _pbAtEndSincePerf = null;
+      pb._pbVelocity = 0;
+      pb._pbWheelAccum = 0;
+      pb._pbAtEndSincePerf = null;
       map.setPlaybackMode(traceEl.checked);
       if (pbBarEl) pbBarEl.classList.toggle("hidden", !traceEl.checked);
       if (traceEl.checked) {
@@ -3378,13 +1456,13 @@ function main() {
         // Don't set playhead here - let the playback loop handle it
         map.setPlaybackPlaying(false);
         updatePlaybackUi();
-        _pbLastPerf = 0;
-        _pbLastUiPerf = 0;
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+        pb._pbLastPerf = 0;
+        pb._pbLastUiPerf = 0;
+        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
       } else {
         map.setPlaybackPlaying(false);
-        _pbLastPerf = 0;
-        _pbLastUiPerf = 0;
+        pb._pbLastPerf = 0;
+        pb._pbLastUiPerf = 0;
       }
     });
   } else {
@@ -3395,9 +1473,50 @@ function main() {
     map._ensurePlaybackPoints(window.__lastState || { mobile: [], fixed: [] });
     map.setPlaybackPlaying(false);
     updatePlaybackUi();
-    _pbLastPerf = 0;
-    _pbLastUiPerf = 0;
-    if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+    pb._pbLastPerf = 0;
+    pb._pbLastUiPerf = 0;
+    if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
+  }
+
+  // Enter/refresh SERVER-SYNC mode: jump to the server-polling runway point
+  // (data edge − predicted-seconds-to-next-poll × speed, corrected for wall
+  // time already elapsed) and play forward, so the playhead reaches the edge
+  // just as the next poll extends it. Called by the lit-button click AND by a
+  // speed change while already in server-sync mode (runway scales with speed).
+  // This is the ONLY path that snaps — new data and drift never do. Defined at
+  // main() scope so both the pbPlay and pbSpeed handlers can reach it.
+  function _pbSyncToRunway() {
+      const b = map.getPlaybackBounds();
+      if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
+      const dataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+        ? map._playbackMaxMs : b.maxMs;
+      const meta = map.lastState && map.lastState.meta ? map.lastState.meta : {};
+      let nextInS = Number(meta.polling_next_update_in_s);
+      if (!isFinite(nextInS)) nextInS = Number(meta.polling_predicted_interval_s);
+      if (!isFinite(nextInS)) nextInS = 600;
+      const elapsedS = isFinite(pb._pbLastServerResponseMs)
+        ? Math.max(0, (Date.now() - pb._pbLastServerResponseMs) / 1000) : 0;
+      const remS = Math.max(0, nextInS - elapsedS);
+      const target = PlaybackUI.computeRunwayTargetMs({
+        dataEdgeMs: dataEdge, minMs: b.minMs, remSec: remS,
+        speed: map.getPlaybackSpeed() || 1.0,
+      });
+      map._playbackLiveFollow = true;
+      pb._pbPageAutoFollow = true;
+      pb._pbPaused = false;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+      if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
+      map.setPlaybackTimeMs(target);
+      pb._pbLoopStartMs = target;
+      pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      pb._pbWheelAccum = 0;
+      pb._pbAtEndSincePerf = null;
+      pb._pbIsRewinding = false;
+      map.setPlaybackPlaying(true);
+      pb._pbLastPerf = 0;
+      if (pb._pbRAF) cancelAnimationFrame(pb._pbRAF);
+      pb._pbRAF = requestAnimationFrame(playbackLoop);
+      updatePlaybackUi();
   }
 
   if (pbPlayEl) {
@@ -3406,7 +1525,7 @@ function main() {
       e.preventDefault();
       pbPlayEl.click();
     }, { passive: false });
-    
+
     pbPlayEl.addEventListener("click", () => {
       // Enable playback mode if not already (e.g. historical data)
       if (!map.playbackMode) {
@@ -3415,104 +1534,110 @@ function main() {
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
-      const atEnd = map.isPlaybackAtEnd(100);
-      // Buffer snap target and Live window: all speeds.
-      const _spd = map.getPlaybackSpeed() || 1.0;
-      const _nextInS3 = Number(map.lastState?.meta?.polling_next_update_in_s) ?? Number(map.lastState?.meta?.polling_predicted_interval_s) ?? 600;
-      const _wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
-      const _remS = Math.max(0, _nextInS3 - _wallElapsed);
-      const _snapMs = _remS * 1000 * _spd;
-      const _lwMs = _snapMs;
-      const curMs = map.getPlaybackTimeMs();
-      const inLiveWindow = atEnd || (
-        _lwMs > 0 && curMs != null && isFinite(curMs) && curMs >= b.maxMs - _lwMs
-      );
-      
-      // If in LIVE mode, clicking turns OFF live camera follow (but keeps playback running).
-      // This allows the user to stay at the end receiving new data, but without the camera auto-following.
-      if (map._playbackLiveFollow) {
+      const _curMs = map.getPlaybackTimeMs();
+      const action = PlaybackUI.computeClickAction({
+        playing: map.getPlaybackPlaying(),
+        liveFollow: map._playbackLiveFollow,
+      });
+
+      if (action === "sync") {
+        // Clicking the lit (server-sync) button re-syncs to the runway point.
+        _pbSyncToRunway();
+        return;
+      }
+
+      if (action === "pause") {
+        // PAUSE — only reachable OUTSIDE the live window (playing in the past).
+        // Freeze the playhead exactly where it is: it is already behind the
+        // live zone, so the dim shade + ◀◀ REW show without any skip-back.
         map._playbackLiveFollow = false;
         try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
         if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
-        // Set loop start to current position so rewind doesn't go to beginning of time
-        const curMs = map.getPlaybackTimeMs();
-        if (curMs != null && isFinite(curMs)) {
-          _pbLoopStartMs = curMs;
-        }
-        // Keep playback running (or start it if paused)
-        if (!map.getPlaybackPlaying()) {
-          _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-          map.setPlaybackPlaying(true);
-          _pbLastPerf = 0;
-          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        }
-        updatePlaybackUi();
-        return;
-      }
-
-      // If in live window, enable LIVE mode at any speed (not for historical replays)
-      if (inLiveWindow && !map._playbackLiveFollow && !map._historicalMode) {
-        map._playbackLiveFollow = true;
-        _pbPageAutoFollow = true; // resume page tracking in LIVE mode
-        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
-        // Snap playhead to leading edge of buffer
-        if (_snapMs > 0) {
-          const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
-          map.setPlaybackTimeMs(bufferStart);
-        }
-        _pbVelocity = 0;
-        _pbAtEndSincePerf = null;
-        _pbIsRewinding = false;
-        map.setPlaybackPlaying(true);
-        _pbLastPerf = 0;
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
-        return;
-      }
-
-      // >5x at end: snap to buffer position and play (no Live mode)
-      if (atEnd && _spd > 5 && _snapMs > 0) {
-        const bufferStart = Math.max(b.minMs, b.maxMs - _snapMs);
-        map.setPlaybackTimeMs(bufferStart);
-        _pbVelocity = _pbPlaybackSpeed * _spd;
-        _pbAtEndSincePerf = null;
-        _pbIsRewinding = false;
-        map.setPlaybackPlaying(true);
-        _pbLastPerf = 0;
-        if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        updatePlaybackUi();
-        return;
-      }
-
-      // If currently playing (not LIVE mode), pause
-      if (map.getPlaybackPlaying()) {
         map.setPlaybackPlaying(false);
-        _pbVelocity = 0;
-        _pbWheelAccum = 0;
-        _pbAtEndSincePerf = null;
-        _pbIsRewinding = false;
+        pb._pbPaused = true;
+        pb._pbVelocity = 0;
+        pb._pbWheelAccum = 0;
+        pb._pbAtEndSincePerf = null;
+        pb._pbIsRewinding = false;
+        if (_curMs != null && isFinite(_curMs)) pb._pbLoopStartMs = _curMs;
         updatePlaybackUi();
         return;
       }
 
-      // Paused - just play from current position
-      _pbAtEndSincePerf = null;
-      _pbWheelAccum = 0;
-      _pbIsRewinding = false;
+      // PLAY from the current position at the selected speed. If the playhead
+      // is at the wall-clock edge, playing from here IS going live — the RIDE
+      // block keeps it pinned to the ticking edge (Live at 1x, lit Pause above).
+      pb._pbAtEndSincePerf = null;
+      pb._pbWheelAccum = 0;
+      pb._pbIsRewinding = false;
+      pb._pbPaused = false;   // play clears the explicit pause hold
       // Capture replay point A if it hasn't been set via scrubbing.
-      if (_pbLoopStartMs == null || !isFinite(Number(_pbLoopStartMs))) {
+      if (pb._pbLoopStartMs == null || !isFinite(Number(pb._pbLoopStartMs))) {
         const cur = map.getPlaybackTimeMs();
-        _pbLoopStartMs = (cur != null && isFinite(Number(cur))) ? Number(cur) : b.minMs;
+        pb._pbLoopStartMs = (cur != null && isFinite(Number(cur))) ? Number(cur) : b.minMs;
       }
-      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+      // Playing from the data edge IS going live (measured against the data
+      // edge — the wall extension can run a full poll interval ahead of it).
+      const _playDataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+        ? map._playbackMaxMs : b.maxMs;
+      const _playCur = map.getPlaybackTimeMs();
+      if (!map._historicalMode && _playCur != null && isFinite(_playCur)
+          && _playCur >= _playDataEdge - 1500) {
+        map._playbackLiveFollow = true;
+        pb._pbPageAutoFollow = true;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+      }
+      pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
       map.setPlaybackPlaying(true);
-      _pbLastPerf = 0;
+      pb._pbLastPerf = 0;
       // Always restart the loop
-      if (_pbRAF) cancelAnimationFrame(_pbRAF);
-      _pbRAF = requestAnimationFrame(playbackLoop);
+      if (pb._pbRAF) cancelAnimationFrame(pb._pbRAF);
+      pb._pbRAF = requestAnimationFrame(playbackLoop);
       updatePlaybackUi();
     });
   }
+
+  // ── Scrub-release resume ──────────────────────────────────────────────────
+  // Edge proximity for the drag-to-live gesture: generous enough to hit at
+  // slider pixel granularity (~0.5% of the visible range, 15 s minimum).
+  const _pbEdgeSnapEpsMs = () => {
+    const b = map.getPlaybackBounds();
+    const dur = (isFinite(b.minMs) && isFinite(b.maxMs)) ? (b.maxMs - b.minMs) : 0;
+    return Math.max(15000, dur * 0.005);
+  };
+  // Shared release handler for scrub gestures: commit the slider position,
+  // then restore what the user was doing before grabbing it. Released at the
+  // wall-clock edge → go Live (the "drag into the live edge" gesture).
+  // Otherwise resume playing only if playback was active when the drag
+  // started — a scrub while paused stays paused (button keeps "Play").
+  const _pbResumeFromScrub = (resetPerfToNow) => {
+    applyScrub();
+    const wasActive = !!pb._pbResumeAfterScrub;
+    pb._pbResumeAfterScrub = false;
+    // "Released at the edge" is measured against the DATA edge, not the
+    // wall-clock max — scrubs are clamped to the data edge (applyScrub), and
+    // the wall extension can run up to a full poll interval ahead of it.
+    const _dataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+      ? map._playbackMaxMs : map.getPlaybackBounds().maxMs;
+    const _cur = map.getPlaybackTimeMs();
+    const goLive = !map._historicalMode && _cur != null && isFinite(_cur)
+      && _cur >= _dataEdge - _pbEdgeSnapEpsMs();
+    if (goLive) {
+      map._playbackLiveFollow = true;
+      pb._pbPageAutoFollow = true;
+      try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+      const bb = map.getPlaybackBounds();
+      if (isFinite(bb.maxMs)) map.setPlaybackTimeMs(bb.maxMs);
+    }
+    if (goLive || wasActive) {
+      map.setPlaybackPlaying(true);
+      pb._pbLastPerf = resetPerfToNow ? performance.now() : 0;
+      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
+    } else {
+      map.setPlaybackPlaying(false);
+    }
+    updatePlaybackUi();
+  };
 
   if (pbSpeedEl) {
     // Restore saved speed
@@ -3525,46 +1650,17 @@ function main() {
       }
     }
     pbSpeedEl.addEventListener("change", () => {
-      const prevSpeed = map.getPlaybackSpeed() || 1.0;
       map.setPlaybackSpeed(pbSpeedEl.value);
       localStorage.setItem("mobileair.playbackSpeed", pbSpeedEl.value);
-      const newSpeed = map.getPlaybackSpeed() || 1.0;
-
-      // If in LIVE mode, recalculate buffer position when speed changes.
-      // LIVE mode is supported at every speed.
-      if (map._playbackLiveFollow) {
-        {
-          // Recalculate buffer start for the new speed.
-          // Larger speed = larger buffer window = playhead must move back.
-          // Smaller speed = smaller buffer window = playhead should move forward
-          //   (otherwise it's behind the new buffer start and Live button state
-          //   becomes inconsistent — the user expects to be "caught up").
-          const b = map.getPlaybackBounds();
-          if (isFinite(b.minMs) && isFinite(b.maxMs) && b.maxMs > b.minMs) {
-            const meta = map.lastState?.meta || {};
-            const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
-            const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
-            const remS = Math.max(0, nextInS - wallElapsed);
-            const snapMs = remS * 1000 * newSpeed;
-            if (snapMs > 0) {
-              const bufferStart = Math.max(b.minMs, b.maxMs - snapMs);
-              const curMs = map.getPlaybackTimeMs();
-              if (curMs != null && isFinite(curMs)) {
-                // Speed increased: snap back if ahead of new (larger) buffer start
-                // Speed decreased: snap forward if behind new (smaller) buffer start
-                if (curMs > bufferStart || curMs < bufferStart) {
-                  map.setPlaybackTimeMs(bufferStart);
-                  // Reset LIVE tracking so buffer accumulation restarts from here
-                  _pbLiveStartWallMs = performance.now();
-                  _pbLiveStartDataMs = b.maxMs;
-                }
-              }
-            }
-          }
-        }
+      // In server-sync mode the runway scales with speed, so re-snap to the
+      // new runway point (a faster speed needs more runway to still be playing
+      // when the next poll lands). Outside server-sync mode, speed only flips
+      // the button label, no playhead move.
+      if (map._playbackLiveFollow && !map._historicalMode) {
+        _pbSyncToRunway();
+      } else {
+        updatePlaybackUi();
       }
-
-      updatePlaybackUi();
     });
   }
 
@@ -3578,505 +1674,91 @@ function main() {
     if (!map._playbackLiveFollow) return; // only applies in LIVE mode
     const b = map.getPlaybackBounds();
     if (!isFinite(b.minMs) || !isFinite(b.maxMs) || b.maxMs <= b.minMs) return;
-    const speed = map.getPlaybackSpeed() || 1.0;
-    const meta = map.lastState?.meta || {};
-    const nextInS = Number(meta.polling_next_update_in_s) ?? Number(meta.polling_predicted_interval_s) ?? 600;
-    const wallElapsed = (Date.now() - _pbLastServerResponseMs) / 1000;
-    const remS = Math.max(0, nextInS - wallElapsed);
-    const bufferMs = remS * 1000 * speed;
-    if (bufferMs > 0) {
-      const bufferStart = Math.max(b.minMs, b.maxMs - bufferMs);
-      map.setPlaybackTimeMs(bufferStart);
-      // Restart LIVE tracking from current position
-      _pbLiveStartWallMs = performance.now();
-      _pbLiveStartDataMs = b.maxMs;
-      // Reset the frame timer so dt doesn't include backgrounded time
-      _pbLastPerf = 0;
-      updatePlaybackUi();
-    }
+    // Snap straight to the wall-clock edge — that is where "live" is now.
+    map.setPlaybackTimeMs(b.maxMs);
+    // Restart LIVE tracking from current position
+    pb._pbLiveStartWallMs = performance.now();
+    pb._pbLiveStartDataMs = b.maxMs;
+    // Reset the frame timer so dt doesn't include backgrounded time
+    pb._pbLastPerf = 0;
+    updatePlaybackUi();
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
   // DAY SELECTOR: Load historical data for past days
   // ─────────────────────────────────────────────────────────────────────────────
   window._historicalState = null;  // Cached historical data when not "live"
-  
-  // Loading state tracking - shared between historical and snapshot loading
-  let _isLoadingData = false;
-
-  // Shade over the map (not the UI) while data is loading
-  function setMapLoadingShade(on) {
-    const shade = document.getElementById("mapLoadingShade");
-    if (shade) shade.classList.toggle("hidden", !on);
-  }
-  
-  // Track current selected day for menu display
-  let _selectedDayValue = "live";
-  
-  /**
-   * Validate that a state object has the expected schema.
-   * Returns true if valid, false if not.
-   * This is a security boundary - validates structure before any processing.
-   */
-  function validateStateSchema(state) {
-    if (!state || typeof state !== "object") return false;
-    // Must have mobile or fixed arrays
-    if (!Array.isArray(state.mobile) && !Array.isArray(state.fixed)) return false;
-    // Check mobile entries have id
-    if (Array.isArray(state.mobile)) {
-      for (const m of state.mobile) {
-        if (!m || typeof m !== "object" || !("id" in m)) return false;
-      }
-    }
-    // Check fixed entries have id
-    if (Array.isArray(state.fixed)) {
-      for (const f of state.fixed) {
-        if (!f || typeof f !== "object" || !("id" in f)) return false;
-      }
-    }
-    return true;
-  }
-  
-  /**
-   * Check if we have valid data that can be saved.
-   */
-  function canSaveSnapshot() {
-    if (_isLoadingData) return false;
-    const state = map._historicalMode ? window._historicalState : window.__lastState;
-    if (!state) return false;
-    if (!validateStateSchema(state)) return false;
-    // Must have at least some data
-    const mobileCount = Array.isArray(state.mobile) ? state.mobile.length : 0;
-    const fixedCount = Array.isArray(state.fixed) ? state.fixed.length : 0;
-    return (mobileCount > 0 || fixedCount > 0);
-  }
-
-  function updateSaveButtonState() {
-    // No-op: old button removed, menu handles state dynamically
-  }
-  
-  async function loadHistoricalDay(dateStr) {
-    if (dateStr === "live") {
-      window._historicalState = null;
-      map._historicalMode = false;
-      map._historicalDateStr = null;
-      // Clear all per-vehicle caches from historical viewing
-      map.clearVehicleCaches();
-      map._playbackPtsById = new Map();
-      map._playbackPtsKey = null;
-      map._playbackNowMs = null;
-      map._playbackInitialized = false;
-      map._playbackLiveFollow = true;
-      // Clear historical wind — live fetch will repopulate
-      map._windSnapshots = null;
-      map._windSnapshotKeys = [];
-      map._windField = null;
-      map._windFieldEtag = null;
-      map._windFieldLastFetch = 0;
-      // Restore live state to the map immediately
-      const liveSt = window.__lastState || { mobile: [], fixed: [] };
-      map.lastState = liveSt;
-      map._ensurePlaybackPoints(liveSt);
-      map.drawOverlay(liveSt);
-      renderLists(liveSt, selectedId);
-      renderDetails(liveSt, selectedId);
-      // Update status bar
-      const statusEl = document.getElementById("statusText");
-      if (statusEl) {
-        statusEl.textContent = "Live";
-        statusEl.classList.add("live");
-        statusEl.classList.remove("offline");
-      }
-      updateSaveButtonState();
-      // Trigger an immediate live poll to get fresh data
-      setTimeout(tick, 100);
-      return;
-    }
-    
-    const statusEl = document.getElementById("statusText");
-    if (statusEl) {
-      statusEl.textContent = "Loading...";
-      statusEl.classList.remove("live");
-    }
-    
-    // Disable save while loading
-    _isLoadingData = true;
-    setMapLoadingShade(true);
-    updateSaveButtonState();
-    
-    try {
-      // Load from local snapshots — we already store all data (mobile, fixed,
-      // purpleair, etc.) so there's no need to fetch from upstream history servers.
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`, { headers: { "X-App-Token": APP_TOKEN } });
-      if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.error || `No snapshot for ${dateStr}`);
-      }
-      const loadedState = await resp.json();
-
-      // Validate the loaded data before using it
-      if (!validateStateSchema(loadedState)) {
-        throw new Error("Invalid data structure in snapshot");
-      }
-      
-      _mapImmobileToParked(loadedState);
-      window._historicalState = loadedState;
-
-      // Cache raw GPS coordinates only if debug mode is enabled
-      // (Deep copying all trails is expensive and only needed for debug visualization)
-      if (map._pbDebugPath) {
-        map._rawGpsById = new Map();
-        const mobs = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
-        for (const m of mobs) {
-          if (m?.id && Array.isArray(m.trail)) {
-            const rawTrail = m.trail.map(pt => ({...pt}));
-            map._rawGpsById.set(String(m.id), rawTrail);
-          }
-        }
-      }
-      
-      // Release accumulated live-polling state — not needed during history
-      // and can be very large (unbounded trail concatenation).
-      _accumulatedState = null;
-      _newestTrailMs = null;
-      _stateEtag = null;
-
-      // Reset ALL playback state and per-vehicle caches for fresh historical data.
-      // Without this, smooth-path, physics, and trace caches from prior snapshots
-      // accumulate and progressively slow the render loop.
-      map.clearVehicleCaches();
-      map._historicalMode = true;
-      map._historicalDateStr = dateStr;
-      map._playbackPtsById = new Map();
-      map._playbackPtsKey = null;
-      map._persistedTrailById = new Map();  // Clear persisted trails
-      map._playbackNowMs = null;  // Reset playback time
-      _pbPageIndex = -1;  // Reset paging for new data
-      _pbPageAutoFollow = true;
-      _pbSlidingWindowCenter = null;
-
-      // Enable DVR/playback mode for historical data
-      // NOTE: setPlaybackMode(true) sets _playbackLiveFollow=true and draws overlay,
-      // so we must disable live follow AFTER and avoid the internal draw.
-      map.playbackMode = true;  // Set directly to avoid immediate draw
-      map._playbackLiveFollow = false;  // Historical always starts at beginning, not live tail
-      if (traceEl) traceEl.checked = true;
-      if (pbBarEl) pbBarEl.classList.remove("hidden");
-      
-      // Build playback points; start the playhead at the earliest data.
-      map._ensurePlaybackPoints(window._historicalState);
-      const b = map.getPlaybackBounds();
-      if (isFinite(b.minMs)) map.setPlaybackTimeMs(b.minMs);
-      
-      // Store state, render sidebar, draw ONLY tiles (no overlay yet)
-      map.lastState = window._historicalState;
-      map.drawTiles();
-      renderLists(window._historicalState, selectedId);
-      
-      if (statusEl) {
-        statusEl.textContent = `Snapshot: ${dateStr}`;
-        statusEl.classList.remove("live");
-      }
-      
-      updatePlaybackUi();
-      
-      // Draw overlay NOW with playback time already set
-      map.drawOverlay(window._historicalState);
-      
-      // Fetch road edges for debug visualization if enabled
-      if (map._pbDebugPath && map._pbDebugRoadLines) {
-        map._fetchRoadEdgesForViewport();
-      }
-      
-      // Start playback loop (auto-play)
-      _pbLastPerf = 0;
-      _pbLastUiPerf = 0;
-      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-      map.setPlaybackPlaying(true);
-      updatePlaybackUi();
-      _pbRAF = requestAnimationFrame(playbackLoop);
-    } catch (e) {
-      console.error("Failed to load historical data:", e);
-      if (statusEl) {
-        statusEl.textContent = e.message || "Error loading history";
-        statusEl.classList.add("offline");
-      }
-      // Show alert for user visibility
-      alert(`Failed to load historical data:\n${e.message}`);
-    } finally {
-      _isLoadingData = false;
-      setMapLoadingShade(false);
-      updateSaveButtonState();
-    }
-  }
-  
-  // ─────────────────────────────────────────────────────────────────────────────
-  // SAVE/LOAD: Persist and restore daily snapshots
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  function getSnapshotDateStr() {
-    // Determine the date to use for saving based on the data being viewed
-    // 1. If viewing a historical day via the menu, use that date
-    if (_selectedDayValue && _selectedDayValue !== "live") {
-      return _selectedDayValue;  // Already in YYYY-MM-DD format
-    }
-    
-    // 2. Otherwise, derive from the newest reading timestamp in the current state
-    const state = map._historicalMode ? window._historicalState : window.__lastState;
-    const newestMs = newestReadingMsFromState(state);
-    if (newestMs != null && isFinite(newestMs)) {
-      const d = new Date(newestMs);
-      return d.toISOString().split("T")[0];
-    }
-    
-    // 3. Fallback to today
-    return new Date().toISOString().split("T")[0];
-  }
-
-  async function saveSnapshot() {
-    if (map._historicalMode) {
-      console.warn("Cannot save: viewing historical snapshot");
-      return;
-    }
-    const statusEl = document.getElementById("statusText");
-    const dateStr = getSnapshotDateStr();
-    
-    try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/save?date=${encodeURIComponent(dateStr)}`, {
-        method: "POST",
-        headers: { "Content-Length": "0", "X-App-Token": APP_TOKEN },
-        credentials: "same-origin",
-      });
-      if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.error || `HTTP ${resp.status}`);
-      }
-      const result = await resp.json();
-      
-      if (statusEl) {
-        const prevText = statusEl.textContent;
-        statusEl.textContent = `Saved ${dateStr}`;
-        setTimeout(() => {
-          if (statusEl.textContent === `Saved ${dateStr}`) {
-            statusEl.textContent = prevText;
-          }
-        }, 2000);
-      }
-      console.log("Snapshot saved:", result);
-    } catch (e) {
-      console.error("Failed to save snapshot:", e);
-      if (statusEl) {
-        statusEl.textContent = "Save failed";
-        statusEl.classList.add("offline");
-      }
-    } finally {
-      updateSaveButtonState();
-    }
-  }
-
-  async function showLoadModal() {
-    // Fetch available snapshots
-    let snapshots = [];
-    try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshots`, { headers: { "X-App-Token": APP_TOKEN } });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json();
-      snapshots = data.snapshots || [];
-    } catch (e) {
-      console.error("Failed to list snapshots:", e);
-      return;
-    }
-
-    // Create modal
-    const modal = document.createElement("div");
-    modal.className = "snapshotModal";
-    
-    const content = document.createElement("div");
-    content.className = "snapshotModalContent";
-    
-    const title = document.createElement("h3");
-    title.textContent = "Load Saved Day";
-    content.appendChild(title);
-    
-    const list = document.createElement("div");
-    list.className = "snapshotList";
-    
-    if (snapshots.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "snapshotEmpty";
-      empty.textContent = "No saved snapshots found";
-      list.appendChild(empty);
-    } else {
-      for (const snap of snapshots) {
-        const item = document.createElement("div");
-        item.className = "snapshotItem";
-        
-        const dateSpan = document.createElement("span");
-        dateSpan.className = "date";
-        // Format date nicely
-        const d = new Date(snap.date + "T12:00:00");
-        const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
-        const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-        dateSpan.textContent = `${dayName} ${monthDay}`;
-        
-        const sizeSpan = document.createElement("span");
-        sizeSpan.className = "size";
-        const sizeMB = (snap.size_bytes / (1024 * 1024)).toFixed(1);
-        sizeSpan.textContent = `${sizeMB} MB`;
-        
-        item.appendChild(dateSpan);
-        item.appendChild(sizeSpan);
-        
-        item.addEventListener("click", async () => {
-          modal.remove();
-          await loadSnapshotByDate(snap.date);
-        });
-        
-        list.appendChild(item);
-      }
-    }
-    content.appendChild(list);
-    
-    const closeBtn = document.createElement("button");
-    closeBtn.className = "snapshotModalClose";
-    closeBtn.textContent = "Cancel";
-    closeBtn.addEventListener("click", () => modal.remove());
-    content.appendChild(closeBtn);
-    
-    modal.appendChild(content);
-    modal.addEventListener("click", (e) => {
-      if (e.target === modal) modal.remove();
-    });
-    
-    document.body.appendChild(modal);
-  }
-
-  async function loadSnapshotByDate(dateStr, extraParams = "") {
-    const statusEl = document.getElementById("statusText");
-    if (statusEl) {
-      statusEl.textContent = "Loading...";
-      statusEl.classList.remove("live");
-    }
-    
-    // Disable save while loading
-    _isLoadingData = true;
-    setMapLoadingShade(true);
-    updateSaveButtonState();
-    
-    try {
-      const resp = await fetch(`${appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}`, { headers: { "X-App-Token": APP_TOKEN } });
-      if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.error || `HTTP ${resp.status}`);
-      }
-      const loadedState = await resp.json();
-      
-      // Validate the loaded data before using it
-      if (!validateStateSchema(loadedState)) {
-        throw new Error("Invalid data structure in snapshot");
-      }
-      
-      _mapImmobileToParked(loadedState);
-      window._historicalState = loadedState;
-
-      // Load wind snapshots from the historical snapshot if present
-      if (!window.WIND_LOADING_DISABLED && loadedState.wind_snapshots && typeof loadedState.wind_snapshots === "object") {
-        map._windSnapshots = loadedState.wind_snapshots;
-        map._windSnapshotKeys = Object.keys(loadedState.wind_snapshots).sort();
-        if (map._windSnapshotKeys.length > 0) {
-          const latest = map._windSnapshotKeys[map._windSnapshotKeys.length - 1];
-          map._windField = loadedState.wind_snapshots[latest];
-        }
-      } else {
-        map._windSnapshots = null;
-        map._windSnapshotKeys = [];
-        map._windField = null;
-      }
-
-      // Cache raw GPS coordinates only if debug mode is enabled
-      if (map._pbDebugPath) {
-        map._rawGpsById = new Map();
-        const mobs = Array.isArray(loadedState?.mobile) ? loadedState.mobile : [];
-        for (const m of mobs) {
-          if (m?.id && Array.isArray(m.trail)) {
-            const rawTrail = m.trail.map(pt => ({...pt}));
-            map._rawGpsById.set(String(m.id), rawTrail);
-          }
-        }
-      }
-      
-      // Reset ALL playback state for fresh historical data
-      map._historicalMode = true;
-      map._historicalDateStr = dateStr;
-      map._playbackPtsById = new Map();
-      map._playbackPtsKey = null;
-      map._persistedTrailById = new Map();
-      map._playbackNowMs = null;
-      _pbPageIndex = -1;  // Reset paging for new data
-      _pbPageAutoFollow = true;
-      _pbSlidingWindowCenter = null;
-
-      // Enable DVR/playback mode
-      map.playbackMode = true;
-      map._playbackLiveFollow = false;
-      if (traceEl) traceEl.checked = true;
-      if (pbBarEl) pbBarEl.classList.remove("hidden");
-      
-      // Build playback points; start the playhead at the earliest data.
-      map._ensurePlaybackPoints(window._historicalState);
-      const b = map.getPlaybackBounds();
-      if (isFinite(b.minMs)) {
-        map.setPlaybackTimeMs(b.minMs);
-      }
-      
-      // Store state, render sidebar, draw
-      map.lastState = window._historicalState;
-      map.drawTiles();
-      renderLists(window._historicalState, selectedId);
-      
-      if (statusEl) {
-        statusEl.textContent = `Snapshot: ${dateStr}`;
-        statusEl.classList.remove("live");
-      }
-      
-      updatePlaybackUi();
-      map.drawOverlay(window._historicalState);
-      
-      // Start playback loop (auto-play)
-      _pbLastPerf = 0;
-      _pbLastUiPerf = 0;
-      _pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
-      map.setPlaybackPlaying(true);
-      updatePlaybackUi();
-      _pbRAF = requestAnimationFrame(playbackLoop);
-    } catch (e) {
-      console.error("Failed to load snapshot:", e);
-      if (statusEl) {
-        statusEl.textContent = "Load failed";
-        statusEl.classList.add("offline");
-      }
-    } finally {
-      _isLoadingData = false;
-      setMapLoadingShade(false);
-      updateSaveButtonState();
-    }
-  }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // PLAYBACK MENU: Dropup menu for save/load/days
+  // SAVE/LOAD, DAY SELECTOR, PLAYBACK MENU: Extracted to ui_snapshots_menus.js
+  // (SnapshotsMenusUI). The module owns the menu/submenu DOM refs, the menu-
+  // close and submenu show/hide debounce timers, and (as instance properties,
+  // not privately) the two mutable scalars also read/written by unmoved
+  // main() code: `_isLoadingData` (StateSync's isLoadingData() getter below,
+  // and tick()'s historical-mode skip check) and `_selectedDayValue` (the
+  // embed ?date= URL-param handler further down). `traceEl`/`pbBarEl` are
+  // DOM refs already looked up above; `tick` is defined later in main() but
+  // only invoked (not called) at construction time, so forward reference via
+  // a lazy wrapper is safe. `deps.dimEl`/`satEl`/`themeEl` are ThemeUI's refs.
   // ─────────────────────────────────────────────────────────────────────────────
-  const pbMenuBtn = document.getElementById("pbMenuBtn");
-  const pbMenu = document.getElementById("pbMenu");
-  const pbDaysSubmenu = document.getElementById("pbDaysSubmenu");
+  const snapshotsMenus = new SnapshotsMenusUI({
+    map,
+    document,
+    pb,
+    deps: {
+      getSelectedId: () => selectedId,
+      traceEl,
+      pbBarEl,
+      validateStateSchema: StateSync.validateStateSchema,
+      newestReadingMsFromState,
+      mapImmobileToParked: (state) => StateSync._mapImmobileToParked(state),
+      renderLists,
+      renderDetails,
+      updatePlaybackUi: () => updatePlaybackUi(),
+      playbackLoop: () => playbackLoop(),
+      setMapLoadingShade: (on) => setMapLoadingShade(on),
+      tick: () => tick(),
+      getAutoCameraEnabled: () => _autoCameraEnabled,
+      getCurrentThemeKey: () => _currentThemeKey,
+      setCurrentThemeKey: (k) => { _currentThemeKey = k; },
+      themeEl, dimEl, satEl,
+      applyThemeAndFilters,
+      loadDimForTheme,
+      loadSatForTheme,
+      saveThemeForMode,
+    },
+  });
+  // Thin delegates keep every original call site in main() untouched.
+  function canSaveSnapshot() { return snapshotsMenus.canSaveSnapshot(); }
+  function updateSaveButtonState() { return snapshotsMenus.updateSaveButtonState(); }
+  function loadHistoricalDay(dateStr) { return snapshotsMenus.loadHistoricalDay(dateStr); }
+  function getSnapshotDateStr() { return snapshotsMenus.getSnapshotDateStr(); }
+  function saveSnapshot() { return snapshotsMenus.saveSnapshot(); }
+  function showLoadModal() { return snapshotsMenus.showLoadModal(); }
+  function loadSnapshotByDate(dateStr, extraParams = "") { return snapshotsMenus.loadSnapshotByDate(dateStr, extraParams); }
+  function _updateAutoCameraBtn() { return snapshotsMenus._updateAutoCameraBtn(); }
+  function closePlaybackMenuImmediate() { return snapshotsMenus.closePlaybackMenuImmediate(); }
+  function closePlaybackMenu() { return snapshotsMenus.closePlaybackMenu(); }
+  function cancelMenuHide() { return snapshotsMenus.cancelMenuHide(); }
+  function openPlaybackMenu() { return snapshotsMenus.openPlaybackMenu(); }
+  function togglePlaybackMenu() { return snapshotsMenus.togglePlaybackMenu(); }
+  function showSubmenuDebounced(submenuEl, parentEl, onShow) { return snapshotsMenus.showSubmenuDebounced(submenuEl, parentEl, onShow); }
+  function hideSubmenuDebounced(submenuEl, parentEl, e) { return snapshotsMenus.hideSubmenuDebounced(submenuEl, parentEl, e); }
+  function updateDaysSubmenu() { return snapshotsMenus.updateDaysSubmenu(); }
+  function updateThemeSubmenu() { return snapshotsMenus.updateThemeSubmenu(); }
+  function showAboutModal() { return snapshotsMenus.showAboutModal(); }
+  function handleMenuAction(action) { return snapshotsMenus.handleMenuAction(action); }
+  function syncDisplaySliders() { return snapshotsMenus.syncDisplaySliders(); }
+
+  // Playback menu DOM refs main() still reads/writes directly (share button,
+  // auto-camera click listener, days/theme submenu hover wiring below).
+  const pbMenuBtn = snapshotsMenus.pbMenuBtn;
+  const pbMenu = snapshotsMenus.pbMenu;
+  const pbDaysSubmenu = snapshotsMenus.pbDaysSubmenu;
+  const pbThemeSubmenu = snapshotsMenus.pbThemeSubmenu;
   const shareBtn = document.getElementById("shareBtn");
   const autoCameraBtn = document.getElementById("autoCameraBtn");
 
-  function _updateAutoCameraBtn() {
-    if (!autoCameraBtn) return;
-    autoCameraBtn.classList.toggle("active", _autoCameraEnabled);
-    autoCameraBtn.title = `Auto-center camera: ${_autoCameraEnabled ? "on" : "off"}`;
-    autoCameraBtn.setAttribute("aria-label", `Toggle auto-center camera (currently ${_autoCameraEnabled ? "on" : "off"})`);
-  }
   _updateAutoCameraBtn();
 
   if (autoCameraBtn) {
@@ -4087,113 +1769,7 @@ function main() {
       if (_autoCameraEnabled) _performCameraFit({ force: true });
     });
   }
-  
-  // Menu close delay for better UX
-  let _menuHideTimer = null;
-  const MENU_HIDE_DELAY = 150; // ms before hiding main menu
-  
-  function closePlaybackMenuImmediate() {
-    if (_menuHideTimer) {
-      clearTimeout(_menuHideTimer);
-      _menuHideTimer = null;
-    }
-    if (pbMenu) {
-      pbMenu.classList.remove("visible");
-      pbMenu.classList.add("hidden");
-    }
-    if (pbMenuBtn) pbMenuBtn.classList.remove("open");
-    // Also hide submenus
-    if (pbDaysSubmenu) pbDaysSubmenu.classList.remove("visible");
-    const pbThemeSubmenuEl = document.getElementById("pbThemeSubmenu");
-    if (pbThemeSubmenuEl) pbThemeSubmenuEl.classList.remove("visible");
-    const pbDisplaySubmenuEl = document.getElementById("pbDisplaySubmenu");
-    if (pbDisplaySubmenuEl) pbDisplaySubmenuEl.classList.remove("visible");
-  }
-  
-  function closePlaybackMenu() {
-    closePlaybackMenuImmediate();
-  }
-  
-  function cancelMenuHide() {
-    if (_menuHideTimer) {
-      clearTimeout(_menuHideTimer);
-      _menuHideTimer = null;
-    }
-  }
-  
-  function openPlaybackMenu() {
-    if (!pbMenu) return;
-    cancelMenuHide();
-    pbMenu.classList.remove("hidden");
-    pbMenu.classList.add("visible");
-    if (pbMenuBtn) pbMenuBtn.classList.add("open");
-    updateDaysSubmenu();
-  }
-  
-  function togglePlaybackMenu() {
-    if (!pbMenu) return;
-    const isOpen = pbMenu.classList.contains("visible");
-    if (isOpen) {
-      closePlaybackMenu();
-    } else {
-      openPlaybackMenu();;
-    }
-  }
-  
-  // Centralized submenu show/hide with debouncing
-  const SUBMENU_SHOW_DELAY = 80; // ms before showing a different submenu
-  const SUBMENU_HIDE_DELAY = 200; // ms before hiding submenu
-  let _submenuShowTimer = null;
-  let _submenuHideTimer = null;
-  let _currentSubmenu = null; // track which submenu is open
-  
-  function showSubmenuDebounced(submenuEl, parentEl, onShow) {
-    // Cancel any pending hide
-    if (_submenuHideTimer) {
-      clearTimeout(_submenuHideTimer);
-      _submenuHideTimer = null;
-    }
-    // If this submenu is already open, no delay needed
-    if (_currentSubmenu === submenuEl) {
-      if (_submenuShowTimer) clearTimeout(_submenuShowTimer);
-      _submenuShowTimer = null;
-      return;
-    }
-    // Cancel any pending show of a different submenu
-    if (_submenuShowTimer) clearTimeout(_submenuShowTimer);
-    _submenuShowTimer = setTimeout(() => {
-      _submenuShowTimer = null;
-      // Hide all submenus
-      const pbThemeSubmenu = document.getElementById("pbThemeSubmenu");
-      if (pbThemeSubmenu) pbThemeSubmenu.classList.remove("visible");
-      const pbDisplaySubmenu = document.getElementById("pbDisplaySubmenu");
-      if (pbDisplaySubmenu) pbDisplaySubmenu.classList.remove("visible");
-      if (pbDaysSubmenu) pbDaysSubmenu.classList.remove("visible");
-      // Show requested submenu
-      if (onShow) onShow();
-      submenuEl.classList.add("visible");
-      _currentSubmenu = submenuEl;
-    }, SUBMENU_SHOW_DELAY);
-  }
-  
-  function hideSubmenuDebounced(submenuEl, parentEl, e) {
-    // Don't hide if moving to parent menu item or submenu itself
-    if (e && e.relatedTarget && (parentEl.contains(e.relatedTarget) || submenuEl.contains(e.relatedTarget))) {
-      return;
-    }
-    // Cancel pending show
-    if (_submenuShowTimer) {
-      clearTimeout(_submenuShowTimer);
-      _submenuShowTimer = null;
-    }
-    if (_submenuHideTimer) clearTimeout(_submenuHideTimer);
-    _submenuHideTimer = setTimeout(() => {
-      submenuEl.classList.remove("visible");
-      if (_currentSubmenu === submenuEl) _currentSubmenu = null;
-      _submenuHideTimer = null;
-    }, SUBMENU_HIDE_DELAY);
-  }
-  
+
   // Wire up Days submenu
   const pbMenuSubEl = document.querySelector(".pbMenuSub[data-submenu='days']");
   if (pbMenuSubEl && pbDaysSubmenu) {
@@ -4202,85 +1778,10 @@ function main() {
     pbDaysSubmenu.addEventListener("mouseenter", () => showSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, null));
     pbDaysSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDaysSubmenu, pbMenuSubEl, e));
   }
-  
-  function updateDaysSubmenu() {
-    if (!pbDaysSubmenu) return;
-    pbDaysSubmenu.innerHTML = "";
 
-    // Always show Today (Live) first
-    const liveItem = document.createElement("div");
-    liveItem.className = "pbSubmenuItem" + (_selectedDayValue === "live" ? " active" : "");
-    liveItem.textContent = "🔮 Today (Live)";
-    liveItem.addEventListener("click", (e) => {
-      e.stopPropagation();
-      _selectedDayValue = "live";
-      loadHistoricalDay("live");
-      closePlaybackMenu();
-    });
-    pbDaysSubmenu.appendChild(liveItem);
-
-    // Show the past 7 days, built purely from the local calendar — no network.
-    // Whether a snapshot actually exists is discovered when the user clicks
-    // (snapshot/load returns an error for missing days).
-    const now = new Date();
-    for (let i = 1; i <= 7; i++) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
-      const yyyy = d.getFullYear();
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      const dateStr = `${yyyy}-${mm}-${dd}`;
-      const dayName = d.toLocaleDateString("en-US", { weekday: "short" });
-      const monthDay = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-      const item = document.createElement("div");
-      item.className = "pbSubmenuItem";
-      item.textContent = `${dayName} ${monthDay}`;
-      if (_selectedDayValue === dateStr) item.classList.add("active");
-      item.addEventListener("click", (e) => {
-        e.stopPropagation();
-        _selectedDayValue = dateStr;
-        loadHistoricalDay(dateStr);
-        closePlaybackMenu();
-      });
-      pbDaysSubmenu.appendChild(item);
-    }
-  }
-  
-  // Theme submenu
-  const pbThemeSubmenu = document.getElementById("pbThemeSubmenu");
-  
-  function updateThemeSubmenu() {
-    if (!pbThemeSubmenu) return;
-    pbThemeSubmenu.innerHTML = "";
-    
-    const keys = Object.keys(TILE_THEMES);
-    for (const k of keys) {
-      const item = document.createElement("div");
-      item.className = "pbSubmenuItem";
-      if (k === _currentThemeKey) {
-        item.classList.add("active");
-      }
-      item.textContent = TILE_THEMES[k].label || k;
-      item.dataset.value = k;
-      item.addEventListener("click", (e) => {
-        e.stopPropagation();
-        _currentThemeKey = k;
-        saveThemeForMode(k);
-        if (themeEl) themeEl.value = k;
-        const dim = loadDimForTheme(k);
-        if (dimEl) dimEl.value = String(dim);
-        const sat = loadSatForTheme(k);
-        if (satEl) satEl.value = String(sat);
-        applyThemeAndFilters(k, dim, sat);
-        updateThemeSubmenu();
-        // Keep menu open so user can easily try different themes
-      });
-      pbThemeSubmenu.appendChild(item);
-    }
-  }
   // Register for use by applyTheme (defined earlier)
   window._updateThemeSubmenu = updateThemeSubmenu;
-  
+
   // Wire up Theme submenu hover (uses centralized debounce)
   const pbThemeSubEl = document.querySelector(".pbMenuSub[data-submenu='theme']");
   if (pbThemeSubEl && pbThemeSubmenu) {
@@ -4289,102 +1790,7 @@ function main() {
     pbThemeSubmenu.addEventListener("mouseenter", () => showSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, updateThemeSubmenu));
     pbThemeSubmenu.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbThemeSubmenu, pbThemeSubEl, e));
   }
-  
-  // ── Owner token secret tap state ──
-  let _aboutTapCount = 0;
-  let _aboutTapTimer = null;
 
-  function showAboutModal() {
-    const modal = document.getElementById("aboutModal");
-    if (!modal) return;
-    modal.classList.remove("hidden");
-
-    // Reset token section visibility each time modal opens
-    const tokenSection = document.getElementById("ownerTokenSection");
-    const tokenInput = document.getElementById("ownerTokenInput");
-    const tokenSaveBtn = document.getElementById("ownerTokenSave");
-    const tokenStatus = document.getElementById("ownerTokenStatus");
-    if (tokenSection) tokenSection.classList.add("hidden");
-    _aboutTapCount = 0;
-
-    // Tap version label 5 times to reveal token input
-    const versionEl = modal.querySelector(".aboutVersion");
-    if (versionEl) {
-      versionEl.style.cursor = "default";
-      versionEl.onclick = () => {
-        _aboutTapCount++;
-        clearTimeout(_aboutTapTimer);
-        _aboutTapTimer = setTimeout(() => { _aboutTapCount = 0; }, 2000);
-        if (_aboutTapCount >= 5) {
-          _aboutTapCount = 0;
-          if (tokenSection) {
-            tokenSection.classList.remove("hidden");
-            if (tokenInput) tokenInput.value = localStorage.getItem("dusty_owner_tok") || "";
-            if (tokenStatus) tokenStatus.textContent = "";
-          }
-        }
-      };
-    }
-
-    // Save token button
-    if (tokenSaveBtn && tokenInput) {
-      tokenSaveBtn.onclick = async () => {
-        const val = (tokenInput.value || "").trim();
-        if (val) {
-          localStorage.setItem("dusty_owner_tok", val);
-          // Exchange for HttpOnly cookie immediately
-          try {
-            const res = await fetch("/api/auth", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", "X-App-Token": APP_TOKEN },
-              body: JSON.stringify({ token: val }),
-              credentials: "same-origin",
-            });
-            if (tokenStatus) tokenStatus.textContent = res.ok ? "Saved & authenticated. Reload to apply." : "Saved but auth failed — check token.";
-          } catch (_) {
-            if (tokenStatus) tokenStatus.textContent = "Saved. Reload to apply.";
-          }
-        } else {
-          localStorage.removeItem("dusty_owner_tok");
-          // Clear the auth cookie
-          try { await fetch("/api/auth", { method: "DELETE", headers: { "X-App-Token": APP_TOKEN }, credentials: "same-origin" }); } catch (_) {}
-          if (tokenStatus) tokenStatus.textContent = "Cleared.";
-        }
-      };
-    }
-
-    const closeBtn = modal.querySelector(".aboutModalClose");
-    const onClose = () => {
-      modal.classList.add("hidden");
-      closeBtn.removeEventListener("click", onClose);
-    };
-    closeBtn.addEventListener("click", onClose);
-    modal.addEventListener("click", function handler(e) {
-      if (e.target === modal || e.target.classList.contains("aboutModalX")) {
-        onClose();
-        modal.removeEventListener("click", handler);
-      }
-    });
-  }
-
-  function handleMenuAction(action) {
-    switch (action) {
-      case "save":
-        saveSnapshot();
-        break;
-      case "load":
-        showLoadModal();
-        break;
-      case "about":
-        showAboutModal();
-        break;
-      case "debug":
-        if (window._fdToggle) window._fdToggle();
-        break;
-    }
-    closePlaybackMenu();
-  }
-  
   if (pbMenuBtn) {
     pbMenuBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -4435,18 +1841,9 @@ function main() {
   }
 
   // Wire up Display submenu hover (uses centralized debounce)
+  // syncDisplaySliders moved to ui_snapshots_menus.js (file-scope delegate above).
   const pbDisplaySubEl = document.querySelector(".pbMenuSub[data-submenu='display']");
   if (pbDisplaySubEl && pbDisplaySubmenu) {
-    function syncDisplaySliders() {
-      if (menuDimEl && dimEl) menuDimEl.value = dimEl.value;
-      if (menuSatEl && satEl) menuSatEl.value = satEl.value;
-      if (menuAlphaEl) {
-        const raw = localStorage.getItem(PA_ALPHA_STORAGE_KEY);
-        const v = raw != null ? Number(raw) : 27;
-        menuAlphaEl.value = Math.max(0, Math.min(100, isFinite(v) ? v : 27));
-      }
-    }
-    
     pbDisplaySubEl.addEventListener("mouseenter", () => showSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, syncDisplaySliders));
     pbDisplaySubEl.addEventListener("mouseleave", (e) => hideSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, e));
     pbDisplaySubmenu.addEventListener("mouseenter", () => showSubmenuDebounced(pbDisplaySubmenu, pbDisplaySubEl, syncDisplaySliders));
@@ -4515,101 +1912,9 @@ function main() {
   });
 
   if (pbScrubEl) {
-    const applyScrub = () => {
-      const b = map.getPlaybackBounds();
-      if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
-      // When paging is active, slider is relative to the page range
-      const pr = _pbPagingActive() ? _pbGetPageRange() : b;
-      const relMs = Number(pbScrubEl.value);
-      if (!isFinite(relMs)) return;
-      const tMs = pr.minMs + relMs;
-      const clampedT = clamp(tMs, b.minMs, b.maxMs);
-
-      map.setPlaybackTimeMs(clampedT);
-
-      // Don't auto-enable LIVE mode when dragging - user must click the Live button.
-      // Just track where the user left the playhead as replay point A.
-      _pbLoopStartMs = clampedT;
-
-      updatePlaybackUi();
-      map._compositePaFieldOnTiles(map.lastState);
-      map.drawOverlay(map.lastState);
-
-      // Start or stop edge-jog during drag
-      if (_pbScrubbing && _pbSlidingWindowCenter != null) {
-        _pbStartEdgeJog();
-      }
-    };
-
-    // Edge-jog: when the slider thumb is in the outer 10% during a drag,
-    // continuously shift the sliding window in that direction.
-    const _pbEdgeThreshold = 0.10; // outer 10% of slider triggers jog
-    function _pbStartEdgeJog() {
-      if (_pbJogRAF) return; // already running
-      _pbJogLastPerf = performance.now();
-      _pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
-    }
-    function _pbStopEdgeJog() {
-      if (_pbJogRAF) { cancelAnimationFrame(_pbJogRAF); _pbJogRAF = null; }
-    }
-    function _pbEdgeJogTick(now) {
-      _pbJogRAF = null;
-      if (!_pbScrubbing || _pbSlidingWindowCenter == null) return;
-
-      const maxVal = Number(pbScrubEl.max);
-      const curVal = Number(pbScrubEl.value);
-      if (!maxVal) return;
-      const frac = curVal / maxVal; // 0..1 position within window
-
-      // Determine jog direction and intensity
-      let jogDir = 0;
-      let intensity = 0;
-      if (frac >= 1 - _pbEdgeThreshold) {
-        jogDir = 1; // jog forward
-        intensity = (frac - (1 - _pbEdgeThreshold)) / _pbEdgeThreshold; // 0..1
-      } else if (frac <= _pbEdgeThreshold) {
-        jogDir = -1; // jog backward
-        intensity = (_pbEdgeThreshold - frac) / _pbEdgeThreshold; // 0..1
-      }
-
-      if (jogDir !== 0) {
-        const dt = now - _pbJogLastPerf;
-        // Jog speed: up to 1 page-width per second at full intensity
-        const jogSpeed = _pbPageSizeMs * intensity * 1.0;
-        const shift = jogDir * jogSpeed * (dt / 1000);
-
-        const gb = map.getPlaybackBounds();
-        const prevCenter = _pbSlidingWindowCenter;
-        _pbSlidingWindowCenter = clamp(
-          _pbSlidingWindowCenter + shift,
-          gb.minMs + _pbPageSizeMs / 2,
-          gb.maxMs - _pbPageSizeMs / 2
-        );
-
-        // Re-apply scrub with the new window position — the absolute time
-        // the thumb maps to changes as the window shifts under it.
-        const pr = _pbGetPageRange();
-        const relMs = Number(pbScrubEl.value);
-        const tMs = clamp(pr.minMs + relMs, gb.minMs, gb.maxMs);
-        map.setPlaybackTimeMs(tMs);
-        _pbLoopStartMs = tMs;
-
-        // Always update timestamp display during jog, even if window is
-        // clamped to the data boundary (so the user sees the time isn't moving).
-        updatePlaybackUi();
-        map.drawOverlay(map.lastState);
-      } else {
-        // Not in the jog zone — still update the timestamp so it's never stale
-        // after the user drags out of the edge zone.
-        updatePlaybackUi();
-      }
-
-      _pbJogLastPerf = now;
-      // Keep ticking while dragging
-      if (_pbScrubbing) {
-        _pbJogRAF = requestAnimationFrame(_pbEdgeJogTick);
-      }
-    }
+    // applyScrub / _pbStartEdgeJog / _pbStopEdgeJog / _pbEdgeJogTick moved to
+    // ui_playback.js (file-scope delegates above); the scrub listeners below
+    // call them through those delegates.
 
     // ─── Mouse/pen track-drag: jogger sensitivity for clicks outside the nub ──
     let _scrubPointerOnTrack = false;
@@ -4634,18 +1939,22 @@ function main() {
         }
       }
       // Cancel ALL physics immediately - user is taking control
-      _pbVelocity = 0;
-      _pbWheelAccum = 0;
-      _pbAtEndSincePerf = null;
-      _pbArrivedAtEndViaPlayback = false; // user is scrubbing, not playing
-      _pbIsRewinding = false;
-      _pbEaseStartPerf = null;
-      _pbIsWheelCoasting = false;
-      _pbScrubbing = true;
+      pb._pbVelocity = 0;
+      pb._pbWheelAccum = 0;
+      pb._pbAtEndSincePerf = null;
+      pb._pbArrivedAtEndViaPlayback = false; // user is scrubbing, not playing
+      pb._pbIsRewinding = false;
+      pb._pbEaseStartPerf = null;
+      pb._pbIsWheelCoasting = false;
+      pb._pbScrubbing = true;
+      pb._pbPaused = false;
       map._scrubbing = true;
-      _pbDidDrag = false; // track if user actually dragged
+      pb._pbDidDrag = false; // track if user actually dragged
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
+      // Remember whether playback was active so release can restore it —
+      // a scrub started while paused stays paused (button keeps "Play").
+      pb._pbResumeAfterScrub = map.getPlaybackPlaying() || map._playbackLiveFollow;
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false; // exit live mode when user grabs slider
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
@@ -4653,9 +1962,9 @@ function main() {
       // Activate sliding window: freeze the current window in place for the drag.
       // If already in sliding window mode, keep the existing center.
       // If in index-based mode, convert the current page center to a sliding window.
-      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+      if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
         const pr = _pbGetPageRange();
-        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+        pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
       }
       updatePlaybackUi();
     });
@@ -4665,21 +1974,21 @@ function main() {
     }, { capture: true });
     // Jogger-sensitivity drag when pointer started on the track
     pbScrubEl.addEventListener("pointermove", (e) => {
-      if (!_scrubPointerOnTrack || !_pbScrubbing) return;
+      if (!_scrubPointerOnTrack || !pb._pbScrubbing) return;
       const dx = e.clientX - _scrubPointerStartX;
       const rect = pbScrubEl.getBoundingClientRect();
       const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
       const delta = (dx / rect.width) * range * _scrubPointerSensitivity;
       const newVal = clamp(_scrubPointerStartVal + delta, Number(pbScrubEl.min), Number(pbScrubEl.max));
       pbScrubEl.value = String(newVal);
-      _pbDidDrag = true;
+      pb._pbDidDrag = true;
       _pbLastScrubPos = newVal;
       _pbLastScrubTime = performance.now();
-      if (!_scrubRAF) {
-        _scrubRAF = requestAnimationFrame(() => {
-          _scrubRAF = 0;
+      if (!_getScrubRAF()) {
+        _setScrubRAF(requestAnimationFrame(() => {
+          _setScrubRAF(0);
           applyScrub();
-        });
+        }));
       }
     });
     pbScrubEl.addEventListener("pointerup", () => {
@@ -4693,10 +2002,10 @@ function main() {
       _scrubPointerStartVal = null;
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
-      _pbScrubbing = false;
+      pb._pbScrubbing = false;
       map._scrubbing = false;
-      _pbVelocity = 0;
-      _pbPageAutoFollow = true; // resume auto-following after manual scrub
+      pb._pbVelocity = 0;
+      pb._pbPageAutoFollow = true; // resume auto-following after manual scrub
 
       // Page back if slider is near the left edge (1% threshold)
       if (_pbPagingActive() && Number(pbScrubEl.value) <= Number(pbScrubEl.max) * 0.01) {
@@ -4704,88 +2013,80 @@ function main() {
         const pr = _pbGetPageRange();
         if (pr.minMs > gb.minMs) {
           // Shift the sliding window left by one page
-          if (_pbSlidingWindowCenter != null) {
-            _pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, _pbSlidingWindowCenter - _pbPageSizeMs);
-          } else if (_pbPageIndex > 0) {
-            _pbSetPage(_pbPageIndex - 1);
+          if (pb._pbSlidingWindowCenter != null) {
+            pb._pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, pb._pbSlidingWindowCenter - _pbPageSizeMs);
+          } else if (pb._pbPageIndex > 0) {
+            _pbSetPage(pb._pbPageIndex - 1);
           }
           const prev = _pbGetPageRange();
           map.setPlaybackTimeMs(prev.maxMs);
-          _pbLoopStartMs = prev.maxMs;
+          pb._pbLoopStartMs = prev.maxMs;
           pbScrubEl.max = String(prev.maxMs - prev.minMs);
           pbScrubEl.value = pbScrubEl.max;
           map.setPlaybackPlaying(true);
-          _pbLastPerf = performance.now();
-          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          pb._pbLastPerf = performance.now();
+          if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
           updatePlaybackUi();
           map.drawOverlay(map.lastState);
           return;
         }
       }
 
-      // Don't auto-enable LIVE mode when released at end - user must click Live button.
-      map.setPlaybackPlaying(true);
-      _pbLastPerf = performance.now();
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-      applyScrub();
+      _pbResumeFromScrub(true);
 
     });
-    var _scrubRAF = 0;
     pbScrubEl.addEventListener("input", () => {
       if (_scrubPointerOnTrack) return; // track drag handled by pointermove
       const now = performance.now();
       const pos = Number(pbScrubEl.value);
 
       // User is dragging
-      _pbDidDrag = true;
+      pb._pbDidDrag = true;
       _pbLastScrubPos = pos;
       _pbLastScrubTime = now;
 
       map.setPlaybackPlaying(false);
       // Coalesce rapid input events into a single rAF to avoid
       // overwhelming iPad Safari with drawOverlay() calls
-      if (!_scrubRAF) {
-        _scrubRAF = requestAnimationFrame(() => {
-          _scrubRAF = 0;
+      if (!_getScrubRAF()) {
+        _setScrubRAF(requestAnimationFrame(() => {
+          _setScrubRAF(0);
           applyScrub();
-        });
+        }));
       }
     });
     pbScrubEl.addEventListener("change", () => {
       // 'change' fires on release - only handle clicks here
       // Drags with inertia are handled by pointerup
-      if (_pbDidDrag) {
+      if (pb._pbDidDrag) {
         // Drag was handled by pointerup - do nothing here
         return;
       }
-      // For clicks on the track (not drags), just resume playing
-      _pbScrubbing = false;
+      // For clicks on the track (not drags): commit and restore prior state
+      pb._pbScrubbing = false;
       map._scrubbing = false;
-      _pbVelocity = 0; // no inertia for clicks
-      map.setPlaybackPlaying(true);
-      _pbLastPerf = 0;
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-      applyScrub();
+      pb._pbVelocity = 0; // no inertia for clicks
+      _pbResumeFromScrub(false);
     });
 
     // Scroll wheel on the scrub bar adds momentum (iPod-style)
     pbScrubEl.addEventListener("wheel", (e) => {
       e.preventDefault();
       // Cancel any pending rewind and stop normal playback
-      _pbAtEndSincePerf = null;
-      _pbArrivedAtEndViaPlayback = false; // user is scrolling, not playing
-      _pbIsRewinding = false;
-      _pbPageAutoFollow = true; // resume page tracking when scrolling
+      pb._pbAtEndSincePerf = null;
+      pb._pbArrivedAtEndViaPlayback = false; // user is scrolling, not playing
+      pb._pbIsRewinding = false;
+      pb._pbPageAutoFollow = true; // resume page tracking when scrolling
       map.setPlaybackPlaying(false); // Let wheel nudge control velocity
       // Exit LIVE mode on scroll
       map._playbackLiveFollow = false;
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
-      _pbIsWheelCoasting = true;
-      _pbCommitLoopStartOnCoastEnd = true;
+      pb._pbIsWheelCoasting = true;
+      pb._pbCommitLoopStartOnCoastEnd = true;
       // Activate sliding window so the playhead isn't clamped to a fixed page boundary
-      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+      if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
         const pr = _pbGetPageRange();
-        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+        pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
       }
       // Two-finger swipe (deltaX) or vertical scroll wheel (deltaY): scrub through time.
       // deltaX > 0 = swipe right = backward; deltaY > 0 = scroll down = forward.
@@ -4803,10 +2104,10 @@ function main() {
       let mwBoost = 1;
       if (isMouseWheel && _isWin) {
         const now = performance.now();
-        if (now - _pbMwLastTs > 80) _pbMwAccum = 0;
-        _pbMwAccum += Math.abs(isHorizontal ? rawDx : rawDy);
-        _pbMwLastTs = now;
-        mwBoost = Math.max(0.55 * Math.sqrt(_pbMwAccum), 1);
+        if (now - pb._pbMwLastTs > 80) pb._pbMwAccum = 0;
+        pb._pbMwAccum += Math.abs(isHorizontal ? rawDx : rawDy);
+        pb._pbMwLastTs = now;
+        mwBoost = Math.max(0.55 * Math.sqrt(pb._pbMwAccum), 1);
         mwBoost = Math.min(mwBoost, 60);
       } else if (isMouseWheel && _isMac) {
         mwBoost = 1;
@@ -4814,17 +2115,17 @@ function main() {
       const delta = isHorizontal ? rawDx * mwBoost : (isMouseWheel ? rawDy * mwBoost : -rawDy) * 0.15;
       const nudgeDur = Math.min(durMs, 21600000); // cap at 6h so scroll speed is consistent
       const nudge = (delta / 1000) * (nudgeDur / 480);
-      const prevDir = Math.sign(_pbVelocity);
-      _pbVelocity -= nudge;
+      const prevDir = Math.sign(pb._pbVelocity);
+      pb._pbVelocity -= nudge;
       // On direction reversal, snap window so playhead stays just outside the jog zone
-      if (prevDir !== 0 && Math.sign(_pbVelocity) !== 0 && Math.sign(_pbVelocity) !== prevDir) {
+      if (prevDir !== 0 && Math.sign(pb._pbVelocity) !== 0 && Math.sign(pb._pbVelocity) !== prevDir) {
         _pbSnapWindowToPlayhead();
         updatePlaybackUi();
       }
       // Ensure loop is running
-      if (!_pbRAF) {
-        _pbLastPerf = performance.now(); // valid dt for next frame
-        _pbRAF = requestAnimationFrame(playbackLoop);
+      if (!pb._pbRAF) {
+        pb._pbLastPerf = performance.now(); // valid dt for next frame
+        pb._pbRAF = requestAnimationFrame(playbackLoop);
       }
     }, { passive: false });
 
@@ -4850,26 +2151,28 @@ function main() {
       const thumbX = rect.left + thumbFrac * rect.width;
       _scrubTouchOnThumb = Math.abs(touch.clientX - thumbX) < 24;
       // Run the same setup as pointerdown (which won't fire since we prevented default)
-      _pbVelocity = 0;
-      _pbWheelAccum = 0;
-      _pbAtEndSincePerf = null;
-      _pbArrivedAtEndViaPlayback = false;
-      _pbIsRewinding = false;
-      _pbEaseStartPerf = null;
-      _pbIsWheelCoasting = false;
-      _pbScrubbing = true;
+      pb._pbVelocity = 0;
+      pb._pbWheelAccum = 0;
+      pb._pbAtEndSincePerf = null;
+      pb._pbArrivedAtEndViaPlayback = false;
+      pb._pbIsRewinding = false;
+      pb._pbEaseStartPerf = null;
+      pb._pbIsWheelCoasting = false;
+      pb._pbScrubbing = true;
+      pb._pbPaused = false;
       map._scrubbing = true;
-      _pbDidDrag = false;
+      pb._pbDidDrag = false;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
+      pb._pbResumeAfterScrub = map.getPlaybackPlaying() || map._playbackLiveFollow;
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false;
       try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
       _resetLiveTracking();
       // Activate sliding window
-      if (_pbPagingActive() && _pbSlidingWindowCenter == null) {
+      if (_pbPagingActive() && pb._pbSlidingWindowCenter == null) {
         const pr = _pbGetPageRange();
-        _pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
+        pb._pbSlidingWindowCenter = (pr.minMs + pr.maxMs) / 2;
       }
       updatePlaybackUi();
     }, { passive: false });
@@ -4885,14 +2188,14 @@ function main() {
       const delta = (dx / rect.width) * range * sens;
       _scrubTouchRawTarget = _scrubTouchStartVal + delta;
       pbScrubEl.value = String(clamp(_scrubTouchRawTarget, Number(pbScrubEl.min), Number(pbScrubEl.max)));
-      _pbDidDrag = true;
+      pb._pbDidDrag = true;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
-      if (!_scrubRAF) {
-        _scrubRAF = requestAnimationFrame(() => {
-          _scrubRAF = 0;
+      if (!_getScrubRAF()) {
+        _setScrubRAF(requestAnimationFrame(() => {
+          _setScrubRAF(0);
           applyScrub();
-        });
+        }));
       }
     }, { passive: false });
 
@@ -4903,42 +2206,39 @@ function main() {
       _scrubTouchRawTarget = null;
       _scrubTouchOnThumb = false;
       // Cancel any pending applyScrub rAF so it doesn't overwrite page-back
-      if (_scrubRAF) { cancelAnimationFrame(_scrubRAF); _scrubRAF = 0; }
+      if (_getScrubRAF()) { cancelAnimationFrame(_getScrubRAF()); _setScrubRAF(0); }
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
-      _pbScrubbing = false;
+      pb._pbScrubbing = false;
       map._scrubbing = false;
-      _pbVelocity = 0;
-      _pbPageAutoFollow = true;
+      pb._pbVelocity = 0;
+      pb._pbPageAutoFollow = true;
 
       // Page back if user dragged past the left edge
       if (_pbPagingActive() && rawTarget != null && rawTarget < 0) {
         const gb = map.getPlaybackBounds();
         const pr = _pbGetPageRange();
         if (pr.minMs > gb.minMs) {
-          if (_pbSlidingWindowCenter != null) {
-            _pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, _pbSlidingWindowCenter - _pbPageSizeMs);
-          } else if (_pbPageIndex > 0) {
-            _pbSetPage(_pbPageIndex - 1);
+          if (pb._pbSlidingWindowCenter != null) {
+            pb._pbSlidingWindowCenter = Math.max(gb.minMs + _pbPageSizeMs / 2, pb._pbSlidingWindowCenter - _pbPageSizeMs);
+          } else if (pb._pbPageIndex > 0) {
+            _pbSetPage(pb._pbPageIndex - 1);
           }
           const prev = _pbGetPageRange();
           map.setPlaybackTimeMs(prev.maxMs);
-          _pbLoopStartMs = prev.maxMs;
+          pb._pbLoopStartMs = prev.maxMs;
           pbScrubEl.max = String(prev.maxMs - prev.minMs);
           pbScrubEl.value = pbScrubEl.max;
           map.setPlaybackPlaying(true);
-          _pbLastPerf = performance.now();
-          if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
+          pb._pbLastPerf = performance.now();
+          if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
           updatePlaybackUi();
           map.drawOverlay(map.lastState);
           return;
         }
       }
 
-      map.setPlaybackPlaying(true);
-      _pbLastPerf = performance.now();
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-      applyScrub();
+      _pbResumeFromScrub(true);
     });
   }
 
@@ -4963,24 +2263,24 @@ function main() {
   // ─────────────────────────────────────────────────────────────────────────────
   if (pbPagePrevEl) {
     pbPagePrevEl.addEventListener("click", () => {
-      if (_pbPageIndex <= 0) return;
-      _pbSetPage(_pbPageIndex - 1);
+      if (pb._pbPageIndex <= 0) return;
+      _pbSetPage(pb._pbPageIndex - 1);
       // Jump playhead to start of new page
       const pr = _pbGetPageRange();
       map.setPlaybackTimeMs(pr.minMs);
-      _pbLoopStartMs = pr.minMs;
+      pb._pbLoopStartMs = pr.minMs;
       map.drawOverlay(map.lastState);
     });
   }
   if (pbPageNextEl) {
     pbPageNextEl.addEventListener("click", () => {
       const total = _pbPageCount();
-      if (_pbPageIndex >= total - 1) return;
-      _pbSetPage(_pbPageIndex + 1);
+      if (pb._pbPageIndex >= total - 1) return;
+      _pbSetPage(pb._pbPageIndex + 1);
       // Jump playhead to start of new page
       const pr = _pbGetPageRange();
       map.setPlaybackTimeMs(pr.minMs);
-      _pbLoopStartMs = pr.minMs;
+      pb._pbLoopStartMs = pr.minMs;
       map.drawOverlay(map.lastState);
     });
   }
@@ -4993,207 +2293,32 @@ function main() {
   let _tickLastForceRefreshSeq = null;
   let _tickConsecutiveFailures = 0; // for exponential backoff on errors
 
-  /**
-   * Map backend "immobile" field → frontend "parked" field on all mobile sensors.
-   * The backend sends `immobile: bool` but the UI reads `parked`.
-   */
-  function _mapImmobileToParked(st) {
-    if (!st || !Array.isArray(st.mobile)) return;
-    for (var i = 0; i < st.mobile.length; i++) {
-      var m = st.mobile[i];
-      if (m && m.immobile != null) m.parked = !!m.immobile;
-    }
-  }
-
-  // ── SSE (Server-Sent Events) — push-based state change notifications ──
-  let _sseConnected = false;
-  let _sseLastSeq = null;
-  let _sseSource = null;
-
-  // ── Client ID: reuse the one declared at file scope (line ~88) ──
-
-  // ── Analytics batching ──
-  var _analyticsQueue = [];
-  var _analyticsLastFlush = 0;
-  var _ANALYTICS_FLUSH_MS = 300000; // 5 min
-
-  function _flushAnalytics() {
-    if (!_analyticsQueue.length) return;
-    var events = _analyticsQueue.splice(0, 50);
-    var body = JSON.stringify({ client_id: _clientId, events: events });
-    try {
-      fetch((appConfig.apiBaseUrl || "/api") + "/analytics", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: body
-      }).catch(function() {});
-    } catch (e) {}
-    _analyticsLastFlush = Date.now();
-  }
-
-  function pushAnalyticsEvent(type, payload) {
-    _analyticsQueue.push({ type: type, payload: payload });
-    if (Date.now() - _analyticsLastFlush > _ANALYTICS_FLUSH_MS) {
-      _flushAnalytics();
-    }
-  }
-
-  /**
-   * Merge an SSE delta into the current live state.
-   * delta.trail_new: { sensorId: [points...], ... }
-   * delta.mobile: [ { id, lat, lon, idle, readings }, ... ]
-   */
-  function _mergeDelta(delta) {
-    var st = window.__lastState;
-    if (!st || !st.mobile) return false;
-
-    var changed = false;
-
-    // Merge new trail points
-    var trailNew = delta.trail_new;
-    if (trailNew && typeof trailNew === "object") {
-      var mobileById = {};
-      for (var i = 0; i < st.mobile.length; i++) {
-        var m = st.mobile[i];
-        if (m && m.id) mobileById[m.id] = m;
-      }
-      for (var sid in trailNew) {
-        var sensor = mobileById[sid] || mobileById["mobile:" + sid];
-        if (!sensor) continue;
-        var existing = sensor.trail || [];
-        var incoming = trailNew[sid];
-        if (!Array.isArray(incoming) || !incoming.length) continue;
-        // Find the latest timestamp in existing trail to avoid duplicates
-        var maxExistingT = 0;
-        for (var j = existing.length - 1; j >= 0 && j >= existing.length - 5; j--) {
-          var pt = existing[j];
-          if (pt && typeof pt.t === "number" && pt.t > maxExistingT) maxExistingT = pt.t;
-        }
-        var appended = 0;
-        for (var k = 0; k < incoming.length; k++) {
-          var np = incoming[k];
-          if (np && typeof np.t === "number" && np.t > maxExistingT) {
-            existing.push(np);
-            appended++;
-          }
-        }
-        if (appended > 0) {
-          sensor.trail = existing;
-          changed = true;
-        }
-      }
-    }
-
-    // Merge mobile sensor summaries (readings, position)
-    var mobileSummaries = delta.mobile;
-    if (Array.isArray(mobileSummaries)) {
-      var byId = {};
-      for (var mi = 0; mi < st.mobile.length; mi++) {
-        if (st.mobile[mi] && st.mobile[mi].id) byId[st.mobile[mi].id] = st.mobile[mi];
-      }
-      for (var si = 0; si < mobileSummaries.length; si++) {
-        var summ = mobileSummaries[si];
-        if (!summ || !summ.id) continue;
-        var target = byId[summ.id];
-        if (!target) continue;
-        if (summ.lat != null) target.lat = summ.lat;
-        if (summ.lon != null) target.lon = summ.lon;
-        if (summ.immobile != null) { target.immobile = summ.immobile; target.parked = !!summ.immobile; }
-        if (summ.readings) target.readings = summ.readings;
-        changed = true;
-      }
-    }
-
-    // Update meta timestamps
-    if (delta.ts) {
-      st.ts = delta.ts;
-      if (st.meta) st.meta.ts = delta.ts;
-    }
-
-    return changed;
-  }
-
-  var _sseDeferTimer = null; // deferred render after gesture settles
-
-  function connectSSE() {
-    if (_sseSource) { try { _sseSource.close(); } catch {} }
-    var url = (appConfig.apiBaseUrl || "/api") + "/events";
-    _sseSource = new EventSource(url);
-
-    _sseSource.onopen = function () {
-      _sseConnected = true;
-      // Shorten the next scheduled poll now that SSE is live.
-      if (_tickTimeout) {
-        clearTimeout(_tickTimeout);
-        _tickTimeout = setTimeout(tick, POLL_MS_SSE);
-      }
-    };
-
-    // Named event: "delta" — incremental state update pushed by server
-    _sseSource.addEventListener("delta", function (ev) {
-      try {
-        var delta = JSON.parse(ev.data);
-        var seq = delta.seq;
-        if (seq != null && seq !== _sseLastSeq) {
-          _sseLastSeq = seq;
-          // Skip delta merge if viewing historical data
-          if (window._historicalState || _isLoadingData) return;
-          if (_mergeDelta(delta) && map) {
-            if (map._isGesturing()) {
-              // State merged in-place; gesture redraws reflect it via lastState ref.
-              // Defer full render + sidebar until gesture settles.
-              clearTimeout(_sseDeferTimer);
-              _sseDeferTimer = setTimeout(function() {
-                map.draw(window.__lastState);
-                try { renderLists(window.__lastState, selectedId); } catch (e) {}
-                try { renderDetails(window.__lastState, selectedId); } catch (e) {}
-              }, 300);
-            } else {
-              map.draw(window.__lastState);
-              try { renderLists(window.__lastState, selectedId); } catch (e) {}
-              try { renderDetails(window.__lastState, selectedId); } catch (e) {}
-            }
-          }
-          // Reschedule safety-net poll
-          if (_tickTimeout) clearTimeout(_tickTimeout);
-          _tickTimeout = setTimeout(tick, POLL_MS_SSE);
-        }
-      } catch (e) { try { console.warn("[SSE delta]", e); } catch {} }
-    });
-
-    // Named event: "wind" — new wind snapshot pushed by server
-    _sseSource.addEventListener("wind", function (ev) {
-      try {
-        var snap = JSON.parse(ev.data);
-        if (snap.key && snap.points && map) {
-          map.mergeWindSnapshot(snap.key, snap.points);
-        }
-      } catch (e) { try { console.warn("[SSE wind]", e); } catch {} }
-    });
-
-    // Default "message" event — backward-compatible notification
-    _sseSource.onmessage = function (ev) {
-      try {
-        var msg = JSON.parse(ev.data);
-        var seq = msg.seq;
-        if (seq != null && seq !== _sseLastSeq) {
-          _sseLastSeq = seq;
-          // New data available — fetch immediately.
-          if (_tickTimeout) clearTimeout(_tickTimeout);
-          tick();
-        }
-      } catch {}
-    };
-
-    _sseSource.onerror = function () {
-      _sseConnected = false;
-      // EventSource auto-reconnects; revert to normal polling in the meantime.
-      if (_tickTimeout) {
-        clearTimeout(_tickTimeout);
-        _tickTimeout = setTimeout(tick, POLL_MS);
-      }
-    };
-  }
+  // fetchState/etag/delta-merge/SSE/analytics moved to ui_state_sync.js
+  // (StateSync). Instantiate here (once `map`/`selectedId`/`tick` exist in
+  // this closure) and wire the callbacks it needs to reach into main()'s
+  // state. window.__stateSync is used by the top-level fetchState()/
+  // resetAccumulated() shims declared before main().
+  const _mapImmobileToParked = StateSync._mapImmobileToParked;
+  window.__stateSync = new StateSync({
+    appToken: APP_TOKEN,
+    apiBaseUrl: appConfig.apiBaseUrl,
+    getMap: () => map,
+    getSelectedId: () => selectedId,
+    isLoadingData: () => snapshotsMenus._isLoadingData,
+    getClientId: () => _clientId,
+    rescheduleTick: (delayMs) => {
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      _tickTimeout = setTimeout(tick, delayMs);
+    },
+    tickNow: () => {
+      if (_tickTimeout) clearTimeout(_tickTimeout);
+      tick();
+    },
+    POLL_MS: POLL_MS,
+    POLL_MS_SSE: POLL_MS_SSE,
+  });
+  const pushAnalyticsEvent = (type, payload) => window.__stateSync.pushAnalyticsEvent(type, payload);
+  const connectSSE = () => window.__stateSync.connectSSE();
 
   async function tick() {
     // Safety valve: if _tickInFlight has been true for over 60 seconds, force-reset it.
@@ -5210,7 +2335,7 @@ function main() {
     
     // Skip live data fetching when viewing historical data OR while loading it
     // Playback loop handles all drawing in historical mode
-    if (window._historicalState || _isLoadingData) {
+    if (window._historicalState || snapshotsMenus._isLoadingData) {
       if (_tickTimeout) clearTimeout(_tickTimeout);
       _tickTimeout = setTimeout(tick, POLL_MS);
       return;
@@ -5234,9 +2359,7 @@ function main() {
       _tickInFlight = false;
       // Reset delta/etag state so recovery gets a full refresh
       // (server may have restarted with different state).
-      _stateEtag = null;
-      _newestTrailMs = null;
-      _accumulatedState = null;
+      window.__stateSync.resetAccumulated();
       // Reschedule with exponential backoff: 5s, 10s, 20s, 40s … capped at POLL_MS.
       const backoffMs = Math.min(POLL_MS, 5000 * Math.pow(2, Math.min(_tickConsecutiveFailures - 1, 5)));
       if (_tickTimeout) clearTimeout(_tickTimeout);
@@ -5248,8 +2371,8 @@ function main() {
     // 304 fast-path: server confirmed nothing changed. Just heartbeat the
     // status indicators (so "Live" doesn't drift to "Offline") and reschedule.
     // Skip the full draw + sidebar re-render: same data → same pixels.
-    if (_lastStateWasNotModified) {
-      _pbLastServerResponseMs = Date.now();
+    if (window.__stateSync.wasNotModified()) {
+      pb._pbLastServerResponseMs = Date.now();
       _tickConsecutiveFailures = 0;
       const statusElLive = document.getElementById("statusText");
       if (statusElLive && !statusElLive.classList.contains("live")) {
@@ -5258,7 +2381,7 @@ function main() {
         statusElLive.classList.add("live");
       }
       _tickInFlight = false;
-      const pollMs = _sseConnected ? POLL_MS_SSE : POLL_MS;
+      const pollMs = window.__stateSync.isSSEConnected() ? POLL_MS_SSE : POLL_MS;
       if (_tickTimeout) clearTimeout(_tickTimeout);
       _tickTimeout = setTimeout(tick, pollMs);
       return;
@@ -5271,7 +2394,7 @@ function main() {
     _mapImmobileToParked(st);
 
     window.__lastState = st;
-    _pbLastServerResponseMs = Date.now();
+    pb._pbLastServerResponseMs = Date.now();
     _tickConsecutiveFailures = 0; // reset backoff on success
 
     // Update save button now that we have data
@@ -5423,9 +2546,9 @@ function main() {
       _tickInFlight = false;
       // Always reschedule. Use server-provided timing if available, else fallback.
       // When SSE is connected, use a long safety-net interval (SSE drives timely updates).
-      var basePollMs = _sseConnected ? POLL_MS_SSE : POLL_MS;
+      var basePollMs = window.__stateSync.isSSEConnected() ? POLL_MS_SSE : POLL_MS;
       const clientPollS = Number(window.__lastState?.meta?.client_poll_in_s);
-      const nextMs = _sseConnected ? basePollMs
+      const nextMs = window.__stateSync.isSSEConnected() ? basePollMs
         : (isFinite(clientPollS) && clientPollS > 0) ? clientPollS * 1000 : basePollMs;
       if (_tickTimeout) clearTimeout(_tickTimeout);
       _tickTimeout = setTimeout(tick, nextMs);
@@ -5479,176 +2602,29 @@ function main() {
   }
 
   // ── Screensaver mode (bottom-left hot corner → hide all UI) ──
-  // Park the mouse in the bottom-left ~40px corner for 3 s to activate.
-  // Uses a generous inset (not pixel 0,0) to avoid conflicting with OS hot corners.
-  // Activating adds body.screensaver which fades all chrome, and triggers pb-hidden
-  // on the playback bar so everything disappears together.
-  {
-    const SS_DELAY_MS = 3000;
-    const SS_CORNER_PX = 40; // px from left edge and bottom edge
-    let _ssTimer = null;
-    let _ssActive = false;
-
-    const _ssEnter = () => {
-      if (_ssActive) return;
-      _ssActive = true;
-      _screensaverActive = true;
-      document.body.classList.add("screensaver");
-      var pb = document.getElementById("playbackBar");
-      if (pb) pb.classList.add("pb-ss-hidden");
-
-      // Snapshot current state for restoration on exit
-      var sb = map.getPlaybackBounds();
-      _ssSnapshot = {
-        centerLat: map.center.lat, centerLon: map.center.lon, zoom: map.zoom,
-        timeMs: map.getPlaybackTimeMs(), speed: map.getPlaybackSpeed(),
-        playing: map.getPlaybackPlaying(), liveFollow: map._playbackLiveFollow,
-      };
-
-      // Configure: 60x from start
-      map._playbackLiveFollow = false;
-      map.setPlaybackSpeed(60);
-      if (pbSpeedEl) pbSpeedEl.value = "60";
-      if (isFinite(sb.minMs)) map.setPlaybackTimeMs(sb.minMs);
-      _pbVelocity = _pbPlaybackSpeed * 60;
-      map.setPlaybackPlaying(true);
-      _pbLastPerf = 0;
-      if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-
-      // Poll for end-of-playback to trigger 10s pause then loop
-      _ssLoopInterval = setInterval(() => {
-        if (!_screensaverActive) return;
-        // While waiting in the 10s pause, check if new data arrived
-        if (_ssLoopTimer != null) {
-          var sb2 = map.getPlaybackBounds();
-          if (isFinite(sb2.maxMs) && _ssEndMaxMs != null && sb2.maxMs > _ssEndMaxMs + 100) {
-            clearTimeout(_ssLoopTimer); _ssLoopTimer = null;
-            // Jump to where the new data begins and resume playing
-            map.setPlaybackTimeMs(_ssEndMaxMs);
-            _ssEndMaxMs = null;
-            _pbVelocity = _pbPlaybackSpeed * 60;
-            map.setPlaybackPlaying(true);
-            _pbLastPerf = 0;
-            if (!_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-          }
-          return;
-        }
-        // Detect playback stalled at end (velocity zeroed by physics loop)
-        if (map.isPlaybackAtEnd(200) && Math.abs(_pbVelocity) < 0.1) {
-          var sb3 = map.getPlaybackBounds();
-          _ssEndMaxMs = isFinite(sb3.maxMs) ? sb3.maxMs : null;
-          _ssLoopTimer = setTimeout(() => {
-            _ssLoopTimer = null; _ssEndMaxMs = null;
-            if (!_screensaverActive) return;
-            if (pbPlayEl) pbPlayEl.click();
-          }, 10000);
-        }
-      }, 500);
-
-      // Force camera follow on enter
-      _performCameraFit({ force: true });
-    };
-
-    // Expose to the URL-param handler in loadConfig().then() so ?demo=1
-    // can enter the screensaver once initial state is ready. Wrap so we can
-    // tag this session as demo-origin for the exit path.
-    _demoTriggerSS = () => { _enteredViaDemo = true; _ssEnter(); };
-
-    const _ssExit = () => {
-      clearTimeout(_ssTimer);
-      _ssTimer = null;
-      if (!_ssActive) return;
-      _ssActive = false;
-      _screensaverActive = false;
-      if (_ssLoopInterval) { clearInterval(_ssLoopInterval); _ssLoopInterval = null; }
-      if (_ssLoopTimer) { clearTimeout(_ssLoopTimer); _ssLoopTimer = null; }
-      _ssEndMaxMs = null;
-      document.body.classList.remove("screensaver");
-      var pb = document.getElementById("playbackBar");
-      if (pb) pb.classList.remove("pb-ss-hidden");
-
-      // Restore pre-screensaver state.
-      // Demo-origin sessions (?demo=1) skip the _ssSnapshot.timeMs restoration:
-      // in live mode that captured time is the latest-sample timestamp at
-      // entry — often tens of minutes behind real time and unchanged across
-      // tick() arrivals during the demo run — so restoring it leaves the
-      // playback bar stuck in the past until the user scrubs. Center/zoom/
-      // speed from the snapshot are still sound (they reflect app defaults
-      // captured on page load) and are restored.
-      if (_enteredViaDemo && _ssSnapshot) {
-        _enteredViaDemo = false;
-        map.center.lat = _ssSnapshot.centerLat;
-        map.center.lon = _ssSnapshot.centerLon;
-        map.zoom = _ssSnapshot.zoom;
-        map.setPlaybackSpeed(_ssSnapshot.speed);
-        if (pbSpeedEl) pbSpeedEl.value = String(_ssSnapshot.speed);
-        map.setPlaybackPlaying(false);
-        _pbVelocity = 0;
-        if (_pbRAF) { cancelAnimationFrame(_pbRAF); _pbRAF = null; }
-        // Discriminate live vs snapshot mode via _historicalState, not
-        // map.playbackMode (which is true for both once canvas playback is
-        // initialized).
-        if (window._historicalState) {
-          // Snapshot mode (from ?date=...): live-follow stays off; leave the
-          // playhead where the demo left it so the user sees a coherent frame.
-          map._playbackLiveFollow = false;
-        } else {
-          // Live mode: re-engage live follow and snap to latest data so the
-          // playback bar reflects true "now" instead of the stale entry time.
-          // Next tick() keeps it synced.
-          map._playbackLiveFollow = true;
-          var _sb = map.getPlaybackBounds();
-          if (_sb && isFinite(_sb.maxMs)) map.setPlaybackTimeMs(_sb.maxMs);
-        }
-        _ssSnapshot = null;
-        _pbLastPerf = 0;
-        updatePlaybackUi();
-        map.drawOverlay(map.lastState, { cacheUnderlay: false });
-      } else if (_ssSnapshot) {
-        map.center.lat = _ssSnapshot.centerLat;
-        map.center.lon = _ssSnapshot.centerLon;
-        map.zoom = _ssSnapshot.zoom;
-        map.setPlaybackSpeed(_ssSnapshot.speed);
-        if (pbSpeedEl) pbSpeedEl.value = String(_ssSnapshot.speed);
-        map.setPlaybackTimeMs(_ssSnapshot.timeMs);
-        map.setPlaybackPlaying(_ssSnapshot.playing);
-        map._playbackLiveFollow = _ssSnapshot.liveFollow;
-        _pbVelocity = _ssSnapshot.playing ? _pbPlaybackSpeed * (_ssSnapshot.speed || 1) : 0;
-        _pbLastPerf = 0;
-        if (_ssSnapshot.playing && !_pbRAF) _pbRAF = requestAnimationFrame(playbackLoop);
-        _ssSnapshot = null;
-        updatePlaybackUi();
-        map.drawOverlay(map.lastState, { cacheUnderlay: false });
-      }
-    };
-
-    const _ssCheck = (x, y) => {
-      const inCorner = x <= SS_CORNER_PX &&
-        y >= window.innerHeight - SS_CORNER_PX;
-      const inBottomStrip = y >= window.innerHeight - SS_CORNER_PX;
-      if (inCorner && !_ssActive && !_ssTimer) {
-        _ssTimer = setTimeout(_ssEnter, SS_DELAY_MS);
-      } else if (!inCorner && !_ssActive) {
-        if (_ssTimer) { clearTimeout(_ssTimer); _ssTimer = null; }
-      } else if (_ssActive && !inBottomStrip) {
-        _ssExit();
-      }
-    };
-
-    document.addEventListener("mousemove", (e) => {
-      _ssCheck(e.clientX, e.clientY);
-    });
-
-    document.addEventListener("touchstart", (e) => {
-      var t = e.touches[0];
-      if (t) _ssCheck(t.clientX, t.clientY);
-    }, { passive: true });
-
-    // Any key press exits screensaver
-    document.addEventListener("keydown", () => {
-      if (_ssActive) _ssExit();
-    });
-  }
+  // Extracted to ui_screensaver.js (ScreensaverUI). The module owns the
+  // screensaver activation state, the ?demo=1 auto-enter retry loop, and the
+  // hot-corner mousemove/touchstart/keydown listeners internally. `map`, `pb`,
+  // `pbSpeedEl`, `pbPlayEl`, `_performCameraFit`, `updatePlaybackUi`, and
+  // `playbackLoop` are shared with unmoved main() code and passed via deps.
+  // `getScreensaverActive` preserves the original call site used by
+  // PlaybackUI's deps (see the `playback` construction above).
+  const screensaver = new ScreensaverUI({
+    map,
+    document,
+    pb,
+    deps: {
+      pbSpeedEl,
+      pbPlayEl,
+      performCameraFit: (opts) => _performCameraFit(opts),
+      updatePlaybackUi: () => updatePlaybackUi(),
+      playbackLoop: () => playbackLoop(),
+      getDemoParam: () => _demoParam,
+    },
+  });
+  // Thin delegates keep every original call site in main() untouched.
+  function _demoEnterWhenReady() { return screensaver._demoEnterWhenReady(); }
+  function _getScreensaverActive() { return screensaver.getScreensaverActive(); }
 
   // Load server config before starting data polling
   // This allows the server to control CDN/caching behavior
@@ -5666,31 +2642,6 @@ function main() {
     const _urlDate = _urlParams.get('date');
     console.log("[EmbedParam] search:", window.location.search, "date:", _urlDate);
 
-    // Defer screensaver entry until the map has a meaningful playback-bounds
-    // span. Finite bounds alone aren't enough: the first tick() may produce
-    // minMs≈maxMs (a single datapoint), so _ssEnter's "rewind to start" lands
-    // right at the end and nothing animates. Require at least MIN_DEMO_SPAN_MS
-    // before firing. Polls on a 100ms interval, giving up after ~10s so we
-    // still enter even on a sparse/slow-loading day.
-    const MIN_DEMO_SPAN_MS = 60 * 1000; // at least 60s of playback data
-    const _demoEnterWhenReady = () => {
-      if (!_demoParam || !_demoTriggerSS) return;
-      let attempts = 0;
-      const tryEnter = () => {
-        if (!_demoTriggerSS) return; // already fired or unavailable
-        const sb = map.getPlaybackBounds();
-        const hasSpan = sb && isFinite(sb.minMs) && isFinite(sb.maxMs)
-          && (sb.maxMs - sb.minMs) >= MIN_DEMO_SPAN_MS;
-        if (hasSpan || attempts++ > 100) {
-          const fn = _demoTriggerSS;
-          _demoTriggerSS = null; // fire exactly once
-          try { fn(); } catch (e) { console.warn("[demo] _ssEnter failed:", e); }
-        } else {
-          setTimeout(tryEnter, 100);
-        }
-      };
-      tryEnter();
-    };
     if (_urlDate && /^\d{4}-\d{2}-\d{2}$/.test(_urlDate)) {
       console.log("[EmbedParam] Valid date, calling loadSnapshotByDate:", _urlDate);
       try {
@@ -5703,7 +2654,7 @@ function main() {
         }
         await loadSnapshotByDate(_urlDate, _extraParams);
         console.log("[EmbedParam] loadSnapshotByDate resolved. _historicalState:", !!window._historicalState, "playbackMode:", map.playbackMode);
-        _selectedDayValue = _urlDate;
+        snapshotsMenus._selectedDayValue = _urlDate;
 
         // Override playhead: start hour + playhead offset in minutes
         if (isFinite(_urlStart) && _urlStart >= 0 && _urlStart <= 23) {
