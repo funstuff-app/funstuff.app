@@ -261,19 +261,57 @@ describe("an idle playhead at the edge GOES LIVE (never freezes)", () => {
   });
 });
 
-describe("computeClickAction — no pause inside the live sync window", () => {
+describe("computeClickAction — Live click re-syncs, never pauses at the edge", () => {
   const click = PlaybackUI.computeClickAction;
-  it("Live inside the window → 'none' (stays Live, cannot pause here)", () => {
-    assert.equal(click({ playing: true, liveFollow: true, inLiveWindow: true }), "none");
-    assert.equal(click({ playing: false, liveFollow: true, inLiveWindow: true }), "none");
-    assert.equal(click({ playing: true, liveFollow: false, inLiveWindow: true }), "none");
+  it("clicking lit Live (active at the edge) → 'sync' (jump to runway)", () => {
+    assert.equal(click({ playing: true, liveFollow: true, atLiveEdge: true }), "sync");
+    assert.equal(click({ playing: false, liveFollow: true, atLiveEdge: true }), "sync");
+    assert.equal(click({ playing: true, liveFollow: false, atLiveEdge: true }), "sync");
   });
-  it("playing OUTSIDE the window (in the past) → 'pause'", () => {
-    assert.equal(click({ playing: true, liveFollow: false, inLiveWindow: false }), "pause");
+  it("active behind the edge (catching up) → 'pause'", () => {
+    assert.equal(click({ playing: true, liveFollow: false, atLiveEdge: false }), "pause");
   });
   it("paused → 'play'", () => {
-    assert.equal(click({ playing: false, liveFollow: false, inLiveWindow: false }), "play");
-    assert.equal(click({ playing: false, liveFollow: false, inLiveWindow: true }), "play");
+    assert.equal(click({ playing: false, liveFollow: false, atLiveEdge: false }), "play");
+    assert.equal(click({ playing: false, liveFollow: false, atLiveEdge: true }), "play");
+  });
+});
+
+describe("computeRunwayTargetMs — server-polling sync point", () => {
+  const runway = PlaybackUI.computeRunwayTargetMs;
+  it("backs off the data edge by remSec × speed × 1000", () => {
+    // 100 s until poll, 1x → 100 s of runway behind the data edge
+    assert.equal(runway({ dataEdgeMs: 1_000_000, minMs: 0, remSec: 100, speed: 1 }), 1_000_000 - 100_000);
+    // higher speed → more runway (consuming timeline faster)
+    assert.equal(runway({ dataEdgeMs: 1_000_000, minMs: 0, remSec: 100, speed: 10 }), 1_000_000 - 1_000_000);
+  });
+  it("clamps to minMs when the runway exceeds available data", () => {
+    assert.equal(runway({ dataEdgeMs: 1_000_000, minMs: 950_000, remSec: 100, speed: 10 }), 950_000);
+  });
+  it("no runway when a poll is imminent (remSec ≤ 0) → the data edge itself", () => {
+    assert.equal(runway({ dataEdgeMs: 1_000_000, minMs: 0, remSec: 0, speed: 5 }), 1_000_000);
+    assert.equal(runway({ dataEdgeMs: 1_000_000, minMs: 0, remSec: -30, speed: 5 }), 1_000_000);
+  });
+});
+
+describe("new data while riding Live never moves the playhead", () => {
+  it("a poll that extends the data edge does not rewind or snap the playhead", () => {
+    const h = makeHarness({ dataEdgeLagMs: 5000 });
+    // ride the wall edge
+    h.map.setPlaybackPlaying(true);
+    h.map.setPlaybackTimeMs(h.map.getPlaybackBounds().maxMs - 50);
+    h.startLoop();
+    h.step(300);
+    const tRiding = h.map.getPlaybackTimeMs();
+    const wallEdge = h.map.getPlaybackBounds().maxMs;
+    // a server poll lands: the data edge jumps forward toward now
+    h.map._playbackMaxMs = h.map._playbackMaxMs + 5000;
+    h.step(300);
+    const tAfter = h.map.getPlaybackTimeMs();
+    // playhead kept ticking with wall time (never jumped backward to a sync point)
+    assert.ok(tAfter >= tRiding, "playhead did not rewind on new data");
+    assert.ok(tAfter >= wallEdge - 1000, "playhead stayed at the ticking wall edge");
+    assert.equal(h.map.getPlaybackPlaying(), true, "still playing (uninterrupted)");
   });
 });
 

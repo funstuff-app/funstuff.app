@@ -51,19 +51,37 @@
    * `lit` is the .isLive glow.
    */
   /**
-   * What a click on the transport button does. There is NO pause inside the
-   * live sync window: at/near the wall-clock edge it is Live and stays Live
-   * (the only way out is to scrub back). Pause exists only OUTSIDE the window.
-   *   active + inside the live window  → "none"  (stay Live)
-   *   active + outside (playing past)  → "pause"
-   *   not active (paused)              → "play"
+   * What a click on the transport button does. There is NO pause at the live
+   * edge: clicking the lit "Live" button re-syncs to the server-polling
+   * runway point (see computeRunwayTargetMs) so playback flows forward and
+   * reaches the edge just as the next poll lands — it never pauses there.
+   *   active + at the live edge (lit Live) → "sync"   (jump to runway point)
+   *   active + behind it (catching up)     → "pause"
+   *   not active (paused)                  → "play"
    * "active" = playing OR live-following.
    */
-  PlaybackUI.computeClickAction = function ({ playing, liveFollow, inLiveWindow }) {
+  PlaybackUI.computeClickAction = function ({ playing, liveFollow, atLiveEdge }) {
     const active = !!playing || !!liveFollow;
-    if (active && inLiveWindow) return "none";
+    if (active && atLiveEdge) return "sync";
     if (active) return "pause";
     return "play";
+  };
+
+  /**
+   * The server-polling runway/sync point: back off from the data edge by the
+   * runway (predicted seconds until the next poll × playback speed), so
+   * playing forward from here reaches the data edge right as the next poll
+   * extends it — continuous playback. Clamped to minMs. Only the explicit
+   * Live click uses this; new data arriving and drift catch-up never snap.
+   *   remSec — seconds until the next server poll (server's planned time,
+   *            corrected for wall time already elapsed since it was sent)
+   */
+  PlaybackUI.computeRunwayTargetMs = function ({ dataEdgeMs, minMs, remSec, speed }) {
+    const s = (isFinite(speed) && speed > 0) ? speed : 1.0;
+    const rem = (isFinite(remSec) && remSec > 0) ? remSec : 0;
+    const runwayMs = rem * 1000 * s;
+    const target = dataEdgeMs - runwayMs;
+    return (isFinite(minMs) && target < minMs) ? minMs : target;
   };
 
   PlaybackUI.computeButtonState = function ({ historical, playing, liveFollow, atEnd }) {
@@ -295,6 +313,7 @@
     const _pbWheelFriction = 0.985;     // velocity decay per ms for wheel scroll (stops faster)
     const _pbForceStrength = 0.008;     // how quickly velocity changes toward target (per ms)
     const _pbVelocityThreshold = 0.1;   // below this, considered "at rest"
+    const _pbEdgeEpsMs = 3000;          // "reached the edge" tolerance (covers a fast frame)
     const _pbEaseInDistance = 0.02;     // start braking when within 2% of bounds (only near edges)
 
     // When playhead hits end, wait until all vehicle physics states have reached
@@ -774,13 +793,17 @@
         const _dataEdgeRideMs = (!map._historicalMode
           && map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
           ? map._playbackMaxMs : b.maxMs;
-        const _rideSyncEps = Math.max(15000, (b.maxMs - b.minMs) * 0.005);
+        // Ride only when the playhead has actually REACHED an edge (a few
+        // seconds of it), not a big fraction of the timeline. A wider zone
+        // would swallow the Live-click runway snap (which lands the playhead
+        // a runway BEHIND the data edge on purpose). _pbEdgeEpsMs covers one
+        // fast-speed frame so a high-speed playhead can't skip past the edge.
         const _atLeadingEdge = !map._historicalMode
           && !pb._pbPaused           // an explicit pause holds; don't re-ride it
           && !pb._pbScrubbing
           && !pb._pbIsRewinding
           && pb._pbVelocity >= -_pbVelocityThreshold
-          && (tMs >= b.maxMs - 1000 || tMs >= _dataEdgeRideMs - _rideSyncEps);
+          && (tMs >= b.maxMs - 1000 || tMs >= _dataEdgeRideMs - _pbEdgeEpsMs);
         // Resolve loop start within current bounds.
         const loopStartMsRaw = (pb._pbLoopStartMs != null) ? Number(pb._pbLoopStartMs) : null;
         const loopStartMs = (isFinite(loopStartMsRaw)) ? clamp(loopStartMsRaw, b.minMs, b.maxMs) : b.minMs;

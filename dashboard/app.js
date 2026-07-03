@@ -1493,24 +1493,53 @@ function main() {
       const b = map.getPlaybackBounds();
       if (!isFinite(b.minMs) || !isFinite(b.maxMs) || !(b.maxMs > b.minMs)) return;
 
-      // Is the playhead inside the live sync window (at/near the wall-clock
-      // edge)? Inside it there is NO pause — it is Live and stays Live; the
-      // only way out is to scrub back. Pause exists only OUTSIDE the window.
+      // At the live edge (the lit "Live" state) clicking RE-SYNCS to the
+      // server-polling runway point; it never pauses there. Pause exists only
+      // behind the edge (catching up). Same edge test as the button label.
       const _curMs = map.getPlaybackTimeMs();
       const _dataEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
         ? map._playbackMaxMs : b.maxMs;
-      const _syncEps = Math.max(15000, (b.maxMs - b.minMs) * 0.005);
-      const _inLiveWindow = !map._historicalMode
-        && _curMs != null && isFinite(_curMs) && _curMs >= _dataEdge - _syncEps;
+      const _atLiveEdge = !map._historicalMode && map.isPlaybackAtEnd(1500);
 
       const action = PlaybackUI.computeClickAction({
         playing: map.getPlaybackPlaying(),
         liveFollow: map._playbackLiveFollow,
-        inLiveWindow: _inLiveWindow,
+        atLiveEdge: _atLiveEdge,
       });
 
-      if (action === "none") {
-        // Live within the sync window: clicking does nothing. Stay live.
+      if (action === "sync") {
+        // Clicking the lit Live button: jump to the server-polling runway
+        // point (data edge − predicted-seconds-to-next-poll × speed, corrected
+        // for wall time already elapsed) and play forward, so the playhead
+        // reaches the edge just as the next poll extends it. This is the ONLY
+        // path that snaps — new data arriving and drift catch-up never do.
+        const meta = map.lastState && map.lastState.meta ? map.lastState.meta : {};
+        let nextInS = Number(meta.polling_next_update_in_s);
+        if (!isFinite(nextInS)) nextInS = Number(meta.polling_predicted_interval_s);
+        if (!isFinite(nextInS)) nextInS = 600;
+        const elapsedS = isFinite(pb._pbLastServerResponseMs)
+          ? Math.max(0, (Date.now() - pb._pbLastServerResponseMs) / 1000) : 0;
+        const remS = Math.max(0, nextInS - elapsedS);
+        const target = PlaybackUI.computeRunwayTargetMs({
+          dataEdgeMs: _dataEdge, minMs: b.minMs, remSec: remS,
+          speed: map.getPlaybackSpeed() || 1.0,
+        });
+        map._playbackLiveFollow = true;
+        pb._pbPageAutoFollow = true;
+        pb._pbPaused = false;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "1"); } catch {}
+        if (typeof map._resetLiveTracking === "function") map._resetLiveTracking();
+        map.setPlaybackTimeMs(target);
+        pb._pbLoopStartMs = target;
+        pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+        pb._pbWheelAccum = 0;
+        pb._pbAtEndSincePerf = null;
+        pb._pbIsRewinding = false;
+        map.setPlaybackPlaying(true);
+        pb._pbLastPerf = 0;
+        if (pb._pbRAF) cancelAnimationFrame(pb._pbRAF);
+        pb._pbRAF = requestAnimationFrame(playbackLoop);
+        updatePlaybackUi();
         return;
       }
 
