@@ -82,13 +82,15 @@
     return (isFinite(minMs) && target < minMs) ? minMs : target;
   };
 
-  PlaybackUI.computeButtonState = function ({ historical, playing, liveFollow, speed }) {
+  PlaybackUI.computeButtonState = function ({ historical, playing, liveFollow, atWallEdge, speed }) {
     const active = !!playing || !!liveFollow;
     if (historical) return { label: active ? "Pause" : "Play", lit: false };
-    // Server-sync mode (liveFollow): LIT — tracking the live edge / server
-    // cadence, at any speed. Labelled "Live" only at 1x (functionally real
-    // time); above 1x it is a lit "Pause" (keeping up with the server, but
-    // faster than real time is not "Live").
+    // AT the wall-clock edge = pinned to NOW = real time, whatever the speed
+    // setting (the ride block moves at wall rate there) → "Live" at ANY speed.
+    if (active && atWallEdge) return { label: "Live", lit: true };
+    // Server-sync CATCH-UP (liveFollow but behind the edge, playing the
+    // runway): LIT — keeping up with the server cadence. "Live" only at 1x;
+    // above 1x it is a lit "Pause" (faster than real time, not live yet).
     if (liveFollow) return (speed === 1) ? { label: "Live", lit: true } : { label: "Pause", lit: true };
     if (active) return { label: "Pause", lit: false };   // playing in the past, not synced
     return { label: "Play", lit: false };
@@ -543,6 +545,8 @@
           historical: !!map._historicalMode,
           playing: map.getPlaybackPlaying(),
           liveFollow: !!map._playbackLiveFollow,
+          // At the wall-clock edge (riding NOW) → real time at any speed.
+          atWallEdge: hasBounds && !map._historicalMode && map.isPlaybackAtEnd(1500),
           speed: map.getPlaybackSpeed() || 1.0,
         });
         pbPlayEl.textContent = st.label;

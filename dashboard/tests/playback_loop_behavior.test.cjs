@@ -165,9 +165,9 @@ describe("riding the wall-clock edge (the wall clock NEVER stops at the end)", (
       assert.ok(b.maxMs - t <= 1000,
         `playhead rides within 1s of the wall edge (gap ${Math.round(b.maxMs - t)}ms)`);
       h.playback.updatePlaybackUi();
-      const expectLabel = (speed === 1) ? "Live" : "Pause";
-      assert.equal(h.btn.textContent, expectLabel, `label at ${speed}x`);
-      assert.ok(h.btn.classList.contains("isLive"), `lit (server-sync) at ${speed}x`);
+      // riding the wall edge = real time at any speed → lit "Live"
+      assert.equal(h.btn.textContent, "Live", `label at ${speed}x at the wall edge`);
+      assert.ok(h.btn.classList.contains("isLive"), `lit at ${speed}x`);
       assert.ok(h.badge.classList.contains("hidden"), "no REW badge while riding");
       assert.ok(h.shade.classList.contains("hidden"), "no dim shade while riding");
     });
@@ -196,8 +196,8 @@ describe("forward momentum into the end goes LIVE (finger-scroll freeze bug)", (
     assert.ok(b.maxMs - h.map.getPlaybackTimeMs() <= 1000,
       "playhead keeps up with the ticking wall edge after the fling");
     h.playback.updatePlaybackUi();
-    // harness default speed is 5x → lit "Pause" (server-sync, not real time)
-    assert.equal(h.btn.textContent, "Pause");
+    // riding the wall edge → lit "Live" at any speed (harness default 5x)
+    assert.equal(h.btn.textContent, "Live");
     assert.ok(h.btn.classList.contains("isLive"));
   });
 
@@ -236,9 +236,9 @@ describe("an idle playhead at the edge GOES LIVE (never freezes)", () => {
     for (let i = 0; i < 8; i++) assert.ok(h.step(300), `loop alive frame ${i}`);
     assert.ok(h.map.getPlaybackTimeMs() > t1, "playhead advanced with wall time");
     h.playback.updatePlaybackUi();
-    // harness default speed is 5x → lit "Pause" (server-sync)
-    assert.equal(h.btn.textContent, "Pause");
-    assert.ok(h.btn.classList.contains("isLive"), "lit (server-sync)");
+    // riding the wall edge → lit "Live" at any speed (harness default 5x)
+    assert.equal(h.btn.textContent, "Live");
+    assert.ok(h.btn.classList.contains("isLive"), "lit");
     assert.ok(h.badge.classList.contains("hidden"), "no REW badge while live at the edge");
     assert.ok(h.shade.classList.contains("hidden"), "no dim while live");
   });
