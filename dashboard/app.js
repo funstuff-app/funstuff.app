@@ -1923,9 +1923,17 @@ function main() {
     const _scrubPointerSensitivity = 0.3;
 
     pbScrubEl.addEventListener("pointerdown", (e) => {
-      // Detect if pointer landed on the thumb vs the track (mouse/pen only)
+      // On touch devices, pointerdown fires BEFORE touchstart. Defer entirely
+      // to touchstart (which runs its own equivalent setup) — otherwise this
+      // handler pauses playback and computes _pbResumeAfterScrub first, then
+      // touchstart re-derives "was it playing?" from the now-already-paused
+      // state and always gets false, so release never resumes (mobile-only
+      // pause-on-release bug; desktop only fires pointerdown, never touchstart).
+      if (e.pointerType === "touch") return;
+      // Detect if pointer landed on the thumb vs the track (mouse/pen only —
+      // touch already bailed above)
       _scrubPointerOnTrack = false;
-      if (e.pointerType !== "touch") {
+      {
         const rect = pbScrubEl.getBoundingClientRect();
         const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
         const curVal = Number(pbScrubEl.value);
