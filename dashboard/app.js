@@ -2199,12 +2199,15 @@ function main() {
       pb._pbDidDrag = true;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
-      if (!_getScrubRAF()) {
-        _setScrubRAF(requestAnimationFrame(() => {
-          _setScrubRAF(0);
-          applyScrub();
-        }));
-      }
+      // Call directly rather than coalescing via requestAnimationFrame: on
+      // real mobile Safari/Chrome, rAF callbacks queued from inside an active,
+      // preventDefault()-ed touch gesture can be deferred by the compositor
+      // until the gesture ends, so the field only snapped into place on
+      // touchend instead of tracking the drag (desktop's native "input" event
+      // path doesn't hit this — the browser's own slider-thumb compositing
+      // keeps that rAF flowing). touchmove's own dispatch rate is already
+      // bounded by the OS/browser touch sampling, so this is not overwhelming.
+      applyScrub();
     }, { passive: false });
 
     pbScrubEl.addEventListener("touchend", () => {
