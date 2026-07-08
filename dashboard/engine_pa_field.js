@@ -377,6 +377,7 @@
       const _findFingerprintValidRange = g.FieldSensors._findFingerprintValidRange;
       const _MAX_MODE_GROUPS = g.FieldSensors._MAX_MODE_GROUPS;
       const _LEGEND_TAB_AQI_KEY = g.FieldSensors._LEGEND_TAB_AQI_KEY;
+      const _LEGEND_TAB_FIELD_SPREAD = g.FieldSensors._LEGEND_TAB_FIELD_SPREAD;
       const _OVERFETCH = g.FieldSensors._OVERFETCH;
       const _OVERFETCH_MAX_DEVICE_PX = g.FieldSensors._OVERFETCH_MAX_DEVICE_PX;
       const latLonToWorld = g.latLonToWorld;
@@ -549,15 +550,19 @@
       const _c0 = _fd.cutCeil  != null ? _fd.cutCeil  : 0.7;
       const _floor = Math.min(_f0, _c0), _ceil = Math.max(_f0, _c0);
       const _slope = (_ceil - _floor) / (_VIS_A - _VIS_B);
+      // Per-pollutant spread (max-mode has no single selected pollutant to key
+      // off of, so it keeps the unscaled default — see _LEGEND_TAB_FIELD_SPREAD).
+      const _spread = (!maxMode && _LEGEND_TAB_FIELD_SPREAD[pollutantTab]) || { sigmaMult: 1, cutMult: 1 };
       let cutoffDeg = (_floor + _slope * (_visVDeg - _VIS_B)) * _delta;
       cutoffDeg = Math.max(0.02, Math.min(cutoffDeg, _ceil));
+      cutoffDeg *= _spread.cutMult;
       const refW = latLonToWorld(clat, clon + cutoffDeg, z);
       const cutoffPx = Math.abs(refW.x - centerW.x);
       const cutoffSq = cutoffPx * cutoffPx;
       const FIELD_ALPHA = _fd.alpha != null ? _fd.alpha : (window._paFieldAlpha ?? 46);
       // Nadaraya-Watson Gaussian kernel bandwidth: σ = cutoff/sigmaDivisor (~2.5km 2σ-radius per sensor).
       const sigmaDivisor = _fd.sigmaDivisor;
-      const sigma = cutoffPx / sigmaDivisor;
+      const sigma = (cutoffPx / sigmaDivisor) * _spread.sigmaMult;
       const twoSigmaSq = 2 * sigma * sigma;
 
       // ── Build stride-5 sensor array(s): [sx, sy, aqi, twoSigSq, weightMultiplier, ...] ──
