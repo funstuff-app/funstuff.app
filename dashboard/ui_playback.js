@@ -319,6 +319,13 @@
     const _pbVelocityThreshold = 0.1;   // below this, considered "at rest"
     const _pbEdgeEpsMs = 3000;          // "reached the edge" tolerance (covers a fast frame)
     const _pbEaseInDistance = 0.02;     // start braking when within 2% of bounds (only near edges)
+    // Repaint cap for the field+overlay canvases during playback, independent of
+    // display refresh rate. The playhead itself still advances every RAF tick (time
+    // stays accurate, UI labels stay smooth via their own uiMinDt gate below) — this
+    // only throttles the expensive repaint, which a slow-moving vehicle map doesn't
+    // need faster than ~30fps to read as smooth. Uncapped, this repainted once per
+    // display refresh (up to 120Hz on ProMotion) for motion no one can perceive.
+    const _pbDrawMinDt = 33;            // ~30fps ceiling on field/overlay repaint
 
     // When playhead hits end, wait until all vehicle physics states have reached
     // the end of their path, then trigger rewind.
@@ -1002,11 +1009,12 @@
       }
 
       // ─────────────────────────────────────────────────────────────────────────
-      // RENDER
+      // RENDER — capped to _pbDrawMinDt (see declaration above for why)
       // ─────────────────────────────────────────────────────────────────────────
-      if (didAdvanceTime) {
+      if (didAdvanceTime && (now - pb._pbLastDrawPerf) >= _pbDrawMinDt) {
         map._compositePaFieldOnTiles(map.lastState);
         map.drawOverlay(map.lastState, { cacheUnderlay: true });
+        pb._pbLastDrawPerf = now;
       }
 
       // (The old "stop at the live buffer window and wait for a Live click"
