@@ -1,0 +1,220 @@
+/**
+ * Reset, base element styles, and cross-cutting accessibility rules that
+ * apply everywhere (focus-visible, reduced-motion, tap target floor).
+ */
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  height: 100dvh;
+  height: -webkit-fill-available;
+  margin: 0;
+  background: var(--ink-950);
+  color: var(--ink-100);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+  line-height: var(--lh-md);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular numerals everywhere a value updates — the "instrument" feel — plus
+   a monospace fallback class for the densest numeric readouts. */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+#app {
+  position: relative;
+  height: 100%;
+  height: 100dvh;
+  height: -webkit-fill-available;
+  display: flex;
+  flex-direction: column;
+}
+
+a { color: var(--accent-live); }
+a:hover { color: color-mix(in oklch, var(--accent-live) 70%, white); }
+
+button, select, input {
+  font-family: inherit;
+  color: inherit;
+}
+
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ── Focus-visible: real keyboard focus styling everywhere (the old system
+   had exactly one :focus rule in 2,224 lines) ── */
+:focus { outline: none; }
+:focus-visible {
+  outline: 2px solid var(--accent-live);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+/* Pill/round controls want a matching round focus ring, not a square one */
+.pill:focus-visible,
+button[class*="Btn"]:focus-visible {
+  outline-offset: 3px;
+}
+
+/* ── Reduced motion: collapse to instant everywhere ── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── Minimum touch target: 44×44 hit area on icon-only controls, achieved
+   via a transparent pseudo-expansion so visual size can stay compact ── */
+.tapTarget {
+  position: relative;
+}
+.tapTarget::after {
+  content: "";
+  position: absolute;
+  inset: 50%;
+  width: max(100%, var(--tap-min));
+  height: max(100%, var(--tap-min));
+  transform: translate(-50%, -50%);
+}
+
+/* ── Scrollbars: thin, ink-toned, no light-mode default flash ── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink-600) transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--ink-600);
+  border-radius: var(--radius-pill);
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--ink-500); }
+
+.hidden { display: none !important; }
+.srOnly {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/**
+ * ── Shared primitives ──────────────────────────────────────────────────
+ * Every panel/surface/button in the app composes from these instead of
+ * hand-rolling its own radius/border/shadow combination.
+ */
+
+/* Surface: a solid ink card. This is the DEFAULT panel treatment — glass/
+   blur is reserved for exactly one place (the topbar) per the design brief,
+   not sprinkled everywhere. */
+.surface {
+  background: var(--ink-900);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-raised);
+}
+.surface--raised {
+  background: var(--ink-850);
+}
+
+/* Glass: the one deliberate blur treatment (topbar + playback transport —
+   both float directly over the live map and benefit from seeing through). */
+.glass {
+  background: var(--scrim-strong);
+  backdrop-filter: blur(14px) saturate(1.4);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+}
+
+.iconBtn {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: var(--radius-md);
+  color: var(--ink-100);
+  cursor: pointer;
+  transition: background var(--ease-standard), border-color var(--ease-standard);
+}
+.iconBtn:hover { background: var(--ink-800); }
+.iconBtn:active { background: var(--ink-750); }
+.iconBtn svg { display: block; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 34px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--hairline);
+  background: var(--ink-850);
+  color: var(--ink-100);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  transition: background var(--ease-standard), border-color var(--ease-standard),
+              color var(--ease-standard), box-shadow var(--ease-standard);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.pill:hover { border-color: var(--hairline-strong); }
+
+/* "Live" state — the cyan accent, lit. Used on the transport button whenever
+   server-sync mode is active (see 06-playback.css for the touch specifics). */
+.pill--live {
+  background: var(--accent-live-dim);
+  border-color: var(--accent-live-line);
+  color: var(--accent-live);
+  font-weight: var(--weight-bold);
+  text-shadow: 0 0 12px var(--accent-live-line);
+}
+
+/* "Time" state — the violet accent, for anything that reflects the user is
+   scrubbed into the past (kept distinct from --pill--live intentionally). */
+.pill--time {
+  background: var(--accent-time-dim);
+  border-color: var(--accent-time-line);
+  color: var(--accent-time);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 24px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--ink-800);
+  color: var(--ink-300);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: 0.02em;
+}
+
+.divider {
+  height: 1px;
+  background: var(--hairline);
+  border: none;
+  margin: var(--space-2) 0;
+}

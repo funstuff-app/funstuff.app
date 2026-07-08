@@ -1,0 +1,146 @@
+/**
+ * DustyTrails design tokens — "atmospheric instrument" system.
+ *
+ * Principle: chrome stays near-monochrome so the pollution field and vehicle
+ * trails (the actual data) keep visual priority. Color is reserved for two
+ * things — the AQI ramp (data) and the accent pair below (UI state). The two
+ * accents are chosen OUTSIDE the AQI hue range (cyan→blue→green→yellow→
+ * orange→red→maroon) so a UI affordance is never mistakable for a data value:
+ *   --accent-live  electric cyan-blue  — "now" (live/playing state)
+ *   --accent-time  violet-magenta      — "then" (scrubbed into the past)
+ * This mirrors the DVR mental model: cyan = present, violet = time-travel.
+ *
+ * AQI-* tokens mirror dashboard/colors.js AQI_PALETTE exactly (that file
+ * drives the actual field/marker rendering and is NOT touched by this
+ * redesign) — they exist here only so this stylesheet's own chrome never
+ * hand-types an AQI hex literal.
+ */
+:root {
+  /* ── Neutral ink scale (cool undertone: night-sky, not sterile gray) ── */
+  --ink-950: oklch(9%  0.020 262);   /* app background */
+  --ink-900: oklch(13% 0.020 262);   /* base panel */
+  --ink-850: oklch(16% 0.020 262);   /* raised panel / card */
+  --ink-800: oklch(20% 0.018 262);   /* hover surface */
+  --ink-750: oklch(24% 0.017 262);   /* pressed / selected surface */
+  --ink-700: oklch(29% 0.016 262);   /* solid border/divider */
+  --ink-600: oklch(38% 0.014 262);   /* disabled content */
+  --ink-500: oklch(52% 0.012 262);   /* muted / secondary text */
+  --ink-300: oklch(74% 0.008 262);   /* body text */
+  --ink-100: oklch(94% 0.004 262);   /* primary text, near-white */
+
+  /* Alpha overlays on the ink scale, for glass/scrim surfaces */
+  --scrim-weak:   oklch(9% 0.02 262 / 0.45);
+  --scrim-strong: oklch(9% 0.02 262 / 0.86);
+  --hairline:     oklch(94% 0.004 262 / 0.09);
+  --hairline-strong: oklch(94% 0.004 262 / 0.18);
+
+  /* ── Accent pair (UI state, never data) ── */
+  --accent-live:      oklch(78% 0.135 220);
+  --accent-live-dim:  oklch(78% 0.135 220 / 0.16);
+  --accent-live-line: oklch(78% 0.135 220 / 0.55);
+  --accent-time:      oklch(72% 0.17  322);
+  --accent-time-dim:  oklch(72% 0.17  322 / 0.16);
+  --accent-time-line: oklch(72% 0.17  322 / 0.55);
+  --accent-warn:      oklch(76% 0.17  55);
+
+  /* ── AQI ramp (mirrors colors.js AQI_PALETTE — reference only) ── */
+  --aqi-1-cyan:    #00FFFF;
+  --aqi-2-ltblue:  #00CCFF;
+  --aqi-3-blue:    #0099FF;
+  --aqi-4-green:   #00E400;
+  --aqi-5-dkgreen: #009900;
+  --aqi-6-dkrgreen:#006600;
+  --aqi-7-yellow:  #FFFF00;
+  --aqi-8-orange:  #FF7E00;
+  --aqi-9-red:     #FF0000;
+  --aqi-10-purple: #8F3F97;
+  --aqi-11-maroon: #7E0023;
+
+  /* ── Type scale (8 steps, defined line-heights, tabular nums for data) ── */
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+
+  --text-2xs:  11px; --lh-2xs:  14px;
+  --text-xs:   12px; --lh-xs:   16px;
+  --text-sm:   13px; --lh-sm:   18px;
+  --text-md:   14px; --lh-md:   20px;
+  --text-lg:   16px; --lh-lg:   22px;
+  --text-xl:   19px; --lh-xl:   24px;
+  --text-2xl:  24px; --lh-2xl:  30px;
+  --text-3xl:  30px; --lh-3xl:  36px;
+
+  --weight-regular: 450;
+  --weight-medium:  550;
+  --weight-bold:    700;
+  --weight-black:   800;
+
+  /* ── Spacing scale ── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* ── Radius scale ── */
+  --radius-sm:   6px;
+  --radius-md:   10px;
+  --radius-lg:   16px;
+  --radius-pill: 999px;
+
+  /* ── Elevation (used once, deliberately — not the default panel look) ── */
+  --shadow-raised: 0 1px 2px oklch(9% 0.02 262 / 0.35), 0 8px 24px oklch(9% 0.02 262 / 0.35);
+  --shadow-float:  0 2px 6px oklch(9% 0.02 262 / 0.4), 0 16px 40px oklch(9% 0.02 262 / 0.45);
+
+  /* ── Motion (two curves replace the old 12+ ad-hoc timings) ── */
+  --ease-standard:   180ms cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: 380ms cubic-bezier(0.2, 0, 0, 1);
+  --ease-spring:     420ms cubic-bezier(0.34, 1.4, 0.4, 1);
+
+  /* ── Touch target floor (accessibility) ── */
+  --tap-min: 44px;
+
+  /* ── Z-index scale (preserves the exact stacking order the canvas engine
+       and gesture layer assume — map paint order is load-bearing, not
+       decorative; do not renumber without checking every layer below) ── */
+  --z-map-bg: -1;      /* filtered background fallback, behind tiles */
+  --z-map-tiles: 0;
+  --z-map-lift: 1;     /* shadow-lift blend layer */
+  --z-map-field: 2;    /* PA pollution field canvas */
+  --z-map-overlay: 3;  /* trails/markers canvas + paused shade */
+  --z-map-shade: 4;    /* loading shade, above everything map-layer */
+  --z-panel: 12;       /* legend / sidebar / playback bar */
+  --z-panel-toggle: 15;
+  --z-camera-btn: 19;
+  --z-topbar: 20;
+  --z-dropdown: 50;
+  --z-footer: 100;
+  --z-modal: 200;
+  --z-modal-top: 201;
+  --z-debug: 9999;
+
+  /* ── Basemap filter knobs (JS writes these per theme; unchanged contract) ── */
+  --map-saturate: 0.55;
+  --map-brightness: 0.72;
+  --map-contrast: 1.12;
+  --map-shadow-lift: 0;
+
+  /* ── Legacy aliases: old token names some engine/UI JS or CSS may still
+       reference (map_view.js filter code reads var(--map-*), untouched).
+       Kept for compatibility since those are outside this redesign's scope. ── */
+  --bg: var(--ink-950);
+  --panel: var(--ink-900);
+  --panel2: var(--ink-850);
+  --text: var(--ink-100);
+  --muted: var(--ink-500);
+  --accent: var(--accent-live);
+  --border: var(--hairline);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --ease-standard: 1ms linear;
+    --ease-emphasized: 1ms linear;
+    --ease-spring: 1ms linear;
+  }
+}

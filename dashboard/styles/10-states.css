@@ -1,0 +1,67 @@
+/**
+ * Cross-cutting presentation states, toggled by JS on <html> or <body>.
+ * Loaded last so these overrides win over individual component rules.
+ */
+
+/* ── Lite mode: embedded/iframe preview — hide all chrome, map only ── */
+body.lite #topbar,
+body.lite .playbackBar,
+body.lite #sidebar,
+body.lite #menuBtn,
+body.lite .controls,
+body.lite #legend,
+body.lite #legendToggle,
+body.lite #camReplayBtn,
+body.lite #camCenterBtn,
+body.lite .pbMenuBtn,
+html.lite #topbar,
+html.lite .playbackBar,
+html.lite #sidebar,
+html.lite #menuBtn,
+html.lite .controls,
+html.lite #legend,
+html.lite #legendToggle,
+html.lite #camReplayBtn,
+html.lite #camCenterBtn,
+html.lite .pbMenuBtn {
+  display: none !important;
+}
+
+/* ── Screensaver mode: same chrome set fades out on idle ── */
+#topbar,
+#sidebar,
+#menuBtn,
+.controls,
+#legend,
+#legendToggle,
+#camReplayBtn,
+#camCenterBtn,
+.pbMenuBtn,
+#appFooter {
+  transition: opacity var(--ease-emphasized);
+}
+body.screensaver { cursor: none; }
+body.screensaver #topbar,
+body.screensaver #sidebar,
+body.screensaver #menuBtn,
+body.screensaver .controls,
+body.screensaver #legend,
+body.screensaver #legendToggle,
+body.screensaver #camReplayBtn,
+body.screensaver #camCenterBtn,
+body.screensaver .pbMenuBtn {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* ── iOS overrides (Safari toolbar-safe-area accommodations) ── */
+html.ios .playbackBar { bottom: 100px; }
+html.ios #fieldDebugPanel { bottom: 100px; }
+@media (max-width: 1120px) {
+  html.ios #fieldDebugPanel { bottom: 200px; }
+  html.ios:has(.playbackBar.pb-hidden) #fieldDebugPanel { bottom: 100px; }
+}
+@media (max-height: 500px) {
+  html.ios-landscape #appFooter { display: none !important; }
+}
+html.ios-landscape .playbackBar { bottom: 46px; }

@@ -1,0 +1,222 @@
+/**
+ * About modal + owner-token panel + PWA install banner.
+ */
+
+.aboutModal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  background: oklch(0% 0 0 / 0.55);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+}
+.aboutModal.hidden { display: none; }
+
+.aboutModalWrap { position: relative; }
+
+.aboutModalContent {
+  background: var(--ink-900);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-float);
+  padding: var(--space-5);
+  min-width: 300px;
+  max-width: 440px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.aboutModalContent h3 {
+  margin: 0 0 4px;
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-black);
+  letter-spacing: -0.01em;
+  color: var(--ink-100);
+}
+.aboutVersion {
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--ink-500);
+  font-variant-numeric: tabular-nums;
+}
+.aboutDesc {
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-md);
+  color: var(--ink-300);
+  line-height: var(--lh-lg);
+}
+.aboutTodo {
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--ink-500);
+  font-style: italic;
+}
+
+.aboutSection { margin-bottom: var(--space-4); }
+.aboutSection h4 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-bold);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent-live);
+}
+.aboutSection p {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--ink-500);
+  line-height: var(--lh-sm);
+}
+.aboutLegal {
+  font-size: 11px !important;
+  color: var(--ink-600) !important;
+}
+.aboutContact {
+  color: var(--accent-live);
+  font-size: var(--text-sm);
+  text-decoration: none;
+}
+.aboutContact:hover { text-decoration: underline; }
+
+.aboutModalClose {
+  margin-top: var(--space-4);
+  width: 100%;
+  height: 38px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--hairline);
+  background: var(--ink-850);
+  color: var(--ink-100);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  transition: background var(--ease-standard), border-color var(--ease-standard);
+}
+.aboutModalClose:hover { background: var(--ink-800); border-color: var(--hairline-strong); }
+
+.aboutModalX {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  z-index: var(--z-modal-top);
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill);
+  font-size: 22px;
+  line-height: 1;
+  color: var(--ink-500);
+  background: var(--ink-850);
+  cursor: pointer;
+  transition: background var(--ease-standard), color var(--ease-standard);
+}
+.aboutModalX:hover { background: var(--ink-800); color: var(--ink-100); }
+
+/* ── Owner token (revealed by tapping the version string) ── */
+.ownerTokenSection { border-top: 1px solid var(--hairline); padding-top: var(--space-3); }
+.ownerTokenSection.hidden { display: none; }
+.ownerTokenLabel {
+  font-size: var(--text-2xs);
+  color: var(--ink-500);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: var(--space-2);
+  display: block;
+}
+.ownerTokenRow { display: flex; gap: var(--space-2); }
+.ownerTokenInput {
+  flex: 1;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--hairline);
+  background: var(--ink-950);
+  color: var(--ink-100);
+  padding: 0 var(--space-2);
+  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+}
+.ownerTokenInput:focus-visible { border-color: var(--accent-live); }
+.ownerTokenSave {
+  height: 32px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--hairline);
+  background: var(--ink-850);
+  color: var(--ink-100);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.ownerTokenSave:hover { background: var(--ink-800); }
+.ownerTokenStatus {
+  font-size: var(--text-2xs);
+  color: oklch(78% 0.16 145);
+  margin-top: var(--space-1);
+  min-height: 16px;
+}
+
+/* ── PWA install banner (Safari, non-standalone) ── */
+.pwaInstallBanner {
+  position: fixed;
+  top: var(--space-2);
+  right: var(--space-2);
+  z-index: var(--z-debug);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg);
+  background: var(--scrim-strong);
+  border: 1px solid var(--accent-live-line);
+  box-shadow: var(--shadow-float);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  opacity: 0;
+  transform: translateY(-20px);
+  transition: opacity var(--ease-emphasized), transform var(--ease-emphasized);
+  max-width: 340px;
+}
+.pwaInstallBanner.hidden { display: none; }
+.pwaInstallBanner.visible { opacity: 1; transform: translateY(0); }
+.pwaInstallDismiss {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-2);
+  background: none;
+  border: none;
+  color: var(--ink-500);
+  font-size: var(--text-lg);
+  cursor: pointer;
+  padding: 2px 6px;
+  line-height: 1;
+}
+.pwaInstallDismiss:hover { color: var(--ink-100); }
+.pwaInstallAppIcon {
+  width: 40px; height: 40px;
+  border-radius: var(--radius-md);
+  flex-shrink: 0;
+  box-shadow: var(--shadow-raised);
+}
+.pwaInstallBody { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pwaInstallTitle { font-size: var(--text-sm); font-weight: var(--weight-bold); color: var(--ink-100); }
+.pwaInstallSteps {
+  font-size: var(--text-xs);
+  color: var(--ink-500);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.pwaInstallShareIcon {
+  display: inline-block;
+  vertical-align: middle;
+  color: var(--accent-live);
+  margin: 0 1px;
+  position: relative;
+  top: -1px;
+}
+.pwaInstallAction { color: var(--accent-live); font-weight: var(--weight-bold); }
