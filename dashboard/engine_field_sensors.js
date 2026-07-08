@@ -61,6 +61,28 @@
   const _LEGEND_TAB_AQI_KEY = {
     pm25: "pm2.5", pm10: "pm10", o3: "ozone", no2: "no2", co: "co",
   };
+  /**
+   * Per-pollutant field kernel spread. PM2.5/PM10/CO are primary pollutants
+   * emitted right at the source (tailpipes, roads) — a tight, peaky kernel
+   * reads as a real plume, and PurpleAir gives them dense coverage anyway.
+   * Ozone is secondary (forms photochemically over hours, often locally
+   * SUPPRESSED near fresh NOx by titration) and has only sparse fixed-DAQ
+   * coverage (no PurpleAir), so the same tight kernel renders it as isolated
+   * bullseyes around single monitors instead of the smooth, regional field
+   * ozone actually has. NO2 sits between the two: still road-primary, but
+   * fixed-only coverage like ozone, so it gets a smaller bump.
+   * sigmaMult widens the Gaussian falloff (bandwidth); cutMult widens the
+   * radius a sensor's influence reaches before being excluded entirely —
+   * both need to move together, or a wider falloff just fades to nothing
+   * faster inside the same unchanged cutoff radius.
+   */
+  const _LEGEND_TAB_FIELD_SPREAD = {
+    pm25: { sigmaMult: 1,    cutMult: 1 },
+    pm10: { sigmaMult: 1,    cutMult: 1 },
+    o3:   { sigmaMult: 2.4,  cutMult: 1.8 },
+    no2:  { sigmaMult: 1.3,  cutMult: 1.2 },
+    co:   { sigmaMult: 1,    cutMult: 1 },
+  };
   /** Pollutants composited in "no selection" max-mode field (one kernel each). */
   // Max-mode field groups. Particulates (PM2.5 + PM10) form ONE field: same
   // unit/scale and fixed sensors report both, so they blend smoothly instead of
@@ -557,6 +579,7 @@
     _OVERFETCH_MARGIN_EXHAUST,
     _LEGEND_TAB_READING_KEYS,
     _LEGEND_TAB_AQI_KEY,
+    _LEGEND_TAB_FIELD_SPREAD,
     _MAX_MODE_GROUPS,
     _LEGEND_TAB_LABEL,
     _LEGEND_TAB_TRAIL_KEYS,
