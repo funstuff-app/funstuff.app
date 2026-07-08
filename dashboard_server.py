@@ -4911,10 +4911,20 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                 if js_file.exists():
                     return self._send(200, js_file.read_bytes(), "text/javascript",
                                       cache_control="public, max-age=3600, s-maxage=86400")
-            # CSS - short cache, versioned via ?v= in HTML
+            # CSS - short cache, versioned via ?v= in HTML.
+            # /styles.css is the legacy single-file stylesheet; /styles/*.css
+            # serves the split token+component system (mirrors the .js
+            # flat-filename-only matcher above — one level under /styles/,
+            # no further nesting, same cache policy).
             if path_no_query == "/styles.css":
                 return self._send(200, (static_dir / "styles.css").read_bytes(), "text/css",
                                   cache_control="public, max-age=3600, s-maxage=86400")
+            if path_no_query.startswith("/styles/") and path_no_query.endswith(".css") \
+                    and "/" not in path_no_query[len("/styles/"):]:
+                css_file = static_dir / "styles" / path_no_query[len("/styles/"):]
+                if css_file.exists():
+                    return self._send(200, css_file.read_bytes(), "text/css",
+                                      cache_control="public, max-age=3600, s-maxage=86400")
             if path_no_query == "/manifest.json":
                 # Use relative URLs — avoids Host-header injection and works
                 # behind any reverse proxy or CDN without scheme/host mismatch.

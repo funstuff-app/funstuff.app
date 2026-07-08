@@ -24,15 +24,32 @@
 
   <!-- PWA / Add to Dock -->
   <link rel="manifest" href="manifest.json" />
-  <meta name="theme-color" content="#111826" />
+  <meta name="theme-color" content="#0b0e13" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="DustyTrails" />
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
-  
-  <link rel="stylesheet" href="/styles.css?v=20260702e" />
+
+  <!-- Design system: tokens → base/primitives → components → cross-cutting
+       states → responsive. No bundler in this project (see the 26 <script
+       defer> tags below) — multiple stylesheets is the idiomatic answer
+       here, same pattern as the JS module chain. -->
+  <link rel="stylesheet" href="/styles/00-tokens.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/01-base.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/02-shell.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/03-map.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/04-legend.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/05-sidebar.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/06-playback.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/07-menu.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/08-modal.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/09-debug.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/12-jogwheel-legacy.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/10-states.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/11-responsive.css?v=20260707redesign3" />
+
   <script>if(new URLSearchParams(location.search).get('lite')==='1')document.documentElement.classList.add('lite');</script>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
@@ -44,11 +61,14 @@
       <button id="menuBtn" class="menuBtn" type="button" title="Toggle sensor list" aria-label="Toggle menu">
         <span class="hamburger"></span>
       </button>
-      <div class="brand">DustyTrails</div>
-      <div class="status">
+      <div class="brandRow">
+        <span class="brandMark" aria-hidden="true"></span>
+        <div class="brand">DustyTrails</div>
+      </div>
+      <div class="status" aria-live="polite">
         <span id="statusText">Loading…</span>
         <span class="sep">•</span>
-        <span id="lastUpdated">—</span>
+        <span id="lastUpdated" class="num">—</span>
       </div>
       <div class="controls">
         <!-- Hidden theme select (controlled via menu) -->
@@ -60,33 +80,24 @@
       <!-- DVR menu in topbar -->
       <div class="pbMenuWrap topbarMenu">
         <button id="autoCameraBtn" type="button" class="autoCameraBtn active" title="Auto-center camera: on" aria-label="Toggle auto-center camera" style="display:none"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="6"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/></svg></button>
-        <button id="shareBtn" type="button" class="shareBtn" title="Share" aria-label="Share"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 7l4-4 4 4"/><path d="M5 11v9a2 2 0 002 2h10a2 2 0 002-2v-9"/></svg></button>
+        <button id="shareBtn" type="button" class="shareBtn" title="Share" aria-label="Share"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 7l4-4 4 4"/><path d="M5 11v9a2 2 0 002 2h10a2 2 0 002-2v-9"/></svg></button>
         <button id="pbMenuBtn" type="button" class="pbMenuBtn" title="More options">Menu</button>
         <div id="pbMenu" class="pbMenu hidden">
-          <!-- <div class="pbMenuItem" data-action="save">
-            <span class="pbMenuIcon">💾</span>
-            <span class="pbMenuLabel">Save Snapshot</span>
-          </div>
-          <div class="pbMenuItem" data-action="load">
-            <span class="pbMenuIcon">📂</span>
-            <span class="pbMenuLabel">Load Snapshot</span>
-          </div>
-          <div class="pbMenuDivider"></div> -->
           <div class="pbMenuItem pbMenuSub" data-submenu="days">
             <span class="pbMenuArrow">‹</span>
-            <span class="pbMenuIcon">📅</span>
+            <span class="pbMenuIcon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/><circle cx="8" cy="15" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="15" r="1" fill="currentColor" stroke="none"/><circle cx="16" cy="15" r="1" fill="currentColor" stroke="none"/></svg></span>
             <span class="pbMenuLabel">Select Day</span>
             <div class="pbSubmenu" id="pbDaysSubmenu"></div>
           </div>
           <div class="pbMenuItem pbMenuSub" data-submenu="theme">
             <span class="pbMenuArrow">‹</span>
-            <span class="pbMenuIcon">🎨</span>
+            <span class="pbMenuIcon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 000 18c1.4 0 1.9-1 1.2-2.1-.5-.8-.1-1.9.9-2.1 1.6-.3 2.9-1.6 2.9-3.3C17 8.5 14.9 6 12 6"/><circle cx="8.5" cy="10.5" r="1.1" fill="currentColor" stroke="none"/><circle cx="12" cy="8" r="1.1" fill="currentColor" stroke="none"/></svg></span>
             <span class="pbMenuLabel">Theme</span>
             <div class="pbSubmenu" id="pbThemeSubmenu"></div>
           </div>
           <div class="pbMenuItem pbMenuSub" data-submenu="display">
             <span class="pbMenuArrow">‹</span>
-            <span class="pbMenuIcon">🖥️</span>
+            <span class="pbMenuIcon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="13" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></span>
             <span class="pbMenuLabel">Display</span>
             <div class="pbSubmenu pbSubmenuSliders" id="pbDisplaySubmenu">
               <label class="pbSliderRow">
@@ -105,11 +116,11 @@
           </div>
           <div class="pbMenuDivider"></div>
           <div class="pbMenuItem" data-action="debug" id="pbDebugItem">
-            <span class="pbMenuIcon">🔧</span>
+            <span class="pbMenuIcon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 00-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 005.4-5.4l-2.1 2.1-2-2z"/></svg></span>
             <span class="pbMenuLabel">Debug</span>
           </div>
           <div class="pbMenuItem" data-action="about">
-            <span class="pbMenuIcon">ℹ️</span>
+            <span class="pbMenuIcon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="7.8" r="1" fill="currentColor" stroke="none"/></svg></span>
             <span class="pbMenuLabel">About</span>
           </div>
         </div>
@@ -312,7 +323,10 @@
   </div>
 
   <!-- Load order: nav engine → camera logic → config → projections → colors →
-       aqi → format → data → MapView class → sidebar UI → main entry point -->
+       aqi → format → data → engine controllers → MapView class → sidebar UI →
+       ui_* controllers → main entry point. Unchanged from pre-redesign —
+       this is the tested, working rendering/data engine; this redesign only
+       touched the chrome around it. -->
   <script defer src="map_nav_engine.js?v=20260224a"></script>
   <script defer src="camera_fit_logic.js?v=20260224a"></script>
   <script defer src="config.js?v=20260702a"></script>
@@ -341,26 +355,26 @@
   <script defer src="ui_playback.js?v=20260702p"></script>
   <script defer src="ui_snapshots_menus.js?v=20260701a"></script>
   <script defer src="ui_screensaver.js?v=20260701a"></script>
-  <script defer src="app.js?v=20260702j"></script>
+  <script defer src="app.js?v=20260707b"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">
-    <div style="font-weight:bold; margin-bottom:4px; color:#fff; font-size:10px;">Field Debug</div>
-    <div style="display:grid; grid-template-columns:42px 30px 1fr; gap:2px 4px; align-items:center;">
-      <span>sigma÷</span><span id="fdSigmaVal" style="text-align:right">13</span><input id="fdSigma" type="range" min="1" max="20" step="0.5" value="13" style="height:14px;width:100%;">
-      <span>cut f</span><span id="fdCutFloorVal" style="text-align:right">0.3</span><input id="fdCutFloor" type="range" min="0.02" max="1.0" step="0.01" value="0.3" style="height:14px;width:100%;">
-      <span>cut c</span><span id="fdCutCeilVal" style="text-align:right">0.7</span><input id="fdCutCeil" type="range" min="0.02" max="1.0" step="0.01" value="0.7" style="height:14px;width:100%;">
-      <span>blur</span><span id="fdBlurVal" style="text-align:right">2</span><input id="fdBlur" type="range" min="0" max="6" step="1" value="2" style="height:14px;width:100%;">
-      <span>delta</span><span id="fdDeltaVal" style="text-align:right">1</span><input id="fdDelta" type="range" min="0.1" max="3" step="0.05" value="1" style="height:14px;width:100%;">
+    <div class="fdTitle">Field Debug</div>
+    <div class="fdGrid">
+      <span>sigma÷</span><span id="fdSigmaVal" class="fdVal">13</span><input id="fdSigma" type="range" min="1" max="20" step="0.5" value="13">
+      <span>cut f</span><span id="fdCutFloorVal" class="fdVal">0.3</span><input id="fdCutFloor" type="range" min="0.02" max="1.0" step="0.01" value="0.3">
+      <span>cut c</span><span id="fdCutCeilVal" class="fdVal">0.7</span><input id="fdCutCeil" type="range" min="0.02" max="1.0" step="0.01" value="0.7">
+      <span>blur</span><span id="fdBlurVal" class="fdVal">2</span><input id="fdBlur" type="range" min="0" max="6" step="1" value="2">
+      <span>delta</span><span id="fdDeltaVal" class="fdVal">1</span><input id="fdDelta" type="range" min="0.1" max="3" step="0.05" value="1">
     </div>
-    <div style="margin-top:4px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-      <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowWind" type="checkbox" style="margin:0;"> wind vectors</label>
-      <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="fdShowVirtual" type="checkbox" style="margin:0;"> ghost sensors</label>
-      <label style="display:flex; align-items:center; gap:3px; cursor:pointer;"><input id="pbDebugPath" type="checkbox" style="margin:0;"> road debug</label>
+    <div class="fdChecks">
+      <label><input id="fdShowWind" type="checkbox"> wind vectors</label>
+      <label><input id="fdShowVirtual" type="checkbox"> ghost sensors</label>
+      <label><input id="pbDebugPath" type="checkbox"> road debug</label>
     </div>
-    <div style="margin-top:4px; display:flex; align-items:center; gap:6px;">
+    <div class="fdUpscale">
       <span>upscale</span>
-      <select id="fdUpscale" style="font-size:10px; background:#222; color:#ccc; border:1px solid #555; border-radius:3px; padding:1px 2px;">
+      <select id="fdUpscale">
         <option value="high">high</option>
         <option value="medium">medium</option>
         <option value="low">low</option>
@@ -482,5 +496,3 @@
   </script>
 </body>
 </html>
-
-

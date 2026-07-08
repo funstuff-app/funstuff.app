@@ -1,0 +1,244 @@
+/**
+ * App shell: topbar (the one deliberate glass surface) + footer.
+ */
+
+#topbar {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  z-index: var(--z-topbar);
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--hairline);
+  touch-action: manipulation;
+  overscroll-behavior: contain;
+}
+
+/* Hamburger — opens the sensor sidebar */
+.menuBtn {
+  width: 36px;
+  height: 36px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  transition: background var(--ease-standard);
+  flex-shrink: 0;
+}
+.menuBtn:hover { background: var(--ink-800); }
+.menuBtn .hamburger {
+  width: 20px;
+  height: 2px;
+  background: var(--ink-100);
+  position: relative;
+  border-radius: 1px;
+}
+.menuBtn .hamburger::before,
+.menuBtn .hamburger::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  width: 20px;
+  height: 2px;
+  background: var(--ink-100);
+  border-radius: 1px;
+}
+.menuBtn .hamburger::before { top: -6px; }
+.menuBtn .hamburger::after { top: 6px; }
+
+.brandRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/* Decorative live-sensor mark next to the wordmark — purely presentational,
+   no JS dependency. Pulses gently; respects prefers-reduced-motion globally. */
+.brandMark {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-live);
+  box-shadow: 0 0 8px var(--accent-live-line);
+  flex-shrink: 0;
+  animation: brandPulse 2.4s var(--ease-standard) infinite;
+}
+@keyframes brandPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.55; transform: scale(0.82); }
+}
+
+.brand {
+  font-weight: var(--weight-black);
+  font-size: var(--text-lg);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  color: var(--ink-100);
+}
+
+.status {
+  color: var(--ink-500);
+  font-size: var(--text-sm);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  overflow: hidden;
+}
+
+#statusText {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--weight-medium);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-size: var(--text-2xs);
+}
+#statusText::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--ink-600);
+  flex-shrink: 0;
+  transition: background var(--ease-standard), box-shadow var(--ease-standard);
+}
+#statusText.live {
+  color: var(--accent-live);
+}
+#statusText.live::before {
+  background: var(--accent-live);
+  box-shadow: 0 0 6px var(--accent-live-line);
+  animation: brandPulse 2.4s var(--ease-standard) infinite;
+}
+#statusText.offline {
+  color: oklch(70% 0.18 25);
+}
+#statusText.offline::before {
+  background: oklch(70% 0.18 25);
+}
+
+#lastUpdated {
+  font-size: var(--text-2xs);
+  color: var(--ink-600);
+}
+
+.sep { opacity: 0.5; color: var(--ink-600); }
+
+.controls {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* DVR menu cluster, right-aligned */
+.pbMenuWrap {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  position: relative;
+}
+.topbarMenu { display: flex; align-items: center; }
+.topbarMenu .pbMenu {
+  bottom: auto;
+  top: calc(100% + var(--space-2));
+  margin: 0;
+  right: 0;
+  left: auto;
+}
+
+.autoCameraBtn {
+  width: 34px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--hairline);
+  background: var(--ink-850);
+  color: var(--ink-600);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--ease-standard), border-color var(--ease-standard),
+              color var(--ease-standard), box-shadow var(--ease-standard);
+  touch-action: manipulation;
+}
+.autoCameraBtn svg { width: 16px; height: 16px; flex-shrink: 0; display: block; }
+.autoCameraBtn:hover { border-color: var(--hairline-strong); color: var(--ink-100); }
+.autoCameraBtn.active {
+  background: var(--accent-live-dim);
+  border-color: var(--accent-live-line);
+  color: var(--accent-live);
+  box-shadow: 0 0 8px -2px var(--accent-live-line);
+}
+
+.shareBtn {
+  width: 34px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--hairline);
+  background: var(--ink-850);
+  color: var(--ink-100);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--ease-standard), border-color var(--ease-standard), transform var(--ease-standard);
+}
+.shareBtn:hover { border-color: var(--hairline-strong); background: var(--ink-800); }
+.shareBtn:active, .shareBtn.open {
+  background: var(--accent-live-dim);
+  border-color: var(--accent-live-line);
+  transform: scale(0.96);
+}
+.shareBtn svg { width: 18px; height: 18px; }
+
+/* ── Footer: quiet, legal/attribution text — de-emphasized on purpose ── */
+#appFooter {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  z-index: var(--z-footer);
+  padding: var(--space-1) var(--space-3);
+  background: var(--scrim-strong);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--text-2xs);
+  color: var(--ink-600);
+  text-align: center;
+  line-height: 1.4;
+  letter-spacing: 0.01em;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+@media (min-width: 769px) {
+  #appFooter { padding: var(--space-2) var(--space-4); }
+}
+
+.footerRow1 {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.footerSentence { white-space: nowrap; }
+.footerContent { color: var(--ink-500); }
+.footerDisclaimer { color: var(--ink-600); }
+
+#appFooter .contactLink {
+  color: var(--ink-500);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  margin: 0 var(--space-2);
+}
+#appFooter .contactLink:hover { color: var(--ink-100); }

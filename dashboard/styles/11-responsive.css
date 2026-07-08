@@ -1,0 +1,27 @@
+/**
+ * Breakpoint overrides. Loaded last (after 10-states.css) so it wins.
+ */
+
+@media (max-width: 1080px) {
+  .sidebarPanel { width: 270px; }
+}
+
+@media (max-width: 768px) {
+  #topbar {
+    gap: var(--space-2);
+    padding-left: var(--space-2);
+    padding-right: var(--space-2);
+  }
+  .brand { font-size: var(--text-md); }
+  .status { font-size: var(--text-xs); gap: 4px; }
+  /* Hide the separator + lastUpdated on very small screens to save space */
+  .status .sep, #lastUpdated { display: none; }
+  .sidebarPanel { width: 290px; }
+
+  .footerDisclaimer { display: block; font-size: 10px; }
+  .footerRow1 .footerDisclaimer { display: inline; }
+}
+
+@media (display-mode: standalone) {
+  .footerDisclaimer { font-size: 10px; }
+}

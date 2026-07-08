@@ -1,0 +1,79 @@
+/**
+ * Field-debug panel — developer-only (behind Menu › Debug or ?fieldDebug=1).
+ * Deliberately utilitarian, not a showcase surface. Tokenized for
+ * consistency with the rest of the app but kept visually minimal on purpose.
+ */
+#fieldDebugPanel {
+  position: fixed;
+  bottom: 64px;
+  right: var(--space-3);
+  z-index: var(--z-debug);
+  background: var(--ink-900);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  font: 10px/1.4 var(--font-mono);
+  color: var(--ink-300);
+  width: 220px;
+  pointer-events: auto;
+}
+#fieldDebugPanel.fdHidden { display: none; }
+#fieldDebugPanel .fdTitle {
+  font-weight: var(--weight-bold);
+  margin-bottom: var(--space-1);
+  color: var(--ink-100);
+  font-size: 10px;
+}
+#fieldDebugPanel .fdGrid {
+  display: grid;
+  grid-template-columns: 42px 30px 1fr;
+  gap: 2px var(--space-1);
+  align-items: center;
+}
+#fieldDebugPanel .fdVal { text-align: right; color: var(--ink-500); }
+#fieldDebugPanel input[type="range"] {
+  height: 14px;
+  width: 100%;
+  accent-color: var(--accent-live);
+}
+#fieldDebugPanel .fdChecks {
+  margin-top: var(--space-1);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+#fieldDebugPanel .fdChecks label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+}
+#fieldDebugPanel .fdChecks input { margin: 0; accent-color: var(--accent-live); }
+#fieldDebugPanel .fdUpscale {
+  margin-top: var(--space-1);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+#fieldDebugPanel select {
+  font-size: 10px;
+  background: var(--ink-850);
+  color: var(--ink-300);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-sm);
+  padding: 1px 4px;
+}
+
+/* Overlap: playback bar (center, 700px) reaches the debug panel (right,
+   220px) below ~1120px viewport width — lift it above the bar when both
+   are visible; drop back down when the bar auto-hides. */
+@media (max-width: 1120px) {
+  #fieldDebugPanel {
+    bottom: 168px;
+    transition: bottom var(--ease-emphasized);
+  }
+  html:has(.playbackBar.pb-hidden) #fieldDebugPanel {
+    bottom: 64px;
+  }
+}
