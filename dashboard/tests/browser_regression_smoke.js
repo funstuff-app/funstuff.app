@@ -136,6 +136,24 @@
       hooks.triggerMenuAction("debug");
       check("debug panel toggles closed", !hooks.isDebugPanelOpen());
 
+      // Draw-rate ceiling — measured BEFORE the play/pause test below touches
+      // playback state (a paused/non-live map legitimately draws ~0fps,
+      // which would make this check meaningless without proving anything).
+      // Only asserted when the window was actually live and the tab stayed
+      // visible throughout; otherwise recorded as informational so an
+      // inactive-playback or backgrounded-tab artifact can't masquerade as
+      // either a pass or a fail.
+      const map = window.__map || window.map;
+      const wasLiveAtStart = !!map && (map.getPlaybackPlaying() || map._playbackLiveFollow);
+      const rate = await hooks.measureDrawRate(2000);
+      if (!wasLiveAtStart || rate.wasHidden) {
+        check(`live-playback repaint stays under 50fps ceiling (SKIPPED: ${!wasLiveAtStart ? "not live/playing" : "tab backgrounded"} during measurement)`,
+          true, `drawCount=${rate.drawCount}`);
+      } else {
+        check("live-playback repaint stays under 50fps ceiling",
+          rate.fps == null || rate.fps < 50, `measured ${rate.fps ?? "n/a"}fps`);
+      }
+
       // Play/pause has real state-machine nuance (Live/Play/Pause depend on
       // wall-edge position, server-sync mode, speed — see
       // PlaybackUI.computeButtonState) that belongs in the dedicated
@@ -149,17 +167,6 @@
         !clickThrew && !!byId("pbPlay") && !!hooks.getPlayLabel(),
         `label now "${hooks.getPlayLabel()}"`);
       check("speed selector works", hooks.setSpeed(10));
-
-      // Draw-rate ceiling — only asserted when the measurement is trustworthy
-      // (tab stayed visible the whole window). Otherwise recorded as
-      // informational so an environment artifact can't masquerade as a pass.
-      const rate = await hooks.measureDrawRate(2000);
-      if (rate.wasHidden) {
-        check("live-playback repaint stays under 50fps ceiling (SKIPPED: tab backgrounded during measurement)", true, `drawCount=${rate.drawCount}`);
-      } else {
-        check("live-playback repaint stays under 50fps ceiling",
-          rate.fps == null || rate.fps < 50, `measured ${rate.fps ?? "n/a"}fps`);
-      }
 
       // Feature-presence flags — NOT counted toward passed/total. Expected
       // value changes as each PR merges; interpret alongside merge state,
