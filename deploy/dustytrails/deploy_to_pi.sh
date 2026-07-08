@@ -304,6 +304,12 @@ build_staging() {
     cp "$REPO_ROOT/dashboard/"*.js "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/index.html" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/styles.css" "$STAGING_DIR/dashboard/"
+    # Token-based stylesheet cascade (dashboard/styles/00-tokens.css ..
+    # 12-jogwheel-legacy.css) — index.html links these individually, not just
+    # the legacy styles.css above. Staged by glob for the same reason the JS
+    # files are: an explicit list silently drops new files added later.
+    mkdir -p "$STAGING_DIR/dashboard/styles"
+    cp "$REPO_ROOT/dashboard/styles/"*.css "$STAGING_DIR/dashboard/styles/"
     cp "$REPO_ROOT/dashboard/tui.html" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/tui.css" "$STAGING_DIR/dashboard/"
     cp "$REPO_ROOT/dashboard/manifest.json" "$STAGING_DIR/dashboard/"
