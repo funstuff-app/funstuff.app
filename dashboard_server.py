@@ -2455,16 +2455,29 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
     # Get mobile data time range for filtering
     mobile_time_range = _get_mobile_time_range(st.get("mobile", []))
     
-    # Build a lookup of existing fixed sensors by approximate location
-    fixed_by_loc: dict[tuple[float, float], dict[str, Any]] = {}
-    for fs in fixed_list:
-        lat = fs.get("lat")
-        lon = fs.get("lon")
-        if lat is not None and lon is not None:
-            # Round to ~100m precision for matching
-            key = (round(lat, 3), round(lon, 3))
-            fixed_by_loc[key] = fs
-    
+    # Match an AirNow site to an existing fixed sensor by real distance, not
+    # exact-rounding dict keys. A coordinate like 40.7335 can round to 40.733
+    # or 40.734 depending on float representation, so two readings for the
+    # SAME physical site (e.g. Hawthorne at 40.7335 vs AirNow's
+    # 40.733501) can land in different buckets and never merge — the site
+    # then shows up twice with disagreeing values, which is exactly what
+    # skews the live pollution field around it. List sizes here (tens to low
+    # hundreds of fixed sensors) make an O(n) scan per AirNow site trivial.
+    _MATCH_TOLERANCE_DEG = 0.0015  # ~150m
+
+    def _find_matching_fixed(lat: float, lon: float) -> dict[str, Any] | None:
+        best = None
+        best_dist_sq = _MATCH_TOLERANCE_DEG ** 2
+        for fs in fixed_list:
+            flat, flon = fs.get("lat"), fs.get("lon")
+            if flat is None or flon is None:
+                continue
+            dist_sq = (lat - flat) ** 2 + (lon - flon) ** 2
+            if dist_sq < best_dist_sq:
+                best = fs
+                best_dist_sq = dist_sq
+        return best
+
     # Track which AirNow sites we've added
     added_airnow_sites: set[str] = set()
     
@@ -2493,9 +2506,9 @@ def _merge_airnow_into_fixed(st: dict[str, Any], app_state: AppState) -> None:
         if not filtered_readings:
             continue
         
-        # Try to find matching existing fixed sensor
-        key = (round(lat, 3), round(lon, 3))
-        existing = fixed_by_loc.get(key)
+        # Try to find matching existing fixed sensor (distance-based, see
+        # _find_matching_fixed above for why this isn't exact-rounding)
+        existing = _find_matching_fixed(lat, lon)
         
         # Build readings dict from AirNow data with history
         airnow_readings_dict = _airnow_to_readings_dict(
