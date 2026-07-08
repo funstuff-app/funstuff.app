@@ -4,7 +4,12 @@ import time
 import os
 import json
 import tempfile
-from dashboard_server import AppState, update_app_state_with_new_data, _scrub_broken_mobile_sensors
+from dashboard_server import (
+    AppState,
+    update_app_state_with_new_data,
+    _scrub_broken_mobile_sensors,
+    _merge_airnow_into_fixed,
+)
 
 class TestDashboardServerLogic(unittest.TestCase):
     def setUp(self):
@@ -471,6 +476,75 @@ class TestGpsSpikeRemoval(unittest.TestCase):
         lats = [p["lat"] for p in self.app_state.persistent_mobile["BUS1"]["trail"]]
         self.assertTrue(all(lat < 40.01 for lat in lats),
                         f"Multi-poll teleport points should be removed, got lats: {lats}")
+
+
+class TestMergeAirnowIntoFixed(unittest.TestCase):
+    """Regression coverage for the Hawthorne double-entry bug: an existing
+    fixed sensor and its AirNow counterpart at (float-representation-)
+    adjacent coordinates must merge into one sensor, not two with
+    disagreeing readings — the duplicate is what skewed the live pollution
+    field around it (a real elevated reading and a stale duplicate rendered
+    as if they were two distinct nearby sites)."""
+
+    def setUp(self):
+        self.app_state = AppState(
+            lock=threading.Lock(),
+            state={"mobile": [], "fixed": [], "meta": {}},
+            persistent_mobile={},
+        )
+
+    def test_rounding_boundary_coordinates_still_merge(self):
+        # 40.7335 and 40.733501 are the same physical site (Hawthorne) but
+        # round(_, 3) sends them to different buckets (40.733 vs 40.734) —
+        # this is the exact pair that produced the duplicate in production.
+        existing = {
+            "id": "Hawthorne",
+            "name": "Hawthorne",
+            "lat": 40.7335,
+            "lon": -111.8717,
+            "readings": {"OZNE": {"value": "42.00", "ci": 2}},
+        }
+        st = {"mobile": [], "fixed": [existing]}
+        self.app_state.airnow_sites = {
+            "HAWTHORNE_AIRNOW": {
+                "latitude": 40.733501,
+                "longitude": -111.871696,
+                "site_name": "Hawthorne",
+            }
+        }
+        self.app_state.airnow_readings = {"HAWTHORNE_AIRNOW": {"OZONE": 62}}
+
+        _merge_airnow_into_fixed(st, self.app_state)
+
+        self.assertEqual(len(st["fixed"]), 1,
+            f"expected one merged sensor, got {len(st['fixed'])}: {st['fixed']}")
+        # The existing (Utah DAQ) reading is authoritative — AirNow fills
+        # gaps, it doesn't override a param the fixed sensor already reports.
+        self.assertEqual(st["fixed"][0]["readings"]["OZNE"]["value"], "42.00")
+
+    def test_distinct_nearby_sites_stay_separate(self):
+        # Two genuinely different sites ~1.5km apart must NOT be merged.
+        existing = {
+            "id": "SiteA",
+            "name": "Site A",
+            "lat": 40.7335,
+            "lon": -111.8717,
+            "readings": {"OZNE": {"value": "42.00", "ci": 2}},
+        }
+        st = {"mobile": [], "fixed": [existing]}
+        self.app_state.airnow_sites = {
+            "SITE_B": {
+                "latitude": 40.745,
+                "longitude": -111.8717,
+                "site_name": "Site B",
+            }
+        }
+        self.app_state.airnow_readings = {"SITE_B": {"OZONE": 30}}
+
+        _merge_airnow_into_fixed(st, self.app_state)
+
+        self.assertEqual(len(st["fixed"]), 2,
+            f"expected two distinct sensors, got {len(st['fixed'])}: {st['fixed']}")
 
 
 if __name__ == "__main__":
