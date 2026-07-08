@@ -743,6 +743,7 @@ function main() {
     _pbRAF: null,
     _pbLastPerf: 0,
     _pbLastUiPerf: 0,
+    _pbLastDrawPerf: 0,
     _pbScrubbing: false,  // true when pointer is down on scrub bar
     _pbResumeAfterScrub: false,  // was playback active when the scrub began
     _pbMoveDeltaMs: 0,  // signed ms the playhead last moved (REW direction)
