@@ -621,6 +621,29 @@
 
     if (this.view.playbackMode) {
       this._ensurePlaybackPoints(this.view.lastState);
+
+      // ── Existence gate ──────────────────────────────────────────────────
+      // A sensor whose first trail point is later than the playhead did not
+      // exist yet at this moment in the timeline: HIDE it, exactly like the
+      // fixed-sensor interpolator hides pre-first-report readings
+      // (data_utils.js interpolateFixedReadingsAtTime). The old behavior
+      // (dim to 0.3, or worse, fall through to the live position at full
+      // opacity for movement-filtered sensors) painted phantom markers
+      // across timeline hours before the sensor's data began.
+      const id = m && m.id != null ? String(m.id) : "";
+      const t = this.view._playbackNowMs;
+      const rng = (id && this.view._playbackTrailRangeById)
+        ? this.view._playbackTrailRangeById.get(id) : null;
+      if (rng && t != null && isFinite(t) && t < rng.tMinMs) {
+        return {
+          lat, lon, angle, flipX, speedMps,
+          opacity: 0, hidden: true,
+          reading: null, readings: null, held: false,
+        };
+      }
+
+      let staticReading = null;
+      let staticReadings = null;
       const smp = this._playbackSampleForMobile(m, nowMs);
       if (smp) {
         lat = smp.lat;
@@ -629,25 +652,27 @@
         flipX = !!smp.flipX;
         speedMps = Number(smp.speedMps) || 0;
         opacity = (typeof smp.opacity === "number" && isFinite(smp.opacity)) ? smp.opacity : 1;
-        // Dim markers that haven't "started" yet in the timeline
-        if (smp.beforeFirst) {
-          opacity = 0.3;
-        }
+      } else if (rng && Array.isArray(rng.staticPts) && rng.staticPts.length >= 1
+                 && t != null && isFinite(t)) {
+        // Movement-filtered (jitter/idle) sensor inside its existence window:
+        // pin the marker to the newest point at-or-before the playhead so the
+        // position AND the displayed reading are time-correct, instead of the
+        // live snapshot frozen across the whole timeline.
+        const sp = rng.staticPts;
+        let k = sp.length - 1;
+        while (k > 0 && sp[k].tMs > t) k--;
+        lat = sp[k].lat;
+        lon = sp[k].lon;
+        staticReading = g.primaryReadingKeyedFromPoint(sp[k]) || null;
+        staticReadings = sp[k].readings || null;
       } else {
         // Fallback: if no playback sample but we have trail data, use first/last trail point
-        const id = m && m.id != null ? String(m.id) : "";
         const pts = id ? this.view._playbackPtsById.get(id) : null;
-        const t = this.view._playbackNowMs;
         if (pts && pts.length >= 1 && t != null && isFinite(t)) {
-          // Before first point: show at first position (dimmed)
+          // The existence gate above already handled t < tMin.
           // After last point: show at last position
-          const tMin = pts[0].tMs;
           const tMax = pts[pts.length - 1].tMs;
-          if (t < tMin) {
-            lat = pts[0].lat;
-            lon = pts[0].lon;
-            opacity = 0.3; // Dimmed - hasn't "started" yet
-          } else if (t >= tMax) {
+          if (t >= tMax) {
             lat = pts[pts.length - 1].lat;
             lon = pts[pts.length - 1].lon;
           }
@@ -666,8 +691,8 @@
         flipX,
         speedMps,
         opacity,
-        reading: smp?.reading || null,
-        readings: smp?.readings || null,
+        reading: smp?.reading || staticReading,
+        readings: smp?.readings || staticReadings,
         held,
       };
     }
@@ -730,6 +755,16 @@
     this.view._playbackPtsKey = key;
 
     const nextPtsById = new Map();
+    // Existence window per mobile: id -> { tMinMs, tMaxMs, staticPts }.
+    // Populated for EVERY mobile with at least one parseable trail point —
+    // including sensors the movement filter below excludes from physics.
+    // Without this, an excluded sensor carries no time information at all
+    // downstream, and the pose fallback painted it at its live position at
+    // every playhead position, including times before its first data point
+    // ever existed (the resurrected-idle-bus phantom). staticPts holds the
+    // parsed points ONLY for movement-filtered sensors, so their marker can
+    // still show the time-correct position/reading inside their window.
+    const nextTrailRangeById = new Map();
     let minMs = Infinity;
     let maxMs = -Infinity;
 
@@ -748,7 +783,10 @@
       const serverTrail = Array.isArray(m?.trail) ? m.trail : [];
       const persisted = (this.view._historicalMode || this.view.playbackMode) ? [] : (this.view._persistedTrailById.get(id)?.trail || []);
       const src = (serverTrail.length >= 2) ? serverTrail : (persisted.length >= 2 ? persisted : serverTrail);
-      if (!Array.isArray(src) || src.length < 2) continue;
+      // length >= 1 (not 2): a single-point trail can't animate, but its one
+      // timestamp still defines WHEN the sensor exists — it must feed the
+      // existence window below or the sensor renders at all playhead times.
+      if (!Array.isArray(src) || src.length < 1) continue;
 
       const pts = [];
       for (const p of src) {
@@ -778,7 +816,21 @@
           }
           filtered = lo > 0 ? pts.slice(lo) : pts;
         }
-        if (!Array.isArray(filtered) || filtered.length < 2) {
+        if (!Array.isArray(filtered) || filtered.length < 1) {
+          continue;
+        }
+
+        // Existence window: recorded for every sensor with parseable points,
+        // BEFORE the animatability/movement gates below.
+        const range = {
+          tMinMs: filtered[0].tMs,
+          tMaxMs: filtered[filtered.length - 1].tMs,
+          staticPts: null,
+        };
+        nextTrailRangeById.set(id, range);
+
+        if (filtered.length < 2) {
+          range.staticPts = filtered;
           continue;
         }
 
@@ -797,11 +849,16 @@
         }
         if (totalM >= g.MapView.MIN_TRAIL_LENGTH_M) {
           nextPtsById.set(id, filtered);
+        } else {
+          // Movement-filtered (jitter-only) sensor: no physics/spline entry,
+          // but keep its parsed points so the pose can be time-indexed.
+          range.staticPts = filtered;
         }
       }
     }
 
     this.view._playbackPtsById = nextPtsById;
+    this.view._playbackTrailRangeById = nextTrailRangeById;
 
     // Extend the timeline to cover fixed/PA sensor history, not just mobile
     // trails. Fixed sensors report from midnight while buses only start at

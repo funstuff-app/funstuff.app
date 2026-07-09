@@ -2750,6 +2750,10 @@
 
     const drawMobileMarker = (m) => {
       const pose = view._mobilePoseForRender(m, nowMs);
+      // Existence gate: the playhead is earlier than this sensor's first data
+      // point — it does not exist yet at this timeline position. Skip it
+      // entirely (matches how fixed sensors hide pre-first-report readings).
+      if (pose && pose.hidden) return;
       let lat = pose.lat;
       let lon = pose.lon;
       let angle = pose.angle;
@@ -2783,6 +2787,7 @@
       // Important: trail points often carry only a subset of pollutants (commonly ozone-only),
       // so in DVR live-follow that subset must not override the actual current readings.
       let pr = primaryReadingForSensor(m);
+      let prNoData = false;
       if (view.playbackMode && pose && pose.reading) {
         const prHist = pose.reading;
         // When in historical mode (viewing past days), always use historical trail reading.
@@ -2809,8 +2814,14 @@
           }
         }
       } else if (view.playbackMode && !view.isPlaybackAtEnd(200) && !view._playbackPtsById.has(String(m.id))) {
-        // Sensor has no playback trail data (e.g. parked at depot) — show "--" instead of frozen live value
+        // Sensor has no time-locatable playback reading at this playhead —
+        // show "--" instead of a frozen live value. prNoData locks this in:
+        // the legend-pollutant override below reads live m.readings when the
+        // pose has none, which would resurrect the frozen value it exists to
+        // suppress. (Movement-filtered sensors inside their existence window
+        // don't land here: their pose carries per-point readings.)
         pr = { key: "", value: "--", color: "#666666" };
+        prNoData = true;
       }
       // Expose the selected sensor's displayed pollutant key for legend sync
       if (!_skipLegendExport) {
@@ -2824,7 +2835,7 @@
 
       // Legend pollutant override: show the legend's chosen pollutant on ALL mobile markers
       // In playback mode, prefer trail-point readings (historical) over live m.readings
-      if (view._markerPollutantOverride != null) {
+      if (view._markerPollutantOverride != null && !prNoData) {
         const src = (view.playbackMode && pose && pose.readings) ? pose.readings : m.readings;
         const legendPr = _readingForLegendTab(src, view._markerPollutantOverride);
         if (legendPr) {
