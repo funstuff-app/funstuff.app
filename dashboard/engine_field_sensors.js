@@ -89,23 +89,23 @@
    * SEVERAL stations survive the blend because their neighbors agree.
    */
   /**
-   * gradient: true (ozone) = exact-at-station IDW surface. The field equals
-   * each station's own reading AT the station (an orange 71 ppb monitor
-   * renders orange at its location — never averaged, medianed, or blended
-   * away; weighted-MEAN kernels dilute a station against its neighbors at
-   * its own position, which is what kept swallowing real exceedances) and
-   * decays with 1/d² so the value glides across the ENTIRE gap to the
-   * neighboring stations' levels: a kilometers-long gradient, colors
-   * interpolating naturally through the existing ramp as the value falls.
-   * No global takeover — far from an elevated monitor the field is whatever
-   * the local monitors read. idwSoftFrac rounds the peak top so the station
-   * reads as a soft hill, not a pin. Coverage (covSigmaMult/coverageRef)
-   * only bounds WHERE the field exists, fading softly past the network.
+   * gradient: true (ozone) = BASELINE + RESIDUAL surface (see
+   * _gradientGrid). The wide kernel (sigmaMult) interpolates the smooth
+   * regional level; each station then adds back its own deviation from
+   * that level with a flat-top falloff that equals 1 AT the station, so a
+   * monitor reading into the orange band renders its true band exactly at
+   * its location (normalized interpolations shave the peak wherever
+   * neighbors leak in — a reading 1 ppb into the band always came out
+   * yellow) and the glow's reach scales with how far the reading sits
+   * above the regional level, gliding back to baseline with no edge.
+   * residualFrac sets the residual falloff radius as a fraction of the
+   * cutoff. Coverage (covSigmaMult/coverageRef) only bounds WHERE the
+   * field exists, fading softly past the network.
    */
   const _LEGEND_TAB_FIELD_SPREAD = {
     pm25: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
     pm10: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
-    o3:   { gradient: true, sigmaMult: 1, cutMult: 1.8, covSigmaMult: 2.4, coverageRef: 0.15, idwSoftFrac: 0.04, neighborBlend: 0 },
+    o3:   { gradient: true, sigmaMult: 2.4, cutMult: 1.8, covSigmaMult: 1.4, coverageRef: 0.15, residualFrac: 0.09, neighborBlend: 0 },
     no2:  { sigmaMult: 1.3,  cutMult: 1.2, neighborBlend: 0.3 },
     co:   { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
   };

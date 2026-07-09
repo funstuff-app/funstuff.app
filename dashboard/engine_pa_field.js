@@ -605,9 +605,9 @@
         // colors on its own.
         let gradientIdw = null;
         if (_spread.gradient) {
-          const soft = cutoffPx * (_spread.idwSoftFrac || 0.03);
+          const residR = cutoffPx * (_spread.residualFrac || 0.09);
           gradientIdw = {
-            softSq: soft * soft,
+            residRSq: residR * residR,
             covTwoSigmaSq: twoSigmaSq * _spread.covSigmaMult * _spread.covSigmaMult,
             coverageRef: _spread.coverageRef,
           };
@@ -1001,7 +1001,7 @@
         if (!gr.covCell || gr.covCell.length !== gw * gh) {
           gr.covCell = new Float32Array(gw * gh);
         }
-        this._idwGrid(sensors, gw, gh, cellSize, gradientIdw.softSq,
+        this._gradientGrid(sensors, gw, gh, cellSize, gradientIdw.residRSq,
           gradientIdw.covTwoSigmaSq, gr.aqiCell, gr.covCell);
         this._paintPaCells(gr.aqiCell, gr.covCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, gradientIdw.coverageRef);
         return;
@@ -1010,29 +1010,68 @@
       this._paintPaCells(gr.aqiCell, gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
     }
 
-    /** Gradient-mode grid: inverse-distance-weighted value surface — exact
-     *  at every station, 1/d² decay blending across the whole gap between
-     *  stations — plus a wide Gaussian coverage weight for opacity, so the
-     *  field exists across the network and fades out softly past it.
-     *  sensors: stride-5 [sx, sy, aqi, twoSigSq(value, unused), mult]. */
-    _idwGrid(sensors, gw, gh, cellSize, softSq, covTwoSigmaSq, outAqi, outCov) {
+    /** Gradient-mode grid: BASELINE + RESIDUAL surface.
+     *  baseline(x)  — wide Gaussian weighted mean of all stations: the
+     *                 smooth regional level the field relaxes to.
+     *  residual_i   — v_i − baseline(x_i): how far station i's own reading
+     *                 sits above/below that regional level.
+     *  value(x)     — baseline(x) + Σ residual_i · K_i(x), with a flat-top
+     *                 quartic falloff K = 1/(1+(d/R)⁴) that equals 1 AT the
+     *                 station. The station therefore renders its true value
+     *                 and band EXACTLY (normalized interpolations shave the
+     *                 peak wherever neighbors leak in — a reading 1 ppb into
+     *                 the orange band always came out yellow), and its glow
+     *                 widens with severity: the further over the band, the
+     *                 farther out value(x) stays above the boundary before
+     *                 gliding back to the regional baseline. No edges: K and
+     *                 the baseline are both smooth.
+     *  outCov       — wide Gaussian coverage for opacity only: full across
+     *                 the network, soft fade past the outermost station.
+     *  sensors: stride-5 [sx, sy, aqi, twoSigSq(baseline width), mult]. */
+    _gradientGrid(sensors, gw, gh, cellSize, residRSq, covTwoSigmaSq, outAqi, outCov) {
+      const n = sensors.length / 5;
+      // Per-station baseline (same wide kernel the per-cell pass uses, self
+      // included so baseline(x_i) matches and exactness holds).
+      const resid = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const xi = sensors[i * 5], yi = sensors[i * 5 + 1];
+        let wSum = 0, vSum = 0;
+        for (let j = 0; j < n; j++) {
+          const dx = sensors[j * 5] - xi;
+          const dy = sensors[j * 5 + 1] - yi;
+          const w = sensors[j * 5 + 4] * Math.exp(-(dx * dx + dy * dy) / sensors[j * 5 + 3]);
+          wSum += w;
+          vSum += w * sensors[j * 5 + 2];
+        }
+        resid[i] = wSum > 0 ? sensors[i * 5 + 2] - vSum / wSum : 0;
+      }
       for (let gy = 0; gy < gh; gy++) {
         const py = (gy + 0.5) * cellSize;
         for (let gx = 0; gx < gw; gx++) {
           const pxx = (gx + 0.5) * cellSize;
-          let wSum = 0, vSum = 0, covSum = 0;
-          for (let i = 0; i < sensors.length; i += 5) {
-            const dx = pxx - sensors[i];
-            const dy = py  - sensors[i + 1];
+          let wSum = 0, vSum = 0, covSum = 0, kSum = 0, krSum = 0;
+          for (let i = 0; i < n; i++) {
+            const dx = pxx - sensors[i * 5];
+            const dy = py  - sensors[i * 5 + 1];
             const d2 = dx * dx + dy * dy;
-            const m = sensors[i + 4];
-            const w = m / (d2 + softSq);
+            const m = sensors[i * 5 + 4];
+            const w = m * Math.exp(-d2 / sensors[i * 5 + 3]);
             wSum += w;
-            vSum += w * sensors[i + 2];
+            vSum += w * sensors[i * 5 + 2];
+            const q = d2 / residRSq;
+            const k = 1 / (1 + q * q);
+            kSum += k;
+            krSum += k * resid[i];
             covSum += m * Math.exp(-d2 / covTwoSigmaSq);
           }
           const cell = gy * gw + gx;
-          outAqi[cell] = wSum > 0 ? vSum / wSum : 0;
+          // Residuals are INTERPOLATED (normalized when kernels overlap),
+          // never summed: overlapping elevated stations must not stack into
+          // a phantom hotspot hotter than either really reads. The max(1,·)
+          // denominator keeps single-station exactness (kSum≈1 at a station)
+          // and decays the residual smoothly to zero away from all stations.
+          const residField = kSum > 0 ? krSum / Math.max(1, kSum) : 0;
+          outAqi[cell] = wSum > 0.0001 ? (vSum / wSum + residField) : 0;
           outCov[cell] = covSum;
         }
       }
