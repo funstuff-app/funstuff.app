@@ -503,7 +503,7 @@
         // _collectPaFieldSensors.  Skip when virtual sensors are present:
         // their ages change every frame so the fast-skip must stay disabled.
         if (!hasVirtuals && !view._paFieldValidRange) {
-          view._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
+          view._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs, maxMode ? _MAX_MODE_GROUPS.reduce((a, g2) => a.concat(g2.tabs), []) : [pollutantTab]);
           this._paFieldValidViewKey = viewKey;
           this._paFieldValidFixed = fixed;
           this._paFieldValidPollutant = renderTab;
@@ -676,7 +676,7 @@
       // When virtual sensors are present their ages shift every frame, so the
       // fast-skip must stay disabled (no valid range).
       if (!hasVirtuals) {
-        view._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
+        view._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs, maxMode ? _MAX_MODE_GROUPS.reduce((a, g2) => a.concat(g2.tabs), []) : [pollutantTab]);
         this._paFieldValidViewKey = viewKey;
         this._paFieldValidFixed = fixed;
         this._paFieldValidPollutant = renderTab;
@@ -1043,7 +1043,11 @@
           wSum += w;
           vSum += w * sensors[j * 5 + 2];
         }
-        resid[i] = wSum > 0 ? sensors[i * 5 + 2] - vSum / wSum : 0;
+        // Elevated-only: negative residuals are dominated by calibration
+        // scatter / stuck-low units and rendered as nonsensical "clean air"
+        // dips around individual stations. The baseline already carries the
+        // low information; only genuine exceedances get a local glow.
+        resid[i] = wSum > 0 ? Math.max(0, sensors[i * 5 + 2] - vSum / wSum) : 0;
       }
       for (let gy = 0; gy < gh; gy++) {
         const py = (gy + 0.5) * cellSize;
@@ -1059,7 +1063,12 @@
             wSum += w;
             vSum += w * sensors[i * 5 + 2];
             const q = d2 / residRSq;
-            const k = 1 / (1 + q * q);
+            // Squared quartic: flat top at the station, then a FAST tail
+            // (~6% at 1.4R, ~0.2% at 2R) so a glow stays a compact halo
+            // around its own station instead of tinting kilometers out and
+            // bridging into neighboring stations' glows.
+            const kq = 1 / (1 + q * q);
+            const k = kq * kq;
             kSum += k;
             krSum += k * resid[i];
             covSum += m * Math.exp(-d2 / covTwoSigmaSq);

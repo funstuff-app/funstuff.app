@@ -105,7 +105,7 @@
   const _LEGEND_TAB_FIELD_SPREAD = {
     pm25: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
     pm10: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
-    o3:   { gradient: true, sigmaMult: 2.4, cutMult: 1.8, covSigmaMult: 1.4, coverageRef: 0.15, residualFrac: 0.09, neighborBlend: 0 },
+    o3:   { gradient: true, sigmaMult: 2.4, cutMult: 1.8, covSigmaMult: 1.4, coverageRef: 0.15, residualFrac: 0.05, neighborBlend: 0 },
     no2:  { sigmaMult: 1.3,  cutMult: 1.2, neighborBlend: 0.3 },
     co:   { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
   };
@@ -293,12 +293,15 @@
     }
 
     // Fingerprint built AFTER dedup so it reflects only the kept sensors.
-    // Max mode quantizes at 4 AQI points (finer than _aqiColorCat) so the
-    // field recomputes when a sensor visibly changes within a coarse AQI band
-    // (PA dot sub-bands are finer than AQI categories).
+    // ALWAYS quantized at 4 AQI points, never at color-category granularity:
+    // the field renders from continuous values, so a category-based
+    // fingerprint let a sensor drift a whole band's width (15+ ppb of
+    // ozone) without ever invalidating the cached field canvas — the field
+    // froze until some unrelated sensor crossed a band, then "randomly"
+    // caught up.
     for (const s of sensors) {
       fingerprint += (maxTabs && maxTabs.length) ? ("m" + Math.round(s.aqi / 4) + ",")
-        : (isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(g.valueToAqi(aqiKey, s.value) ?? 0));
+        : ("q" + Math.round((g.valueToAqi(aqiKey, s.value) ?? 0) / 4) + ",");
     }
 
     return { sensors, fingerprint };
@@ -433,15 +436,24 @@
 
     const sensors = Array.from(sensorMap.values());
     let fingerprint = "";
+    // Quantized-value fingerprint — see the fixed-sensor collector's note.
     for (const s of sensors) fingerprint += (maxTabs && maxTabs.length && s.aqi != null) ? ("m" + Math.round(s.aqi / 4) + ",")
-      : (isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(g.valueToAqi(aqiKey, s.value) ?? 0));
+      : ("q" + Math.round((g.valueToAqi(aqiKey, s.value) ?? 0) / 4) + ",");
     return { sensors, fingerprint };
   }
 
   /** Compute the playback time range over which the PA field fingerprint is unchanged.
    *  Scans each sensor's PM2.5 timeline to find the nearest past and future points
    *  where _pm25ColorCat would change. Returns { fromMs, toMs }. */
-  function _findFingerprintValidRange(fixed, playbackTimeMs) {
+  function _findFingerprintValidRange(fixed, playbackTimeMs, tabs) {
+    // The window in which the DISPLAYED pollutant's field cannot change.
+    // MUST inspect the same pollutant series and the same quantization the
+    // collector fingerprints with. The original version hardcoded PM2.5
+    // color categories no matter what was displayed, so the O3/NO2/CO field
+    // was declared "still valid" until some sensor's PM2.5 happened to
+    // cross a band — scrubbing showed stale ozone until a random unrelated
+    // repaint. tabs defaults to ["pm25"] for legacy callers.
+    const tabList = (Array.isArray(tabs) && tabs.length) ? tabs : ["pm25"];
     let nextChangeMs = Infinity;
     let prevChangeMs = -Infinity;
 
@@ -449,43 +461,49 @@
       if (!f) continue;
       const readings = f && f.readings;
       if (!readings) continue;
-      // Check PM2.5-like keys (same keys _collectPaFieldSensors uses)
-      const r = readings["PM25"] || readings["PM2.5"] || readings["pm25"] || readings["pm2.5"];
-      if (!r || !r._parsedTimeline) continue;
-      const { timesMs, valuesF } = r._parsedTimeline;
-      if (!timesMs || timesMs.length < 2) continue;
+      for (const tab of tabList) {
+        const keys = _LEGEND_TAB_READING_KEYS[tab];
+        const aqiKey = _LEGEND_TAB_AQI_KEY[tab] || "pm2.5";
+        if (!keys) continue;
+        let r = null;
+        for (const rk of keys) { const cand = readings[rk]; if (cand) { r = cand; break; } }
+        if (!r || !r._parsedTimeline) continue;
+        const { timesMs, valuesF } = r._parsedTimeline;
+        if (!timesMs || timesMs.length < 2) continue;
 
-      // Binary search for current index
-      let idx;
-      if (playbackTimeMs <= timesMs[0]) {
-        idx = 0;
-      } else if (playbackTimeMs >= timesMs[timesMs.length - 1]) {
-        idx = timesMs.length - 1;
-      } else {
-        let lo = 0, hi = timesMs.length - 1;
-        while (lo < hi) {
-          const mid = (lo + hi + 1) >> 1;
-          if (timesMs[mid] <= playbackTimeMs) lo = mid;
-          else hi = mid - 1;
+        // Binary search for current index
+        let idx;
+        if (playbackTimeMs <= timesMs[0]) {
+          idx = 0;
+        } else if (playbackTimeMs >= timesMs[timesMs.length - 1]) {
+          idx = timesMs.length - 1;
+        } else {
+          let lo = 0, hi = timesMs.length - 1;
+          while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (timesMs[mid] <= playbackTimeMs) lo = mid;
+            else hi = mid - 1;
+          }
+          idx = lo;
         }
-        idx = lo;
-      }
 
-      const curCat = _pm25ColorCat(valuesF[idx]);
+        // Same 4-AQI quantization as the collector fingerprints.
+        const qOf = (v) => Math.round((g.valueToAqi(aqiKey, v) ?? 0) / 4);
+        const curQ = qOf(valuesF[idx]);
 
-      // Forward: find the next data point that changes color category
-      for (let i = idx + 1; i < timesMs.length; i++) {
-        if (_pm25ColorCat(valuesF[i]) !== curCat) {
-          if (timesMs[i] < nextChangeMs) nextChangeMs = timesMs[i];
-          break;
+        // Forward: next sample that changes the quantized value
+        for (let i = idx + 1; i < timesMs.length; i++) {
+          if (qOf(valuesF[i]) !== curQ) {
+            if (timesMs[i] < nextChangeMs) nextChangeMs = timesMs[i];
+            break;
+          }
         }
-      }
-      // Backward: find when the current category segment started
-      for (let i = idx - 1; i >= 0; i--) {
-        if (_pm25ColorCat(valuesF[i]) !== curCat) {
-          // Current segment started at timesMs[i+1]
-          if (timesMs[i + 1] > prevChangeMs) prevChangeMs = timesMs[i + 1];
-          break;
+        // Backward: when the current quantized segment started
+        for (let i = idx - 1; i >= 0; i--) {
+          if (qOf(valuesF[i]) !== curQ) {
+            if (timesMs[i + 1] > prevChangeMs) prevChangeMs = timesMs[i + 1];
+            break;
+          }
         }
       }
     }
