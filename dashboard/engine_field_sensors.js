@@ -76,26 +76,53 @@
    * both need to move together, or a wider falloff just fades to nothing
    * faster inside the same unchanged cutoff radius.
    *
-   * regionalPriorW: kernel-weight of a synthetic observation at the MEDIAN
-   * of the visible sensors, blended into the VALUE of covered cells only.
-   * It flattens per-station bullseyes into regional gradients (median, not
-   * mean, so one broken station can't drag the baseline). A station's real
-   * reading still dominates near it (fixed-sensor kernel weight ~10). The
-   * prior must never extend COVERAGE — an earlier version that inflated
-   * coverage weight painted the field across the entire world at low zoom.
+   * regionalPriorW: max kernel-weight of a synthetic observation at the
+   * MEDIAN of the visible sensors (median, not mean, so one broken station
+   * can't drag the baseline), blended into the VALUE of covered cells only.
+   * COVERAGE-ADAPTIVE via priorFadeW: the effective prior weight is
+   * regionalPriorW * max(0, 1 - wSum/priorFadeW), i.e. ZERO wherever any
+   * station has meaningful weight and ramping in only as coverage thins.
+   * A real reading must always win at and around its own station — a
+   * constant prior shaved a station's 73 ppb (orange band) down into the
+   * yellow band across its entire neighborhood, hiding a real exceedance
+   * the max-AQI composite view was showing correctly. The prior's only job
+   * is filling the thin space BETWEEN stations with the regional level.
+   * It must never extend COVERAGE (an earlier version that inflated
+   * coverage weight painted the field across the entire world at low zoom).
    *
-   * coverageRef: kernel-weight where opacity saturates (painter default 0.5
-   * = legacy fade). Lower values keep mid-gap cells INSIDE the station
-   * network at full strength (no dark voids between stations) while the
-   * field still fades out ~a kernel width past the outermost station —
-   * bounded by real coverage in every direction.
+   * TWO BANDWIDTHS, one job each. sigma (from sigmaMult, which compounds
+   * with cutMult since sigma derives from the cutoff) is the VALUE
+   * bandwidth: it must stay at ~the base bandwidth (sigmaMult*cutMult ≈ 1)
+   * or a genuinely-high station gets averaged into its lower neighbors and
+   * a real 73 ppb exceedance renders yellow instead of orange — the max-AQI
+   * composite honors station readings precisely because it uses the tight
+   * base kernel. covSigmaMult is the COVERAGE bandwidth (opacity only),
+   * wider so gaps between stations stay filled and the field fades out
+   * smoothly past the network edge. Computed for free from the value
+   * kernel: w^(1/covSigmaMult²) IS the wider Gaussian.
+   *
+   * coverageRef: coverage-weight where opacity saturates (painter default
+   * 0.5 = legacy fade). Lower values keep mid-gap cells INSIDE the station
+   * network at full strength while cells beyond the outermost station still
+   * fade to transparent — bounded by real coverage in every direction.
+   */
+  /**
+   * regional: true = WELL-MIXED GAS MODE. The pollutant has no meaningful
+   * local spatial structure at city scale (ozone: secondary, photochemical,
+   * mixes valley-wide; station-to-station spread is dominated by
+   * inter-sensor calibration, not real gradients). The field renders ONE
+   * value everywhere inside network coverage — no kernels, no blobs, no
+   * low/high islands — at the MAX of the fixed monitors' AQI, which is the
+   * EPA AirNow area-reporting convention (an area's AQI is the highest of
+   * its monitors). Coverage (covSigmaMult/coverageRef) only shapes where
+   * the field fades out at the network edge.
    */
   const _LEGEND_TAB_FIELD_SPREAD = {
-    pm25: { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0,   coverageRef: 0 },
-    pm10: { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0,   coverageRef: 0 },
-    o3:   { sigmaMult: 2.4,  cutMult: 1.8, regionalPriorW: 1.5, coverageRef: 0.15 },
-    no2:  { sigmaMult: 1.3,  cutMult: 1.2, regionalPriorW: 0.5, coverageRef: 0.3 },
-    co:   { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0,   coverageRef: 0 },
+    pm25: { sigmaMult: 1,    cutMult: 1,   covSigmaMult: 0, regionalPriorW: 0,   priorFadeW: 1, coverageRef: 0 },
+    pm10: { sigmaMult: 1,    cutMult: 1,   covSigmaMult: 0, regionalPriorW: 0,   priorFadeW: 1, coverageRef: 0 },
+    o3:   { regional: true, sigmaMult: 1, cutMult: 1.8, covSigmaMult: 2.4, regionalPriorW: 0, priorFadeW: 1, coverageRef: 0.15 },
+    no2:  { sigmaMult: 0.85, cutMult: 1.2, covSigmaMult: 2.0, regionalPriorW: 0.5, priorFadeW: 1, coverageRef: 0.3 },
+    co:   { sigmaMult: 1,    cutMult: 1,   covSigmaMult: 0, regionalPriorW: 0,   priorFadeW: 1, coverageRef: 0 },
   };
   /** Pollutants composited in "no selection" max-mode field (one kernel each). */
   // Max-mode field groups. Particulates (PM2.5 + PM10) form ONE field: same
