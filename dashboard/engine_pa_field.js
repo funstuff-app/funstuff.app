@@ -550,19 +550,9 @@
       const _c0 = _fd.cutCeil  != null ? _fd.cutCeil  : 0.7;
       const _floor = Math.min(_f0, _c0), _ceil = Math.max(_f0, _c0);
       const _slope = (_ceil - _floor) / (_VIS_A - _VIS_B);
-      // Per-pollutant spread. Max-mode composites all pollutants with the
-      // unscaled base kernel; a SELECTED pollutant must have an explicit
-      // config — no silent defaults: rendering a pollutant with the wrong
-      // physics model (e.g. ozone as if it were dust) must fail loudly, not
-      // quietly look wrong.
-      const _BASE_SPREAD = { sigmaMult: 1, cutMult: 1 };
-      const _spread = maxMode ? _BASE_SPREAD : _LEGEND_TAB_FIELD_SPREAD[pollutantTab];
-      if (!_spread) {
-        throw new Error(`[PaField] no _LEGEND_TAB_FIELD_SPREAD config for selected pollutant "${pollutantTab}" — refusing to render with defaults`);
-      }
-      if (_spread.regional && !(_spread.covSigmaMult > 1 && _spread.coverageRef > 0)) {
-        throw new Error(`[PaField] regional pollutant "${pollutantTab}" requires covSigmaMult>1 and coverageRef>0`);
-      }
+      // Per-pollutant spread (max-mode has no single selected pollutant to key
+      // off of, so it keeps the unscaled default — see _LEGEND_TAB_FIELD_SPREAD).
+      const _spread = (!maxMode && _LEGEND_TAB_FIELD_SPREAD[pollutantTab]) || { sigmaMult: 1, cutMult: 1 };
       let cutoffDeg = (_floor + _slope * (_visVDeg - _VIS_B)) * _delta;
       cutoffDeg = Math.max(0.02, Math.min(cutoffDeg, _ceil));
       cutoffDeg *= _spread.cutMult;
@@ -609,36 +599,7 @@
         this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
       } else {
         const s5 = buildS5(allSensors, _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5");
-        let prior = null;
-        let flatAqi = null;
-        if (_spread.regional) {
-          // WELL-MIXED GAS (ozone): no local spatial structure at city scale —
-          // station-to-station spread is calibration scatter, not real
-          // gradients, so kernels/blobs are wrong by construction. One value
-          // everywhere inside coverage, at the MAX of the fixed monitors'
-          // AQI (EPA AirNow area convention: an area's AQI is the highest of
-          // its monitors). Fixed monitors preferred: mobile ozone readings
-          // are single-unit and jitter band-to-band minute to minute.
-          let maxFixed = -Infinity, maxAny = -Infinity;
-          for (let i = 0; i < s5.length; i += 5) {
-            const aqi = s5[i + 2];
-            if (aqi > maxAny) maxAny = aqi;
-            // weightMultiplier 10 marks fixed monitors (see
-            // _PA_FIELD_FIXED_WEIGHT_MULTIPLIER); virtual mobiles are ~1.
-            if (s5[i + 4] >= 5 && aqi > maxFixed) maxFixed = aqi;
-          }
-          flatAqi = isFinite(maxFixed) ? maxFixed : maxAny;
-        } else if (_spread.regionalPriorW > 0 && s5.length >= 5) {
-          // Locally-emitted pollutants keep kernel structure, with a median
-          // prior filling thin coverage between stations.
-          const vals = [];
-          for (let i = 0; i < s5.length; i += 5) vals.push(s5[i + 2]);
-          vals.sort((a, b) => a - b);
-          const mid = vals.length >> 1;
-          const med = (vals.length % 2) ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
-          prior = { aqi: med, w: _spread.regionalPriorW, fadeW: _spread.priorFadeW || 1 };
-        }
-        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH, prior, _spread.coverageRef, _spread.covSigmaMult, flatAqi);
+        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
       }
 
       // Stash the inputs needed to lazily compute per-pollutant field maxes
@@ -850,22 +811,17 @@
      *  no pixels. Shared by the single-pollutant and max-mode render paths.
      *  sensors: stride-5 Float64Array [sx, sy, aqi, twoSigSq, weightMultiplier, ...].
      *  cutoffSq: expanded range²; isoCutoffSq: isotropic range²; wind or null. */
-    _kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, outAqi, outW, covPow, outCov) {
+    _kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, outAqi, outW) {
       const isAniso = wind != null && wind.stretch > 1.001;
       const wwx = isAniso ? wind.wx : 0;
       const wwy = isAniso ? wind.wy : 0;
       const wStretch = isAniso ? wind.stretch : 1;
       const wUpwind  = isAniso ? wind.upwindShrink : 1;
-      // covPow (0<p<1) accumulates a SECOND, wider coverage kernel for free:
-      // w^p of a Gaussian with bandwidth σ is the Gaussian with bandwidth
-      // σ/√p. Coverage (opacity) can then reach farther than the value
-      // bandwidth without flattening station readings into each other.
-      const hasCov = covPow != null && covPow > 0 && covPow < 1 && outCov != null;
       for (let gy = 0; gy < gh; gy++) {
         const py = (gy + 0.5) * cellSize;
         for (let gx = 0; gx < gw; gx++) {
           const pxx = (gx + 0.5) * cellSize;
-          let wSum = 0, vSum = 0, covSum = 0;
+          let wSum = 0, vSum = 0;
           for (let i = 0; i < sensors.length; i += 5) {
             const dx = pxx - sensors[i];
             const dy = py  - sensors[i + 1];
@@ -885,12 +841,10 @@
             const w = sensors[i + 4] * Math.exp(-d2 / sensors[i + 3]);
             wSum += w;
             vSum += w * sensors[i + 2];
-            if (hasCov) covSum += Math.pow(w, covPow);
           }
           const cell = gy * gw + gx;
           outW[cell] = wSum;
           outAqi[cell] = wSum >= 0.001 ? vSum / wSum : 0;
-          if (hasCov) outCov[cell] = covSum;
         }
       }
     }
@@ -898,13 +852,7 @@
     /** Color a per-cell (aqi, weight) grid into the grid canvas, apply the
      *  Cauchy blur, commit, and upscale. Also sets view._paFieldMaxAqi to the
      *  max AQI within the viewport region. Shared painter for both render paths. */
-    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, coverageRef) {
-      // Kernel weight at which the field saturates to full opacity. Default
-      // 0.5 reproduces the legacy fade (min(1, wSum*2)). Regional pollutants
-      // pass a lower ref so mid-gap cells inside the sensor network render at
-      // full strength while cells beyond the outermost stations still fade
-      // to nothing — bounded by real coverage, never painted globally.
-      const covRef = (typeof coverageRef === "number" && coverageRef > 0) ? coverageRef : 0.5;
+    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH) {
       const view = this.view;
       const _aqiToRgb = g.FieldSensors._aqiToRgb;
       const { tc, tctx, imgData } = view._paGrid;
@@ -929,7 +877,7 @@
           if (wSum < 0.001) {
             px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
           } else {
-            const fade = Math.min(1, wSum / covRef);
+            const fade = Math.min(1, wSum * 2);
             const alpha = Math.round(FIELD_ALPHA * fade);
             const val = aqiCell[cell];
             if (inVpY && gx >= vpGxMin && gx < vpGxMax && val > fieldMaxAqi) {
@@ -999,50 +947,11 @@
      *  sensors: stride-5 Float64Array [sx, sy, aqi, twoSigSq, weightMultiplier, ...]
      *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
      *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
-     *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic.
-     *  prior: { aqi, w, fadeW } regional prior or null — blended into the
-     *  VALUE of covered cells, COVERAGE-ADAPTIVELY: effective weight is
-     *  w * max(0, 1 - wSum/fadeW), so it is zero wherever a real station has
-     *  meaningful weight (a station's own reading/band must never be shaved
-     *  by the prior) and only fills the thin space between stations with the
-     *  regional level. It must NOT touch wCell: opacity stays tied to real
-     *  sensor proximity, so the field still ends where the sensor network
-     *  ends (adding prior weight to coverage painted the entire world at any
-     *  zoom).
-     *  coverageRef: kernel-weight at which the field reaches full opacity
-     *  (painter default 0.5 preserves legacy fade). Lower = gaps between
-     *  stations inside the network stay filled while the perimeter still
-     *  fades out over ~a kernel width. */
-    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, prior, coverageRef, covSigmaMult, flatAqi) {
+     *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
+    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
       const gr = this._ensurePaGrid(gw, gh);
-      // Separate coverage (opacity) kernel, wider than the value kernel —
-      // see _kernelGrid's covPow note and _LEGEND_TAB_FIELD_SPREAD.
-      const useCov = typeof covSigmaMult === "number" && covSigmaMult > 1;
-      const covPow = useCov ? 1 / (covSigmaMult * covSigmaMult) : null;
-      if (useCov && (!gr.covCell || gr.covCell.length !== gw * gh)) {
-        gr.covCell = new Float32Array(gw * gh);
-      }
-      this._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind,
-        gr.aqiCell, gr.wCell, covPow, useCov ? gr.covCell : null);
-      if (flatAqi != null && isFinite(flatAqi)) {
-        // Regional gas mode: ONE value everywhere — the field carries no
-        // spatial information, only the coverage boundary does.
-        gr.aqiCell.fill(flatAqi);
-      } else if (prior && prior.w > 0) {
-        const n = gw * gh;
-        const fadeW = prior.fadeW > 0 ? prior.fadeW : 1;
-        for (let c = 0; c < n; c++) {
-          const w = gr.wCell[c];
-          const pw = prior.w * Math.max(0, 1 - w / fadeW);
-          if (pw <= 0) continue;   // real station dominates — value untouched
-          // At w→0 this resolves to exactly the regional median, which is
-          // what coverage-only cells (wide kernel reaches, tight one doesn't)
-          // must render — without it they'd paint the kernel's 0-AQI filler.
-          gr.aqiCell[c] = (gr.aqiCell[c] * w + prior.aqi * pw) / (w + pw);
-        }
-      }
-      // Alpha comes from the coverage kernel when present; value stays tight.
-      this._paintPaCells(gr.aqiCell, useCov ? gr.covCell : gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, coverageRef);
+      this._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, gr.aqiCell, gr.wCell);
+      this._paintPaCells(gr.aqiCell, gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
     }
 
     /** Max-mode field: render EACH pollutant's own kernel field independently
