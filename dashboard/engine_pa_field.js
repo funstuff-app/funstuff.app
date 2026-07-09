@@ -599,6 +599,36 @@
         this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
       } else {
         const s5 = buildS5(allSensors, _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5");
+        // Neighbor-consensus smoothing for regional gases — data-level, not
+        // renderer-level (see _LEGEND_TAB_FIELD_SPREAD.neighborBlend). Each
+        // station's FIELD input moves toward the distance-weighted mean of
+        // the other stations, so one off-cadence or miscalibrated monitor
+        // (MTMET updates every few minutes; the DAQ stations hourly) nudges
+        // the shared airmass level instead of forming a local zone around
+        // itself. Marker labels keep the raw newest reading.
+        const _nb = _spread.neighborBlend;
+        const nSens = s5.length / 5;
+        if (_nb > 0 && nSens >= 3) {
+          const blended = new Float64Array(nSens);
+          for (let i = 0; i < nSens; i++) {
+            const xi = s5[i * 5], yi = s5[i * 5 + 1];
+            let wSum = 0, vSum = 0;
+            for (let j = 0; j < nSens; j++) {
+              if (j === i) continue;
+              const dx = s5[j * 5] - xi;
+              const dy = s5[j * 5 + 1] - yi;
+              const w = s5[j * 5 + 4] * Math.exp(-(dx * dx + dy * dy) / s5[j * 5 + 3]);
+              wSum += w;
+              vSum += w * s5[j * 5 + 2];
+            }
+            // Isolated station (no meaningful neighbors in range): keep its
+            // own value — there is no consensus to defer to.
+            blended[i] = wSum > 0.05
+              ? (1 - _nb) * s5[i * 5 + 2] + _nb * (vSum / wSum)
+              : s5[i * 5 + 2];
+          }
+          for (let i = 0; i < nSens; i++) s5[i * 5 + 2] = blended[i];
+        }
         this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
       }
 

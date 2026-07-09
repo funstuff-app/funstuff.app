@@ -76,12 +76,24 @@
    * both need to move together, or a wider falloff just fades to nothing
    * faster inside the same unchanged cutoff radius.
    */
+  /**
+   * neighborBlend: fraction of each station's FIELD input replaced by the
+   * distance-weighted consensus of its neighbor stations before
+   * interpolation (0 = off, field input is the raw reading). For regional
+   * gases the monitors sample one shared airmass: station-to-station
+   * disagreement is calibration scatter plus update cadence (MTMET updates
+   * every few minutes, the DAQ/AirNow stations hourly on the hour), so a
+   * single station's fresher or offset reading must NUDGE the field, never
+   * restructure it into a local zone. Marker labels are untouched — the
+   * newest raw reading still wins on the sensor itself. Trends supported by
+   * SEVERAL stations survive the blend because their neighbors agree.
+   */
   const _LEGEND_TAB_FIELD_SPREAD = {
-    pm25: { sigmaMult: 1,    cutMult: 1 },
-    pm10: { sigmaMult: 1,    cutMult: 1 },
-    o3:   { sigmaMult: 2.4,  cutMult: 1.8 },
-    no2:  { sigmaMult: 1.3,  cutMult: 1.2 },
-    co:   { sigmaMult: 1,    cutMult: 1 },
+    pm25: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
+    pm10: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
+    o3:   { sigmaMult: 2.4,  cutMult: 1.8, neighborBlend: 0.6 },
+    no2:  { sigmaMult: 1.3,  cutMult: 1.2, neighborBlend: 0.3 },
+    co:   { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
   };
   /** Pollutants composited in "no selection" max-mode field (one kernel each). */
   // Max-mode field groups. Particulates (PM2.5 + PM10) form ONE field: same
