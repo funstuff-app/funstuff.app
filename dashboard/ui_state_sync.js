@@ -38,6 +38,30 @@
     return best;
   }
 
+  /**
+   * Topbar status label for a live-mode state object (pure; historical mode
+   * owns its own label in ui_snapshots_menus.js). One implementation shared
+   * by tick()'s 200 and 304 paths and the SSE liveness hook so the label can
+   * never disagree with itself.
+   * @returns {{ text: string, live: boolean, offline: boolean }}
+   */
+  function computeStatusLabel(st) {
+    const meta = (st && st.meta) || {};
+    const mobileCount = Array.isArray(st?.mobile) ? st.mobile.length : 0;
+    const fixedCount = Array.isArray(st?.fixed) ? st.fixed.length : 0;
+    if (mobileCount === 0 && fixedCount === 0) {
+      return { text: "Loading...", live: false, offline: false };
+    }
+    if (meta.data_stale) {
+      const ageS = meta.data_age_s || 0;
+      const ageMin = Math.floor(ageS / 60);
+      const ageHr = Math.floor(ageMin / 60);
+      const ageStr = ageHr > 0 ? `${ageHr}h` : `${ageMin}m`;
+      return { text: `Stale (${ageStr} old)`, live: false, offline: true };
+    }
+    return { text: "Live", live: true, offline: false };
+  }
+
   /** Merge a delta state into the accumulated state.
    *  - Mobile trails: append new points to existing vehicles.
    *  - Fixed sensors / meta: replace entirely (always current).
@@ -357,6 +381,10 @@
       self._sseConnected = true;
       // Shorten the next scheduled poll now that SSE is live.
       cfg.rescheduleTick(cfg.POLL_MS_SSE);
+      // A (re)opened stream is server contact: let the app clear a lingering
+      // "Offline" set by a failed poll — the reschedule above would otherwise
+      // keep deferring the poll that repaints the label.
+      if (cfg.onServerAlive) { try { cfg.onServerAlive(); } catch {} }
     };
 
     // Named event: "delta" — incremental state update pushed by server
@@ -387,6 +415,8 @@
           }
           // Reschedule safety-net poll
           cfg.rescheduleTick(cfg.POLL_MS_SSE);
+          // Fresh server data over SSE = online, whatever the last poll said.
+          if (cfg.onServerAlive) { try { cfg.onServerAlive(); } catch {} }
         }
       } catch (e) { try { console.warn("[SSE delta]", e); } catch {} }
     });
@@ -427,6 +457,7 @@
   StateSync._mergeStateDelta = _mergeStateDelta;
   StateSync.newestReadingMsFromState = newestReadingMsFromState;
   StateSync.validateStateSchema = validateStateSchema;
+  StateSync.computeStatusLabel = computeStatusLabel;
   StateSync._mapImmobileToParked = _mapImmobileToParked;
 
   return StateSync;

@@ -2294,6 +2294,22 @@ function main() {
   let _tickLastForceRefreshSeq = null;
   let _tickConsecutiveFailures = 0; // for exponential backoff on errors
 
+  // Single writer for the topbar status label in live mode (historical mode
+  // owns its own text in ui_snapshots_menus.js). Called from tick()'s success
+  // path AND from the SSE liveness hook below — an SSE delta is server
+  // contact just as much as a poll, and before this the label could stick on
+  // "Offline" forever: one failed poll set it, then every delta pushed the
+  // recovery poll another POLL_MS_SSE out via rescheduleTick while the map
+  // visibly kept updating.
+  function updateStatusIndicator(st) {
+    const statusEl = document.getElementById("statusText");
+    if (!statusEl) return;
+    const s = StateSync.computeStatusLabel(st);
+    statusEl.textContent = s.text;
+    statusEl.classList.toggle("live", s.live);
+    statusEl.classList.toggle("offline", s.offline);
+  }
+
   // fetchState/etag/delta-merge/SSE/analytics moved to ui_state_sync.js
   // (StateSync). Instantiate here (once `map`/`selectedId`/`tick` exist in
   // this closure) and wire the callbacks it needs to reach into main()'s
@@ -2314,6 +2330,14 @@ function main() {
     tickNow: () => {
       if (_tickTimeout) clearTimeout(_tickTimeout);
       tick();
+    },
+    // SSE liveness: a delta (or a reopened stream) proves the server is
+    // reachable — clear any lingering "Offline" from a failed poll and reset
+    // the poll backoff. Historical mode owns its own status text; skip it.
+    onServerAlive: () => {
+      if (window._historicalState) return;
+      _tickConsecutiveFailures = 0;
+      updateStatusIndicator(window.__lastState);
     },
     POLL_MS: POLL_MS,
     POLL_MS_SSE: POLL_MS_SSE,
@@ -2375,12 +2399,9 @@ function main() {
     if (window.__stateSync.wasNotModified()) {
       pb._pbLastServerResponseMs = Date.now();
       _tickConsecutiveFailures = 0;
-      const statusElLive = document.getElementById("statusText");
-      if (statusElLive && !statusElLive.classList.contains("live")) {
-        statusElLive.textContent = "Live";
-        statusElLive.classList.remove("offline");
-        statusElLive.classList.add("live");
-      }
+      // Recompute from the retained state rather than force-setting "Live":
+      // a 304 on stale data must keep saying "Stale", not flip it to Live.
+      updateStatusIndicator(window.__lastState);
       _tickInFlight = false;
       const pollMs = window.__stateSync.isSSEConnected() ? POLL_MS_SSE : POLL_MS;
       if (_tickTimeout) clearTimeout(_tickTimeout);
@@ -2401,32 +2422,7 @@ function main() {
     // Update save button now that we have data
     updateSaveButtonState();
     
-    if (statusEl) {
-      const meta = st.meta || {};
-      const mobileCount = Array.isArray(st.mobile) ? st.mobile.length : 0;
-      const fixedCount = Array.isArray(st.fixed) ? st.fixed.length : 0;
-      const hasData = mobileCount > 0 || fixedCount > 0;
-      
-      if (!hasData) {
-        // No data yet - still loading
-        statusEl.textContent = "Loading...";
-        statusEl.classList.remove("live");
-        statusEl.classList.remove("offline");
-      } else if (meta.data_stale) {
-        // ALL sources are stale
-        const ageS = meta.data_age_s || 0;
-        const ageMin = Math.floor(ageS / 60);
-        const ageHr = Math.floor(ageMin / 60);
-        const ageStr = ageHr > 0 ? `${ageHr}h` : `${ageMin}m`;
-        statusEl.textContent = `Stale (${ageStr} old)`;
-        statusEl.classList.remove("live");
-        statusEl.classList.add("offline");
-      } else {
-        statusEl.textContent = "Live";
-        statusEl.classList.remove("offline");
-        statusEl.classList.add("live");
-      }
-    }
+    updateStatusIndicator(st);
     const bestMs = newestReadingMsFromState(st);
     if (bestMs != null) {
       document.getElementById("lastUpdated").textContent = new Date(bestMs).toLocaleTimeString();

@@ -13,8 +13,8 @@
  * State OWNED by OverlayRenderer (moved off MapView): the trace-mode static
  * overlay canvas + key + dirty flag (_overlayStaticCanvas/_overlayStaticKey/
  * _overlayStaticDirty), the per-frame dedupe stamp (_overlayLastDrawMs), the
- * per-frame emoji/text/fixed-interp caches (_emojiCanvasCache/_textWidthCache/
- * _fixedInterpCache), and the playback trail-cache bookkeeping that is read only
+ * per-frame text/fixed-interp caches (_textWidthCache/_fixedInterpCache; emoji
+ * sprites live in the module-level _emojiInkCache), and the playback trail-cache bookkeeping that is read only
  * here (_trailCacheTimeMs/_trailCacheCenterW/_trailCacheZoom/_trailCacheBufW/
  * _trailCacheBufH/_lastTrailRedrawPerf).
  *
@@ -72,6 +72,61 @@
     } catch (_) {
       return false;
     }
+  }
+
+  // ── Shared emoji sprite cache (ink-centered) ──────────────────────────────
+  // Pre-renders an emoji to an offscreen canvas (drawImage of a cached canvas
+  // is far cheaper than fillText with color-emoji fonts, ~1-3ms saved per call
+  // on iOS Safari). Centering uses the glyph's MEASURED ink box
+  // (actualBoundingBox*) rather than textBaseline "middle": emoji ink sits
+  // asymmetrically around the font's middle metric, and the offset is
+  // glyph-specific — 🏛️ rendered visibly off-center in its marker circle
+  // while others looked passable. Falls back to middle-baseline centering
+  // when the engine doesn't report ink metrics.
+  const _emojiInkCache = new Map();
+  function _emojiInkCanvas(emoji, size) {
+    const key = `${emoji}|${size}`;
+    let c = _emojiInkCache.get(key);
+    if (c) return c;
+    const px = size * 2; // 2x for clarity at retina
+    c = document.createElement("canvas");
+    c.width = px; c.height = px;
+    const ec = c.getContext("2d");
+    const setFont = (fpx) => {
+      ec.font = `${fpx}px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif`;
+    };
+    setFont(px);
+    ec.textAlign = "center";
+    ec.textBaseline = "alphabetic";
+    let m = ec.measureText(emoji);
+    const hasInk = m
+      && isFinite(m.actualBoundingBoxAscent) && isFinite(m.actualBoundingBoxDescent)
+      && isFinite(m.actualBoundingBoxLeft) && isFinite(m.actualBoundingBoxRight)
+      && (m.actualBoundingBoxAscent + m.actualBoundingBoxDescent) > 0;
+    if (hasInk) {
+      // If the ink box would clip the canvas, shrink the font once to fit.
+      const inkW = m.actualBoundingBoxLeft + m.actualBoundingBoxRight;
+      const inkH = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent;
+      const overflow = Math.max(inkW, inkH) / px;
+      if (overflow > 1) {
+        setFont(Math.floor(px / overflow));
+        m = ec.measureText(emoji);
+      }
+      // Anchor so the ink box midpoint lands exactly at the canvas center.
+      const x = px / 2 + (m.actualBoundingBoxLeft - m.actualBoundingBoxRight) / 2;
+      const y = px / 2 + (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) / 2;
+      ec.fillText(emoji, x, y);
+    } else {
+      ec.textBaseline = "middle";
+      ec.fillText(emoji, px / 2, px / 2);
+    }
+    _emojiInkCache.set(key, c);
+    while (_emojiInkCache.size > 200) {
+      const oldest = _emojiInkCache.keys().next().value;
+      if (oldest == null) break;
+      _emojiInkCache.delete(oldest);
+    }
+    return c;
   }
 
   /**
@@ -1101,10 +1156,10 @@
           ctx.lineWidth = isSel ? 2.4 : 2.0;
           ctx.stroke();
 
-          ctx.font = `${_fFont2}px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif`;
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText(emoji, sp.x, sp.y);
+          // Ink-centered sprite (raw middle-baseline fillText drew the glyph
+          // off-center in the circle — most visibly 🏛️ on fixed sensors).
+          ctx.drawImage(_emojiInkCanvas(emoji, _fFont2),
+            sp.x - _fFont2 / 2, sp.y - _fFont2 / 2, _fFont2, _fFont2);
         }
 
         const isHov = (view._hoveredId === keyF);
@@ -1444,32 +1499,10 @@
     const mobiles = Array.isArray(state.mobile) ? state.mobile : [];
     const fixed = Array.isArray(state.fixed) ? state.fixed : [];
 
-    // --- Per-frame caches (reset each drawOverlay call) ---
-    // Emoji pre-render cache: drawImage of a cached canvas is far cheaper than
-    // fillText with color-emoji fonts on iOS Safari (~1-3ms per fillText avoided).
-    if (!this._emojiCanvasCache) this._emojiCanvasCache = new Map();
-    const getEmojiCanvas = (emoji, size) => {
-      const key = `${emoji}|${size}`;
-      let c = this._emojiCanvasCache.get(key);
-      if (c) return c;
-      const px = size * 2; // 2x for clarity at retina
-      c = document.createElement("canvas");
-      c.width = px; c.height = px;
-      const ec = c.getContext("2d");
-      // Render at native canvas pixels so downscaling preserves the intended size.
-      ec.font = `${px}px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif`;
-      ec.textAlign = "center";
-      ec.textBaseline = "middle";
-      ec.fillText(emoji, px / 2, px / 2);
-      this._emojiCanvasCache.set(key, c);
-      // Evict oldest entries if cache grows too large
-      while (this._emojiCanvasCache.size > 200) {
-        const oldest = this._emojiCanvasCache.keys().next().value;
-        if (oldest == null) break;
-        this._emojiCanvasCache.delete(oldest);
-      }
-      return c;
-    };
+    // Emoji sprites come from the shared module-level ink-centered cache
+    // (_emojiInkCanvas) so the static fixed-marker pass and this dynamic pass
+    // render identically.
+    const getEmojiCanvas = _emojiInkCanvas;
 
     // measureText cache: avoids repeated glyph layout for identical strings.
     if (!this._textWidthCache) this._textWidthCache = new Map();
