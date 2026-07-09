@@ -134,6 +134,7 @@
       // Clear all per-vehicle caches from historical viewing
       map.clearVehicleCaches();
       map._playbackPtsById = new Map();
+      map._playbackTrailRangeById = new Map();
       map._playbackPtsKey = null;
       map._playbackNowMs = null;
       map._playbackInitialized = false;
@@ -217,6 +218,7 @@
       map._historicalMode = true;
       map._historicalDateStr = dateStr;
       map._playbackPtsById = new Map();
+      map._playbackTrailRangeById = new Map();
       map._playbackPtsKey = null;
       map._persistedTrailById = new Map();  // Clear persisted trails
       map._playbackNowMs = null;  // Reset playback time
@@ -486,6 +488,7 @@
       map._historicalMode = true;
       map._historicalDateStr = dateStr;
       map._playbackPtsById = new Map();
+      map._playbackTrailRangeById = new Map();
       map._playbackPtsKey = null;
       map._persistedTrailById = new Map();
       map._playbackNowMs = null;

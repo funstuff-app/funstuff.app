@@ -145,6 +145,10 @@ class MapView {
     this._playbackMinMs = null;
     this._playbackMaxMs = null;
     this._playbackPtsById = new Map(); // id -> [{lat,lon,tMs}, ...]
+    // id -> { tMinMs, tMaxMs, staticPts } existence window for EVERY mobile
+    // with parseable trail points, including movement-filtered ones (see
+    // engine_playback_engine.js _ensurePlaybackPoints).
+    this._playbackTrailRangeById = new Map();
     this._playbackPtsKey = "";
     this._physicsStateById = new Map(); // id -> {u, v, segIdx, lastPerfMs}
     // LIVE follow-tail: when true, keep playhead pinned to end-of-data (maxMs).
