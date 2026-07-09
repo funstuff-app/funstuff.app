@@ -77,46 +77,70 @@
   // ── Shared emoji sprite cache (ink-centered) ──────────────────────────────
   // Pre-renders an emoji to an offscreen canvas (drawImage of a cached canvas
   // is far cheaper than fillText with color-emoji fonts, ~1-3ms saved per call
-  // on iOS Safari). Centering uses the glyph's MEASURED ink box
-  // (actualBoundingBox*) rather than textBaseline "middle": emoji ink sits
-  // asymmetrically around the font's middle metric, and the offset is
-  // glyph-specific — 🏛️ rendered visibly off-center in its marker circle
-  // while others looked passable. Falls back to middle-baseline centering
-  // when the engine doesn't report ink metrics.
+  // on iOS Safari). Centering is PIXEL-measured: the glyph is drawn once into
+  // a padded scratch canvas, the true ink bounding box is found by scanning
+  // alpha, and that box is blitted centered into the sprite. Font metrics are
+  // deliberately not trusted — textBaseline "middle" centers font metrics,
+  // not ink (🏛️ drew visibly off-center), and TextMetrics actualBoundingBox*
+  // reports em-box/fallback-font numbers for color emoji on WebKit, which
+  // made a metrics-based fix look perfect on Chromium and stay wrong on
+  // Safari. Pixels are ground truth on every engine. Runs once per
+  // emoji|size, then cached.
   const _emojiInkCache = new Map();
   function _emojiInkCanvas(emoji, size) {
     const key = `${emoji}|${size}`;
     let c = _emojiInkCache.get(key);
     if (c) return c;
     const px = size * 2; // 2x for clarity at retina
+    const font = `${px}px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif`;
+
+    // Draw into a generously padded scratch so ink can never clip while
+    // being measured, wherever the engine happens to place the glyph.
+    const pad = px;
+    const scratch = document.createElement("canvas");
+    scratch.width = scratch.height = px + pad * 2;
+    const sc = scratch.getContext("2d", { willReadFrequently: true });
+    sc.font = font;
+    sc.textAlign = "center";
+    sc.textBaseline = "middle";
+    sc.fillText(emoji, scratch.width / 2, scratch.height / 2);
+
+    let minX = scratch.width, maxX = -1, minY = scratch.height, maxY = -1;
+    try {
+      const d = sc.getImageData(0, 0, scratch.width, scratch.height).data;
+      for (let y = 0; y < scratch.height; y++) {
+        const row = y * scratch.width;
+        for (let x = 0; x < scratch.width; x++) {
+          if (d[(row + x) * 4 + 3] > 8) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+    } catch (_) { /* maxX stays -1 → metric-free fallback below */ }
+
     c = document.createElement("canvas");
     c.width = px; c.height = px;
     const ec = c.getContext("2d");
-    const setFont = (fpx) => {
-      ec.font = `${fpx}px Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif`;
-    };
-    setFont(px);
-    ec.textAlign = "center";
-    ec.textBaseline = "alphabetic";
-    let m = ec.measureText(emoji);
-    const hasInk = m
-      && isFinite(m.actualBoundingBoxAscent) && isFinite(m.actualBoundingBoxDescent)
-      && isFinite(m.actualBoundingBoxLeft) && isFinite(m.actualBoundingBoxRight)
-      && (m.actualBoundingBoxAscent + m.actualBoundingBoxDescent) > 0;
-    if (hasInk) {
-      // If the ink box would clip the canvas, shrink the font once to fit.
-      const inkW = m.actualBoundingBoxLeft + m.actualBoundingBoxRight;
-      const inkH = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent;
-      const overflow = Math.max(inkW, inkH) / px;
-      if (overflow > 1) {
-        setFont(Math.floor(px / overflow));
-        m = ec.measureText(emoji);
-      }
-      // Anchor so the ink box midpoint lands exactly at the canvas center.
-      const x = px / 2 + (m.actualBoundingBoxLeft - m.actualBoundingBoxRight) / 2;
-      const y = px / 2 + (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) / 2;
-      ec.fillText(emoji, x, y);
+    if (maxX >= 0) {
+      // 1px breathing room so sub-threshold antialiased fringe isn't cropped.
+      minX = Math.max(0, minX - 1); minY = Math.max(0, minY - 1);
+      maxX = Math.min(scratch.width - 1, maxX + 1);
+      maxY = Math.min(scratch.height - 1, maxY + 1);
+      const inkW = maxX - minX + 1;
+      const inkH = maxY - minY + 1;
+      // Blit the ink box centered; scale down (never up) if it overflows.
+      const scale = Math.min(1, px / inkW, px / inkH);
+      const dw = inkW * scale;
+      const dh = inkH * scale;
+      ec.drawImage(scratch, minX, minY, inkW, inkH,
+        (px - dw) / 2, (px - dh) / 2, dw, dh);
     } else {
+      // Nothing rendered or pixels unreadable — legacy centering.
+      ec.font = font;
+      ec.textAlign = "center";
       ec.textBaseline = "middle";
       ec.fillText(emoji, px / 2, px / 2);
     }
