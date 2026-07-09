@@ -614,7 +614,7 @@
           const med = (vals.length % 2) ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
           prior = { aqi: med, w: _spread.regionalPriorW };
         }
-        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH, prior);
+        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH, prior, _spread.coverageRef);
       }
 
       // Stash the inputs needed to lazily compute per-pollutant field maxes
@@ -867,7 +867,13 @@
     /** Color a per-cell (aqi, weight) grid into the grid canvas, apply the
      *  Cauchy blur, commit, and upscale. Also sets view._paFieldMaxAqi to the
      *  max AQI within the viewport region. Shared painter for both render paths. */
-    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH) {
+    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, coverageRef) {
+      // Kernel weight at which the field saturates to full opacity. Default
+      // 0.5 reproduces the legacy fade (min(1, wSum*2)). Regional pollutants
+      // pass a lower ref so mid-gap cells inside the sensor network render at
+      // full strength while cells beyond the outermost stations still fade
+      // to nothing — bounded by real coverage, never painted globally.
+      const covRef = (typeof coverageRef === "number" && coverageRef > 0) ? coverageRef : 0.5;
       const view = this.view;
       const _aqiToRgb = g.FieldSensors._aqiToRgb;
       const { tc, tctx, imgData } = view._paGrid;
@@ -892,7 +898,7 @@
           if (wSum < 0.001) {
             px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
           } else {
-            const fade = Math.min(1, wSum * 2);
+            const fade = Math.min(1, wSum / covRef);
             const alpha = Math.round(FIELD_ALPHA * fade);
             const val = aqiCell[cell];
             if (inVpY && gx >= vpGxMin && gx < vpGxMax && val > fieldMaxAqi) {
@@ -963,21 +969,28 @@
      *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
      *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
      *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic.
-     *  prior: { aqi, w } regional prior or null — blended into every cell as a
-     *  synthetic observation, so coverage never drops to zero and uncovered
-     *  cells render at the regional level instead of transparent voids. */
-    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, prior) {
+     *  prior: { aqi, w } regional prior or null — blended into the VALUE of
+     *  cells that have real sensor coverage, pulling them toward the regional
+     *  median so per-station bullseyes flatten into gradients. It must NOT
+     *  touch wCell: opacity stays tied to real sensor proximity, so the field
+     *  still ends where the sensor network ends (adding prior weight to
+     *  coverage painted the entire world at any zoom).
+     *  coverageRef: kernel-weight at which the field reaches full opacity
+     *  (painter default 0.5 preserves legacy fade). Lower = gaps between
+     *  stations inside the network stay filled while the perimeter still
+     *  fades out over ~a kernel width. */
+    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, prior, coverageRef) {
       const gr = this._ensurePaGrid(gw, gh);
       this._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, gr.aqiCell, gr.wCell);
       if (prior && prior.w > 0) {
         const n = gw * gh;
         for (let c = 0; c < n; c++) {
           const w = gr.wCell[c];
+          if (w < 0.001) continue; // no real coverage — stays transparent
           gr.aqiCell[c] = (gr.aqiCell[c] * w + prior.aqi * prior.w) / (w + prior.w);
-          gr.wCell[c] = w + prior.w;
         }
       }
-      this._paintPaCells(gr.aqiCell, gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
+      this._paintPaCells(gr.aqiCell, gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, coverageRef);
     }
 
     /** Max-mode field: render EACH pollutant's own kernel field independently

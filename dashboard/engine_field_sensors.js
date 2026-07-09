@@ -76,22 +76,26 @@
    * both need to move together, or a wider falloff just fades to nothing
    * faster inside the same unchanged cutoff radius.
    *
-   * regionalPriorW: kernel-weight of a synthetic "everywhere" observation at
-   * the MEDIAN of the visible sensors. Wider kernels alone still render a
-   * regional pollutant as sensor-centered discs with dark voids between
-   * stations whenever readings genuinely vary — a weighted mean has nothing
-   * to say where no station reaches, so the field faded to transparent.
-   * With the prior, uncovered cells relax to the regional median (a smooth
-   * valley-wide wash) and stations bend that baseline locally; near a
-   * station the real reading dominates (fixed-sensor kernel weight ~10 vs
-   * prior 0.4). 0 disables (primary pollutants keep their plume look).
+   * regionalPriorW: kernel-weight of a synthetic observation at the MEDIAN
+   * of the visible sensors, blended into the VALUE of covered cells only.
+   * It flattens per-station bullseyes into regional gradients (median, not
+   * mean, so one broken station can't drag the baseline). A station's real
+   * reading still dominates near it (fixed-sensor kernel weight ~10). The
+   * prior must never extend COVERAGE — an earlier version that inflated
+   * coverage weight painted the field across the entire world at low zoom.
+   *
+   * coverageRef: kernel-weight where opacity saturates (painter default 0.5
+   * = legacy fade). Lower values keep mid-gap cells INSIDE the station
+   * network at full strength (no dark voids between stations) while the
+   * field still fades out ~a kernel width past the outermost station —
+   * bounded by real coverage in every direction.
    */
   const _LEGEND_TAB_FIELD_SPREAD = {
-    pm25: { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0 },
-    pm10: { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0 },
-    o3:   { sigmaMult: 2.4,  cutMult: 1.8, regionalPriorW: 0.4 },
-    no2:  { sigmaMult: 1.3,  cutMult: 1.2, regionalPriorW: 0.15 },
-    co:   { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0 },
+    pm25: { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0,   coverageRef: 0 },
+    pm10: { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0,   coverageRef: 0 },
+    o3:   { sigmaMult: 2.4,  cutMult: 1.8, regionalPriorW: 1.5, coverageRef: 0.15 },
+    no2:  { sigmaMult: 1.3,  cutMult: 1.2, regionalPriorW: 0.5, coverageRef: 0.3 },
+    co:   { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0,   coverageRef: 0 },
   };
   /** Pollutants composited in "no selection" max-mode field (one kernel each). */
   // Max-mode field groups. Particulates (PM2.5 + PM10) form ONE field: same
