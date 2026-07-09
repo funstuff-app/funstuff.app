@@ -1924,9 +1924,17 @@ function main() {
     const _scrubPointerSensitivity = 0.3;
 
     pbScrubEl.addEventListener("pointerdown", (e) => {
-      // Detect if pointer landed on the thumb vs the track (mouse/pen only)
+      // On touch devices, pointerdown fires BEFORE touchstart. Defer entirely
+      // to touchstart (which runs its own equivalent setup) — otherwise this
+      // handler pauses playback and computes _pbResumeAfterScrub first, then
+      // touchstart re-derives "was it playing?" from the now-already-paused
+      // state and always gets false, so release never resumes (mobile-only
+      // pause-on-release bug; desktop only fires pointerdown, never touchstart).
+      if (e.pointerType === "touch") return;
+      // Detect if pointer landed on the thumb vs the track (mouse/pen only —
+      // touch already bailed above)
       _scrubPointerOnTrack = false;
-      if (e.pointerType !== "touch") {
+      {
         const rect = pbScrubEl.getBoundingClientRect();
         const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
         const curVal = Number(pbScrubEl.value);
@@ -2192,12 +2200,15 @@ function main() {
       pb._pbDidDrag = true;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
-      if (!_getScrubRAF()) {
-        _setScrubRAF(requestAnimationFrame(() => {
-          _setScrubRAF(0);
-          applyScrub();
-        }));
-      }
+      // Call directly rather than coalescing via requestAnimationFrame: on
+      // real mobile Safari/Chrome, rAF callbacks queued from inside an active,
+      // preventDefault()-ed touch gesture can be deferred by the compositor
+      // until the gesture ends, so the field only snapped into place on
+      // touchend instead of tracking the drag (desktop's native "input" event
+      // path doesn't hit this — the browser's own slider-thumb compositing
+      // keeps that rAF flowing). touchmove's own dispatch rate is already
+      // bounded by the OS/browser touch sampling, so this is not overwhelming.
+      applyScrub();
     }, { passive: false });
 
     pbScrubEl.addEventListener("touchend", () => {
