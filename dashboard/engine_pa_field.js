@@ -599,14 +599,24 @@
         this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
       } else {
         const s5 = buildS5(allSensors, _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5");
-        // Neighbor-consensus smoothing for regional gases — data-level, not
-        // renderer-level (see _LEGEND_TAB_FIELD_SPREAD.neighborBlend). Each
+        // Gradient (IDW) mode — see _LEGEND_TAB_FIELD_SPREAD.gradient. The
+        // station's value spreads outward from its exact location; the
+        // blending of VALUES across the field produces the interpolated
+        // colors on its own.
+        let gradientIdw = null;
+        if (_spread.gradient) {
+          const soft = cutoffPx * (_spread.idwSoftFrac || 0.03);
+          gradientIdw = {
+            softSq: soft * soft,
+            covTwoSigmaSq: twoSigmaSq * _spread.covSigmaMult * _spread.covSigmaMult,
+            coverageRef: _spread.coverageRef,
+          };
+        }
+        // Neighbor-consensus smoothing (non-gradient pollutants only) — each
         // station's FIELD input moves toward the distance-weighted mean of
-        // the other stations, so one off-cadence or miscalibrated monitor
-        // (MTMET updates every few minutes; the DAQ stations hourly) nudges
-        // the shared airmass level instead of forming a local zone around
-        // itself. Marker labels keep the raw newest reading.
-        const _nb = _spread.neighborBlend;
+        // the other stations, damping single-station cadence/calibration
+        // artifacts. Marker labels keep the raw newest reading.
+        const _nb = _spread.gradient ? 0 : _spread.neighborBlend;
         const nSens = s5.length / 5;
         if (_nb > 0 && nSens >= 3) {
           const blended = new Float64Array(nSens);
@@ -629,7 +639,7 @@
           }
           for (let i = 0; i < nSens; i++) s5[i * 5 + 2] = blended[i];
         }
-        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH, gradientIdw);
       }
 
       // Stash the inputs needed to lazily compute per-pollutant field maxes
@@ -882,7 +892,11 @@
     /** Color a per-cell (aqi, weight) grid into the grid canvas, apply the
      *  Cauchy blur, commit, and upscale. Also sets view._paFieldMaxAqi to the
      *  max AQI within the viewport region. Shared painter for both render paths. */
-    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH) {
+    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, coverageRef) {
+      // Weight at which opacity saturates. Default 0.5 = legacy min(1, w*2).
+      // Gradient mode passes a lower ref so the field holds full strength
+      // across the station network and fades softly past its perimeter.
+      const covRef = (typeof coverageRef === "number" && coverageRef > 0) ? coverageRef : 0.5;
       const view = this.view;
       const _aqiToRgb = g.FieldSensors._aqiToRgb;
       const { tc, tctx, imgData } = view._paGrid;
@@ -907,7 +921,7 @@
           if (wSum < 0.001) {
             px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
           } else {
-            const fade = Math.min(1, wSum * 2);
+            const fade = Math.min(1, wSum / covRef);
             const alpha = Math.round(FIELD_ALPHA * fade);
             const val = aqiCell[cell];
             if (inVpY && gx >= vpGxMin && gx < vpGxMax && val > fieldMaxAqi) {
@@ -977,11 +991,51 @@
      *  sensors: stride-5 Float64Array [sx, sy, aqi, twoSigSq, weightMultiplier, ...]
      *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
      *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
-     *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
-    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
+     *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic.
+     *  gradientIdw: { softSq, covTwoSigmaSq, coverageRef } or null — IDW
+     *  value surface (exact at stations) + Gaussian coverage alpha, for
+     *  gradient-mode pollutants (ozone). */
+    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, gradientIdw) {
       const gr = this._ensurePaGrid(gw, gh);
+      if (gradientIdw) {
+        if (!gr.covCell || gr.covCell.length !== gw * gh) {
+          gr.covCell = new Float32Array(gw * gh);
+        }
+        this._idwGrid(sensors, gw, gh, cellSize, gradientIdw.softSq,
+          gradientIdw.covTwoSigmaSq, gr.aqiCell, gr.covCell);
+        this._paintPaCells(gr.aqiCell, gr.covCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, gradientIdw.coverageRef);
+        return;
+      }
       this._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, gr.aqiCell, gr.wCell);
       this._paintPaCells(gr.aqiCell, gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
+    }
+
+    /** Gradient-mode grid: inverse-distance-weighted value surface — exact
+     *  at every station, 1/d² decay blending across the whole gap between
+     *  stations — plus a wide Gaussian coverage weight for opacity, so the
+     *  field exists across the network and fades out softly past it.
+     *  sensors: stride-5 [sx, sy, aqi, twoSigSq(value, unused), mult]. */
+    _idwGrid(sensors, gw, gh, cellSize, softSq, covTwoSigmaSq, outAqi, outCov) {
+      for (let gy = 0; gy < gh; gy++) {
+        const py = (gy + 0.5) * cellSize;
+        for (let gx = 0; gx < gw; gx++) {
+          const pxx = (gx + 0.5) * cellSize;
+          let wSum = 0, vSum = 0, covSum = 0;
+          for (let i = 0; i < sensors.length; i += 5) {
+            const dx = pxx - sensors[i];
+            const dy = py  - sensors[i + 1];
+            const d2 = dx * dx + dy * dy;
+            const m = sensors[i + 4];
+            const w = m / (d2 + softSq);
+            wSum += w;
+            vSum += w * sensors[i + 2];
+            covSum += m * Math.exp(-d2 / covTwoSigmaSq);
+          }
+          const cell = gy * gw + gx;
+          outAqi[cell] = wSum > 0 ? vSum / wSum : 0;
+          outCov[cell] = covSum;
+        }
+      }
     }
 
     /** Max-mode field: render EACH pollutant's own kernel field independently
