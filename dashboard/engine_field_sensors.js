@@ -75,13 +75,23 @@
    * radius a sensor's influence reaches before being excluded entirely —
    * both need to move together, or a wider falloff just fades to nothing
    * faster inside the same unchanged cutoff radius.
+   *
+   * regionalPriorW: kernel-weight of a synthetic "everywhere" observation at
+   * the MEDIAN of the visible sensors. Wider kernels alone still render a
+   * regional pollutant as sensor-centered discs with dark voids between
+   * stations whenever readings genuinely vary — a weighted mean has nothing
+   * to say where no station reaches, so the field faded to transparent.
+   * With the prior, uncovered cells relax to the regional median (a smooth
+   * valley-wide wash) and stations bend that baseline locally; near a
+   * station the real reading dominates (fixed-sensor kernel weight ~10 vs
+   * prior 0.4). 0 disables (primary pollutants keep their plume look).
    */
   const _LEGEND_TAB_FIELD_SPREAD = {
-    pm25: { sigmaMult: 1,    cutMult: 1 },
-    pm10: { sigmaMult: 1,    cutMult: 1 },
-    o3:   { sigmaMult: 2.4,  cutMult: 1.8 },
-    no2:  { sigmaMult: 1.3,  cutMult: 1.2 },
-    co:   { sigmaMult: 1,    cutMult: 1 },
+    pm25: { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0 },
+    pm10: { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0 },
+    o3:   { sigmaMult: 2.4,  cutMult: 1.8, regionalPriorW: 0.4 },
+    no2:  { sigmaMult: 1.3,  cutMult: 1.2, regionalPriorW: 0.15 },
+    co:   { sigmaMult: 1,    cutMult: 1,   regionalPriorW: 0 },
   };
   /** Pollutants composited in "no selection" max-mode field (one kernel each). */
   // Max-mode field groups. Particulates (PM2.5 + PM10) form ONE field: same

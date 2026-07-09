@@ -599,7 +599,22 @@
         this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
       } else {
         const s5 = buildS5(allSensors, _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5");
-        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+        // Regional prior (secondary/regional pollutants only — see
+        // _LEGEND_TAB_FIELD_SPREAD.regionalPriorW): a synthetic everywhere-
+        // observation at the MEDIAN sensor AQI, so the field relaxes to the
+        // regional level between stations instead of fading to transparent
+        // voids. Median, not mean: one broken low/high station must not drag
+        // the whole valley's baseline.
+        let prior = null;
+        if (_spread.regionalPriorW > 0 && s5.length >= 5) {
+          const vals = [];
+          for (let i = 0; i < s5.length; i += 5) vals.push(s5[i + 2]);
+          vals.sort((a, b) => a - b);
+          const mid = vals.length >> 1;
+          const med = (vals.length % 2) ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+          prior = { aqi: med, w: _spread.regionalPriorW };
+        }
+        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH, prior);
       }
 
       // Stash the inputs needed to lazily compute per-pollutant field maxes
@@ -947,10 +962,21 @@
      *  sensors: stride-5 Float64Array [sx, sy, aqi, twoSigSq, weightMultiplier, ...]
      *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
      *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
-     *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
-    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
+     *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic.
+     *  prior: { aqi, w } regional prior or null — blended into every cell as a
+     *  synthetic observation, so coverage never drops to zero and uncovered
+     *  cells render at the regional level instead of transparent voids. */
+    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, prior) {
       const gr = this._ensurePaGrid(gw, gh);
       this._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, gr.aqiCell, gr.wCell);
+      if (prior && prior.w > 0) {
+        const n = gw * gh;
+        for (let c = 0; c < n; c++) {
+          const w = gr.wCell[c];
+          gr.aqiCell[c] = (gr.aqiCell[c] * w + prior.aqi * prior.w) / (w + prior.w);
+          gr.wCell[c] = w + prior.w;
+        }
+      }
       this._paintPaCells(gr.aqiCell, gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
     }
 
