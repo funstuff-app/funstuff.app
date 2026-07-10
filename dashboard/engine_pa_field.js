@@ -472,7 +472,13 @@
         let fp = "", total = 0, anyVirtual = false;
         for (const grp of _MAX_MODE_GROUPS) {
           const pf = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, grp.incl, bufW, bufH, paRefNowMs, grp.tabs);
-          const vf = _collectVirtualMobileSensors(mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, grp.incl, bufW, bufH, grp.tabs);
+          // Gradient groups (o3) take no mobile input — same rule as the
+          // single-pollutant path below, same reason: mobile readings are
+          // local, and as virtual stations they drag the regional baseline.
+          const _grpSpread = _LEGEND_TAB_FIELD_SPREAD[grp.incl];
+          const vf = (_grpSpread && _grpSpread.gradient)
+            ? { sensors: [], fingerprint: "" }
+            : _collectVirtualMobileSensors(mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, grp.incl, bufW, bufH, grp.tabs);
           const sensors = pf.sensors.concat(vf.sensors);
           if (vf.sensors.length) anyVirtual = true;
           total += sensors.length;
@@ -579,8 +585,9 @@
       // Blend in AQI space: the non-linear concentration→AQI transform gives high
       // concentrations proportionally more weight in the kernel average,
       // so a local spike stays visible instead of being diluted by neighbors.
-      const buildS5 = (sensors, aqiKey) => {
+      const buildS5 = (sensors, aqiKey, twoSigSqOverride) => {
         const arr = new Float64Array(sensors.length * 5);
+        const sensorTwoSigSq = twoSigSqOverride || twoSigmaSq;
         for (let i = 0; i < sensors.length; i++) {
           const sensor = sensors[i];
           const si5 = i * 5;
@@ -588,7 +595,7 @@
           arr[si5 + 1] = sensor.sy;
           const aqi = (sensor.aqi != null && isFinite(sensor.aqi)) ? sensor.aqi : valueToAqi(aqiKey, sensor.value);
           arr[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
-          arr[si5 + 3] = twoSigmaSq;
+          arr[si5 + 3] = sensorTwoSigSq;
           arr[si5 + 4] = sensor.weightMultiplier;
         }
         return arr;
@@ -602,11 +609,33 @@
 
       // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
       if (maxMode) {
-        // One stride-5 array per pollutant; composite per-cell max across fields.
-        const perPollS5 = perPollSensors.map(pp =>
-          buildS5(pp.sensors, _LEGEND_TAB_AQI_KEY[pp.incl] || "pm2.5")
-        );
-        this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+        // One config per pollutant group; composite per-cell max across fields.
+        // Gradient groups (o3) derive their own spread-scaled parameters with
+        // the SAME formulas as the single-pollutant path, so a gradient
+        // pollutant's surface is identical whether its tab is selected or not
+        // (previously max mode ran o3 through the unscaled default kernel and
+        // the broad regional field collapsed to a small ring per station).
+        // Kernel groups keep the unscaled default — unchanged behavior.
+        const perPollCfg = perPollSensors.map(pp => {
+          const sp = _LEGEND_TAB_FIELD_SPREAD[pp.incl];
+          const aqiKey = _LEGEND_TAB_AQI_KEY[pp.incl] || "pm2.5";
+          if (sp && sp.gradient) {
+            const gCutoffPx = cutoffPx * (sp.cutMult || 1);
+            const gSigma = (gCutoffPx / sigmaDivisor) * (sp.sigmaMult || 1);
+            const gTwoSigmaSq = 2 * gSigma * gSigma;
+            const gResidR = gCutoffPx * (sp.residualFrac || 0.09);
+            return {
+              s5: buildS5(pp.sensors, aqiKey, gTwoSigmaSq),
+              gradientIdw: {
+                residRSq: gResidR * gResidR,
+                covTwoSigmaSq: gTwoSigmaSq * (sp.covSigmaMult || 1) * (sp.covSigmaMult || 1),
+                coverageRef: sp.coverageRef,
+              },
+            };
+          }
+          return { s5: buildS5(pp.sensors, aqiKey), gradientIdw: null };
+        });
+        this._computeMaxModeFieldSync(perPollCfg, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
       } else {
         const s5 = buildS5(allSensors, _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5");
         // Gradient (IDW) mode — see _LEGEND_TAB_FIELD_SPREAD.gradient. The
@@ -1095,20 +1124,28 @@
           // denominator keeps single-station exactness (kSum≈1 at a station)
           // and decays the residual smoothly to zero away from all stations.
           const residField = kSum > 0 ? krSum / Math.max(1, kSum) : 0;
-          outAqi[cell] = wSum > 0.0001 ? (vSum / wSum + residField) : 0;
+          // Value surface must extend at least as far as the coverage alpha
+          // does (cov >= 0.001 paints): the weighted mean tends smoothly to
+          // the nearest station's value, so keep it defined down to numeric
+          // noise. A larger epsilon zeroes the fringe and the max-mode
+          // composite (which claims cells by aqi > 0) loses the outer
+          // coverage band its own tab still paints.
+          outAqi[cell] = wSum > 1e-9 ? (vSum / wSum + residField) : 0;
           outCov[cell] = covSum;
         }
       }
     }
 
-    /** Max-mode field: render EACH pollutant's own kernel field independently
+    /** Max-mode field: render EACH pollutant's own field independently
      *  (so PurpleAir, which only measures PM2.5, never enters other pollutants'
      *  fields), then composite the PER-CELL MAX AQI across pollutants. This is
      *  the true "worst pollutant wins" surface — a single blended pass over
      *  mixed per-sensor maxes instead averages dense low-PM2.5 PA sensors down
      *  and suppresses a region's high ozone/NO2/etc.
-     *  perPollS5: array of stride-5 Float64Arrays, one per pollutant. */
-    _computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
+     *  perPollCfg: [{ s5, gradientIdw }] — s5 is the stride-5 Float64Array;
+     *  gradientIdw non-null runs that group through the gradient surface
+     *  (same model its own tab renders) instead of the kernel regression. */
+    _computeMaxModeFieldSync(perPollCfg, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
       const gr = this._ensurePaGrid(gw, gh);
       const n = gw * gh;
       if (!gr.bestAqi || gr.bestAqi.length !== n) {
@@ -1119,8 +1156,26 @@
       }
       gr.bestAqi.fill(0);
       gr.bestW.fill(0);
-      for (const s5 of perPollS5) {
+      for (const cfg of perPollCfg) {
+        const s5 = cfg && cfg.s5;
         if (!s5 || !s5.length) continue;
+        if (cfg.gradientIdw) {
+          // Gradient group: same surface as its own tab. tmpW holds the
+          // coverage sum; the claim threshold matches the single-tab painter
+          // (covSum >= 0.001 paints). The stored weight is rescaled so the
+          // shared painter's fade (w / 0.5) reproduces this group's own
+          // alpha ramp (cov / coverageRef) exactly.
+          this._gradientGrid(s5, gw, gh, cellSize, cfg.gradientIdw.residRSq,
+            cfg.gradientIdw.covTwoSigmaSq, gr.tmpAqi, gr.tmpW);
+          const covScale = 0.5 / ((typeof cfg.gradientIdw.coverageRef === "number" && cfg.gradientIdw.coverageRef > 0) ? cfg.gradientIdw.coverageRef : 0.5);
+          for (let c = 0; c < n; c++) {
+            if (gr.tmpW[c] >= 0.001 && gr.tmpAqi[c] > gr.bestAqi[c]) {
+              gr.bestAqi[c] = gr.tmpAqi[c];
+              gr.bestW[c]   = gr.tmpW[c] * covScale;
+            }
+          }
+          continue;
+        }
         this._kernelGrid(s5, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, gr.tmpAqi, gr.tmpW);
         for (let c = 0; c < n; c++) {
           // A pollutant claims a cell only where it has coverage AND its AQI is

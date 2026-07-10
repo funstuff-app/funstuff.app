@@ -188,28 +188,62 @@
             pf._paFieldValidFixed = null; pf._paFieldFingerprint = null;
             pf._paFieldPrevCanvas = null;
           };
-          const hash = (c) => {
-            if (!c) return "none";
+          const stats = (c) => {
+            if (!c) return { hash: "none", painted: 0 };
             const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
-            let h = 0;
-            for (let i = 0; i < d.length; i += 7) h = (h * 31 + d[i]) >>> 0;
-            return h.toString(16) + ":" + c.width + "x" + c.height;
+            let h = 0, painted = 0;
+            for (let i = 0; i < d.length; i += 4) {
+              if (d[i + 3] > 0) painted++;
+              h = (h * 31 + d[i] + d[i + 3]) >>> 0;
+            }
+            return { hash: h.toString(16) + ":" + c.width + "x" + c.height, painted };
           };
-          const compute = (state) => { bust(); pf._ensurePaField(state, pbMs); return hash(map._paFieldCanvas); };
-          map.setPaFieldPollutant("o3");
-          const withMobile = compute(st);
-          const noMobile = compute(Object.assign({}, st, { mobile: [] }));
-          map.setPaFieldPollutant(prevTab);
-          bust();
-          map._compositePaFieldOnTiles(st);
-          if (withMobile === "none" && noMobile === "none") {
+          const compute = (tab, state) => {
+            map.setPaFieldPollutant(tab);
+            bust();
+            pf._ensurePaField(state, pbMs);
+            return stats(map._paFieldCanvas);
+          };
+          const withMobile = compute("o3", st);
+          const noMobile = compute("o3", Object.assign({}, st, { mobile: [] }));
+          if (withMobile.painted === 0 && noMobile.painted === 0) {
             check("o3 gradient field ignores mobile sensors (SKIPPED: no o3 field in view)", true);
           } else {
             check("o3 gradient field ignores mobile sensors",
-              withMobile === noMobile, `with=${withMobile} without=${noMobile}`);
+              withMobile.hash === noMobile.hash,
+              `with=${withMobile.hash} without=${noMobile.hash}`);
           }
+
+          // Max-mode parity: a gradient pollutant must render the SAME
+          // surface whether its tab is selected or not (max mode used to run
+          // o3 through the unscaled default kernel, collapsing the regional
+          // field to a small ring per station). Strip the state to non-PA
+          // fixed sensors so o3 dominates every covered cell, then compare
+          // coverage between the o3 tab and max mode. Asserted on coverage,
+          // not bit-identity: a legitimate no2/co spike above o3 may
+          // re-color cells without being a regression (identity is still
+          // reported in the detail).
+          const stripped = Object.assign({}, st, {
+            mobile: [],
+            fixed: (st.fixed || []).filter((f) => f && !f.purpleair),
+          });
+          const o3Solo = compute("o3", stripped);
+          const maxSolo = compute(null, stripped);
+          if (o3Solo.painted === 0) {
+            check("gradient (o3) field renders identically in max mode (SKIPPED: no o3 coverage in view)", true);
+          } else {
+            const ratio = maxSolo.painted / o3Solo.painted;
+            check("gradient (o3) field renders identically in max mode",
+              ratio >= 0.95 && ratio <= 1.05,
+              `coverage ratio ${ratio.toFixed(3)}, bitIdentical=${o3Solo.hash === maxSolo.hash}`);
+          }
+
+          map.setPaFieldPollutant(prevTab);
+          bust();
+          map._compositePaFieldOnTiles(st);
         } else {
           check("o3 gradient field ignores mobile sensors (SKIPPED: map unsized)", true);
+          check("gradient (o3) field renders identically in max mode (SKIPPED: map unsized)", true);
         }
       }
 
