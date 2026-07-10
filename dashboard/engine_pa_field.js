@@ -625,11 +625,7 @@
             const gTwoSigmaSq = 2 * gSigma * gSigma;
             const gResidR = gCutoffPx * (sp.residualFrac || 0.09);
             return {
-              // s5 (default scale) CONTESTS cells like any kernel pollutant;
-              // s5Grad + gradientIdw add the broad regional FILL surface.
-              // See _computeMaxModeFieldSync for why these are separate.
-              s5: buildS5(pp.sensors, aqiKey),
-              s5Grad: buildS5(pp.sensors, aqiKey, gTwoSigmaSq),
+              s5: buildS5(pp.sensors, aqiKey, gTwoSigmaSq),
               gradientIdw: {
                 residRSq: gResidR * gResidR,
                 covTwoSigmaSq: gTwoSigmaSq * (sp.covSigmaMult || 1) * (sp.covSigmaMult || 1),
@@ -1147,20 +1143,16 @@
      *  mixed per-sensor maxes instead averages dense low-PM2.5 PA sensors down
      *  and suppresses a region's high ozone/NO2/etc.
      *
-     *  Gradient pollutants (o3) participate in two roles:
-     *   - CONTEST (phase 1): near their stations they compete cell-by-cell
-     *     through the same default-scale kernel as every other pollutant, so
-     *     a hot ozone station still out-claims PM2.5 around itself and
-     *     nowhere else.
-     *   - FILL (phase 2): where NO pollutant claimed a cell, the gradient's
-     *     broad regional surface paints it (coverage-faded), so the field no
-     *     longer collapses to a ring per station where the o3 tab shows a
-     *     valley-wide gradient.
-     *  The regional surface itself must NOT contest: its baseline is an
-     *  estimate spread over the whole valley, and letting it compete on AQI
-     *  buried the entire measured PurpleAir PM2.5 field under an ozone wash.
-     *  perPollCfg: [{ s5, s5Grad?, gradientIdw? }] — s5 always contests at
-     *  the shared default scale; s5Grad + gradientIdw add the fill surface. */
+     *  Gradient pollutants (o3) run their own broad gradient surface and
+     *  compete in the SAME per-cell max as every kernel pollutant — worst
+     *  pollutant wins the cell, whether the value came from a measured
+     *  kernel or the regional gradient. (A fill-only variant that let any
+     *  local kernel keep its cells regardless of AQI was tried and rejected:
+     *  a single clean-air PM2.5 station punched a giant low-AQI crater
+     *  through a 100-AQI ozone field.)
+     *  perPollCfg: [{ s5, gradientIdw? }] — gradientIdw non-null runs that
+     *  group through the gradient surface (same model its own tab renders)
+     *  instead of the kernel regression. */
     _computeMaxModeFieldSync(perPollCfg, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
       const gr = this._ensurePaGrid(gw, gh);
       const n = gw * gh;
@@ -1170,16 +1162,28 @@
         gr.tmpAqi  = new Float32Array(n);
         gr.tmpW    = new Float32Array(n);
       }
-      if (!gr.winGrp || gr.winGrp.length !== n) gr.winGrp = new Uint8Array(n);
       gr.bestAqi.fill(0);
       gr.bestW.fill(0);
-      gr.winGrp.fill(0);
-      // ── Phase 1 — contest: every pollutant, gradient ones included, claims
-      // cells through its own default-scale kernel field. ──
-      for (let gi = 0; gi < perPollCfg.length; gi++) {
-        const cfg = perPollCfg[gi];
+      for (const cfg of perPollCfg) {
         const s5 = cfg && cfg.s5;
         if (!s5 || !s5.length) continue;
+        if (cfg.gradientIdw) {
+          // Gradient group: same surface as its own tab. tmpW holds the
+          // coverage sum; the claim threshold matches the single-tab painter
+          // (covSum >= 0.001 paints). The stored weight is rescaled so the
+          // shared painter's fade (w / 0.5) reproduces this group's own
+          // alpha ramp (cov / coverageRef) exactly.
+          this._gradientGrid(s5, gw, gh, cellSize, cfg.gradientIdw.residRSq,
+            cfg.gradientIdw.covTwoSigmaSq, gr.tmpAqi, gr.tmpW);
+          const covScale = 0.5 / ((typeof cfg.gradientIdw.coverageRef === "number" && cfg.gradientIdw.coverageRef > 0) ? cfg.gradientIdw.coverageRef : 0.5);
+          for (let c = 0; c < n; c++) {
+            if (gr.tmpW[c] >= 0.001 && gr.tmpAqi[c] > gr.bestAqi[c]) {
+              gr.bestAqi[c] = gr.tmpAqi[c];
+              gr.bestW[c]   = gr.tmpW[c] * covScale;
+            }
+          }
+          continue;
+        }
         this._kernelGrid(s5, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, gr.tmpAqi, gr.tmpW);
         for (let c = 0; c < n; c++) {
           // A pollutant claims a cell only where it has coverage AND its AQI is
@@ -1188,34 +1192,6 @@
           if (gr.tmpW[c] >= 0.001 && gr.tmpAqi[c] > gr.bestAqi[c]) {
             gr.bestAqi[c] = gr.tmpAqi[c];
             gr.bestW[c]   = gr.tmpW[c];
-            gr.winGrp[c]  = gi + 1;
-          }
-        }
-      }
-      // ── Phase 2 — gradient fill. Runs after ALL contests so group order
-      // can never let a regional fill pre-empt another pollutant's local
-      // claim. (Fill-vs-fill conflicts go to the first-listed group; only o3
-      // is a gradient pollutant today.) ──
-      for (let gi = 0; gi < perPollCfg.length; gi++) {
-        const cfg = perPollCfg[gi];
-        if (!cfg || !cfg.gradientIdw || !cfg.s5Grad || !cfg.s5Grad.length) continue;
-        this._gradientGrid(cfg.s5Grad, gw, gh, cellSize, cfg.gradientIdw.residRSq,
-          cfg.gradientIdw.covTwoSigmaSq, gr.tmpAqi, gr.tmpW);
-        const ref = cfg.gradientIdw.coverageRef;
-        // Rescale coverage into the painter's weight scale: fade = w / 0.5
-        // then reproduces this group's own alpha ramp (cov / coverageRef).
-        const covScale = 0.5 / ((typeof ref === "number" && ref > 0) ? ref : 0.5);
-        for (let c = 0; c < n; c++) {
-          const covW = gr.tmpW[c] * covScale;
-          if (gr.winGrp[c] === gi + 1) {
-            // Cell this pollutant already won in the contest: lift its fade
-            // to the coverage alpha so the contest kernel's fading fringe
-            // doesn't sit as a transparent moat inside the opaque fill.
-            if (covW > gr.bestW[c]) gr.bestW[c] = covW;
-          } else if (gr.winGrp[c] === 0 && gr.tmpW[c] >= 0.001) {
-            gr.bestAqi[c] = gr.tmpAqi[c];
-            gr.bestW[c]   = covW;
-            gr.winGrp[c]  = gi + 1;
           }
         }
       }
