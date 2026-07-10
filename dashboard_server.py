@@ -844,11 +844,14 @@ def save_fixed_history(app_state: AppState) -> None:
 
 def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
     """Load today's saved snapshot and seed persistent_mobile state.
-    
+
     This enables seamless continuity when the server restarts: the saved trail
     data is merged with incoming live data instead of starting from scratch.
-    
-    Returns True if snapshot was loaded, False otherwise (fails silently).
+    A fixed-only snapshot (no mobiles) still seeds PurpleAir sensors and
+    fixed history.
+
+    Returns True if the snapshot seeded anything (mobiles, PurpleAir sensors,
+    or fixed history), False otherwise (fails silently).
     """
     today_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
     try:
@@ -856,13 +859,18 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         if snapshot is None:
             return False
         
+        # A snapshot with no mobiles is still useful: it can seed PurpleAir
+        # sensors and fixed history below (fixed-only snapshots are written
+        # during mobile-feed outages).
         mobiles = snapshot.get("mobile", [])
-        if not isinstance(mobiles, list) or not mobiles:
-            return False
-        
+        if not isinstance(mobiles, list):
+            mobiles = []
+
         now = time.time()
         loaded_count = 0
-        
+        pa_seeded = 0
+        hist_seeded = 0
+
         with app_state.lock:
             for m in mobiles:
                 sid = m.get("id")
@@ -913,7 +921,6 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
         if not app_state.purpleair_sensors:
             fixed = snapshot.get("fixed", [])
             if isinstance(fixed, list):
-                pa_seeded = 0
                 with app_state.lock:
                     for f in fixed:
                         if not f.get("purpleair"):
@@ -955,7 +962,6 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
             fixed = snapshot.get("fixed", [])
             if isinstance(fixed, list):
                 from mobileair.aqi import color_to_idx as _c2i
-                hist_seeded = 0
                 with app_state.lock:
                     for f in fixed:
                         sid_str = f.get("id", "")
@@ -989,7 +995,7 @@ def load_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
                 if hist_seeded:
                     _log(f"[Snapshot] Backfilled {hist_seeded} history entries from snapshot")
 
-        return loaded_count > 0
+        return loaded_count > 0 or pa_seeded > 0 or hist_seeded > 0
         
     except Exception as e:
         # Fail silently - this is optional persistence
@@ -1155,7 +1161,10 @@ def _trim_state_to_window(state: dict[str, Any], window_start_utc: datetime, win
 def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
     """Save current state as today's snapshot.
 
-    Called on graceful shutdown to persist the accumulated trail data.
+    Called periodically from the fetch loop and on graceful shutdown to
+    persist accumulated mobile trails AND fixed/AirNow/PurpleAir data.
+    Saves when either side has meaningful data, so a mobile-feed outage
+    cannot block snapshot persistence.
     Returns True if saved successfully, False otherwise.
     """
     today_str = datetime.now(_MOUNTAIN_TZ).strftime("%Y-%m-%d")
@@ -1166,15 +1175,33 @@ def save_today_snapshot(app_state: AppState, data_dir: Path) -> bool:
                 return False
             state = json.loads(state_bytes.decode("utf-8"))
 
-        # Validate there's something worth saving
+        # Validate there's something worth saving.  Meaningful mobile OR fixed
+        # data is enough: a mobile-feed outage must not block persistence of
+        # fixed/AirNow/PurpleAir data (Jul 2026: the mobile-only gate froze
+        # daily snapshots for two days).  The gate only rejects a truly empty
+        # boot state so a just-started server can't clobber a real snapshot.
         mobiles = state.get("mobile", [])
-        if not isinstance(mobiles, list) or not mobiles:
-            _log("[Snapshot] Nothing to save (no mobile sensors)")
-            return False
+        if not isinstance(mobiles, list):
+            mobiles = []
+        mobile_points = sum(
+            len(m.get("trail") or []) for m in mobiles if isinstance(m, dict))
 
-        total_points = sum(len(m.get("trail", [])) for m in mobiles if isinstance(m, dict))
-        if total_points < 10:
-            _log("[Snapshot] Not enough data to save (fewer than 10 trail points)")
+        fixed = state.get("fixed", [])
+        fixed_with_readings = 0
+        if isinstance(fixed, list):
+            for f in fixed:
+                if not isinstance(f, dict):
+                    continue
+                readings = f.get("readings")
+                if isinstance(readings, dict) and any(
+                    isinstance(r, dict) and r.get("value") is not None
+                    for r in readings.values()
+                ):
+                    fixed_with_readings += 1
+
+        if mobile_points < 10 and fixed_with_readings == 0:
+            _log(f"[Snapshot] Not enough data to save ({mobile_points} mobile "
+                 "trail points, no fixed sensors with readings)")
             return False
 
         # Trim everything to today's 5 AM–5 AM MST window before saving
