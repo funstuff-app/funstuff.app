@@ -620,6 +620,40 @@
       let forceCameraFit = false;
 
       if (hasBounds) {
+        // One-shot refresh resume (stashed by app.js boot from
+        // mobileair.pbResume): restore a lit server-sync ride interrupted by
+        // a refresh. Only a liveFollow+playing position still inside the
+        // current poll window behind the data edge qualifies — paused,
+        // rewound, historical, or aged-out states fall through and the boot
+        // default (live) stands. Runs before the new-data auto-resume below
+        // so the restored position wins the frame.
+        if (pb._pbPendingResume) {
+          const r = pb._pbPendingResume;
+          pb._pbPendingResume = null;
+          const _resumeEdge = (map._playbackMaxMs != null && isFinite(map._playbackMaxMs))
+            ? map._playbackMaxMs : b.maxMs;
+          if (r && r.live && r.playing && !r.hist && !map._historicalMode
+              && isFinite(Number(r.t)) && Number(r.t) >= b.minMs
+              && Number(r.t) < _resumeEdge - 1500) {
+            tMs = Number(r.t);
+            map.setPlaybackTimeMs(tMs);
+            map._playbackLiveFollow = true;
+            pb._pbPageAutoFollow = true;
+            pb._pbPaused = false;
+            pb._pbLoopStartMs = tMs;
+            pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+            map.setPlaybackPlaying(true);
+          } else if (r && (!r.live || r.hist) && !map._historicalMode) {
+            // They left the app NOT live (rewound, paused, or on a loaded
+            // day): land on the actual live edge — not the runway point the
+            // live-follow initializer would pick (the lit button is how you
+            // enter that mode deliberately).
+            tMs = b.maxMs;
+            map.setPlaybackTimeMs(tMs);
+            pb._pbLiveStartWallMs = null; // re-init live tracking from the edge
+          }
+          // else: they were live — the normal boot path stands, unchanged.
+        }
         if (pb._pbLastKnownMaxMs != null && b.maxMs > pb._pbLastKnownMaxMs + 100) {
           newDataArrived = true;
           // Record the update window for future forced camera fits.

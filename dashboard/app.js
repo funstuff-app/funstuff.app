@@ -1479,6 +1479,29 @@ function main() {
     if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
   }
 
+  // ── Refresh-resume ─────────────────────────────────────────────────────────
+  // A refresh always boots LIVE, with ONE exception: a lit server-sync ride
+  // (liveFollow + playing, position still inside the current poll window)
+  // resumes where it was. playbackLoop consumes the stash once real bounds
+  // exist and applies the eligibility check there; everything else — paused,
+  // rewound, historical, aged-out — leaves the live default untouched.
+  // Speed is persisted separately (mobileair.playbackSpeed) and unaffected.
+  try {
+    const _rawResume = localStorage.getItem("mobileair.pbResume");
+    localStorage.removeItem("mobileair.pbResume"); // one-shot
+    if (_rawResume) pb._pbPendingResume = JSON.parse(_rawResume);
+  } catch {}
+  window.addEventListener("pagehide", () => {
+    try {
+      localStorage.setItem("mobileair.pbResume", JSON.stringify({
+        t: map.getPlaybackTimeMs(),
+        playing: !!map.getPlaybackPlaying(),
+        live: !!map._playbackLiveFollow,
+        hist: !!map._historicalMode,
+      }));
+    } catch {}
+  });
+
   // Enter/refresh SERVER-SYNC mode: jump to the server-polling runway point
   // (data edge − predicted-seconds-to-next-poll × speed, corrected for wall
   // time already elapsed) and play forward, so the playhead reaches the edge
@@ -2642,9 +2665,13 @@ function main() {
     if (_urlDate && /^\d{4}-\d{2}-\d{2}$/.test(_urlDate)) {
       console.log("[EmbedParam] Valid date, calling loadSnapshotByDate:", _urlDate);
       try {
-        // Pass start/duration to server so it trims the snapshot before sending
-        const _urlStart = Number(_urlParams.get('start'));
-        const _urlDuration = Number(_urlParams.get('duration'));
+        // Pass start/duration to server so it trims the snapshot before sending.
+        // Absent params must stay NaN — Number(null) is 0, which made a bare
+        // ?date= load silently override the playhead to midnight (start=0).
+        const _urlStartRaw = _urlParams.get('start');
+        const _urlStart = _urlStartRaw == null ? NaN : Number(_urlStartRaw);
+        const _urlDurationRaw = _urlParams.get('duration');
+        const _urlDuration = _urlDurationRaw == null ? NaN : Number(_urlDurationRaw);
         let _extraParams = "";
         if (isFinite(_urlStart) && _urlStart >= 0 && isFinite(_urlDuration) && _urlDuration > 0) {
           _extraParams = `&start=${_urlStart}&duration=${_urlDuration}`;

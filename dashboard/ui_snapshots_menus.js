@@ -118,6 +118,17 @@
     // No-op: old button removed, menu handles state dynamically
   };
 
+  /** Playhead start for a loaded day: 6:00 AM local (users rewind for
+   *  earlier), clamped into the day's data bounds so a day whose data
+   *  starts later still begins on data. Explicit embed params
+   *  (?date=&start=&playhead=) override this after the load returns. */
+  SnapshotsMenusUI.prototype._dayStartPlayheadMs = function (dateStr, b) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ""));
+    if (!m) return b.minMs;
+    const sixAm = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 6, 0, 0, 0).getTime();
+    return Math.min(Math.max(sixAm, b.minMs), b.maxMs);
+  };
+
   SnapshotsMenusUI.prototype.loadHistoricalDay = async function (dateStr) {
     const map = this.map;
     const document = this.document;
@@ -237,10 +248,10 @@
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
 
-      // Build playback points; start the playhead at the earliest data.
+      // Build playback points; start the playhead at 6:00 AM (clamped).
       map._ensurePlaybackPoints(g._historicalState);
       const b = map.getPlaybackBounds();
-      if (isFinite(b.minMs)) map.setPlaybackTimeMs(b.minMs);
+      if (isFinite(b.minMs)) map.setPlaybackTimeMs(this._dayStartPlayheadMs(dateStr, b));
 
       // Store state, render sidebar, draw ONLY tiles (no overlay yet)
       map.lastState = g._historicalState;
@@ -506,11 +517,11 @@
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
 
-      // Build playback points; start the playhead at the earliest data.
+      // Build playback points; start the playhead at 6:00 AM (clamped).
       map._ensurePlaybackPoints(g._historicalState);
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
-        map.setPlaybackTimeMs(b.minMs);
+        map.setPlaybackTimeMs(this._dayStartPlayheadMs(dateStr, b));
       }
 
       // Store state, render sidebar, draw
