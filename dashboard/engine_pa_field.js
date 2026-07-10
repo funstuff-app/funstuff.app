@@ -485,7 +485,17 @@
         hasVirtuals = anyVirtual;
       } else {
         const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH, paRefNowMs, maxMode);
-        const virtualField = _collectVirtualMobileSensors(
+        // Gradient pollutants (o3): the field is the REGIONAL picture, and
+        // only fixed stations measure ambient air at that scale. Mobile
+        // sensors read on-road air (exhaust-scavenged ozone) — local
+        // readings by design. Fed into the gradient as virtual stations
+        // they outnumber the fixed network along their routes and drag the
+        // regional baseline (a weighted mean) to street level across the
+        // whole valley, so the gradient field takes NO mobile input:
+        // trails/markers still show mobile readings, the field ignores them.
+        const _tabSpread = _LEGEND_TAB_FIELD_SPREAD[pollutantTab];
+        const gradientField = !!(_tabSpread && _tabSpread.gradient);
+        const virtualField = gradientField ? { sensors: [], fingerprint: "" } : _collectVirtualMobileSensors(
           mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab, bufW, bufH, maxMode
         );
         view._virtualMobileSensors = virtualField.sensors;
@@ -770,10 +780,15 @@
         const paField = _collectPaFieldSensors(
           fixed, playbackTimeMs, centerW, z, cssW, cssH, tab, bufW, bufH, paRefNowMs
         );
-        const virtualField = _collectVirtualMobileSensors(
-          mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH,
-          virtualRefNowMs, tab, bufW, bufH
-        );
+        // Match _ensurePaField: gradient pollutants take no mobile input,
+        // so the legend max must not see virtual sensors the field ignores.
+        const _tabSpread = g.FieldSensors._LEGEND_TAB_FIELD_SPREAD[tab];
+        const virtualField = (_tabSpread && _tabSpread.gradient)
+          ? { sensors: [] }
+          : _collectVirtualMobileSensors(
+            mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH,
+            virtualRefNowMs, tab, bufW, bufH
+          );
         const allSensors = paField.sensors.concat(virtualField.sensors);
         if (allSensors.length === 0) { result[tab] = null; continue; }
 

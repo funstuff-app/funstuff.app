@@ -168,6 +168,51 @@
         `label now "${hooks.getPlayLabel()}"`);
       check("speed selector works", hooks.setSpeed(10));
 
+      // Gradient-field isolation: gradient pollutants (o3) take NO mobile
+      // input. Mobile sensors are local on-road readings; fed into the
+      // regional gradient as virtual stations they outnumber the fixed
+      // network and drag the baseline to street level across the valley.
+      // Deleting state.mobile must therefore not change the o3 field at all.
+      // (PM2.5 keeps mobile kernels — that path is intentionally untouched.)
+      {
+        const map = window.__map || window.map;
+        const pf = map && map.paField;
+        const st = map && map.lastState;
+        if (pf && st && (map._cssW || 0) >= 2) {
+          const pbMs = map.getPlaybackTimeMs();
+          const prevTab = map._paFieldPollutant ?? null;
+          const bust = () => {
+            map._paFieldKey = null; map._paFieldValidRange = null;
+            map._paFieldCanvas = null; map._paFieldCtx = null;
+            pf._paFieldValidViewKey = null; pf._paFieldValidPollutant = null;
+            pf._paFieldValidFixed = null; pf._paFieldFingerprint = null;
+            pf._paFieldPrevCanvas = null;
+          };
+          const hash = (c) => {
+            if (!c) return "none";
+            const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+            let h = 0;
+            for (let i = 0; i < d.length; i += 7) h = (h * 31 + d[i]) >>> 0;
+            return h.toString(16) + ":" + c.width + "x" + c.height;
+          };
+          const compute = (state) => { bust(); pf._ensurePaField(state, pbMs); return hash(map._paFieldCanvas); };
+          map.setPaFieldPollutant("o3");
+          const withMobile = compute(st);
+          const noMobile = compute(Object.assign({}, st, { mobile: [] }));
+          map.setPaFieldPollutant(prevTab);
+          bust();
+          map._compositePaFieldOnTiles(st);
+          if (withMobile === "none" && noMobile === "none") {
+            check("o3 gradient field ignores mobile sensors (SKIPPED: no o3 field in view)", true);
+          } else {
+            check("o3 gradient field ignores mobile sensors",
+              withMobile === noMobile, `with=${withMobile} without=${noMobile}`);
+          }
+        } else {
+          check("o3 gradient field ignores mobile sensors (SKIPPED: map unsized)", true);
+        }
+      }
+
       // Feature-presence flags — NOT counted toward passed/total. Expected
       // value changes as each PR merges; interpret alongside merge state,
       // don't treat a false here as a failure on its own.
