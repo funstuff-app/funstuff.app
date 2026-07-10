@@ -179,7 +179,10 @@
     try {
       // Load from local snapshots — we already store all data (mobile, fixed,
       // purpleair, etc.) so there's no need to fetch from upstream history servers.
-      const resp = await fetch(`${g.appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`, { headers: { "X-App-Token": g.APP_TOKEN } });
+      // cv= busts caches poisoned by the old "immutable, max-age=86400" header
+      // (removed 2026-07-10): those entries never revalidate, so only a new
+      // URL gets past them. Bump cv when a served day changes under a cache.
+      const resp = await fetch(`${g.appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}&cv=2`, { headers: { "X-App-Token": g.APP_TOKEN } });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `No snapshot for ${dateStr}`);
@@ -443,7 +446,8 @@
     this.updateSaveButtonState();
 
     try {
-      const resp = await fetch(`${g.appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}`, { headers: { "X-App-Token": g.APP_TOKEN } });
+      // cv=2: cache-buster, see loadSnapshotForDate above.
+      const resp = await fetch(`${g.appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}&cv=2`, { headers: { "X-App-Token": g.APP_TOKEN } });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `HTTP ${resp.status}`);
