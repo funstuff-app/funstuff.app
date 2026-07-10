@@ -170,14 +170,6 @@
     const PA_FADE_TAIL = 0.20;
     const paFadeStart = PA_FADE_MS * (1.0 - PA_FADE_TAIL);
 
-    const paLatLons = [];
-    for (const f of fixed) {
-      if (!f || !f.purpleair) continue;
-      const lat = Number(f.lat);
-      const lon = Number(f.lon);
-      if (isFinite(lat) && isFinite(lon)) paLatLons.push(lat, lon);
-    }
-
     const sensors = [];
     const _fixedSlot = new Map();  // overlapping non-PA fixed dedup: slotKey -> {idx, tMs}
     let fingerprint = "";
@@ -190,19 +182,12 @@
       if (lat < _UT_MIN_LAT || lat > _UT_MAX_LAT || lon < _UT_MIN_LON || lon > _UT_MAX_LON) continue;
 
       if (isPm25) {
-        // PM2.5 mode: PurpleAir + nearby non-PA fixed (original behavior)
-        if (!f.purpleair) {
-          let nearPA = false;
-          for (let pi = 0; pi < paLatLons.length; pi += 2) {
-            const dlat = lat - paLatLons[pi];
-            const dlon = lon - paLatLons[pi + 1];
-            if (dlat * dlat + dlon * dlon < _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG * _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG) {
-              nearPA = true;
-              break;
-            }
-          }
-          if (!nearPA) continue;
-        }
+        // PM2.5 mode: PurpleAir + ALL non-PA fixed stations. An earlier
+        // near-PA gate dropped fixed stations with no PurpleAir neighbor,
+        // so a DAQ station with a real PM2.5 reading painted NO field —
+        // everywhere on installs without a PurpleAir key, and in the west
+        // desert on prod. Fixed stations feed every other pollutant's
+        // field unconditionally; PM2.5 is no different.
       } else {
         // Non-PM2.5 mode: only non-PurpleAir fixed sensors (ghost markers)
         if (f.purpleair) continue;
