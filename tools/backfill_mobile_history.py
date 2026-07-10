@@ -457,23 +457,27 @@ def _fixed_template(conn: sqlite3.Connection, snapshots_dir: Path,
     return []
 
 
-def build_fixed_from_readings(
-    conn: sqlite3.Connection,
-    date_str: str,
-    template: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Rebuild fixed-sensor entries for a day from the readings table.
+def _num(v: Any) -> Any:
+    try:
+        f = float(v)
+        return int(f) if f == int(f) else f
+    except (TypeError, ValueError):
+        return None
 
-    Identity comes from the template; per-pollutant value/history arrays are
-    reconstructed exactly like load_fixed_history + _inject_fixed_history do
-    (meta.time_utc is the measurement time; color -> hci via color_to_idx).
+
+def _collect_fixed_day_entries(
+    conn: sqlite3.Connection, date_str: str,
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    """{sensor_id: {pollutant: [entries]}} from readings, windowed + sorted.
+
+    Entry shape mirrors load_fixed_history: meta.time_utc is the measurement
+    time; one entry per measurement time (freshest write wins).
     """
     start_ms, end_ms = day_window_ms(date_str)
-    start_s, end_s = start_ms / 1000.0, end_ms / 1000.0
     rows = conn.execute(
         "SELECT sensor_id, pollutant, value, color, ts, meta FROM readings "
         "WHERE source != 'mobile' AND ts >= ? AND ts < ? ORDER BY ts",
-        (start_s, end_s)).fetchall()
+        (start_ms / 1000.0, end_ms / 1000.0)).fetchall()
 
     hist: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for sensor_id, pollutant, value, color, ts, meta_raw in rows:
@@ -486,20 +490,62 @@ def build_fixed_from_readings(
         if not time_utc:
             continue
         entries = hist.setdefault(sensor_id, {}).setdefault(pollutant, [])
-        # Upstream re-reports the same measurement across polls; keep one
-        # entry per measurement time (the freshest write wins).
         if entries and entries[-1]["time"] == time_utc:
             entries[-1].update(val=value, color=color, recorded_at=ts)
         else:
             entries.append({"val": value, "color": color,
                             "time": time_utc, "recorded_at": ts})
 
-    def _num(v: Any) -> Any:
-        try:
-            f = float(v)
-            return int(f) if f == int(f) else f
-        except (TypeError, ValueError):
-            return None
+    for pols in hist.values():
+        for pol, entries in pols.items():
+            kept = []
+            for e in entries:
+                dt = parse_utc_timestamp(e.get("time") or "")
+                if dt is None:
+                    continue
+                ms = dt.timestamp() * 1000
+                if start_ms <= ms < end_ms:
+                    e["_ms"] = ms
+                    kept.append(e)
+            kept.sort(key=lambda e: e["_ms"])
+            pols[pol] = kept
+    return hist
+
+
+def _reading_from_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    values = [_num(e["val"]) for e in entries]
+    colors = [e.get("color") or "#cccccc" for e in entries]
+    return {
+        "value": values[-1],
+        "ci": color_to_idx(colors[-1]),
+        "history": values,
+        "hci": [color_to_idx(c) for c in colors],
+        "history_colors": colors,
+        "history_times": [e["time"] for e in entries],
+    }
+
+
+def _apply_worst(entry: dict[str, Any]) -> None:
+    worst = _pick_worst_reading_by_aqi(entry.get("readings") or {})
+    entry["ci"] = worst.get("ci") or 0
+    entry["pci"] = worst.get("ci")
+    entry["primary_key"] = worst.get("key")
+    entry["primary_value"] = worst.get("value")
+    entry["primary_aqi"] = worst.get("aqi")
+
+
+def build_fixed_from_readings(
+    conn: sqlite3.Connection,
+    date_str: str,
+    template: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Rebuild fixed-sensor entries for a day from the readings table.
+
+    Identity comes from the template; per-pollutant value/history arrays are
+    reconstructed exactly like load_fixed_history + _inject_fixed_history do
+    (meta.time_utc is the measurement time; color -> hci via color_to_idx).
+    """
+    hist = _collect_fixed_day_entries(conn, date_str)
 
     fixed_out: list[dict[str, Any]] = []
     for tmpl in template:
@@ -508,25 +554,9 @@ def build_fixed_from_readings(
             continue
         readings: dict[str, Any] = {}
         for pol, entries in hist[sid].items():
-            if pol in _WEATHER_KEYS:
+            if pol in _WEATHER_KEYS or not entries:
                 continue
-            entries = [e for e in entries if e.get("time")]
-            entries = [e for e in entries
-                       if (dt := parse_utc_timestamp(e["time"])) is not None
-                       and start_ms <= dt.timestamp() * 1000 < end_ms]
-            if not entries:
-                continue
-            entries.sort(key=lambda e: parse_utc_timestamp(e["time"]).timestamp())
-            values = [_num(e["val"]) for e in entries]
-            colors = [e.get("color") or "#cccccc" for e in entries]
-            readings[pol] = {
-                "value": values[-1],
-                "ci": color_to_idx(colors[-1]),
-                "history": values,
-                "hci": [color_to_idx(c) for c in colors],
-                "history_colors": colors,
-                "history_times": [e["time"] for e in entries],
-            }
+            readings[pol] = _reading_from_entries(entries)
         if not readings:
             continue
         entry = {
@@ -547,14 +577,92 @@ def build_fixed_from_readings(
                  for e in es), default=None)
             if last_rec:
                 entry["last_seen"] = last_rec
-        worst = _pick_worst_reading_by_aqi(readings)
-        entry["ci"] = worst.get("ci") or 0
-        entry["pci"] = worst.get("ci")
-        entry["primary_key"] = worst.get("key")
-        entry["primary_value"] = worst.get("value")
-        entry["primary_aqi"] = worst.get("aqi")
+        _apply_worst(entry)
         fixed_out.append(entry)
     return fixed_out
+
+
+def repair_fixed_histories(
+    conn: sqlite3.Connection,
+    date_str: str,
+    state: dict[str, Any],
+    snapshots_dir: Path,
+) -> dict[str, int]:
+    """Complete truncated fixed-sensor histories in an EXISTING snapshot.
+
+    A snapshot saved mid-day (e.g. the server stopped saving during the
+    Jul 2026 outage) freezes every fixed sensor at its last written reading,
+    so playback shows that value for the rest of the day. The readings table
+    has the full day: union each sensor's stored history with the DB rows
+    per pollutant (DB wins on the same measurement time), refresh the
+    current value/ci, and add sensors the stored snapshot is missing.
+    Stored-only entries are never dropped.
+    """
+    hist = _collect_fixed_day_entries(conn, date_str)
+    fixed = state.get("fixed")
+    if not isinstance(fixed, list):
+        fixed = state["fixed"] = []
+    by_id = {f.get("id"): f for f in fixed if isinstance(f, dict)}
+
+    stats = {"sensors_extended": 0, "entries_added": 0, "sensors_added": 0}
+    for sid, pols in hist.items():
+        entry = by_id.get(sid)
+        if entry is None:
+            continue
+        readings = entry.get("readings")
+        if not isinstance(readings, dict):
+            readings = entry["readings"] = {}
+        entry_changed = False
+        for pol, db_entries in pols.items():
+            if pol in _WEATHER_KEYS or not db_entries:
+                continue
+            reading = readings.get(pol)
+            if not isinstance(reading, dict):
+                reading = readings[pol] = {}
+            stored_times = reading.get("history_times") or []
+            stored_vals = reading.get("history") or []
+            stored_hci = reading.get("hci") or []
+            stored_cols = reading.get("history_colors") or []
+            merged: dict[str, tuple[Any, Any, Any]] = {}
+            for i, t in enumerate(stored_times):
+                if not isinstance(t, str):
+                    continue
+                merged[t] = (
+                    stored_vals[i] if i < len(stored_vals) else None,
+                    stored_hci[i] if i < len(stored_hci) else 0,
+                    stored_cols[i] if i < len(stored_cols) else "#cccccc",
+                )
+            before = len(merged)
+            for e in db_entries:
+                c = e.get("color") or "#cccccc"
+                merged[e["time"]] = (_num(e["val"]), color_to_idx(c), c)
+            if len(merged) == before:
+                continue
+            times = sorted(
+                merged,
+                key=lambda t: (parse_utc_timestamp(t) or datetime.min.replace(
+                    tzinfo=timezone.utc)).timestamp())
+            reading["history"] = [merged[t][0] for t in times]
+            reading["hci"] = [merged[t][1] for t in times]
+            reading["history_colors"] = [merged[t][2] for t in times]
+            reading["history_times"] = times
+            reading["value"] = merged[times[-1]][0]
+            reading["ci"] = merged[times[-1]][1]
+            stats["entries_added"] += len(merged) - before
+            entry_changed = True
+        if entry_changed:
+            _apply_worst(entry)
+            stats["sensors_extended"] += 1
+
+    missing = [sid for sid in hist if sid not in by_id]
+    if missing:
+        template = _fixed_template(conn, snapshots_dir, date_str)
+        tmpl_by_id = {t.get("id"): t for t in template if isinstance(t, dict)}
+        buildable = [tmpl_by_id[sid] for sid in missing if sid in tmpl_by_id]
+        for entry in build_fixed_from_readings(conn, date_str, buildable):
+            fixed.append(entry)
+            stats["sensors_added"] += 1
+    return stats
 
 
 # ── readings-table archival inserts ──────────────────────────────────────────
@@ -722,6 +830,12 @@ def cmd_patch(args: argparse.Namespace) -> int:
                 new_state = existing
                 new_state["mobile"] = merged
                 new_state.setdefault("meta", {})["backfilled"] = True
+                if not args.no_fixed_repair:
+                    fstats = repair_fixed_histories(conn, date_str, new_state,
+                                                    snapshots_dir)
+                    _log(f"  [fixed] repaired: {fstats['sensors_extended']} sensors "
+                         f"extended (+{fstats['entries_added']} history entries), "
+                         f"{fstats['sensors_added']} sensors added")
 
             for sid in sorted(stats):
                 s = stats[sid]
@@ -784,6 +898,8 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-readings", action="store_true",
                    help="skip archival inserts into the readings table")
+    p.add_argument("--no-fixed-repair", action="store_true",
+                   help="skip completing truncated fixed histories from the readings table")
 
     r = sub.add_parser("report", help="per-hour trail coverage of stored snapshots")
     r.add_argument("--db", required=True)
