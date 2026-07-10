@@ -105,9 +105,14 @@
   const _LEGEND_TAB_FIELD_SPREAD = {
     pm25: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
     pm10: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
+    // Gases (o3, no2, co) mix regionally instead of clustering like
+    // particulates, so they render through the gradient model: regional
+    // baseline + elevated-only station residuals, coverage-bounded at the
+    // network edge. Each gas keeps its OWN entry so its parameters tune
+    // independently.
     o3:   { gradient: true, sigmaMult: 2.4, cutMult: 1.8, covSigmaMult: 1.4, coverageRef: 0.15, residualFrac: 0.05, neighborBlend: 0 },
-    no2:  { sigmaMult: 1.3,  cutMult: 1.2, neighborBlend: 0.3 },
-    co:   { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
+    no2:  { gradient: true, sigmaMult: 2.4, cutMult: 1.8, covSigmaMult: 1.4, coverageRef: 0.15, residualFrac: 0.05, neighborBlend: 0 },
+    co:   { gradient: true, sigmaMult: 2.4, cutMult: 1.8, covSigmaMult: 1.4, coverageRef: 0.15, residualFrac: 0.05, neighborBlend: 0 },
   };
   /** Pollutants composited in "no selection" max-mode field (one kernel each). */
   // Max-mode field groups. Particulates (PM2.5 + PM10) form ONE field: same

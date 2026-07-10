@@ -204,14 +204,20 @@
             pf._ensurePaField(state, pbMs);
             return stats(map._paFieldCanvas);
           };
-          const withMobile = compute("o3", st);
-          const noMobile = compute("o3", Object.assign({}, st, { mobile: [] }));
-          if (withMobile.painted === 0 && noMobile.painted === 0) {
-            check("o3 gradient field ignores mobile sensors (SKIPPED: no o3 field in view)", true);
-          } else {
-            check("o3 gradient field ignores mobile sensors",
-              withMobile.hash === noMobile.hash,
-              `with=${withMobile.hash} without=${noMobile.hash}`);
+          // Every gradient pollutant (from the spread table) must ignore
+          // mobile sensors — covers o3, no2, and any gas added later.
+          const spreadTbl = (window.FieldSensors && window.FieldSensors._LEGEND_TAB_FIELD_SPREAD) || {};
+          const gradTabs = Object.keys(spreadTbl).filter((t) => spreadTbl[t] && spreadTbl[t].gradient);
+          for (const gt of gradTabs) {
+            const withMobile = compute(gt, st);
+            const noMobile = compute(gt, Object.assign({}, st, { mobile: [] }));
+            if (withMobile.painted === 0 && noMobile.painted === 0) {
+              check(`${gt} gradient field ignores mobile sensors (SKIPPED: no ${gt} field in view)`, true);
+            } else {
+              check(`${gt} gradient field ignores mobile sensors`,
+                withMobile.hash === noMobile.hash,
+                `with=${withMobile.hash} without=${noMobile.hash}`);
+            }
           }
 
           // Max-mode coverage: a gradient pollutant's broad surface must
