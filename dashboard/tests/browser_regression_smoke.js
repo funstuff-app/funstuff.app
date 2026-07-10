@@ -214,15 +214,13 @@
               `with=${withMobile.hash} without=${noMobile.hash}`);
           }
 
-          // Max-mode parity: a gradient pollutant must render the SAME
-          // surface whether its tab is selected or not (max mode used to run
-          // o3 through the unscaled default kernel, collapsing the regional
-          // field to a small ring per station). Strip the state to non-PA
-          // fixed sensors so o3 dominates every covered cell, then compare
-          // coverage between the o3 tab and max mode. Asserted on coverage,
-          // not bit-identity: a legitimate no2/co spike above o3 may
-          // re-color cells without being a regression (identity is still
-          // reported in the detail).
+          // Max-mode coverage: a gradient pollutant's broad surface must
+          // carry into max mode (it used to run through the unscaled default
+          // kernel, collapsing the regional field to a small ring per
+          // station). Strip the state to non-PA fixed sensors so o3 is the
+          // only broad field, then compare painted coverage between the o3
+          // tab and max mode. Coverage only — values legitimately differ
+          // where other pollutants win their contest cells.
           const stripped = Object.assign({}, st, {
             mobile: [],
             fixed: (st.fixed || []).filter((f) => f && !f.purpleair),
@@ -230,12 +228,29 @@
           const o3Solo = compute("o3", stripped);
           const maxSolo = compute(null, stripped);
           if (o3Solo.painted === 0) {
-            check("gradient (o3) field renders identically in max mode (SKIPPED: no o3 coverage in view)", true);
+            check("gradient (o3) field coverage carries into max mode (SKIPPED: no o3 coverage in view)", true);
           } else {
             const ratio = maxSolo.painted / o3Solo.painted;
-            check("gradient (o3) field renders identically in max mode",
-              ratio >= 0.95 && ratio <= 1.05,
-              `coverage ratio ${ratio.toFixed(3)}, bitIdentical=${o3Solo.hash === maxSolo.hash}`);
+            check("gradient (o3) field coverage carries into max mode",
+              ratio >= 0.95,
+              `coverage ratio ${ratio.toFixed(3)}`);
+          }
+
+          // Max-mode locality: the gradient's regional surface is an
+          // ESTIMATE and must only FILL unclaimed cells — never bury another
+          // pollutant's measured local field by out-scoring it cell-by-cell
+          // (a valley-wide ozone wash once erased the entire PurpleAir PM2.5
+          // field this way). With the full state, max mode must therefore
+          // differ from the pure o3 tab whenever a PM2.5 field exists.
+          const pm25Full = compute("pm25", Object.assign({}, st, { mobile: [] }));
+          if (pm25Full.painted === 0) {
+            check("max-mode fill does not bury the PM2.5 field (SKIPPED: no fixed PM2.5 field in view)", true);
+          } else {
+            const o3Full = compute("o3", st);
+            const maxFull = compute(null, st);
+            check("max-mode fill does not bury the PM2.5 field",
+              maxFull.hash !== o3Full.hash,
+              `max=${maxFull.hash} o3=${o3Full.hash} pm25painted=${pm25Full.painted}`);
           }
 
           map.setPaFieldPollutant(prevTab);
