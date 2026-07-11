@@ -1145,6 +1145,34 @@
           outCov[cell] = covSum;
         }
       }
+      // Station stamp: cells within ~2 cells of a station take its EXACT
+      // reading. The Cauchy blur that follows mixes small plateaus into
+      // their surroundings, so a boundary-exact reading (71 ppb ozone =
+      // AQI 101.0, the first orange value) lost its band to dilution and
+      // rendered yellow until the reading climbed clear of the edge. A
+      // stamp of blur-radius size keeps its center exact through the blur,
+      // so the marker always sits on its true band color; interpolation
+      // continues untouched outside the stamp. Overlapping stamps (only
+      // possible at far zoom) resolve to the highest reading — worst-wins.
+      {
+        const stampR = 2;
+        for (let i = 0; i < n; i++) {
+          const vi = sensors[i * 5 + 2];
+          const scx = Math.floor(sensors[i * 5] / cellSize);
+          const scy = Math.floor(sensors[i * 5 + 1] / cellSize);
+          for (let dy = -stampR; dy <= stampR; dy++) {
+            const gy2 = scy + dy;
+            if (gy2 < 0 || gy2 >= gh) continue;
+            for (let dx = -stampR; dx <= stampR; dx++) {
+              const gx2 = scx + dx;
+              if (gx2 < 0 || gx2 >= gw) continue;
+              if (dx * dx + dy * dy > stampR * stampR + 0.1) continue;
+              const c2 = gy2 * gw + gx2;
+              if (vi > outAqi[c2] || (dx === 0 && dy === 0)) outAqi[c2] = vi;
+            }
+          }
+        }
+      }
     }
 
     /** Max-mode field: render EACH pollutant's own field independently
