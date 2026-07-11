@@ -266,15 +266,16 @@
       }
     }
 
-    // STACKED fixed stations (co-located within ~600 m, e.g. Viewmont +
-    // Bountiful, or QUURB + MTMET sharing a DAQ site): conflicting readings
-    // almost on top of each other force the exactness layer to honor both,
-    // carving steep gradients and shadow rings between their halos. The
-    // HIGHEST current reading wins the stack — worst-wins, the same contract
-    // as max mode. Field input only; every marker still renders.
+    // STACKED fixed stations (within ~2 km, e.g. Viewmont + Bountiful at
+    // ~1.2 km, or QUURB + MTMET sharing a DAQ site): conflicting readings
+    // that close force the exactness layer to honor both, carving steep
+    // gradients and shadow rings between their halos. The HIGHEST current
+    // reading wins the stack — worst-wins, the same contract as max mode.
+    // Genuinely distinct sites (Ogden vs North Ogden, ~4 km) stay separate.
+    // Field input only; every marker still renders.
     if (_fixedSlot.size > 1) {
       const _sp0 = g.latLonToWorld(40.7, -111.9, zoom);
-      const _sp1 = g.latLonToWorld(40.7, -111.894, zoom);
+      const _sp1 = g.latLonToWorld(40.7, -111.876, zoom);
       const _sdx = _sp1.x - _sp0.x;
       const stackRSq = _sdx * _sdx;
       const idxs = [..._fixedSlot.keys()];
