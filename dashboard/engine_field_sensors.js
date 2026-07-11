@@ -176,7 +176,7 @@
     const paFadeStart = PA_FADE_MS * (1.0 - PA_FADE_TAIL);
 
     const sensors = [];
-    const _fixedSlot = new Map();  // overlapping non-PA fixed dedup: slotKey -> {idx, tMs}
+    const _fixedSlot = new Map();  // sensors[] indices of non-PA fixed (stack-merge candidates)
     let fingerprint = "";
     for (const f of fixed) {
       if (!f) continue;
@@ -261,24 +261,41 @@
         // PurpleAir are server-thinned (~1 per 500 m) so they don't overlap.
         sensors.push(cand);
       } else {
-        // Overlapping FIXED sensors (literally co-located, e.g. QUURB + MTMET at
-        // the same DAQ site): the field must be fed by the MOST RECENTLY updated
-        // one, not an averaged blend of fresh + stale. Same idea as the mobile
-        // ghost dedup — one sensor per fine spatial slot, freshest reading wins.
-        // ~22 m grid so only truly co-located instruments merge, never distinct
-        // sites. If the fresh sensor goes offline its time stops advancing and
-        // the other naturally takes over on the next update.
-        const slotKey = ((lat * 5000) | 0) + "," + ((lon * 5000) | 0);
-        const candTMs = (tMs != null && isFinite(tMs)) ? tMs : -Infinity;
-        const ex = _fixedSlot.get(slotKey);
-        if (ex === undefined) {
-          sensors.push(cand);
-          _fixedSlot.set(slotKey, { idx: sensors.length - 1, tMs: candTMs });
-        } else if (candTMs > ex.tMs) {
-          sensors[ex.idx] = cand;  // newer co-located sensor replaces the stale one
-          ex.tMs = candTMs;
+        _fixedSlot.set(sensors.length, true);  // stack-merge candidate
+        sensors.push(cand);
+      }
+    }
+
+    // STACKED fixed stations (co-located within ~600 m, e.g. Viewmont +
+    // Bountiful, or QUURB + MTMET sharing a DAQ site): conflicting readings
+    // almost on top of each other force the exactness layer to honor both,
+    // carving steep gradients and shadow rings between their halos. The
+    // HIGHEST current reading wins the stack — worst-wins, the same contract
+    // as max mode. Field input only; every marker still renders.
+    if (_fixedSlot.size > 1) {
+      const _sp0 = g.latLonToWorld(40.7, -111.9, zoom);
+      const _sp1 = g.latLonToWorld(40.7, -111.894, zoom);
+      const _sdx = _sp1.x - _sp0.x;
+      const stackRSq = _sdx * _sdx;
+      const idxs = [..._fixedSlot.keys()];
+      const dropped = new Set();
+      const aqiOf = (s) => (s.aqi != null && isFinite(s.aqi)) ? s.aqi : (g.valueToAqi(aqiKey, s.value) ?? 0);
+      for (let a = 0; a < idxs.length; a++) {
+        if (dropped.has(idxs[a])) continue;
+        for (let b = a + 1; b < idxs.length; b++) {
+          if (dropped.has(idxs[b])) continue;
+          const sa = sensors[idxs[a]], sb = sensors[idxs[b]];
+          const dx = sa.sx - sb.sx, dy = sa.sy - sb.sy;
+          if (dx * dx + dy * dy > stackRSq) continue;
+          dropped.add(aqiOf(sa) >= aqiOf(sb) ? idxs[b] : idxs[a]);
+          if (dropped.has(idxs[a])) break;
         }
-        // else: older co-located sensor — drop it (the fresher one is kept)
+      }
+      if (dropped.size) {
+        const kept = [];
+        for (let i = 0; i < sensors.length; i++) if (!dropped.has(i)) kept.push(sensors[i]);
+        sensors.length = 0;
+        sensors.push(...kept);
       }
     }
 
