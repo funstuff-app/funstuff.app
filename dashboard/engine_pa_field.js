@@ -1083,7 +1083,8 @@
         for (let j = 0; j < n; j++) {
           const dx = sensors[j * 5] - xi;
           const dy = sensors[j * 5 + 1] - yi;
-          const w = sensors[j * 5 + 4] * Math.exp(-(dx * dx + dy * dy) / sensors[j * 5 + 3]);
+          const bq = (dx * dx + dy * dy) / sensors[j * 5 + 3];
+          const w = sensors[j * 5 + 4] / (1 + bq * bq);
           wSum += w;
           vSum += w * sensors[j * 5 + 2];
         }
@@ -1103,7 +1104,17 @@
             const dy = py  - sensors[i * 5 + 1];
             const d2 = dx * dx + dy * dy;
             const m = sensors[i * 5 + 4];
-            const w = m * Math.exp(-d2 / sensors[i * 5 + 3]);
+            // Inverse-quartic weights, NOT Gaussian: attribution between
+            // stations is decided by distance RATIOS (nearest dominates,
+            // ~16:1 at 1:2 distance), so a sensor-free region interpolates
+            // its CLOSEST stations' readings instead of collapsing to an
+            // equal-width mean where a far station counts like a near one.
+            // Ratios are also scale-free, so the between-station boundaries
+            // stay put as the viewport (and the px-scaled kernel width)
+            // changes with zoom — Gaussian ratios grew the far-station wash
+            // when zooming in.
+            const bq = d2 / sensors[i * 5 + 3];
+            const w = m / (1 + bq * bq);
             wSum += w;
             vSum += w * sensors[i * 5 + 2];
             const q = d2 / residRSq;
