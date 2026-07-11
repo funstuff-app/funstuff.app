@@ -1074,7 +1074,27 @@
      *  sensors: stride-5 [sx, sy, aqi, twoSigSq(baseline width), mult]. */
     _gradientGrid(sensors, gw, gh, cellSize, residRSq, covTwoSigmaSq, outAqi, outCov) {
       const n = sensors.length / 5;
-      // Per-station baseline (same wide kernel the per-cell pass uses, self
+      // Cluster-density equalization: in a plain weighted mean a dense
+      // cluster outvotes a nearby isolated station by sheer count, squeezing
+      // its influence to almost zero distance (an orange station beside ten
+      // yellow ones painted only its own stamp). Dividing each station's
+      // weight by the summed kernel of stations around it makes attribution
+      // a matter of DISTANCE, not of how many instruments a neighborhood
+      // installed. Values remain a normalized mean (bounded, interpolated,
+      // never summed) and station exactness is unchanged.
+      const dens = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        let s = 0;
+        const xi = sensors[i * 5], yi = sensors[i * 5 + 1];
+        for (let j = 0; j < n; j++) {
+          const dx = sensors[j * 5] - xi;
+          const dy = sensors[j * 5 + 1] - yi;
+          const dq = (dx * dx + dy * dy) / sensors[j * 5 + 3];
+          s += sensors[j * 5 + 4] / (1 + dq * dq);
+        }
+        dens[i] = s > 1e-9 ? s : 1;
+      }
+      // Per-station baseline (same kernel the per-cell pass uses, self
       // included so baseline(x_i) matches and exactness holds).
       const resid = new Float64Array(n);
       for (let i = 0; i < n; i++) {
@@ -1084,7 +1104,7 @@
           const dx = sensors[j * 5] - xi;
           const dy = sensors[j * 5 + 1] - yi;
           const bq = (dx * dx + dy * dy) / sensors[j * 5 + 3];
-          const w = sensors[j * 5 + 4] / (1 + bq * bq);
+          const w = (sensors[j * 5 + 4] / dens[j]) / (1 + bq * bq);
           wSum += w;
           vSum += w * sensors[j * 5 + 2];
         }
@@ -1112,9 +1132,10 @@
             // Ratios are also scale-free, so the between-station boundaries
             // stay put as the viewport (and the px-scaled kernel width)
             // changes with zoom — Gaussian ratios grew the far-station wash
-            // when zooming in.
+            // when zooming in. Divided by the station's cluster density —
+            // see the equalization note above.
             const bq = d2 / sensors[i * 5 + 3];
-            const w = m / (1 + bq * bq);
+            const w = (m / dens[i]) / (1 + bq * bq);
             wSum += w;
             vSum += w * sensors[i * 5 + 2];
             const q = d2 / residRSq;
