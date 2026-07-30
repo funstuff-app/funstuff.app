@@ -333,8 +333,6 @@
 
     // Match trail fade timing exactly
     const FADE_TIME_MS = isPlayback ? 45 * 60 * 1000 : 20 * 60 * 1000;
-    const FADE_TAIL_FRAC = 0.20;
-    const fadeStartAgeMs = FADE_TIME_MS * (1.0 - FADE_TAIL_FRAC);
 
     if (!refNowMs || !isFinite(refNowMs)) return { sensors: [], fingerprint: "" };
 
@@ -412,13 +410,17 @@
         const pollVal = Number(rawVal);
         if (!isFinite(pollVal) || pollVal < 0) continue;
 
-        // Decay weight: full for fresh, quadratic falloff in tail
-        let decayWeight = 1.0;
-        if (ageMs > fadeStartAgeMs) {
-          const u = (ageMs - fadeStartAgeMs) / (FADE_TIME_MS - fadeStartAgeMs);
-          decayWeight = (1 - u) * (1 - u);
-          if (decayWeight <= 0.01) continue;
-        }
+        // Decay weight: quadratic falloff applied from age 0, so the LATEST
+        // reading carries the most weight and older ones progressively less.
+        // This used to be a flat 1.0 until fadeStartAgeMs (80% of the window),
+        // which made a 15-minute-old reading count exactly as much as one that
+        // just landed — the newest reading was one equal voice among ~16 min of
+        // ties, so a fresh value could not move the field until the old points
+        // aged out (the poll interval PLUS the trail decay). Same curve, same
+        // window, same rate for every reading; it just starts at age 0.
+        const fadeU = ageMs / FADE_TIME_MS;
+        const decayWeight = (1 - fadeU) * (1 - fadeU);
+        if (decayWeight <= 0.01) continue;
 
         // Spatial dedup: 1 sensor per ~220m cell. Newest-first → skip if slot taken.
         // Reduced to half for performance diagnostics
