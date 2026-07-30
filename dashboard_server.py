@@ -2341,9 +2341,21 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                     trail = m.get("trail", [])
                     if not sid or not trail:
                         continue
-                    new_pts = [p for p in trail
-                               if isinstance(p, dict) and isinstance(p.get("t"), (int, float))
-                               and p["t"] >= start_ms]
+                    # Trail point "t" is a UTC STRING ("2026-07-30 22:10:30 UTC"),
+                    # never a number, so the old isinstance(t, (int, float))
+                    # guard was False for every point: new_pts was always empty
+                    # and trail_new was NEVER sent. SSE clients got the mobile
+                    # summary (marker jumps to the new reading at once) but no
+                    # trail points, so the trail — and the field built from it —
+                    # only refreshed on the client's own full poll. _point_ms
+                    # parses the string form the rest of this file uses.
+                    new_pts = []
+                    for p in trail:
+                        if not isinstance(p, dict):
+                            continue
+                        p_ms = _point_ms(p)
+                        if p_ms is not None and p_ms >= start_ms:
+                            new_pts.append(p)
                     if new_pts:
                         new_trails[sid] = new_pts
                 if new_trails:
