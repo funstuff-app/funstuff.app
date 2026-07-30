@@ -1636,7 +1636,6 @@ function main() {
   // started — a scrub while paused stays paused (button keeps "Play").
   const _pbResumeFromScrub = (resetPerfToNow) => {
     applyScrub();
-    const wasActive = !!pb._pbResumeAfterScrub;
     pb._pbResumeAfterScrub = false;
     // "Released at the edge" is measured against the DATA edge, not the
     // wall-clock max — scrubs are clamped to the data edge (applyScrub), and
@@ -1653,13 +1652,14 @@ function main() {
       const bb = map.getPlaybackBounds();
       if (isFinite(bb.maxMs)) map.setPlaybackTimeMs(bb.maxMs);
     }
-    if (goLive || wasActive) {
-      map.setPlaybackPlaying(true);
-      pb._pbLastPerf = resetPerfToNow ? performance.now() : 0;
-      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-    } else {
-      map.setPlaybackPlaying(false);
-    }
+    // Releasing the scrub ALWAYS resumes playback from the release point —
+    // matching the trackpad wheel path, which always resumes after its coast
+    // decays. The old gate (resume only if playback was active when the drag
+    // began) made a scrub release park paused, so rewinding by drag ended in
+    // a dead stop while the identical wheel gesture kept playing.
+    map.setPlaybackPlaying(true);
+    pb._pbLastPerf = resetPerfToNow ? performance.now() : 0;
+    if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
     updatePlaybackUi();
   };
 
@@ -1976,8 +1976,8 @@ function main() {
       pb._pbDidDrag = false; // track if user actually dragged
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
-      // Remember whether playback was active so release can restore it —
-      // a scrub started while paused stays paused (button keeps "Play").
+      _scrubTouchVel = 0;
+      _scrubVelSamples = 0;
       pb._pbResumeAfterScrub = map.getPlaybackPlaying() || map._playbackLiveFollow;
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false; // exit live mode when user grabs slider
@@ -2006,8 +2006,15 @@ function main() {
       const newVal = clamp(_scrubPointerStartVal + delta, Number(pbScrubEl.min), Number(pbScrubEl.max));
       pbScrubEl.value = String(newVal);
       pb._pbDidDrag = true;
+      const _pNow = performance.now();
+      const _pDt = _pNow - _pbLastScrubTime;
+      if (_pDt > 0 && _pDt < 100) {
+        const inst = (newVal - _pbLastScrubPos) / _pDt;
+        _scrubTouchVel = (_scrubTouchVel === 0) ? inst : (_scrubTouchVel * 0.4 + inst * 0.6);
+        _scrubVelSamples++;
+      }
       _pbLastScrubPos = newVal;
-      _pbLastScrubTime = performance.now();
+      _pbLastScrubTime = _pNow;
       if (!_getScrubRAF()) {
         _setScrubRAF(requestAnimationFrame(() => {
           _setScrubRAF(0);
@@ -2024,10 +2031,17 @@ function main() {
       _scrubPointerOnTrack = false;
       _scrubPointerStartX = null;
       _scrubPointerStartVal = null;
+      // Cancel any pending applyScrub rAF: letting it run after release can
+      // interleave with the resume below (same fix touchend already has).
+      if (_getScrubRAF()) { cancelAnimationFrame(_getScrubRAF()); _setScrubRAF(0); }
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
       pb._pbScrubbing = false;
       map._scrubbing = false;
+      const _pFling = _scrubTouchVel;
+      const _pFlingSamples = _scrubVelSamples;
+      _scrubTouchVel = 0;
+      _scrubVelSamples = 0;
       pb._pbVelocity = 0;
       pb._pbPageAutoFollow = true; // resume auto-following after manual scrub
 
@@ -2056,6 +2070,26 @@ function main() {
         }
       }
 
+      // Fling: same coasting handoff as the wheel/trackpad path (and the
+      // touchend fling below) — friction decays the velocity, then playback
+      // resumes forward automatically. Requires >= 2 velocity samples (one
+      // big-delta input event is a jump, not a gesture) and caps the speed
+      // at the visible range per second.
+      const _pCap = (Number(pbScrubEl.max) || 1) / 1000;
+      const _pV = clamp(_pFling, -_pCap, _pCap);
+      if (_pFlingSamples >= 2 && Math.abs(_pV) > _pbVelocityThreshold) {
+        pb._pbIsWheelCoasting = true;
+        pb._pbCommitLoopStartOnCoastEnd = true;
+        pb._pbVelocity = _pV;
+        map.setPlaybackPlaying(false);
+        map._playbackLiveFollow = false;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
+        pb._pbLastPerf = performance.now();
+        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
+        updatePlaybackUi();
+        return;
+      }
+
       _pbResumeFromScrub(true);
 
     });
@@ -2066,10 +2100,20 @@ function main() {
 
       // User is dragging
       pb._pbDidDrag = true;
+      const _iDt = now - _pbLastScrubTime;
+      if (_iDt > 0 && _iDt < 100) {
+        const inst = (pos - _pbLastScrubPos) / _iDt;
+        _scrubTouchVel = (_scrubTouchVel === 0) ? inst : (_scrubTouchVel * 0.4 + inst * 0.6);
+        _scrubVelSamples++;
+      }
       _pbLastScrubPos = pos;
       _pbLastScrubTime = now;
 
-      map.setPlaybackPlaying(false);
+      // Only pause while the scrub is actually held. Browsers can deliver a
+      // trailing input event AFTER pointerup commits the final value — an
+      // unconditional pause here re-paused playback right after the release
+      // handler resumed it (the intermittent stuck-pause on release).
+      if (pb._pbScrubbing) map.setPlaybackPlaying(false);
       // Coalesce rapid input events into a single rAF to avoid
       // overwhelming iPad Safari with drawOverlay() calls
       if (!_getScrubRAF()) {
@@ -2162,6 +2206,15 @@ function main() {
     let _scrubTouchRawTarget = null;
     let _scrubTouchOnThumb = false;
     const _scrubTouchSensitivity = 0.3;
+    // Fling velocity (timeline ms per wall ms) sampled during scrub moves
+    // (touchmove, pointermove, input), so release can hand it to the same
+    // coasting physics the wheel/trackpad path uses. _pbLastScrubPos/
+    // _pbLastScrubTime were already being written on every move but nothing
+    // ever derived a velocity from them. A fling needs >= 2 samples: a single
+    // big-delta input event (a click far along the track) is a jump, not a
+    // gesture, and its instantaneous "velocity" is garbage.
+    let _scrubTouchVel = 0;
+    let _scrubVelSamples = 0;
 
     pbScrubEl.addEventListener("touchstart", (e) => {
       e.preventDefault();  // stop native 1:1 range tracking
@@ -2188,6 +2241,8 @@ function main() {
       pb._pbDidDrag = false;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
+      _scrubTouchVel = 0;
+      _scrubVelSamples = 0;
       pb._pbResumeAfterScrub = map.getPlaybackPlaying() || map._playbackLiveFollow;
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false;
@@ -2213,8 +2268,17 @@ function main() {
       _scrubTouchRawTarget = _scrubTouchStartVal + delta;
       pbScrubEl.value = String(clamp(_scrubTouchRawTarget, Number(pbScrubEl.min), Number(pbScrubEl.max)));
       pb._pbDidDrag = true;
+      const _tNow = performance.now();
+      const _tDt = _tNow - _pbLastScrubTime;
+      const _tDv = Number(pbScrubEl.value) - _pbLastScrubPos;
+      if (_tDt > 0 && _tDt < 100) {
+        // Light smoothing so one jittery sample can't define the fling.
+        const inst = _tDv / _tDt;
+        _scrubTouchVel = (_scrubTouchVel === 0) ? inst : (_scrubTouchVel * 0.4 + inst * 0.6);
+        _scrubVelSamples++;
+      }
       _pbLastScrubPos = Number(pbScrubEl.value);
-      _pbLastScrubTime = performance.now();
+      _pbLastScrubTime = _tNow;
       if (!_getScrubRAF()) {
         _setScrubRAF(requestAnimationFrame(() => {
           _setScrubRAF(0);
@@ -2235,6 +2299,10 @@ function main() {
       _pbSnapWindowToPlayhead();
       pb._pbScrubbing = false;
       map._scrubbing = false;
+      const _fling = _scrubTouchVel;
+      const _flingSamples = _scrubVelSamples;
+      _scrubTouchVel = 0;
+      _scrubVelSamples = 0;
       pb._pbVelocity = 0;
       pb._pbPageAutoFollow = true;
 
@@ -2260,6 +2328,26 @@ function main() {
           map.drawOverlay(map.lastState);
           return;
         }
+      }
+
+      // Fling: hand the release velocity to the SAME coasting physics the
+      // wheel/trackpad path uses (playbackLoop's friction branch, which
+      // requires playing=false and resumes forward playback once the coast
+      // decays). Without this the release hard-zeroed the velocity, so a
+      // swipe stopped dead while the identical desktop gesture glided.
+      const _tCap = (Number(pbScrubEl.max) || 1) / 1000;
+      const _tV = clamp(_fling, -_tCap, _tCap);
+      if (_flingSamples >= 2 && Math.abs(_tV) > _pbVelocityThreshold) {
+        pb._pbIsWheelCoasting = true;
+        pb._pbCommitLoopStartOnCoastEnd = true;
+        pb._pbVelocity = _tV;
+        map.setPlaybackPlaying(false);
+        map._playbackLiveFollow = false;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
+        pb._pbLastPerf = performance.now();
+        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
+        updatePlaybackUi();
+        return;
       }
 
       _pbResumeFromScrub(true);

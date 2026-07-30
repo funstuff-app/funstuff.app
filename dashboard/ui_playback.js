@@ -988,11 +988,21 @@
           const rewindMinMs = (pb._pbIsRewinding && loopStartMs != null && isFinite(loopStartMs)) ? loopStartMs : b.minMs;
           nextMs = clamp(nextMs, rewindMinMs, b.maxMs);
 
-          // If we hit a bound, zero velocity (unless in active ease - let ease control it)
+          // Rewound INTO the start bound: resume forward playback from there
+          // instead of parking (unless in active ease - let ease control it).
+          // Parking here was the "pause on rewind" gate: the auto-rewind
+          // arrival block below already resumed forward, but it is gated on
+          // _pbIsRewinding, which is never set for a user rewind — so a
+          // backward coast/fling that reached the start died at velocity 0
+          // with playing=false and sat on the PAUSED shade.
           if (nextMs <= rewindMinMs && pb._pbVelocity < 0 && pb._pbEaseStartPerf == null) {
-            pb._pbVelocity = 0;
             pb._pbIsRewinding = false; // rewind complete
+            pb._pbIsWheelCoasting = false;
             nextMs = rewindMinMs;
+            pb._pbVelocity = _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1.0);
+            pb._pbAtEndSincePerf = null;
+            if (!map.getPlaybackPlaying()) map.setPlaybackPlaying(true);
+            updatePlaybackUi();
           }
           if (nextMs >= b.maxMs && pb._pbVelocity > 0) {
             pb._pbVelocity = 0;
