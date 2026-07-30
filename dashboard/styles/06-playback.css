@@ -56,10 +56,18 @@
   padding: 0 calc(64px + var(--space-2) - 28px);
   gap: 2px;
 }
-.pbRow2 .sep { opacity: 0.5; }
+.pbRow2 .sep { opacity: 0.5; flex: 0 0 auto; }
 #pbLeft, #pbNow, #pbRight {
   display: inline-block;
-  min-width: 10ch;
+  /* toLocaleTimeString() runs to 11 chars ("12:00:00 AM"); at the old 10ch
+     floor the flex row squeezed these below their text and the timestamp
+     wrapped to a second line, doubling the row height and shoving the whole
+     playback bar around. Size the floor to the longest string, never wrap,
+     and never shrink: the row height is then constant whatever the clock
+     reads. tabular-nums keeps the columns from jittering digit to digit. */
+  min-width: 11ch;
+  white-space: nowrap;
+  flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
 }
 #pbLeft { text-align: left; }
