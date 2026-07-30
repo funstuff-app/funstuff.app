@@ -1479,6 +1479,29 @@ function main() {
     if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
   }
 
+  // ── Refresh-resume ─────────────────────────────────────────────────────────
+  // A refresh always boots LIVE, with ONE exception: a lit server-sync ride
+  // (liveFollow + playing, position still inside the current poll window)
+  // resumes where it was. playbackLoop consumes the stash once real bounds
+  // exist and applies the eligibility check there; everything else — paused,
+  // rewound, historical, aged-out — leaves the live default untouched.
+  // Speed is persisted separately (mobileair.playbackSpeed) and unaffected.
+  try {
+    const _rawResume = localStorage.getItem("mobileair.pbResume");
+    localStorage.removeItem("mobileair.pbResume"); // one-shot
+    if (_rawResume) pb._pbPendingResume = JSON.parse(_rawResume);
+  } catch {}
+  window.addEventListener("pagehide", () => {
+    try {
+      localStorage.setItem("mobileair.pbResume", JSON.stringify({
+        t: map.getPlaybackTimeMs(),
+        playing: !!map.getPlaybackPlaying(),
+        live: !!map._playbackLiveFollow,
+        hist: !!map._historicalMode,
+      }));
+    } catch {}
+  });
+
   // Enter/refresh SERVER-SYNC mode: jump to the server-polling runway point
   // (data edge − predicted-seconds-to-next-poll × speed, corrected for wall
   // time already elapsed) and play forward, so the playhead reaches the edge
@@ -1613,7 +1636,6 @@ function main() {
   // started — a scrub while paused stays paused (button keeps "Play").
   const _pbResumeFromScrub = (resetPerfToNow) => {
     applyScrub();
-    const wasActive = !!pb._pbResumeAfterScrub;
     pb._pbResumeAfterScrub = false;
     // "Released at the edge" is measured against the DATA edge, not the
     // wall-clock max — scrubs are clamped to the data edge (applyScrub), and
@@ -1630,13 +1652,14 @@ function main() {
       const bb = map.getPlaybackBounds();
       if (isFinite(bb.maxMs)) map.setPlaybackTimeMs(bb.maxMs);
     }
-    if (goLive || wasActive) {
-      map.setPlaybackPlaying(true);
-      pb._pbLastPerf = resetPerfToNow ? performance.now() : 0;
-      if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
-    } else {
-      map.setPlaybackPlaying(false);
-    }
+    // Releasing the scrub ALWAYS resumes playback from the release point —
+    // matching the trackpad wheel path, which always resumes after its coast
+    // decays. The old gate (resume only if playback was active when the drag
+    // began) made a scrub release park paused, so rewinding by drag ended in
+    // a dead stop while the identical wheel gesture kept playing.
+    map.setPlaybackPlaying(true);
+    pb._pbLastPerf = resetPerfToNow ? performance.now() : 0;
+    if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
     updatePlaybackUi();
   };
 
@@ -1953,8 +1976,8 @@ function main() {
       pb._pbDidDrag = false; // track if user actually dragged
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
-      // Remember whether playback was active so release can restore it —
-      // a scrub started while paused stays paused (button keeps "Play").
+      _scrubTouchVel = 0;
+      _scrubVelSamples = 0;
       pb._pbResumeAfterScrub = map.getPlaybackPlaying() || map._playbackLiveFollow;
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false; // exit live mode when user grabs slider
@@ -1983,8 +2006,15 @@ function main() {
       const newVal = clamp(_scrubPointerStartVal + delta, Number(pbScrubEl.min), Number(pbScrubEl.max));
       pbScrubEl.value = String(newVal);
       pb._pbDidDrag = true;
+      const _pNow = performance.now();
+      const _pDt = _pNow - _pbLastScrubTime;
+      if (_pDt > 0 && _pDt < 100) {
+        const inst = (newVal - _pbLastScrubPos) / _pDt;
+        _scrubTouchVel = (_scrubTouchVel === 0) ? inst : (_scrubTouchVel * 0.4 + inst * 0.6);
+        _scrubVelSamples++;
+      }
       _pbLastScrubPos = newVal;
-      _pbLastScrubTime = performance.now();
+      _pbLastScrubTime = _pNow;
       if (!_getScrubRAF()) {
         _setScrubRAF(requestAnimationFrame(() => {
           _setScrubRAF(0);
@@ -2001,10 +2031,17 @@ function main() {
       _scrubPointerOnTrack = false;
       _scrubPointerStartX = null;
       _scrubPointerStartVal = null;
+      // Cancel any pending applyScrub rAF: letting it run after release can
+      // interleave with the resume below (same fix touchend already has).
+      if (_getScrubRAF()) { cancelAnimationFrame(_getScrubRAF()); _setScrubRAF(0); }
       _pbStopEdgeJog();
       _pbSnapWindowToPlayhead();
       pb._pbScrubbing = false;
       map._scrubbing = false;
+      const _pFling = _scrubTouchVel;
+      const _pFlingSamples = _scrubVelSamples;
+      _scrubTouchVel = 0;
+      _scrubVelSamples = 0;
       pb._pbVelocity = 0;
       pb._pbPageAutoFollow = true; // resume auto-following after manual scrub
 
@@ -2033,6 +2070,26 @@ function main() {
         }
       }
 
+      // Fling: same coasting handoff as the wheel/trackpad path (and the
+      // touchend fling below) — friction decays the velocity, then playback
+      // resumes forward automatically. Requires >= 2 velocity samples (one
+      // big-delta input event is a jump, not a gesture) and caps the speed
+      // at the visible range per second.
+      const _pCap = (Number(pbScrubEl.max) || 1) / 1000;
+      const _pV = clamp(_pFling, -_pCap, _pCap);
+      if (_pFlingSamples >= 2 && Math.abs(_pV) > _pbVelocityThreshold) {
+        pb._pbIsWheelCoasting = true;
+        pb._pbCommitLoopStartOnCoastEnd = true;
+        pb._pbVelocity = _pV;
+        map.setPlaybackPlaying(false);
+        map._playbackLiveFollow = false;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
+        pb._pbLastPerf = performance.now();
+        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
+        updatePlaybackUi();
+        return;
+      }
+
       _pbResumeFromScrub(true);
 
     });
@@ -2043,10 +2100,20 @@ function main() {
 
       // User is dragging
       pb._pbDidDrag = true;
+      const _iDt = now - _pbLastScrubTime;
+      if (_iDt > 0 && _iDt < 100) {
+        const inst = (pos - _pbLastScrubPos) / _iDt;
+        _scrubTouchVel = (_scrubTouchVel === 0) ? inst : (_scrubTouchVel * 0.4 + inst * 0.6);
+        _scrubVelSamples++;
+      }
       _pbLastScrubPos = pos;
       _pbLastScrubTime = now;
 
-      map.setPlaybackPlaying(false);
+      // Only pause while the scrub is actually held. Browsers can deliver a
+      // trailing input event AFTER pointerup commits the final value — an
+      // unconditional pause here re-paused playback right after the release
+      // handler resumed it (the intermittent stuck-pause on release).
+      if (pb._pbScrubbing) map.setPlaybackPlaying(false);
       // Coalesce rapid input events into a single rAF to avoid
       // overwhelming iPad Safari with drawOverlay() calls
       if (!_getScrubRAF()) {
@@ -2139,6 +2206,15 @@ function main() {
     let _scrubTouchRawTarget = null;
     let _scrubTouchOnThumb = false;
     const _scrubTouchSensitivity = 0.3;
+    // Fling velocity (timeline ms per wall ms) sampled during scrub moves
+    // (touchmove, pointermove, input), so release can hand it to the same
+    // coasting physics the wheel/trackpad path uses. _pbLastScrubPos/
+    // _pbLastScrubTime were already being written on every move but nothing
+    // ever derived a velocity from them. A fling needs >= 2 samples: a single
+    // big-delta input event (a click far along the track) is a jump, not a
+    // gesture, and its instantaneous "velocity" is garbage.
+    let _scrubTouchVel = 0;
+    let _scrubVelSamples = 0;
 
     pbScrubEl.addEventListener("touchstart", (e) => {
       e.preventDefault();  // stop native 1:1 range tracking
@@ -2165,6 +2241,8 @@ function main() {
       pb._pbDidDrag = false;
       _pbLastScrubPos = Number(pbScrubEl.value);
       _pbLastScrubTime = performance.now();
+      _scrubTouchVel = 0;
+      _scrubVelSamples = 0;
       pb._pbResumeAfterScrub = map.getPlaybackPlaying() || map._playbackLiveFollow;
       map.setPlaybackPlaying(false);
       map._playbackLiveFollow = false;
@@ -2190,8 +2268,17 @@ function main() {
       _scrubTouchRawTarget = _scrubTouchStartVal + delta;
       pbScrubEl.value = String(clamp(_scrubTouchRawTarget, Number(pbScrubEl.min), Number(pbScrubEl.max)));
       pb._pbDidDrag = true;
+      const _tNow = performance.now();
+      const _tDt = _tNow - _pbLastScrubTime;
+      const _tDv = Number(pbScrubEl.value) - _pbLastScrubPos;
+      if (_tDt > 0 && _tDt < 100) {
+        // Light smoothing so one jittery sample can't define the fling.
+        const inst = _tDv / _tDt;
+        _scrubTouchVel = (_scrubTouchVel === 0) ? inst : (_scrubTouchVel * 0.4 + inst * 0.6);
+        _scrubVelSamples++;
+      }
       _pbLastScrubPos = Number(pbScrubEl.value);
-      _pbLastScrubTime = performance.now();
+      _pbLastScrubTime = _tNow;
       if (!_getScrubRAF()) {
         _setScrubRAF(requestAnimationFrame(() => {
           _setScrubRAF(0);
@@ -2212,6 +2299,10 @@ function main() {
       _pbSnapWindowToPlayhead();
       pb._pbScrubbing = false;
       map._scrubbing = false;
+      const _fling = _scrubTouchVel;
+      const _flingSamples = _scrubVelSamples;
+      _scrubTouchVel = 0;
+      _scrubVelSamples = 0;
       pb._pbVelocity = 0;
       pb._pbPageAutoFollow = true;
 
@@ -2237,6 +2328,26 @@ function main() {
           map.drawOverlay(map.lastState);
           return;
         }
+      }
+
+      // Fling: hand the release velocity to the SAME coasting physics the
+      // wheel/trackpad path uses (playbackLoop's friction branch, which
+      // requires playing=false and resumes forward playback once the coast
+      // decays). Without this the release hard-zeroed the velocity, so a
+      // swipe stopped dead while the identical desktop gesture glided.
+      const _tCap = (Number(pbScrubEl.max) || 1) / 1000;
+      const _tV = clamp(_fling, -_tCap, _tCap);
+      if (_flingSamples >= 2 && Math.abs(_tV) > _pbVelocityThreshold) {
+        pb._pbIsWheelCoasting = true;
+        pb._pbCommitLoopStartOnCoastEnd = true;
+        pb._pbVelocity = _tV;
+        map.setPlaybackPlaying(false);
+        map._playbackLiveFollow = false;
+        try { localStorage.setItem(LIVE_MODE_STORAGE_KEY, "0"); } catch {}
+        pb._pbLastPerf = performance.now();
+        if (!pb._pbRAF) pb._pbRAF = requestAnimationFrame(playbackLoop);
+        updatePlaybackUi();
+        return;
       }
 
       _pbResumeFromScrub(true);
@@ -2294,6 +2405,22 @@ function main() {
   let _tickLastForceRefreshSeq = null;
   let _tickConsecutiveFailures = 0; // for exponential backoff on errors
 
+  // Single writer for the topbar status label in live mode (historical mode
+  // owns its own text in ui_snapshots_menus.js). Called from tick()'s success
+  // path AND from the SSE liveness hook below — an SSE delta is server
+  // contact just as much as a poll, and before this the label could stick on
+  // "Offline" forever: one failed poll set it, then every delta pushed the
+  // recovery poll another POLL_MS_SSE out via rescheduleTick while the map
+  // visibly kept updating.
+  function updateStatusIndicator(st) {
+    const statusEl = document.getElementById("statusText");
+    if (!statusEl) return;
+    const s = StateSync.computeStatusLabel(st);
+    statusEl.textContent = s.text;
+    statusEl.classList.toggle("live", s.live);
+    statusEl.classList.toggle("offline", s.offline);
+  }
+
   // fetchState/etag/delta-merge/SSE/analytics moved to ui_state_sync.js
   // (StateSync). Instantiate here (once `map`/`selectedId`/`tick` exist in
   // this closure) and wire the callbacks it needs to reach into main()'s
@@ -2314,6 +2441,14 @@ function main() {
     tickNow: () => {
       if (_tickTimeout) clearTimeout(_tickTimeout);
       tick();
+    },
+    // SSE liveness: a delta (or a reopened stream) proves the server is
+    // reachable — clear any lingering "Offline" from a failed poll and reset
+    // the poll backoff. Historical mode owns its own status text; skip it.
+    onServerAlive: () => {
+      if (window._historicalState) return;
+      _tickConsecutiveFailures = 0;
+      updateStatusIndicator(window.__lastState);
     },
     POLL_MS: POLL_MS,
     POLL_MS_SSE: POLL_MS_SSE,
@@ -2375,12 +2510,9 @@ function main() {
     if (window.__stateSync.wasNotModified()) {
       pb._pbLastServerResponseMs = Date.now();
       _tickConsecutiveFailures = 0;
-      const statusElLive = document.getElementById("statusText");
-      if (statusElLive && !statusElLive.classList.contains("live")) {
-        statusElLive.textContent = "Live";
-        statusElLive.classList.remove("offline");
-        statusElLive.classList.add("live");
-      }
+      // Recompute from the retained state rather than force-setting "Live":
+      // a 304 on stale data must keep saying "Stale", not flip it to Live.
+      updateStatusIndicator(window.__lastState);
       _tickInFlight = false;
       const pollMs = window.__stateSync.isSSEConnected() ? POLL_MS_SSE : POLL_MS;
       if (_tickTimeout) clearTimeout(_tickTimeout);
@@ -2401,32 +2533,7 @@ function main() {
     // Update save button now that we have data
     updateSaveButtonState();
     
-    if (statusEl) {
-      const meta = st.meta || {};
-      const mobileCount = Array.isArray(st.mobile) ? st.mobile.length : 0;
-      const fixedCount = Array.isArray(st.fixed) ? st.fixed.length : 0;
-      const hasData = mobileCount > 0 || fixedCount > 0;
-      
-      if (!hasData) {
-        // No data yet - still loading
-        statusEl.textContent = "Loading...";
-        statusEl.classList.remove("live");
-        statusEl.classList.remove("offline");
-      } else if (meta.data_stale) {
-        // ALL sources are stale
-        const ageS = meta.data_age_s || 0;
-        const ageMin = Math.floor(ageS / 60);
-        const ageHr = Math.floor(ageMin / 60);
-        const ageStr = ageHr > 0 ? `${ageHr}h` : `${ageMin}m`;
-        statusEl.textContent = `Stale (${ageStr} old)`;
-        statusEl.classList.remove("live");
-        statusEl.classList.add("offline");
-      } else {
-        statusEl.textContent = "Live";
-        statusEl.classList.remove("offline");
-        statusEl.classList.add("live");
-      }
-    }
+    updateStatusIndicator(st);
     const bestMs = newestReadingMsFromState(st);
     if (bestMs != null) {
       document.getElementById("lastUpdated").textContent = new Date(bestMs).toLocaleTimeString();
@@ -2646,9 +2753,13 @@ function main() {
     if (_urlDate && /^\d{4}-\d{2}-\d{2}$/.test(_urlDate)) {
       console.log("[EmbedParam] Valid date, calling loadSnapshotByDate:", _urlDate);
       try {
-        // Pass start/duration to server so it trims the snapshot before sending
-        const _urlStart = Number(_urlParams.get('start'));
-        const _urlDuration = Number(_urlParams.get('duration'));
+        // Pass start/duration to server so it trims the snapshot before sending.
+        // Absent params must stay NaN — Number(null) is 0, which made a bare
+        // ?date= load silently override the playhead to midnight (start=0).
+        const _urlStartRaw = _urlParams.get('start');
+        const _urlStart = _urlStartRaw == null ? NaN : Number(_urlStartRaw);
+        const _urlDurationRaw = _urlParams.get('duration');
+        const _urlDuration = _urlDurationRaw == null ? NaN : Number(_urlDurationRaw);
         let _extraParams = "";
         if (isFinite(_urlStart) && _urlStart >= 0 && isFinite(_urlDuration) && _urlDuration > 0) {
           _extraParams = `&start=${_urlStart}&duration=${_urlDuration}`;

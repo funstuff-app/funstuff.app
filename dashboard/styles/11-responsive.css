@@ -20,6 +20,19 @@
 
   .footerDisclaimer { display: block; font-size: 10px; }
   .footerRow1 .footerDisclaimer { display: inline; }
+
+  /* The 44px side padding that aligns the timestamps under the slider ends
+     leaves no room for three 11ch times on a phone. Trim the padding rather
+     than let the timestamps squeeze: squeezing is exactly what wrapped them
+     onto a second line and resized the whole bar (see 06-playback.css). */
+  .pbRow2 { padding-left: var(--space-2); padding-right: var(--space-2); }
+}
+
+@media (max-width: 400px) {
+  /* Last few px on the smallest phones: the "•" separators are decorative and
+     space-between already separates the three columns. Dropping them buys the
+     room the timestamps need to stay on one line. */
+  .pbRow2 .sep { display: none; }
 }
 
 @media (display-mode: standalone) {

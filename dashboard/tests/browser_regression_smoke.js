@@ -168,6 +168,91 @@
         `label now "${hooks.getPlayLabel()}"`);
       check("speed selector works", hooks.setSpeed(10));
 
+      // Gradient-field isolation: gradient pollutants (o3) take NO mobile
+      // input. Mobile sensors are local on-road readings; fed into the
+      // regional gradient as virtual stations they outnumber the fixed
+      // network and drag the baseline to street level across the valley.
+      // Deleting state.mobile must therefore not change the o3 field at all.
+      // (PM2.5 keeps mobile kernels — that path is intentionally untouched.)
+      {
+        const map = window.__map || window.map;
+        const pf = map && map.paField;
+        const st = map && map.lastState;
+        if (pf && st && (map._cssW || 0) >= 2) {
+          const pbMs = map.getPlaybackTimeMs();
+          const prevTab = map._paFieldPollutant ?? null;
+          const bust = () => {
+            map._paFieldKey = null; map._paFieldValidRange = null;
+            map._paFieldCanvas = null; map._paFieldCtx = null;
+            pf._paFieldValidViewKey = null; pf._paFieldValidPollutant = null;
+            pf._paFieldValidFixed = null; pf._paFieldFingerprint = null;
+            pf._paFieldPrevCanvas = null;
+          };
+          const stats = (c) => {
+            if (!c) return { hash: "none", painted: 0 };
+            const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+            let h = 0, painted = 0;
+            for (let i = 0; i < d.length; i += 4) {
+              if (d[i + 3] > 0) painted++;
+              h = (h * 31 + d[i] + d[i + 3]) >>> 0;
+            }
+            return { hash: h.toString(16) + ":" + c.width + "x" + c.height, painted };
+          };
+          const compute = (tab, state) => {
+            map.setPaFieldPollutant(tab);
+            bust();
+            pf._ensurePaField(state, pbMs);
+            return stats(map._paFieldCanvas);
+          };
+          // Every gradient pollutant (from the spread table) must ignore
+          // mobile sensors — covers o3, no2, and any gas added later.
+          const spreadTbl = (window.FieldSensors && window.FieldSensors._LEGEND_TAB_FIELD_SPREAD) || {};
+          const gradTabs = Object.keys(spreadTbl).filter((t) => spreadTbl[t] && spreadTbl[t].gradient);
+          for (const gt of gradTabs) {
+            const withMobile = compute(gt, st);
+            const noMobile = compute(gt, Object.assign({}, st, { mobile: [] }));
+            if (withMobile.painted === 0 && noMobile.painted === 0) {
+              check(`${gt} gradient field ignores mobile sensors (SKIPPED: no ${gt} field in view)`, true);
+            } else {
+              check(`${gt} gradient field ignores mobile sensors`,
+                withMobile.hash === noMobile.hash,
+                `with=${withMobile.hash} without=${noMobile.hash}`);
+            }
+          }
+
+          // Max-mode coverage: a gradient pollutant's broad surface must
+          // carry into max mode (it used to run through the unscaled default
+          // kernel, collapsing the regional field to a small ring per
+          // station). Strip the state to non-PA fixed sensors so o3 is the
+          // only broad field, then compare painted coverage between the o3
+          // tab and max mode. Max mode is per-cell WORST POLLUTANT WINS —
+          // gradient values compete on AQI like every kernel value, so a
+          // hotter regional ozone legitimately covers cleaner local fields
+          // (and a lone clean station cannot crater a hot ozone wash).
+          const stripped = Object.assign({}, st, {
+            mobile: [],
+            fixed: (st.fixed || []).filter((f) => f && !f.purpleair),
+          });
+          const o3Solo = compute("o3", stripped);
+          const maxSolo = compute(null, stripped);
+          if (o3Solo.painted === 0) {
+            check("gradient (o3) field coverage carries into max mode (SKIPPED: no o3 coverage in view)", true);
+          } else {
+            const ratio = maxSolo.painted / o3Solo.painted;
+            check("gradient (o3) field coverage carries into max mode",
+              ratio >= 0.95,
+              `coverage ratio ${ratio.toFixed(3)}, bitIdentical=${o3Solo.hash === maxSolo.hash}`);
+          }
+
+          map.setPaFieldPollutant(prevTab);
+          bust();
+          map._compositePaFieldOnTiles(st);
+        } else {
+          check("o3 gradient field ignores mobile sensors (SKIPPED: map unsized)", true);
+          check("gradient (o3) field renders identically in max mode (SKIPPED: map unsized)", true);
+        }
+      }
+
       // Feature-presence flags — NOT counted toward passed/total. Expected
       // value changes as each PR merges; interpret alongside merge state,
       // don't treat a false here as a failure on its own.

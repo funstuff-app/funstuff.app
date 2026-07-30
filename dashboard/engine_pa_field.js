@@ -472,7 +472,13 @@
         let fp = "", total = 0, anyVirtual = false;
         for (const grp of _MAX_MODE_GROUPS) {
           const pf = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, grp.incl, bufW, bufH, paRefNowMs, grp.tabs);
-          const vf = _collectVirtualMobileSensors(mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, grp.incl, bufW, bufH, grp.tabs);
+          // Gradient groups (o3) take no mobile input — same rule as the
+          // single-pollutant path below, same reason: mobile readings are
+          // local, and as virtual stations they drag the regional baseline.
+          const _grpSpread = _LEGEND_TAB_FIELD_SPREAD[grp.incl];
+          const vf = (_grpSpread && _grpSpread.gradient)
+            ? { sensors: [], fingerprint: "" }
+            : _collectVirtualMobileSensors(mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, grp.incl, bufW, bufH, grp.tabs);
           const sensors = pf.sensors.concat(vf.sensors);
           if (vf.sensors.length) anyVirtual = true;
           total += sensors.length;
@@ -485,7 +491,17 @@
         hasVirtuals = anyVirtual;
       } else {
         const paField = _collectPaFieldSensors(fixed, playbackTimeMs, centerW, z, cssW, cssH, pollutantTab, bufW, bufH, paRefNowMs, maxMode);
-        const virtualField = _collectVirtualMobileSensors(
+        // Gradient pollutants (o3): the field is the REGIONAL picture, and
+        // only fixed stations measure ambient air at that scale. Mobile
+        // sensors read on-road air (exhaust-scavenged ozone) — local
+        // readings by design. Fed into the gradient as virtual stations
+        // they outnumber the fixed network along their routes and drag the
+        // regional baseline (a weighted mean) to street level across the
+        // whole valley, so the gradient field takes NO mobile input:
+        // trails/markers still show mobile readings, the field ignores them.
+        const _tabSpread = _LEGEND_TAB_FIELD_SPREAD[pollutantTab];
+        const gradientField = !!(_tabSpread && _tabSpread.gradient);
+        const virtualField = gradientField ? { sensors: [], fingerprint: "" } : _collectVirtualMobileSensors(
           mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH, virtualRefNowMs, pollutantTab, bufW, bufH, maxMode
         );
         view._virtualMobileSensors = virtualField.sensors;
@@ -503,7 +519,7 @@
         // _collectPaFieldSensors.  Skip when virtual sensors are present:
         // their ages change every frame so the fast-skip must stay disabled.
         if (!hasVirtuals && !view._paFieldValidRange) {
-          view._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
+          view._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs, maxMode ? _MAX_MODE_GROUPS.reduce((a, g2) => a.concat(g2.tabs), []) : [pollutantTab]);
           this._paFieldValidViewKey = viewKey;
           this._paFieldValidFixed = fixed;
           this._paFieldValidPollutant = renderTab;
@@ -569,8 +585,9 @@
       // Blend in AQI space: the non-linear concentration→AQI transform gives high
       // concentrations proportionally more weight in the kernel average,
       // so a local spike stays visible instead of being diluted by neighbors.
-      const buildS5 = (sensors, aqiKey) => {
+      const buildS5 = (sensors, aqiKey, twoSigSqOverride) => {
         const arr = new Float64Array(sensors.length * 5);
+        const sensorTwoSigSq = twoSigSqOverride || twoSigmaSq;
         for (let i = 0; i < sensors.length; i++) {
           const sensor = sensors[i];
           const si5 = i * 5;
@@ -578,7 +595,7 @@
           arr[si5 + 1] = sensor.sy;
           const aqi = (sensor.aqi != null && isFinite(sensor.aqi)) ? sensor.aqi : valueToAqi(aqiKey, sensor.value);
           arr[si5 + 2] = (aqi != null && isFinite(aqi)) ? aqi : 0;
-          arr[si5 + 3] = twoSigmaSq;
+          arr[si5 + 3] = sensorTwoSigSq;
           arr[si5 + 4] = sensor.weightMultiplier;
         }
         return arr;
@@ -592,14 +609,76 @@
 
       // ── Always synchronous — kernel regression is fast (<2ms on 16px grid) ──
       if (maxMode) {
-        // One stride-5 array per pollutant; composite per-cell max across fields.
-        const perPollS5 = perPollSensors.map(pp =>
-          buildS5(pp.sensors, _LEGEND_TAB_AQI_KEY[pp.incl] || "pm2.5")
-        );
-        this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+        // One config per pollutant group; composite per-cell max across fields.
+        // Gradient groups (o3) derive their own spread-scaled parameters with
+        // the SAME formulas as the single-pollutant path, so a gradient
+        // pollutant's surface is identical whether its tab is selected or not
+        // (previously max mode ran o3 through the unscaled default kernel and
+        // the broad regional field collapsed to a small ring per station).
+        // Kernel groups keep the unscaled default — unchanged behavior.
+        const perPollCfg = perPollSensors.map(pp => {
+          const sp = _LEGEND_TAB_FIELD_SPREAD[pp.incl];
+          const aqiKey = _LEGEND_TAB_AQI_KEY[pp.incl] || "pm2.5";
+          if (sp && sp.gradient) {
+            const gCutoffPx = cutoffPx * (sp.cutMult || 1);
+            const gSigma = (gCutoffPx / sigmaDivisor) * (sp.sigmaMult || 1);
+            const gTwoSigmaSq = 2 * gSigma * gSigma;
+            const gResidR = gCutoffPx * (sp.residualFrac || 0.09);
+            return {
+              s5: buildS5(pp.sensors, aqiKey, gTwoSigmaSq),
+              gradientIdw: {
+                residRSq: gResidR * gResidR,
+                covTwoSigmaSq: gTwoSigmaSq * (sp.covSigmaMult || 1) * (sp.covSigmaMult || 1),
+                coverageRef: sp.coverageRef,
+              },
+            };
+          }
+          return { s5: buildS5(pp.sensors, aqiKey), gradientIdw: null };
+        });
+        this._computeMaxModeFieldSync(perPollCfg, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
       } else {
         const s5 = buildS5(allSensors, _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5");
-        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+        // Gradient (IDW) mode — see _LEGEND_TAB_FIELD_SPREAD.gradient. The
+        // station's value spreads outward from its exact location; the
+        // blending of VALUES across the field produces the interpolated
+        // colors on its own.
+        let gradientIdw = null;
+        if (_spread.gradient) {
+          const residR = cutoffPx * (_spread.residualFrac || 0.09);
+          gradientIdw = {
+            residRSq: residR * residR,
+            covTwoSigmaSq: twoSigmaSq * _spread.covSigmaMult * _spread.covSigmaMult,
+            coverageRef: _spread.coverageRef,
+          };
+        }
+        // Neighbor-consensus smoothing (non-gradient pollutants only) — each
+        // station's FIELD input moves toward the distance-weighted mean of
+        // the other stations, damping single-station cadence/calibration
+        // artifacts. Marker labels keep the raw newest reading.
+        const _nb = _spread.gradient ? 0 : _spread.neighborBlend;
+        const nSens = s5.length / 5;
+        if (_nb > 0 && nSens >= 3) {
+          const blended = new Float64Array(nSens);
+          for (let i = 0; i < nSens; i++) {
+            const xi = s5[i * 5], yi = s5[i * 5 + 1];
+            let wSum = 0, vSum = 0;
+            for (let j = 0; j < nSens; j++) {
+              if (j === i) continue;
+              const dx = s5[j * 5] - xi;
+              const dy = s5[j * 5 + 1] - yi;
+              const w = s5[j * 5 + 4] * Math.exp(-(dx * dx + dy * dy) / s5[j * 5 + 3]);
+              wSum += w;
+              vSum += w * s5[j * 5 + 2];
+            }
+            // Isolated station (no meaningful neighbors in range): keep its
+            // own value — there is no consensus to defer to.
+            blended[i] = wSum > 0.05
+              ? (1 - _nb) * s5[i * 5 + 2] + _nb * (vSum / wSum)
+              : s5[i * 5 + 2];
+          }
+          for (let i = 0; i < nSens; i++) s5[i * 5 + 2] = blended[i];
+        }
+        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH, gradientIdw);
       }
 
       // Stash the inputs needed to lazily compute per-pollutant field maxes
@@ -636,7 +715,7 @@
       // When virtual sensors are present their ages shift every frame, so the
       // fast-skip must stay disabled (no valid range).
       if (!hasVirtuals) {
-        view._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs);
+        view._paFieldValidRange = _findFingerprintValidRange(fixed, playbackTimeMs, maxMode ? _MAX_MODE_GROUPS.reduce((a, g2) => a.concat(g2.tabs), []) : [pollutantTab]);
         this._paFieldValidViewKey = viewKey;
         this._paFieldValidFixed = fixed;
         this._paFieldValidPollutant = renderTab;
@@ -730,10 +809,15 @@
         const paField = _collectPaFieldSensors(
           fixed, playbackTimeMs, centerW, z, cssW, cssH, tab, bufW, bufH, paRefNowMs
         );
-        const virtualField = _collectVirtualMobileSensors(
-          mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH,
-          virtualRefNowMs, tab, bufW, bufH
-        );
+        // Match _ensurePaField: gradient pollutants take no mobile input,
+        // so the legend max must not see virtual sensors the field ignores.
+        const _tabSpread = g.FieldSensors._LEGEND_TAB_FIELD_SPREAD[tab];
+        const virtualField = (_tabSpread && _tabSpread.gradient)
+          ? { sensors: [] }
+          : _collectVirtualMobileSensors(
+            mobiles, playbackTimeMs, !!view.playbackMode, centerW, z, cssW, cssH,
+            virtualRefNowMs, tab, bufW, bufH
+          );
         const allSensors = paField.sensors.concat(virtualField.sensors);
         if (allSensors.length === 0) { result[tab] = null; continue; }
 
@@ -852,7 +936,11 @@
     /** Color a per-cell (aqi, weight) grid into the grid canvas, apply the
      *  Cauchy blur, commit, and upscale. Also sets view._paFieldMaxAqi to the
      *  max AQI within the viewport region. Shared painter for both render paths. */
-    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH) {
+    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, coverageRef) {
+      // Weight at which opacity saturates. Default 0.5 = legacy min(1, w*2).
+      // Gradient mode passes a lower ref so the field holds full strength
+      // across the station network and fades softly past its perimeter.
+      const covRef = (typeof coverageRef === "number" && coverageRef > 0) ? coverageRef : 0.5;
       const view = this.view;
       const _aqiToRgb = g.FieldSensors._aqiToRgb;
       const { tc, tctx, imgData } = view._paGrid;
@@ -877,7 +965,7 @@
           if (wSum < 0.001) {
             px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
           } else {
-            const fade = Math.min(1, wSum * 2);
+            const fade = Math.min(1, wSum / covRef);
             const alpha = Math.round(FIELD_ALPHA * fade);
             const val = aqiCell[cell];
             if (inVpY && gx >= vpGxMin && gx < vpGxMax && val > fieldMaxAqi) {
@@ -947,21 +1035,185 @@
      *  sensors: stride-5 Float64Array [sx, sy, aqi, twoSigSq, weightMultiplier, ...]
      *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
      *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
-     *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
-    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
+     *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic.
+     *  gradientIdw: { softSq, covTwoSigmaSq, coverageRef } or null — IDW
+     *  value surface (exact at stations) + Gaussian coverage alpha, for
+     *  gradient-mode pollutants (ozone). */
+    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, gradientIdw) {
       const gr = this._ensurePaGrid(gw, gh);
+      if (gradientIdw) {
+        if (!gr.covCell || gr.covCell.length !== gw * gh) {
+          gr.covCell = new Float32Array(gw * gh);
+        }
+        this._gradientGrid(sensors, gw, gh, cellSize, gradientIdw.residRSq,
+          gradientIdw.covTwoSigmaSq, gr.aqiCell, gr.covCell);
+        this._paintPaCells(gr.aqiCell, gr.covCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, gradientIdw.coverageRef);
+        return;
+      }
       this._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, gr.aqiCell, gr.wCell);
       this._paintPaCells(gr.aqiCell, gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
     }
 
-    /** Max-mode field: render EACH pollutant's own kernel field independently
+    /** Gradient-mode grid: BASELINE + RESIDUAL surface.
+     *  baseline(x)  — wide Gaussian weighted mean of all stations: the
+     *                 smooth regional level the field relaxes to.
+     *  residual_i   — v_i − baseline(x_i): how far station i's own reading
+     *                 sits above/below that regional level.
+     *  value(x)     — baseline(x) + Σ residual_i · K_i(x), with a flat-top
+     *                 quartic falloff K = 1/(1+(d/R)⁴) that equals 1 AT the
+     *                 station. The station therefore renders its true value
+     *                 and band EXACTLY (normalized interpolations shave the
+     *                 peak wherever neighbors leak in — a reading 1 ppb into
+     *                 the orange band always came out yellow), and its glow
+     *                 widens with severity: the further over the band, the
+     *                 farther out value(x) stays above the boundary before
+     *                 gliding back to the regional baseline. No edges: K and
+     *                 the baseline are both smooth.
+     *  outCov       — wide Gaussian coverage for opacity only: full across
+     *                 the network, soft fade past the outermost station.
+     *  sensors: stride-5 [sx, sy, aqi, twoSigSq(baseline width), mult]. */
+    _gradientGrid(sensors, gw, gh, cellSize, residRSq, covTwoSigmaSq, outAqi, outCov) {
+      const n = sensors.length / 5;
+      // Cluster-density equalization: in a plain weighted mean a dense
+      // cluster outvotes a nearby isolated station by sheer count, squeezing
+      // its influence to almost zero distance (an orange station beside ten
+      // yellow ones painted only its own stamp). Dividing each station's
+      // weight by the summed kernel of stations around it makes attribution
+      // a matter of DISTANCE, not of how many instruments a neighborhood
+      // installed. Values remain a normalized mean (bounded, interpolated,
+      // never summed) and station exactness is unchanged.
+      const dens = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        let s = 0;
+        const xi = sensors[i * 5], yi = sensors[i * 5 + 1];
+        for (let j = 0; j < n; j++) {
+          const dx = sensors[j * 5] - xi;
+          const dy = sensors[j * 5 + 1] - yi;
+          const dq = (dx * dx + dy * dy) / sensors[j * 5 + 3];
+          s += sensors[j * 5 + 4] / (1 + dq * dq);
+        }
+        dens[i] = s > 1e-9 ? s : 1;
+      }
+      // Per-station baseline (same kernel the per-cell pass uses, self
+      // included so baseline(x_i) matches and exactness holds).
+      const resid = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const xi = sensors[i * 5], yi = sensors[i * 5 + 1];
+        let wSum = 0, vSum = 0;
+        for (let j = 0; j < n; j++) {
+          const dx = sensors[j * 5] - xi;
+          const dy = sensors[j * 5 + 1] - yi;
+          const bq = (dx * dx + dy * dy) / sensors[j * 5 + 3];
+          const w = (sensors[j * 5 + 4] / dens[j]) / (1 + bq * bq);
+          wSum += w;
+          vSum += w * sensors[j * 5 + 2];
+        }
+        // Elevated-only: negative residuals are dominated by calibration
+        // scatter / stuck-low units and rendered as nonsensical "clean air"
+        // dips around individual stations. The baseline already carries the
+        // low information; only genuine exceedances get a local glow.
+        resid[i] = wSum > 0 ? Math.max(0, sensors[i * 5 + 2] - vSum / wSum) : 0;
+      }
+      for (let gy = 0; gy < gh; gy++) {
+        const py = (gy + 0.5) * cellSize;
+        for (let gx = 0; gx < gw; gx++) {
+          const pxx = (gx + 0.5) * cellSize;
+          let wSum = 0, vSum = 0, covSum = 0, kSum = 0, krSum = 0;
+          for (let i = 0; i < n; i++) {
+            const dx = pxx - sensors[i * 5];
+            const dy = py  - sensors[i * 5 + 1];
+            const d2 = dx * dx + dy * dy;
+            const m = sensors[i * 5 + 4];
+            // Inverse-quartic weights, NOT Gaussian: attribution between
+            // stations is decided by distance RATIOS (nearest dominates,
+            // ~16:1 at 1:2 distance), so a sensor-free region interpolates
+            // its CLOSEST stations' readings instead of collapsing to an
+            // equal-width mean where a far station counts like a near one.
+            // Ratios are also scale-free, so the between-station boundaries
+            // stay put as the viewport (and the px-scaled kernel width)
+            // changes with zoom — Gaussian ratios grew the far-station wash
+            // when zooming in. Divided by the station's cluster density —
+            // see the equalization note above.
+            const bq = d2 / sensors[i * 5 + 3];
+            const w = (m / dens[i]) / (1 + bq * bq);
+            wSum += w;
+            vSum += w * sensors[i * 5 + 2];
+            const q = d2 / residRSq;
+            // Squared quartic: flat top at the station, then a FAST tail
+            // (~6% at 1.4R, ~0.2% at 2R) so a glow stays a compact halo
+            // around its own station instead of tinting kilometers out and
+            // bridging into neighboring stations' glows.
+            const kq = 1 / (1 + q * q);
+            const k = kq * kq;
+            kSum += k;
+            krSum += k * resid[i];
+            covSum += m * Math.exp(-d2 / covTwoSigmaSq);
+          }
+          const cell = gy * gw + gx;
+          // Residuals are INTERPOLATED (normalized when kernels overlap),
+          // never summed: overlapping elevated stations must not stack into
+          // a phantom hotspot hotter than either really reads. The max(1,·)
+          // denominator keeps single-station exactness (kSum≈1 at a station)
+          // and decays the residual smoothly to zero away from all stations.
+          const residField = kSum > 0 ? krSum / Math.max(1, kSum) : 0;
+          // Value surface must extend at least as far as the coverage alpha
+          // does (cov >= 0.001 paints): the weighted mean tends smoothly to
+          // the nearest station's value, so keep it defined down to numeric
+          // noise. A larger epsilon zeroes the fringe and the max-mode
+          // composite (which claims cells by aqi > 0) loses the outer
+          // coverage band its own tab still paints.
+          outAqi[cell] = wSum > 1e-9 ? (vSum / wSum + residField) : 0;
+          outCov[cell] = covSum;
+        }
+      }
+      // Station stamp: cells within ~2 cells of a station take its EXACT
+      // reading. The Cauchy blur that follows mixes small plateaus into
+      // their surroundings, so a boundary-exact reading (71 ppb ozone =
+      // AQI 101.0, the first orange value) lost its band to dilution and
+      // rendered yellow until the reading climbed clear of the edge. A
+      // stamp of blur-radius size keeps its center exact through the blur,
+      // so the marker always sits on its true band color; interpolation
+      // continues untouched outside the stamp. Overlapping stamps (only
+      // possible at far zoom) resolve to the highest reading — worst-wins.
+      {
+        const stampR = 2;
+        for (let i = 0; i < n; i++) {
+          const vi = sensors[i * 5 + 2];
+          const scx = Math.floor(sensors[i * 5] / cellSize);
+          const scy = Math.floor(sensors[i * 5 + 1] / cellSize);
+          for (let dy = -stampR; dy <= stampR; dy++) {
+            const gy2 = scy + dy;
+            if (gy2 < 0 || gy2 >= gh) continue;
+            for (let dx = -stampR; dx <= stampR; dx++) {
+              const gx2 = scx + dx;
+              if (gx2 < 0 || gx2 >= gw) continue;
+              if (dx * dx + dy * dy > stampR * stampR + 0.1) continue;
+              const c2 = gy2 * gw + gx2;
+              if (vi > outAqi[c2] || (dx === 0 && dy === 0)) outAqi[c2] = vi;
+            }
+          }
+        }
+      }
+    }
+
+    /** Max-mode field: render EACH pollutant's own field independently
      *  (so PurpleAir, which only measures PM2.5, never enters other pollutants'
      *  fields), then composite the PER-CELL MAX AQI across pollutants. This is
      *  the true "worst pollutant wins" surface — a single blended pass over
      *  mixed per-sensor maxes instead averages dense low-PM2.5 PA sensors down
      *  and suppresses a region's high ozone/NO2/etc.
-     *  perPollS5: array of stride-5 Float64Arrays, one per pollutant. */
-    _computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
+     *
+     *  Gradient pollutants (o3) run their own broad gradient surface and
+     *  compete in the SAME per-cell max as every kernel pollutant — worst
+     *  pollutant wins the cell, whether the value came from a measured
+     *  kernel or the regional gradient. (A fill-only variant that let any
+     *  local kernel keep its cells regardless of AQI was tried and rejected:
+     *  a single clean-air PM2.5 station punched a giant low-AQI crater
+     *  through a 100-AQI ozone field.)
+     *  perPollCfg: [{ s5, gradientIdw? }] — gradientIdw non-null runs that
+     *  group through the gradient surface (same model its own tab renders)
+     *  instead of the kernel regression. */
+    _computeMaxModeFieldSync(perPollCfg, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
       const gr = this._ensurePaGrid(gw, gh);
       const n = gw * gh;
       if (!gr.bestAqi || gr.bestAqi.length !== n) {
@@ -972,8 +1224,26 @@
       }
       gr.bestAqi.fill(0);
       gr.bestW.fill(0);
-      for (const s5 of perPollS5) {
+      for (const cfg of perPollCfg) {
+        const s5 = cfg && cfg.s5;
         if (!s5 || !s5.length) continue;
+        if (cfg.gradientIdw) {
+          // Gradient group: same surface as its own tab. tmpW holds the
+          // coverage sum; the claim threshold matches the single-tab painter
+          // (covSum >= 0.001 paints). The stored weight is rescaled so the
+          // shared painter's fade (w / 0.5) reproduces this group's own
+          // alpha ramp (cov / coverageRef) exactly.
+          this._gradientGrid(s5, gw, gh, cellSize, cfg.gradientIdw.residRSq,
+            cfg.gradientIdw.covTwoSigmaSq, gr.tmpAqi, gr.tmpW);
+          const covScale = 0.5 / ((typeof cfg.gradientIdw.coverageRef === "number" && cfg.gradientIdw.coverageRef > 0) ? cfg.gradientIdw.coverageRef : 0.5);
+          for (let c = 0; c < n; c++) {
+            if (gr.tmpW[c] >= 0.001 && gr.tmpAqi[c] > gr.bestAqi[c]) {
+              gr.bestAqi[c] = gr.tmpAqi[c];
+              gr.bestW[c]   = gr.tmpW[c] * covScale;
+            }
+          }
+          continue;
+        }
         this._kernelGrid(s5, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, gr.tmpAqi, gr.tmpW);
         for (let c = 0; c < n; c++) {
           // A pollutant claims a cell only where it has coverage AND its AQI is

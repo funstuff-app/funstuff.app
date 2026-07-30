@@ -2341,9 +2341,21 @@ def update_app_state_with_new_data(app_state: AppState, st: dict[str, Any], now:
                     trail = m.get("trail", [])
                     if not sid or not trail:
                         continue
-                    new_pts = [p for p in trail
-                               if isinstance(p, dict) and isinstance(p.get("t"), (int, float))
-                               and p["t"] >= start_ms]
+                    # Trail point "t" is a UTC STRING ("2026-07-30 22:10:30 UTC"),
+                    # never a number, so the old isinstance(t, (int, float))
+                    # guard was False for every point: new_pts was always empty
+                    # and trail_new was NEVER sent. SSE clients got the mobile
+                    # summary (marker jumps to the new reading at once) but no
+                    # trail points, so the trail — and the field built from it —
+                    # only refreshed on the client's own full poll. _point_ms
+                    # parses the string form the rest of this file uses.
+                    new_pts = []
+                    for p in trail:
+                        if not isinstance(p, dict):
+                            continue
+                        p_ms = _point_ms(p)
+                        if p_ms is not None and p_ms >= start_ms:
+                            new_pts.append(p)
                     if new_pts:
                         new_trails[sid] = new_pts
                 if new_trails:
@@ -5537,8 +5549,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                     cache_key = (date_str, _sh, _dh)
                     cached = self._snapshot_window_cache.get(cache_key)
                     if cached is not None:
+                        _etag = '"' + hashlib.md5(cached).hexdigest() + '"'
+                        if self.headers.get("If-None-Match") == _etag:
+                            return self._send_304(_etag, "public, max-age=300, s-maxage=3600")
                         return self._send(200, cached, "application/json",
-                                          cache_control="public, max-age=3600")
+                                          cache_control="public, max-age=300, s-maxage=3600",
+                                          etag=_etag)
                 except (ValueError, TypeError):
                     cache_key = None
             else:
@@ -5637,6 +5653,14 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         pass  # Ignore bad params, serve full day
 
                 body = json.dumps(state).encode("utf-8")
+                # Day snapshots are NOT immutable: backfills, PA stripping and
+                # wind injection can rewrite an already-served day. A long-TTL
+                # immutable header masked the 2026-07 backfill for a full day
+                # (stale empty-mobile payload pinned in browser + edge caches).
+                # Serve with an ETag and force revalidation — a 304 is cheap.
+                etag = '"' + hashlib.md5(body).hexdigest() + '"'
+                if self.headers.get("If-None-Match") == etag:
+                    return self._send_304(etag, "public, no-cache")
                 # Cache windowed responses so subsequent widget loads are instant
                 if cache_key is not None:
                     self._snapshot_window_cache[cache_key] = body
@@ -5645,9 +5669,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
                         oldest = next(iter(self._snapshot_window_cache))
                         del self._snapshot_window_cache[oldest]
                     return self._send(200, body, "application/json",
-                                      cache_control="public, max-age=3600, s-maxage=86400")
+                                      cache_control="public, max-age=300, s-maxage=3600",
+                                      etag=etag)
                 return self._send(200, body, "application/json",
-                                  cache_control="public, max-age=86400, s-maxage=86400, immutable")
+                                  cache_control="public, no-cache", etag=etag)
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 return self._send(500, body, "application/json")

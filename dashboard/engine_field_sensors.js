@@ -76,12 +76,43 @@
    * both need to move together, or a wider falloff just fades to nothing
    * faster inside the same unchanged cutoff radius.
    */
+  /**
+   * neighborBlend: fraction of each station's FIELD input replaced by the
+   * distance-weighted consensus of its neighbor stations before
+   * interpolation (0 = off, field input is the raw reading). For regional
+   * gases the monitors sample one shared airmass: station-to-station
+   * disagreement is calibration scatter plus update cadence (MTMET updates
+   * every few minutes, the DAQ/AirNow stations hourly on the hour), so a
+   * single station's fresher or offset reading must NUDGE the field, never
+   * restructure it into a local zone. Marker labels are untouched — the
+   * newest raw reading still wins on the sensor itself. Trends supported by
+   * SEVERAL stations survive the blend because their neighbors agree.
+   */
+  /**
+   * gradient: true (ozone) = BASELINE + RESIDUAL surface (see
+   * _gradientGrid). The wide kernel (sigmaMult) interpolates the smooth
+   * regional level; each station then adds back its own deviation from
+   * that level with a flat-top falloff that equals 1 AT the station, so a
+   * monitor reading into the orange band renders its true band exactly at
+   * its location (normalized interpolations shave the peak wherever
+   * neighbors leak in — a reading 1 ppb into the band always came out
+   * yellow) and the glow's reach scales with how far the reading sits
+   * above the regional level, gliding back to baseline with no edge.
+   * residualFrac sets the residual falloff radius as a fraction of the
+   * cutoff. Coverage (covSigmaMult/coverageRef) only bounds WHERE the
+   * field exists, fading softly past the network.
+   */
   const _LEGEND_TAB_FIELD_SPREAD = {
-    pm25: { sigmaMult: 1,    cutMult: 1 },
-    pm10: { sigmaMult: 1,    cutMult: 1 },
-    o3:   { sigmaMult: 2.4,  cutMult: 1.8 },
-    no2:  { sigmaMult: 1.3,  cutMult: 1.2 },
-    co:   { sigmaMult: 1,    cutMult: 1 },
+    pm25: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
+    pm10: { sigmaMult: 1,    cutMult: 1,   neighborBlend: 0 },
+    // Gases (o3, no2, co) mix regionally instead of clustering like
+    // particulates, so they render through the gradient model: regional
+    // baseline + elevated-only station residuals, coverage-bounded at the
+    // network edge. Each gas keeps its OWN entry so its parameters tune
+    // independently.
+    o3:   { gradient: true, sigmaMult: 2.4, cutMult: 1.8, covSigmaMult: 1.4, coverageRef: 0.15, residualFrac: 0.05, neighborBlend: 0 },
+    no2:  { gradient: true, sigmaMult: 2.4, cutMult: 1.8, covSigmaMult: 1.4, coverageRef: 0.15, residualFrac: 0.05, neighborBlend: 0 },
+    co:   { gradient: true, sigmaMult: 2.4, cutMult: 1.8, covSigmaMult: 1.4, coverageRef: 0.15, residualFrac: 0.05, neighborBlend: 0 },
   };
   /** Pollutants composited in "no selection" max-mode field (one kernel each). */
   // Max-mode field groups. Particulates (PM2.5 + PM10) form ONE field: same
@@ -144,16 +175,8 @@
     const PA_FADE_TAIL = 0.20;
     const paFadeStart = PA_FADE_MS * (1.0 - PA_FADE_TAIL);
 
-    const paLatLons = [];
-    for (const f of fixed) {
-      if (!f || !f.purpleair) continue;
-      const lat = Number(f.lat);
-      const lon = Number(f.lon);
-      if (isFinite(lat) && isFinite(lon)) paLatLons.push(lat, lon);
-    }
-
     const sensors = [];
-    const _fixedSlot = new Map();  // overlapping non-PA fixed dedup: slotKey -> {idx, tMs}
+    const _fixedSlot = new Map();  // sensors[] indices of non-PA fixed (stack-merge candidates)
     let fingerprint = "";
     for (const f of fixed) {
       if (!f) continue;
@@ -164,19 +187,12 @@
       if (lat < _UT_MIN_LAT || lat > _UT_MAX_LAT || lon < _UT_MIN_LON || lon > _UT_MAX_LON) continue;
 
       if (isPm25) {
-        // PM2.5 mode: PurpleAir + nearby non-PA fixed (original behavior)
-        if (!f.purpleair) {
-          let nearPA = false;
-          for (let pi = 0; pi < paLatLons.length; pi += 2) {
-            const dlat = lat - paLatLons[pi];
-            const dlon = lon - paLatLons[pi + 1];
-            if (dlat * dlat + dlon * dlon < _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG * _PA_FIELD_NON_PURPLEAIR_PROXIMITY_DEG) {
-              nearPA = true;
-              break;
-            }
-          }
-          if (!nearPA) continue;
-        }
+        // PM2.5 mode: PurpleAir + ALL non-PA fixed stations. An earlier
+        // near-PA gate dropped fixed stations with no PurpleAir neighbor,
+        // so a DAQ station with a real PM2.5 reading painted NO field —
+        // everywhere on installs without a PurpleAir key, and in the west
+        // desert on prod. Fixed stations feed every other pollutant's
+        // field unconditionally; PM2.5 is no different.
       } else {
         // Non-PM2.5 mode: only non-PurpleAir fixed sensors (ghost markers)
         if (f.purpleair) continue;
@@ -245,34 +261,55 @@
         // PurpleAir are server-thinned (~1 per 500 m) so they don't overlap.
         sensors.push(cand);
       } else {
-        // Overlapping FIXED sensors (literally co-located, e.g. QUURB + MTMET at
-        // the same DAQ site): the field must be fed by the MOST RECENTLY updated
-        // one, not an averaged blend of fresh + stale. Same idea as the mobile
-        // ghost dedup — one sensor per fine spatial slot, freshest reading wins.
-        // ~22 m grid so only truly co-located instruments merge, never distinct
-        // sites. If the fresh sensor goes offline its time stops advancing and
-        // the other naturally takes over on the next update.
-        const slotKey = ((lat * 5000) | 0) + "," + ((lon * 5000) | 0);
-        const candTMs = (tMs != null && isFinite(tMs)) ? tMs : -Infinity;
-        const ex = _fixedSlot.get(slotKey);
-        if (ex === undefined) {
-          sensors.push(cand);
-          _fixedSlot.set(slotKey, { idx: sensors.length - 1, tMs: candTMs });
-        } else if (candTMs > ex.tMs) {
-          sensors[ex.idx] = cand;  // newer co-located sensor replaces the stale one
-          ex.tMs = candTMs;
+        _fixedSlot.set(sensors.length, true);  // stack-merge candidate
+        sensors.push(cand);
+      }
+    }
+
+    // STACKED fixed stations (within ~2 km, e.g. Viewmont + Bountiful at
+    // ~1.2 km, or QUURB + MTMET sharing a DAQ site): conflicting readings
+    // that close force the exactness layer to honor both, carving steep
+    // gradients and shadow rings between their halos. The HIGHEST current
+    // reading wins the stack — worst-wins, the same contract as max mode.
+    // Genuinely distinct sites (Ogden vs North Ogden, ~4 km) stay separate.
+    // Field input only; every marker still renders.
+    if (_fixedSlot.size > 1) {
+      const _sp0 = g.latLonToWorld(40.7, -111.9, zoom);
+      const _sp1 = g.latLonToWorld(40.7, -111.876, zoom);
+      const _sdx = _sp1.x - _sp0.x;
+      const stackRSq = _sdx * _sdx;
+      const idxs = [..._fixedSlot.keys()];
+      const dropped = new Set();
+      const aqiOf = (s) => (s.aqi != null && isFinite(s.aqi)) ? s.aqi : (g.valueToAqi(aqiKey, s.value) ?? 0);
+      for (let a = 0; a < idxs.length; a++) {
+        if (dropped.has(idxs[a])) continue;
+        for (let b = a + 1; b < idxs.length; b++) {
+          if (dropped.has(idxs[b])) continue;
+          const sa = sensors[idxs[a]], sb = sensors[idxs[b]];
+          const dx = sa.sx - sb.sx, dy = sa.sy - sb.sy;
+          if (dx * dx + dy * dy > stackRSq) continue;
+          dropped.add(aqiOf(sa) >= aqiOf(sb) ? idxs[b] : idxs[a]);
+          if (dropped.has(idxs[a])) break;
         }
-        // else: older co-located sensor — drop it (the fresher one is kept)
+      }
+      if (dropped.size) {
+        const kept = [];
+        for (let i = 0; i < sensors.length; i++) if (!dropped.has(i)) kept.push(sensors[i]);
+        sensors.length = 0;
+        sensors.push(...kept);
       }
     }
 
     // Fingerprint built AFTER dedup so it reflects only the kept sensors.
-    // Max mode quantizes at 4 AQI points (finer than _aqiColorCat) so the
-    // field recomputes when a sensor visibly changes within a coarse AQI band
-    // (PA dot sub-bands are finer than AQI categories).
+    // ALWAYS quantized at 4 AQI points, never at color-category granularity:
+    // the field renders from continuous values, so a category-based
+    // fingerprint let a sensor drift a whole band's width (15+ ppb of
+    // ozone) without ever invalidating the cached field canvas — the field
+    // froze until some unrelated sensor crossed a band, then "randomly"
+    // caught up.
     for (const s of sensors) {
       fingerprint += (maxTabs && maxTabs.length) ? ("m" + Math.round(s.aqi / 4) + ",")
-        : (isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(g.valueToAqi(aqiKey, s.value) ?? 0));
+        : ("q" + Math.round((g.valueToAqi(aqiKey, s.value) ?? 0) / 4) + ",");
     }
 
     return { sensors, fingerprint };
@@ -296,8 +333,6 @@
 
     // Match trail fade timing exactly
     const FADE_TIME_MS = isPlayback ? 45 * 60 * 1000 : 20 * 60 * 1000;
-    const FADE_TAIL_FRAC = 0.20;
-    const fadeStartAgeMs = FADE_TIME_MS * (1.0 - FADE_TAIL_FRAC);
 
     if (!refNowMs || !isFinite(refNowMs)) return { sensors: [], fingerprint: "" };
 
@@ -375,13 +410,17 @@
         const pollVal = Number(rawVal);
         if (!isFinite(pollVal) || pollVal < 0) continue;
 
-        // Decay weight: full for fresh, quadratic falloff in tail
-        let decayWeight = 1.0;
-        if (ageMs > fadeStartAgeMs) {
-          const u = (ageMs - fadeStartAgeMs) / (FADE_TIME_MS - fadeStartAgeMs);
-          decayWeight = (1 - u) * (1 - u);
-          if (decayWeight <= 0.01) continue;
-        }
+        // Decay weight: quadratic falloff applied from age 0, so the LATEST
+        // reading carries the most weight and older ones progressively less.
+        // This used to be a flat 1.0 until fadeStartAgeMs (80% of the window),
+        // which made a 15-minute-old reading count exactly as much as one that
+        // just landed — the newest reading was one equal voice among ~16 min of
+        // ties, so a fresh value could not move the field until the old points
+        // aged out (the poll interval PLUS the trail decay). Same curve, same
+        // window, same rate for every reading; it just starts at age 0.
+        const fadeU = ageMs / FADE_TIME_MS;
+        const decayWeight = (1 - fadeU) * (1 - fadeU);
+        if (decayWeight <= 0.01) continue;
 
         // Spatial dedup: 1 sensor per ~220m cell. Newest-first → skip if slot taken.
         // Reduced to half for performance diagnostics
@@ -407,15 +446,24 @@
 
     const sensors = Array.from(sensorMap.values());
     let fingerprint = "";
+    // Quantized-value fingerprint — see the fixed-sensor collector's note.
     for (const s of sensors) fingerprint += (maxTabs && maxTabs.length && s.aqi != null) ? ("m" + Math.round(s.aqi / 4) + ",")
-      : (isPm25 ? _pm25ColorCat(s.value) : _aqiColorCat(g.valueToAqi(aqiKey, s.value) ?? 0));
+      : ("q" + Math.round((g.valueToAqi(aqiKey, s.value) ?? 0) / 4) + ",");
     return { sensors, fingerprint };
   }
 
   /** Compute the playback time range over which the PA field fingerprint is unchanged.
    *  Scans each sensor's PM2.5 timeline to find the nearest past and future points
    *  where _pm25ColorCat would change. Returns { fromMs, toMs }. */
-  function _findFingerprintValidRange(fixed, playbackTimeMs) {
+  function _findFingerprintValidRange(fixed, playbackTimeMs, tabs) {
+    // The window in which the DISPLAYED pollutant's field cannot change.
+    // MUST inspect the same pollutant series and the same quantization the
+    // collector fingerprints with. The original version hardcoded PM2.5
+    // color categories no matter what was displayed, so the O3/NO2/CO field
+    // was declared "still valid" until some sensor's PM2.5 happened to
+    // cross a band — scrubbing showed stale ozone until a random unrelated
+    // repaint. tabs defaults to ["pm25"] for legacy callers.
+    const tabList = (Array.isArray(tabs) && tabs.length) ? tabs : ["pm25"];
     let nextChangeMs = Infinity;
     let prevChangeMs = -Infinity;
 
@@ -423,43 +471,49 @@
       if (!f) continue;
       const readings = f && f.readings;
       if (!readings) continue;
-      // Check PM2.5-like keys (same keys _collectPaFieldSensors uses)
-      const r = readings["PM25"] || readings["PM2.5"] || readings["pm25"] || readings["pm2.5"];
-      if (!r || !r._parsedTimeline) continue;
-      const { timesMs, valuesF } = r._parsedTimeline;
-      if (!timesMs || timesMs.length < 2) continue;
+      for (const tab of tabList) {
+        const keys = _LEGEND_TAB_READING_KEYS[tab];
+        const aqiKey = _LEGEND_TAB_AQI_KEY[tab] || "pm2.5";
+        if (!keys) continue;
+        let r = null;
+        for (const rk of keys) { const cand = readings[rk]; if (cand) { r = cand; break; } }
+        if (!r || !r._parsedTimeline) continue;
+        const { timesMs, valuesF } = r._parsedTimeline;
+        if (!timesMs || timesMs.length < 2) continue;
 
-      // Binary search for current index
-      let idx;
-      if (playbackTimeMs <= timesMs[0]) {
-        idx = 0;
-      } else if (playbackTimeMs >= timesMs[timesMs.length - 1]) {
-        idx = timesMs.length - 1;
-      } else {
-        let lo = 0, hi = timesMs.length - 1;
-        while (lo < hi) {
-          const mid = (lo + hi + 1) >> 1;
-          if (timesMs[mid] <= playbackTimeMs) lo = mid;
-          else hi = mid - 1;
+        // Binary search for current index
+        let idx;
+        if (playbackTimeMs <= timesMs[0]) {
+          idx = 0;
+        } else if (playbackTimeMs >= timesMs[timesMs.length - 1]) {
+          idx = timesMs.length - 1;
+        } else {
+          let lo = 0, hi = timesMs.length - 1;
+          while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (timesMs[mid] <= playbackTimeMs) lo = mid;
+            else hi = mid - 1;
+          }
+          idx = lo;
         }
-        idx = lo;
-      }
 
-      const curCat = _pm25ColorCat(valuesF[idx]);
+        // Same 4-AQI quantization as the collector fingerprints.
+        const qOf = (v) => Math.round((g.valueToAqi(aqiKey, v) ?? 0) / 4);
+        const curQ = qOf(valuesF[idx]);
 
-      // Forward: find the next data point that changes color category
-      for (let i = idx + 1; i < timesMs.length; i++) {
-        if (_pm25ColorCat(valuesF[i]) !== curCat) {
-          if (timesMs[i] < nextChangeMs) nextChangeMs = timesMs[i];
-          break;
+        // Forward: next sample that changes the quantized value
+        for (let i = idx + 1; i < timesMs.length; i++) {
+          if (qOf(valuesF[i]) !== curQ) {
+            if (timesMs[i] < nextChangeMs) nextChangeMs = timesMs[i];
+            break;
+          }
         }
-      }
-      // Backward: find when the current category segment started
-      for (let i = idx - 1; i >= 0; i--) {
-        if (_pm25ColorCat(valuesF[i]) !== curCat) {
-          // Current segment started at timesMs[i+1]
-          if (timesMs[i + 1] > prevChangeMs) prevChangeMs = timesMs[i + 1];
-          break;
+        // Backward: when the current quantized segment started
+        for (let i = idx - 1; i >= 0; i--) {
+          if (qOf(valuesF[i]) !== curQ) {
+            if (timesMs[i + 1] > prevChangeMs) prevChangeMs = timesMs[i + 1];
+            break;
+          }
         }
       }
     }

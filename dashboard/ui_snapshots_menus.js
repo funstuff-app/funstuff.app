@@ -118,6 +118,17 @@
     // No-op: old button removed, menu handles state dynamically
   };
 
+  /** Playhead start for a loaded day: 6:00 AM local (users rewind for
+   *  earlier), clamped into the day's data bounds so a day whose data
+   *  starts later still begins on data. Explicit embed params
+   *  (?date=&start=&playhead=) override this after the load returns. */
+  SnapshotsMenusUI.prototype._dayStartPlayheadMs = function (dateStr, b) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ""));
+    if (!m) return b.minMs;
+    const sixAm = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 6, 0, 0, 0).getTime();
+    return Math.min(Math.max(sixAm, b.minMs), b.maxMs);
+  };
+
   SnapshotsMenusUI.prototype.loadHistoricalDay = async function (dateStr) {
     const map = this.map;
     const document = this.document;
@@ -179,7 +190,10 @@
     try {
       // Load from local snapshots — we already store all data (mobile, fixed,
       // purpleair, etc.) so there's no need to fetch from upstream history servers.
-      const resp = await fetch(`${g.appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}`, { headers: { "X-App-Token": g.APP_TOKEN } });
+      // cv= busts caches poisoned by the old "immutable, max-age=86400" header
+      // (removed 2026-07-10): those entries never revalidate, so only a new
+      // URL gets past them. Bump cv when a served day changes under a cache.
+      const resp = await fetch(`${g.appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}&cv=2`, { headers: { "X-App-Token": g.APP_TOKEN } });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `No snapshot for ${dateStr}`);
@@ -234,10 +248,10 @@
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
 
-      // Build playback points; start the playhead at the earliest data.
+      // Build playback points; start the playhead at 6:00 AM (clamped).
       map._ensurePlaybackPoints(g._historicalState);
       const b = map.getPlaybackBounds();
-      if (isFinite(b.minMs)) map.setPlaybackTimeMs(b.minMs);
+      if (isFinite(b.minMs)) map.setPlaybackTimeMs(this._dayStartPlayheadMs(dateStr, b));
 
       // Store state, render sidebar, draw ONLY tiles (no overlay yet)
       map.lastState = g._historicalState;
@@ -443,7 +457,8 @@
     this.updateSaveButtonState();
 
     try {
-      const resp = await fetch(`${g.appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}`, { headers: { "X-App-Token": g.APP_TOKEN } });
+      // cv=2: cache-buster, see loadSnapshotForDate above.
+      const resp = await fetch(`${g.appConfig.apiBaseUrl}/snapshot/load?date=${encodeURIComponent(dateStr)}${extraParams}&cv=2`, { headers: { "X-App-Token": g.APP_TOKEN } });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.error || `HTTP ${resp.status}`);
@@ -502,11 +517,11 @@
       if (traceEl) traceEl.checked = true;
       if (pbBarEl) pbBarEl.classList.remove("hidden");
 
-      // Build playback points; start the playhead at the earliest data.
+      // Build playback points; start the playhead at 6:00 AM (clamped).
       map._ensurePlaybackPoints(g._historicalState);
       const b = map.getPlaybackBounds();
       if (isFinite(b.minMs)) {
-        map.setPlaybackTimeMs(b.minMs);
+        map.setPlaybackTimeMs(this._dayStartPlayheadMs(dateStr, b));
       }
 
       // Store state, render sidebar, draw
