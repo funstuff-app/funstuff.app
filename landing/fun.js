@@ -10,6 +10,16 @@
     }, { passive: true });
   }
 
+  /* ── Email links: hrefs assembled at runtime from reversed data attrs
+     so the address isn't sitting in page source for scrapers. ── */
+  var _mailLinks = document.querySelectorAll("[data-mail-u]");
+  for (var _mi = 0; _mi < _mailLinks.length; _mi++) {
+    var _mEl = _mailLinks[_mi];
+    var _mu = (_mEl.getAttribute("data-mail-u") || "").split("").reverse().join("");
+    var _mh = (_mEl.getAttribute("data-mail-h") || "").split("").reverse().join("");
+    if (_mu && _mh) _mEl.href = "mailto:" + _mu + "@" + _mh;
+  }
+
   /* ── Weekend snapshot logic for embedded map widget ── */
   var _widgetLoadTime = Date.now();
   var _widgetSnapshotParams = null;
@@ -93,10 +103,10 @@
       var iframe = document.getElementById("map-iframe");
       if (iframe) iframe.src = (iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/") + "?lite=1&fresh=1&demo=1";
       var overlayLabel = document.getElementById("demo-overlay-label");
-      if (overlayLabel) overlayLabel.textContent = "Live preview \u2014 click to open full app";
+      if (overlayLabel) overlayLabel.textContent = "Demo preview \u2014 click to open full app";
       var indicator = document.getElementById("snapshot-indicator");
       if (indicator) {
-        indicator.textContent = "\u25CF Live";
+        indicator.textContent = "\u25B6 Demo";
         indicator.style.display = "block";
       }
     }
@@ -156,6 +166,7 @@
     tuiOverlay.addEventListener("click", function () {
       tuiOverlay.style.display = "none";
       tuiIframe.classList.add("interactive");
+      tuiIframe.focus();
     });
   }
 
@@ -1405,7 +1416,7 @@
     var h = dim.h;
 
     var iframe = document.createElement("iframe");
-    iframe.src = "https://likes.funstuff.app/";
+    iframe.src = "https://likes.funstuff.app/?random=1";
     iframe.setAttribute("title", "Pictures");
     iframe.setAttribute("loading", "lazy");
     iframe.setAttribute("allow", "autoplay; encrypted-media; picture-in-picture; fullscreen");
@@ -1514,12 +1525,16 @@
   var smDusty = document.getElementById("sm-dustytrails");
   if (smDusty) smDusty.addEventListener("click", openMainWindow);
 
+  var smEmail = document.getElementById("sm-email");
   var smPipes = document.getElementById("sm-pipes");
   var smFlowerbox = document.getElementById("sm-flowerbox");
   var smVideos = document.getElementById("sm-videos");
   var smWinamp = document.getElementById("sm-winamp");
   var smPictures = document.getElementById("sm-pictures");
 
+  if (smEmail) smEmail.addEventListener("click", function () {
+    closeStartMenu();
+  });
   if (smPipes) smPipes.addEventListener("click", function (e) {
     e.preventDefault();
     openPipesWindow();
