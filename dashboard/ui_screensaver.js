@@ -108,11 +108,19 @@
           playing: map.getPlaybackPlaying(), liveFollow: map._playbackLiveFollow,
         };
 
-        // Configure: 60x from start
+        // Configure: 60x from start.
+        // Playhead: only rewind to the global earliest timestamp (sb.minMs)
+        // for an organic hot-corner entry. A ?demo=1 entry arrives with a
+        // playhead app.js already set deliberately from the URL's
+        // start/playhead params — sb.minMs is the min across ALL sensors
+        // (fixed sensors report from the window start; a given mobile's
+        // own trail often begins later), so rewinding to it here could
+        // land before that mobile's first point and clip its trail/marker
+        // to nothing until playback catches back up.
         map._playbackLiveFollow = false;
         map.setPlaybackSpeed(60);
         if (deps.pbSpeedEl) deps.pbSpeedEl.value = "60";
-        if (isFinite(sb.minMs)) map.setPlaybackTimeMs(sb.minMs);
+        if (!self._enteredViaDemo && isFinite(sb.minMs)) map.setPlaybackTimeMs(sb.minMs);
         pb._pbVelocity = self._pbPlaybackSpeed * 60;
         map.setPlaybackPlaying(true);
         pb._pbLastPerf = 0;
