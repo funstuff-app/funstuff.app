@@ -50,6 +50,38 @@ aside, section { min-height: 0; }
   pointer-events: none;
 }
 
+#mapglMap {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-map-tiles);
+  width: 100%;
+  height: 100%;
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+  contain: strict;
+  transition: opacity 160ms ease-out;
+}
+
+#mapglMap canvas { outline: none; }
+
+#mapRoot.mapgl-visible #mapglMap {
+  visibility: visible;
+  opacity: 1;
+}
+
+#mapRoot.mapgl-active #tilesCanvas,
+#mapRoot.mapgl-active #paFieldCanvas,
+#mapRoot.mapgl-active #overlayCanvas {
+  opacity: 0;
+}
+
+#tilesCanvas,
+#paFieldCanvas,
+#overlayCanvas {
+  transition: opacity 160ms ease-out;
+}
+
 #tilesCanvas {
   position: absolute;
   inset: 0;
@@ -127,7 +159,8 @@ aside, section { min-height: 0; }
 
 /* ── Floating map-overlay icon buttons (camera replay / center-fit) ── */
 #camReplayBtn,
-#camCenterBtn {
+#camCenterBtn,
+#map3dToggle {
   position: absolute;
   right: var(--space-3);
   z-index: var(--z-camera-btn);
@@ -151,8 +184,15 @@ aside, section { min-height: 0; }
 #camReplayBtn { top: 110px; display: none; }
 #camReplayBtn.visible { display: flex; }
 #camCenterBtn { top: 150px; display: flex; }
+#map3dToggle { top: 190px; display: flex; }
+#map3dToggle.active {
+  color: var(--ink-100);
+  border-color: oklch(68% 0.13 235 / 0.65);
+  background: oklch(34% 0.08 235 / 0.9);
+}
 #camReplayBtn:hover,
-#camCenterBtn:hover { background: var(--ink-800); color: var(--ink-100); }
+#camCenterBtn:hover,
+#map3dToggle:hover { background: var(--ink-800); color: var(--ink-100); }
 #camReplayBtn.replaying {
   color: oklch(65% 0.18 25);
   border-color: oklch(65% 0.18 25 / 0.4);

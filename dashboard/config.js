@@ -1,9 +1,10 @@
 /* MobileAir dashboard JS
  * - Fetches /api/state
- * - Renders a slippy-tile basemap on tilesCanvas
+ * - Configures the MapLibre GL basemap and canvas fallback tiles
  * - Draws dotted breadcrumb trails + emoji vehicle markers on overlayCanvas
  *
- * No map library is used for overlay/projection; we do Web Mercator ourselves.
+ * Sensor rendering keeps the existing Web Mercator canvas pipeline. MapLibre
+ * consumes those canvases as georeferenced sources for pitched terrain views.
  */
 
 var TILE_SIZE = 256;

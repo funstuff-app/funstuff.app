@@ -26,9 +26,9 @@ a terminal UI, and a retro landing page.
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  Browser Dashboard  (dashboard/)                         │
-│  Vanilla JS · Canvas map · Playback/DVR · PWA            │
+│  Vanilla JS · MapLibre GL 3D map · Playback/DVR · PWA    │
 │  Modular engine: MapView composition root delegating to  │
-│  9 engine_* controllers + 7 ui_* modules (UMD, no build) │
+│  10 engine_* controllers + 7 ui_* modules (UMD, no build)│
 └───────────────────────┬──────────────────────────────────┘
                         │ /api/state, /api/fixed, /api/snapshots …
 ┌───────────────────────▼──────────────────────────────────┐
@@ -117,6 +117,7 @@ dashboard/                 Browser dashboard (vanilla JS, no build step)
 ├── index.html             PWA shell; script tags define the load order
 ├── app.js                 Bootstrap + main() wiring of the ui_* modules
 ├── map_view.js            MapView composition root; delegates to controllers
+├── engine_mapgl_renderer.js MapLibre GL basemap, terrain, canvas sources
 │
 ├── engine_field_sensors.js    Sensor collection for the pollution field
 ├── engine_tile_renderer.js    Map tiles, tile cache, snapshots

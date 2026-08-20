@@ -276,6 +276,10 @@ class MapView {
     const CameraGesturesCtor = (typeof window !== "undefined" ? window : globalThis).CameraGestures;
     this.gestures = new CameraGesturesCtor(this);
 
+    const MapGLRendererCtor = (typeof window !== "undefined" ? window : globalThis).MapGLRenderer;
+    const mapglContainer = document.getElementById("mapglMap");
+    this.mapgl = MapGLRendererCtor ? new MapGLRendererCtor(this, mapglContainer) : null;
+
     // ResizeObserver fires after layout settles — catches window resize, devtools
     // show/hide, and fullscreen toggle more reliably than window "resize".
     // Pass contentRect dimensions directly to avoid reading stale clientHeight:
@@ -462,6 +466,7 @@ class MapView {
     // start new requests at the current epoch.
     this._lastTilesViewSig = null;
     this.draw(this.lastState);
+    if (this.mapgl) this.mapgl.setTheme();
   }
 
   /** Delegates to CameraGestures (engine_camera_gestures.js). */
@@ -768,6 +773,8 @@ class MapView {
   _handleTapSelection(...args) { return this.gestures._handleTapSelection(...args); }
 
   worldToScreen(wx, wy) {
+    const projected = this.mapgl ? this.mapgl.projectWorld(wx, wy) : null;
+    if (projected) return projected;
     const w = this._cssW || 1;
     const h = this._cssH || 1;
     const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
@@ -883,7 +890,10 @@ class MapView {
   _updatePersistedTrails(state) { return this.overlay._updatePersistedTrails(state); }
 
   /** Delegates to TileRenderer (engine_tile_renderer.js). */
-  drawTiles() { this.tiles.drawTiles(); }
+  drawTiles() {
+    if (this.mapgl && this.mapgl.sync()) return;
+    this.tiles.drawTiles();
+  }
 
   /** Delegates to TileRenderer (engine_tile_renderer.js). */
   _captureTilesSnapshot() { this.tiles._captureTilesSnapshot(); }
@@ -1065,7 +1075,10 @@ class MapView {
 
   setPaFieldDim(target) { this.paField.setPaFieldDim(target); }
 
-  _compositePaFieldOnTiles(state, tilesJustRedrawn = false) { this.paField._compositePaFieldOnTiles(state, tilesJustRedrawn); }
+  _compositePaFieldOnTiles(state, tilesJustRedrawn = false) {
+    this.paField._compositePaFieldOnTiles(state, tilesJustRedrawn);
+    if (this.mapgl && this.mapgl.active) this.mapgl.sync();
+  }
 
   _ensurePaField(state, playbackTimeMs) { this.paField._ensurePaField(state, playbackTimeMs); }
 
@@ -1105,7 +1118,11 @@ class MapView {
   _ensureOverlayStatic(state) { return this.overlay._ensureOverlayStatic(state); }
 
   /** Delegates to OverlayRenderer (engine_overlay_renderer.js). */
-  drawOverlay(state, opts = {}) { return this.overlay.drawOverlay(state, opts); }
+  drawOverlay(state, opts = {}) {
+    const result = this.overlay.drawOverlay(state, opts);
+    if (this.mapgl && this.mapgl.active) this.mapgl.sync();
+    return result;
+  }
 }
 // Expose on window for cross-script access (class declarations don't auto-create window properties)
 window.MapView = MapView;
