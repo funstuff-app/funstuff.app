@@ -54,7 +54,13 @@ class MapView {
     this.zoom = 12.58; // 50% more zoomed in than the original 12 (log2 scale: +log2(1.5))
     this._zoomMin = 3;
     this._zoomMax2d = 18;
-    this._zoomMax3d = 16; // 3D: closer than this the pitched camera drops to street level
+    // 3D ceiling. MapLibre's pitched camera sits cos(58deg) * cameraToCenter
+    // px above the CENTER's ground; with the center elevation not yet known
+    // (DEM still loading on entry) that is above sea level: map zoom 14 =
+    // ~2.5 km, which clears the bench/foothills everywhere in the valley; map
+    // zoom 15 (~1.2 km) does not, and MapLibre then re-aims the camera from
+    // ground level.
+    this._zoomMax3d = 15;
     this._zoomMax = this._zoomMax2d;
     // Mouse drag pan (optional). Does not affect trackpad controls.
     // _mouseDragging is shared (read by PlaybackEngine/PaFieldRenderer); the

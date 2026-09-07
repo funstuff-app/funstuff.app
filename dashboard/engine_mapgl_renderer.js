@@ -504,7 +504,19 @@
     this._lastViewKey = "";
     // Zoom ceiling for 3D (every zoom gesture clamps to view._zoomMax).
     this.view._zoomMax = this.view._zoomMax3d;
-    if (this.view.zoom > this.view._zoomMax) this.view.zoom = this.view._zoomMax;
+    if (this.view.zoom > this.view._zoomMax) {
+      // Entering from a closer 2D zoom: back the app out to the 3D ceiling
+      // BEFORE the camera is pushed, and redraw so every zoom-derived cache
+      // (tiles snapshot, trail cache, field, playback points) is rebuilt for
+      // the new zoom instead of waiting for the next gesture. Kill any
+      // in-flight zoom inertia/easing that would write the old zoom back.
+      this.view._stopPinchInertia();
+      this.view._cancelCameraAnimations();
+      this.view.zoom = this.view._zoomMax;
+      this.view._lastTilesViewSig = null;
+      this.view.draw(this.view.lastState);
+      try { if (typeof window.__onMapViewChanged === "function") window.__onMapViewChanged(); } catch {}
+    }
     this.map.setTerrain({ source: "terrain", exaggeration: 1.15 });
     this.sync(true);
     this.map.jumpTo({ pitch: 0, bearing: 0 });
@@ -514,6 +526,22 @@
     window.requestAnimationFrame(() => {
       this.map.easeTo({ pitch: PITCH_3D, bearing: 0, duration: 520 });
       root.classList.add("mapgl-active");
+    });
+    // If MapLibre's terrain correction fired during the ease with the DEM not
+    // yet loaded (center elevation 0), it left a lowered pitch/zoom behind.
+    // Re-apply the requested camera once the map is idle (DEM present); if
+    // it is still under terrain then, the correction runs again with real data.
+    this.map.once("idle", () => {
+      if (!this.active) return;
+      this._lastViewKey = "";
+      this.map.jumpTo({
+        center: [this.view.center.lon, this.view.center.lat],
+        zoom: this.view.zoom - 1,
+        pitch: PITCH_3D,
+        bearing: 0,
+      });
+      this._lastViewKey = `${this.view.center.lon}:${this.view.center.lat}:${this.view.zoom}:${this._lastSizeKey}`;
+      this._cameraDirty = true;
     });
     this._setButtonState(true);
   };
