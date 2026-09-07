@@ -85,6 +85,14 @@ let appConfig = {
 };
 _cfgRoot.appConfig = appConfig;
 
+/** Append the CARTO basemap key (from /api/config) to a cartocdn tile URL. */
+function tileUrlWithKey(url) {
+  const key = _cfgRoot.appConfig && _cfgRoot.appConfig.cartoApiKey;
+  if (!key || !/\.cartocdn\.com\//.test(url)) return url;
+  return url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key);
+}
+_cfgRoot.tileUrlWithKey = tileUrlWithKey;
+
 /**
  * Load server configuration from /api/config endpoint.
  * Falls back to defaults if unavailable (e.g., offline, older server).

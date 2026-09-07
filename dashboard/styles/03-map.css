@@ -71,8 +71,7 @@ aside, section { min-height: 0; }
 }
 
 #mapRoot.mapgl-active #tilesCanvas,
-#mapRoot.mapgl-active #paFieldCanvas,
-#mapRoot.mapgl-active #overlayCanvas {
+#mapRoot.mapgl-active #paFieldCanvas {
   opacity: 0;
 }
 

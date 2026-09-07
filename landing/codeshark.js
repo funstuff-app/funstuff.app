@@ -53,8 +53,9 @@
    * and thereafter refers to it as that slot's armed session. */
   function applyState(d) {
     if (!d || !d.ok) return;
-    if (d.active) S.active = d.active;
+    if (d.active && d.active !== "PoC") S.active = d.active;
     if (d.slots) {
+      d.slots = d.slots.filter(function (sv) { return sv.slot !== "PoC"; });
       S.slots = d.slots;
       d.slots.forEach(function (sv) {
         var b = blade(sv.slot);
@@ -503,17 +504,17 @@
     '.csk h1{font-size:15px;letter-spacing:.32em;margin:0;padding:8px 10px;border-bottom:1px solid #0a4;color:#7f9;text-shadow:0 0 6px #0f6;flex:0 0 auto}',
     '.csk .csk-lockbar{padding:4px 10px;background:#180000;color:#f66;border-bottom:1px solid #600;letter-spacing:.1em;flex:0 0 auto}',
     '.csk .csk-lockbar.csk-unlocked{background:#001800;color:#6f6;border-color:#060}',
-    '.csk .csk-rail{flex:1 1 auto;min-height:0;display:flex;flex-wrap:wrap;align-content:stretch}',
+    '.csk .csk-rail{flex:1 1 auto;min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr);grid-template-columns:repeat(19,max-content) 1fr;grid-auto-flow:column;overflow:hidden}',
     '.csk .csk-blade{display:contents}',
     
     
     '.csk .csk-blade.csk-on .csk-spine{background:#042812;border-color:#0f6;color:#bfe;box-shadow:0 -6px 14px -6px #0f6}',
-    '.csk .csk-spine{order:0;flex:0 0 auto;align-self:flex-start;display:flex;align-items:baseline;gap:8px;padding:4px 14px;margin:6px 2px 0 0;background:#010;border:1px solid #063;border-bottom:0;letter-spacing:.16em;color:#0a6;cursor:pointer;user-select:none}',
+    '.csk .csk-spine{grid-row:1;align-self:end;display:flex;align-items:baseline;gap:8px;padding:4px 14px;margin:6px 2px 0 0;background:#010;border:1px solid #063;border-bottom:0;letter-spacing:.16em;color:#0a6;cursor:pointer;user-select:none}',
     
     '.csk .csk-blade.csk-armed .csk-spine{color:#0f6}.csk .csk-blade.csk-expired .csk-spine{color:#f44}.csk .csk-blade.csk-empty .csk-spine{color:#565}',
     '.csk .csk-spine-name{font-weight:bold;font-size:13px;color:#7f9}','.csk .csk-blade.csk-on .csk-spine-name{color:#bfe;text-shadow:0 0 8px #0f6}',
     '.csk .csk-spine-st{font-size:10px;opacity:.8;letter-spacing:.18em}',
-    '.csk .csk-face{order:1;flex:1 1 100%;min-width:100%;display:none;flex-direction:column;padding:8px 10px 10px;overflow-y:auto;border-top:1px solid #0a4;scrollbar-width:thin;scrollbar-color:#0a4 #000}',
+    '.csk .csk-face{grid-row:2;grid-column:1/-1;min-height:0;min-width:0;display:none;flex-direction:column;padding:8px 10px 10px;overflow-y:auto;border-top:1px solid #0a4;scrollbar-width:thin;scrollbar-color:#0a4 #000}',
     '.csk .csk-face::-webkit-scrollbar{width:7px}.csk .csk-face::-webkit-scrollbar-track{background:#000}.csk .csk-face::-webkit-scrollbar-thumb{background:#0a4;box-shadow:0 0 5px #0f6 inset}',
     '.csk .csk-blade.csk-on .csk-face{display:flex}',
     '.csk .csk-sess{display:flex;align-items:center;gap:10px;flex-wrap:wrap}',

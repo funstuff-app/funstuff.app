@@ -545,7 +545,15 @@
       const pts = view._playbackPtsById.get(String(id));
       if (!pts || pts.length < 2) continue;
 
-      // Use physics distance if available, otherwise estimate from playback time
+      // Use physics distance if available, otherwise estimate from playback time.
+      // Both lookups ride the SAME cumulative-distance array _getPathDistances
+      // already builds/maintains incrementally for rendering (engine_vehicle_
+      // motion.js) — this function used to re-sum haversine distances from the
+      // start of `pts` on every call instead, an O(trail-so-far) rescan that
+      // this 500ms-throttled loop paid again and again, growing with every
+      // point the vehicle had logged that day. Binary search replaces both
+      // linear scans; `pts` is time-sorted, `cumDist` is distance-sorted.
+      const { cumDist } = view._getPathDistances(String(id), pts);
       let currentD = 0;
       if (phys && phys.d > 0) {
         currentD = phys.d;
@@ -553,14 +561,12 @@
         // Estimate position from playback time
         const pbTimeMs = view.getPlaybackTimeMs();
         if (pbTimeMs != null) {
-          let cumD = 0;
-          for (let i = 1; i < pts.length; i++) {
-            if (pts[i].tMs > pbTimeMs) break;
-            const prev = pts[i - 1], curr = pts[i];
-            const segD = g.haversineMeters(prev.lat, prev.lon, curr.lat, curr.lon);
-            if (isFinite(segD)) cumD += segD;
+          let lo = 0, hi = pts.length - 1;
+          while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (pts[mid].tMs <= pbTimeMs) lo = mid; else hi = mid - 1;
           }
-          currentD = cumD;
+          currentD = pts[lo].tMs <= pbTimeMs ? cumDist[lo] : 0;
         }
       }
 
@@ -568,13 +574,15 @@
       const lookaheadD = currentD + g.MapView.CURVATURE_LOOKAHEAD * 2;
 
       // Find indices in trail corresponding to [currentD, lookaheadD]
-      let startIdx = 0, endIdx = pts.length - 1, cumD = 0;
-      for (let i = 1; i < pts.length; i++) {
-        const prev = pts[i - 1], curr = pts[i];
-        const segD = g.haversineMeters(prev.lat, prev.lon, curr.lat, curr.lon);
-        if (isFinite(segD)) cumD += segD;
-        if (cumD < currentD) startIdx = i;
-        if (cumD >= lookaheadD) { endIdx = i; break; }
+      let startIdx = 0, hiS = pts.length - 1;
+      while (startIdx < hiS) {
+        const mid = (startIdx + hiS + 1) >> 1;
+        if (cumDist[mid] <= currentD) startIdx = mid; else hiS = mid - 1;
+      }
+      let endIdx = pts.length - 1, loE = 0;
+      while (loE < endIdx) {
+        const mid = (loE + endIdx) >> 1;
+        if (cumDist[mid] >= lookaheadD) endIdx = mid; else loE = mid + 1;
       }
 
       const fromMs = pts[startIdx]?.tMs;

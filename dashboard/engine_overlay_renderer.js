@@ -1401,7 +1401,7 @@
     // given (view + playbackTime) so skip redundant calls within the same frame.
     {
       const _now = performance.now();
-      if (this._overlayLastDrawMs && (_now - this._overlayLastDrawMs) < 4) return;
+      if (!opts.forceFrame && this._overlayLastDrawMs && (_now - this._overlayLastDrawMs) < 4) return;
       this._overlayLastDrawMs = _now;
     }
     // During gestures/easing, skip legend-export work (no one reads these values).
@@ -1522,7 +1522,13 @@
     // still look smooth. 30s during active scrub, 8s during normal playback.
     // (Was 2s, which redrew the O(vehicles*points) trail cache ~30× per minute
     // during playback even at 1× speed — measurable laptop heat.)
-    const timeThreshold = view._scrubbing ? 30000 : 8000;
+    // Fade tail is the last 9 min of the 45 min window (alpha 1 -> 0 over
+    // 540 s sim), so 20 s of sim time is at most a 4% alpha step per
+    // rebuild: not visible, and 2.5x fewer full trail rebuilds than the old
+    // 8 s. Each rebuild strokes every visible trail with dashed round-capped
+    // lines, which Safari tessellates per dash; at 5x that was a rebuild
+    // every 1.6 s of wall time.
+    const timeThreshold = view._scrubbing ? 30000 : 20000;
     // Sim-time gate: has enough simulated time elapsed to warrant a redraw?
     const simTimeElapsed = Math.abs(timeDelta) > timeThreshold;
     // Wall-time floor: at high playback speeds (60x screensaver), the sim-time gate
@@ -1531,11 +1537,23 @@
     // (pan/zoom) still bypass this gate so interactive response stays snappy.
     const nowPerf = performance.now();
     const wallSinceRedraw = nowPerf - (this._lastTrailRedrawPerf || 0);
-    const timeChanged = simTimeElapsed && wallSinceRedraw > 100;
+    // Not while the camera is moving: a time-driven rebuild mid-gesture is a
+    // full O(vehicles*points) trail redraw that also defeats the translate
+    // fast path below (skipTrailsForGesture requires !timeChanged), so at
+    // higher playback speeds it fired every ~100 ms of a pan. The fade it
+    // refreshes drifts ~1% alpha per 5 s; the rebuild lands on release.
+    const timeChanged = simTimeElapsed && wallSinceRedraw > 250 && !view._isTransientAnimating();
 
     // Precompute center world once per frame; avoids repeated center projection in worldToScreen().
     const centerW = latLonToWorld(view.center.lat, view.center.lon, view.zoom);
-    const worldToScreenFast = (wx, wy) => ({ x: wx - centerW.x + w / 2, y: wy - centerW.y + h / 2 });
+    // 3D: this canvas is displayed screen-aligned over the terrain (not
+    // draped), so everything drawn on it projects through the pitched camera
+    // (view.worldToScreen -> mapgl.projectWorld). Trails are draped instead:
+    // the trail cache buffer is the GL source, see MapGLRenderer.
+    const _is3d = !!(view.mapgl && view.mapgl.active && view.mapgl.ready);
+    const worldToScreenFast = _is3d
+      ? (wx, wy) => view.worldToScreen(wx, wy)
+      : (wx, wy) => ({ x: wx - centerW.x + w / 2, y: wy - centerW.y + h / 2 });
 
     // Overfetch: trail cache buffer is larger than viewport
     const trailBufW = Math.min(Math.ceil(w * _OVERFETCH), Math.floor(_OVERFETCH_MAX_DEVICE_PX / dpr));
@@ -1980,8 +1998,9 @@
         this._lastTrailRedrawPerf = performance.now();
       }
 
-      // Blit cached trails to main canvas
-      if (view._trailCacheCanvas) {
+      // Blit cached trails to main canvas (2D only; in 3D the cache is draped
+      // on the terrain by MapLibre and this canvas holds markers only)
+      if (view._trailCacheCanvas && !_is3d) {
         const tBufW = this._trailCacheBufW || w;
         const tBufH = this._trailCacheBufH || h;
         const tOffX = (tBufW - w) / 2;

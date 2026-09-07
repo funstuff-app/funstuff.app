@@ -47,6 +47,50 @@
     }
   }
 
+  // MapLibre/Mapbox GL's fixed vertical field of view (radians), used by both
+  // engine_mapgl_renderer.js's camera and the ground-distance math below. Kept
+  // as a private constant here (not read from MapGLRenderer) because it is a
+  // property of the GL library itself, not of this app's renderer.
+  const _GL_CAMERA_FOV = 0.6435011087932844; // ≈36.87°
+
+  /**
+   * Ground distance (world-px at the given zoom) from `view.center` to the
+   * FARTHEST point the pitched 3D camera can actually see — the far corner of
+   * the screen, not just the far edge — derived from MapLibre's real camera
+   * geometry instead of a guessed multiplier.
+   *
+   * The camera looks at view.center along a ray pitched `pitchDeg` from
+   * straight down. A ray through screen offset (u, v) — u, v in tangent-plane
+   * units, v>0 toward the top of the screen (the horizon direction) — has
+   * world direction (u, v·cosθ + sinθ, v·sinθ − cosθ) after rotating the
+   * flat-down frame by pitch θ around the screen's horizontal axis. Where
+   * that ray crosses the ground plane (relative to where the boresight ray
+   * crosses it, i.e. relative to view.center):
+   *   relX = H·u / (cosθ − v·sinθ)
+   *   relY = H·v / (cosθ·(cosθ − v·sinθ))
+   * relY doesn't depend on u: horizontal screen offset shears the hit point
+   * sideways but does not change how far down-range it lands, so the top-left
+   * and top-right corners land exactly as far "forward" as top-center — they
+   * are farther from view.center only because they are ALSO offset sideways.
+   * The far corner's distance from view.center is therefore
+   * sqrt(relX(uEdge, vTop)² + relY(vTop)²), which is what this returns.
+   */
+  function _field3dFarCornerDistPx(cssW, cssH, pitchDeg) {
+    const halfFov = _GL_CAMERA_FOV / 2;
+    const hHalfFov = Math.atan(Math.tan(halfFov) * (cssW / Math.max(cssH, 1)));
+    const theta = pitchDeg * Math.PI / 180;
+    const cosT = Math.cos(theta), sinT = Math.sin(theta);
+    const camDist = 0.5 / Math.tan(halfFov) * cssH; // camera-to-screen-center distance, world-px
+    const groundH = camDist * cosT;                 // camera height above the ground plane
+
+    const vTop = Math.tan(halfFov);
+    const uEdge = Math.tan(hHalfFov);
+    const denom = cosT - vTop * sinT; // > 0 as long as pitch + halfFov < 90° (58° + ~18.4° = ~76.4° here, safely under)
+    const relY = (groundH * vTop) / (cosT * denom);
+    const relX = (groundH * uEdge) / denom;
+    return Math.sqrt(relX * relX + relY * relY);
+  }
+
   class PaFieldRenderer {
     /**
      * @param {object} view — MapView instance (owns the shared canvas/center/
@@ -227,13 +271,20 @@
         }
       }
 
+      // The MapGLRenderer reads view._paFieldCanvas directly and georeferences
+      // it onto the terrain itself (see engine_mapgl_renderer.js _syncFieldCanvas)
+      // — the 2D compositing this method does onto view.pfctx below is only
+      // ever seen through the flat #paFieldCanvas element, which is hidden
+      // (opacity:0, see .mapgl-active in 03-map.css) whenever 3D is active.
+      // Every _ctx.save/clearRect/drawImage/restore_ call below was still
+      // running every single frame regardless — real CPU/GPU work spent
+      // painting a canvas nothing can see. `_ensurePaField` (which produces
+      // view._paFieldCanvas, the actual 3D texture source) still must run.
+      const is3d = !!(view.mapgl && view.mapgl.active);
+
       // ── Animation fast-path: transform existing PA field canvas instead of recomputing ──
       if (view._isTransientAnimating() && view._paFieldCanvas && this._paFieldComputedView) {
         if (this._perfProbe) this._perfProbe.fastPath++;
-        const ctx = view.pfctx;
-        if (!ctx) return;
-        const pw = view.paFieldCanvasEl.width;
-        const ph = view.paFieldCanvasEl.height;
         const dpr = view._dpr || (window.devicePixelRatio || 1);
         const cssW = view._cssW || 1;
         const cssH = view._cssH || 1;
@@ -245,14 +296,56 @@
 
         // Margin exhaustion: if pan delta exceeds the overfetch margin, fall through
         // to the static path which will recompute the field centered on current view.
+        // 2D's threshold (_OVERFETCH_MARGIN_EXHAUST) assumes the margin is
+        // invisible until you pan into it, so waiting until most of it is
+        // consumed costs nothing visible. In 3D the whole buffer is on screen
+        // at once — nowhere for staleness to hide — so 3D uses a much tighter
+        // threshold (_OVERFETCH_MARGIN_EXHAUST_3D) and recomputes far sooner.
+        // 2D: while a gesture is in progress only recompute when the buffer
+        // is actually used up (blank would show); the release redraw takes
+        // the static path and recomputes for the new view anyway. At the
+        // resting 0.65 threshold a drag triggered kernel + paint + full
+        // device-res upscale several times per pan.
+        const marginExhaustFrac = is3d
+          ? g.FieldSensors._OVERFETCH_MARGIN_EXHAUST_3D
+          : (view._isGesturing() ? 1.0 : g.FieldSensors._OVERFETCH_MARGIN_EXHAUST);
         const prevC = g.latLonToWorld(prev.centerLat, prev.centerLon, prev.zoom);
         const currC = g.latLonToWorld(view.center.lat, view.center.lon, prev.zoom);
         const absTx = Math.abs(prevC.x - currC.x);
         const absTy = Math.abs(prevC.y - currC.y);
-        if (absTx >= offX * g.FieldSensors._OVERFETCH_MARGIN_EXHAUST || absTy >= offY * g.FieldSensors._OVERFETCH_MARGIN_EXHAUST) {
+        // 3D: the texture is georeferenced by MapLibre, so a pan never shows
+        // a stale POSITION, only missing coverage where the camera has moved
+        // past the buffer's render radius. Exhaust on that distance (radius
+        // beyond the farthest visible corner), never more often than a
+        // quarter viewport of travel. The rectangular (buffer - viewport)/2
+        // margin below is the flat 2D notion and, with the buffer capped
+        // near the viewport size, went to ~14 px in 3D: a full field
+        // recompute every frame or two of a fling.
+        let exhausted;
+        if (is3d) {
+          // Never recompute mid-gesture in 3D: each recompute is kernel
+          // passes + paint + upscale + texture uploads, a visible hitch under
+          // the finger. The texture rides the terrain georeferenced; edge
+          // coverage catches up on release (the mouseup/touchend redraw
+          // takes the static path, which recomputes if the view moved).
+          const far = view._paField3dFarCornerPx || 0;
+          const radius = Math.min(bufW, bufH) / 2;
+          const thr = Math.max(0.65 * (radius - far), 0.25 * Math.min(cssW, cssH));
+          exhausted = !view._isGesturing() && Math.hypot(absTx, absTy) >= thr;
+        } else {
+          exhausted = absTx >= offX * marginExhaustFrac || absTy >= offY * marginExhaustFrac;
+        }
+        if (exhausted) {
           // Force _ensurePaField to recompute despite animating
           this._paFieldMarginExhausted = true;
+        } else if (is3d) {
+          this._paFieldPrevCanvas = null;
+          return;
         } else {
+          const ctx = view.pfctx;
+          if (!ctx) return;
+          const pw = view.paFieldCanvasEl.width;
+          const ph = view.paFieldCanvasEl.height;
           ctx.save();
           ctx.setTransform(1, 0, 0, 1, 0, 0);
           ctx.clearRect(0, 0, pw, ph);
@@ -292,6 +385,32 @@
         if (this._perfProbe) { this._perfProbe.ensureMs += _dur; this._perfProbe.ensureCalls++; }
       }
       if (pbMs != null && isFinite(pbMs)) this._preWarmPaFields(state, pbMs);
+
+      if (is3d) {
+        // Still schedule the cross-fade RAF chain below (it's what keeps
+        // MapGLRenderer.sync() ticking during a fade when nothing else is
+        // driving the frame loop), but skip the hidden 2D canvas paint itself.
+        const fadeT = this._paFieldPrevCanvas
+          ? Math.min(1, (performance.now() - this._paFieldFadeStart) / this._paFieldFadeMs)
+          : 1;
+        if (this._paFieldPrevCanvas && fadeT < 1) {
+          if (!this._paFieldFadeRAF) {
+            this._paFieldFadeRAF = requestAnimationFrame(() => {
+              this._paFieldFadeRAF = null;
+              // Field only. In 3D the overlay is its own GL texture and is
+              // not composited over the field, so redrawing it here (as the
+              // 2D fade chain must) just re-uploaded the full overlay canvas
+              // on every fade frame: ~36 extra uploads per field recompute,
+              // and live playback recomputes about once a second.
+              view._compositePaFieldOnTiles(view.lastState);
+            });
+          }
+        } else {
+          this._paFieldPrevCanvas = null;
+        }
+        return;
+      }
+
       const ctx = view.pfctx;
       if (!ctx) return;
       const pw = view.paFieldCanvasEl.width;
@@ -405,9 +524,46 @@
       const centerW = latLonToWorld(clat, clon, z);
       // Overfetch: collect sensors and compute the field on a buffer larger than
       // the viewport so gesture pans reveal pre-rendered content at the edges.
+      //
+      // In 3D (pitched terrain view) the flat top-down rectangle below is the
+      // wrong shape: a pitched camera sees ground well beyond the viewport's
+      // straight-down footprint toward the horizon, so territory this rectangle
+      // treats as off-screen margin is actually on-screen. Use a circular
+      // render distance centered on the view (aspect-independent, so it
+      // doesn't care which edge of the screen is "toward the horizon"), sized
+      // from the ACTUAL camera geometry (see _field3dFarCornerDistPx) so it is
+      // provably big enough to cover the farthest corner the pitched camera
+      // can see — not a guessed multiplier. The field still feathers to
+      // transparent at that radius instead of a hard cutoff (see
+      // _paintPaCells): a soft edge beats a visible pop-in as the recompute
+      // (see the 3D margin-exhaustion threshold below) re-centers this buffer.
       const maxDevPx = _OVERFETCH_MAX_DEVICE_PX;
-      const bufW = Math.min(Math.ceil(cssW * _OVERFETCH), Math.floor(maxDevPx / dpr));
-      const bufH = Math.min(Math.ceil(cssH * _OVERFETCH), Math.floor(maxDevPx / dpr));
+      const is3d = !!(view.mapgl && view.mapgl.active);
+      let bufW, bufH, fieldRadiusPx;
+      if (is3d) {
+        const pitchDeg = (g.MapGLRenderer && g.MapGLRenderer.PITCH_3D) || 58;
+        const farCornerPx = _field3dFarCornerDistPx(cssW, cssH, pitchDeg);
+        // 3D buffer cap: ~2048 device px rather than the 2D 4096, but never
+        // smaller than the viewport's long edge (+15%): the transient-animation
+        // fast path treats (buffer - viewport)/2 as its pan margin, and a
+        // buffer smaller than the viewport makes that margin negative, i.e.
+        // "exhausted" on every frame, i.e. a full field recompute per frame
+        // while panning. In 3D this canvas is a GL texture re-uploaded on
+        // every recompute and every cross-fade step; at 4096^2 that is a
+        // 64 MB upload each time, the periodic stall on Safari/iPad. The
+        // field is a blurred heatmap; the smaller texture is not
+        // distinguishable on terrain.
+        view._paField3dFarCornerPx = farCornerPx;
+        const capCss = Math.max(Math.max(cssW, cssH) * 1.15, 2048 / dpr);
+        const side = Math.min(Math.ceil(farCornerPx * _OVERFETCH * 2), Math.floor(Math.min(maxDevPx / dpr, capCss)));
+        bufW = side;
+        bufH = side;
+        fieldRadiusPx = side / 2;
+      } else {
+        bufW = Math.min(Math.ceil(cssW * _OVERFETCH), Math.floor(maxDevPx / dpr));
+        bufH = Math.min(Math.ceil(cssH * _OVERFETCH), Math.floor(maxDevPx / dpr));
+        fieldRadiusPx = null;
+      }
 
       // Reference time for PA staleness fade: use data "now", NOT the playback
       // scrub position.  last_seen is a live snapshot (not historical), so
@@ -444,7 +600,11 @@
       // ── Fast skip: if view and data are unchanged and playback time is within
       // the validity window of the current fingerprint, no sensor can have changed
       // color category — skip the expensive _collectPaFieldSensors entirely. ──
-      const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}`;
+      // `is3d` is part of the key (not just cssW/cssH/z/center) because the
+      // render-distance buffer/radius above depends on it — a 2D<->3D toggle
+      // with the view otherwise unchanged must still invalidate the cache and
+      // recompute at the correct buffer size instead of reusing the wrong one.
+      const viewKey = `${cssW}|${cssH}|${z.toFixed(4)}|${clat.toFixed(6)},${clon.toFixed(6)}|3d:${is3d ? 1 : 0}`;
       const pollutantTab = view._paFieldPollutant || "pm25";
       // No pollutant selected: render the worst pollutant per sensor (max AQI).
       const maxMode = view._paFieldPollutant == null;
@@ -529,6 +689,11 @@
 
       // ── Grid dimensions (based on overfetch buffer, not viewport) ──
       // Scale cell size with viewport area to keep per-cell density constant.
+      // Cell size stays pegged to the viewport (not the buffer) even in 3D:
+      // a sensor's Gaussian kernel radius is a fixed number of world-px, set
+      // by viewport zoom, not by how far out the render-distance buffer
+      // reaches — coarsening cells with the buffer made every sensor's smooth
+      // blob render as a blocky/square patch instead of a circle.
       const cellSize = Math.max(16, Math.ceil(Math.sqrt(cssW * cssH / 1400)));
       const gw = Math.ceil(bufW / cellSize);
       const gh = Math.ceil(bufH / cellSize);
@@ -596,10 +761,10 @@
         const perPollS5 = perPollSensors.map(pp =>
           buildS5(pp.sensors, _LEGEND_TAB_AQI_KEY[pp.incl] || "pm2.5")
         );
-        this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+        this._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH, fieldRadiusPx);
       } else {
         const s5 = buildS5(allSensors, _LEGEND_TAB_AQI_KEY[pollutantTab] || "pm2.5");
-        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH);
+        this._computePaFieldSync(s5, gw, gh, cellSize, effectiveCutoffSq, cutoffSq, FIELD_ALPHA, bufW, bufH, dpr, wind, cssW, cssH, fieldRadiusPx);
       }
 
       // Stash the inputs needed to lazily compute per-pollutant field maxes
@@ -817,12 +982,58 @@
       const wwy = isAniso ? wind.wy : 0;
       const wStretch = isAniso ? wind.stretch : 1;
       const wUpwind  = isAniso ? wind.upwindShrink : 1;
+
+      // Spatial buckets, bucket edge = cutoff radius R. Every sensor is first
+      // rejected on raw distance > R (below), so a cell at (px,py) can only be
+      // reached by sensors in its own bucket or the 8 neighbours; iterating
+      // only those is output-identical to the full scan. Sensors farther than
+      // R from the whole buffer are dropped up front for the same reason.
+      // Before this, every cell walked every sensor: with the live sensor set
+      // (~500 fixed, most of them statewide and nowhere near the view) and the
+      // larger 3D grid, that was ~65 ms per field recompute, paid on almost
+      // every pan step in 3D.
+      const R = Math.sqrt(cutoffSq);
+      const bufW = gw * cellSize, bufH = gh * cellSize;
+      const bx0 = -R, by0 = -R;
+      const nbx = Math.max(1, Math.ceil((bufW + 2 * R) / R));
+      const nby = Math.max(1, Math.ceil((bufH + 2 * R) / R));
+      const bucketCount = new Int32Array(nbx * nby);
+      const sensorBucket = new Int32Array(sensors.length / 5);
+      let kept = 0;
+      for (let i = 0, k = 0; i < sensors.length; i += 5, k++) {
+        const sx = sensors[i], sy = sensors[i + 1];
+        if (sx < -R || sx > bufW + R || sy < -R || sy > bufH + R) { sensorBucket[k] = -1; continue; }
+        const bx = Math.min(nbx - 1, Math.floor((sx - bx0) / R));
+        const by = Math.min(nby - 1, Math.floor((sy - by0) / R));
+        const b = by * nbx + bx;
+        sensorBucket[k] = b;
+        bucketCount[b]++;
+        kept++;
+      }
+      const bucketStart = new Int32Array(nbx * nby + 1);
+      for (let b = 0; b < nbx * nby; b++) bucketStart[b + 1] = bucketStart[b] + bucketCount[b];
+      const fill = new Int32Array(nbx * nby);
+      const order = new Int32Array(kept);   // sensor flat-array offsets, grouped by bucket
+      for (let k = 0; k < sensorBucket.length; k++) {
+        const b = sensorBucket[k];
+        if (b < 0) continue;
+        order[bucketStart[b] + fill[b]++] = k * 5;
+      }
+
       for (let gy = 0; gy < gh; gy++) {
         const py = (gy + 0.5) * cellSize;
+        const cby = Math.min(nby - 1, Math.floor((py - by0) / R));
+        const byLo = Math.max(0, cby - 1), byHi = Math.min(nby - 1, cby + 1);
         for (let gx = 0; gx < gw; gx++) {
           const pxx = (gx + 0.5) * cellSize;
+          const cbx = Math.min(nbx - 1, Math.floor((pxx - bx0) / R));
+          const bxLo = Math.max(0, cbx - 1), bxHi = Math.min(nbx - 1, cbx + 1);
           let wSum = 0, vSum = 0;
-          for (let i = 0; i < sensors.length; i += 5) {
+          for (let by = byLo; by <= byHi; by++) {
+          for (let bx = bxLo; bx <= bxHi; bx++) {
+          const b = by * nbx + bx;
+          for (let oi = bucketStart[b], oe = bucketStart[b + 1]; oi < oe; oi++) {
+            const i = order[oi];
             const dx = pxx - sensors[i];
             const dy = py  - sensors[i + 1];
             const rawD2 = dx * dx + dy * dy;
@@ -842,6 +1053,8 @@
             wSum += w;
             vSum += w * sensors[i + 2];
           }
+          }
+          }
           const cell = gy * gw + gx;
           outW[cell] = wSum;
           outAqi[cell] = wSum >= 0.001 ? vSum / wSum : 0;
@@ -851,8 +1064,10 @@
 
     /** Color a per-cell (aqi, weight) grid into the grid canvas, apply the
      *  Cauchy blur, commit, and upscale. Also sets view._paFieldMaxAqi to the
-     *  max AQI within the viewport region. Shared painter for both render paths. */
-    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH) {
+     *  max AQI within the viewport region. Shared painter for both render paths.
+     *  fieldRadiusPx: 3D-only circular render-distance radius (see _ensurePaField);
+     *  null in flat 2D mode, where the buffer's own rectangular edge is the cutoff. */
+    _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, fieldRadiusPx) {
       const view = this.view;
       const _aqiToRgb = g.FieldSensors._aqiToRgb;
       const { tc, tctx, imgData } = view._paGrid;
@@ -868,6 +1083,15 @@
       const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + vpW) / cellSize));
       const vpGyMax = Math.min(gh, Math.ceil((vpMarginY + vpH) / cellSize));
 
+      // Circular render-distance edge feather (3D only). Fades alpha to 0 over
+      // the outer 15% of the radius instead of a hard cutoff, so panning near
+      // the render-distance boundary doesn't pop the field in/out.
+      const cx = cssW / 2, cy = cssH / 2;
+      const featherR = fieldRadiusPx ? fieldRadiusPx * 0.85 : 0;
+      const outerRSq = fieldRadiusPx ? fieldRadiusPx * fieldRadiusPx : 0;
+      const featherRSq = featherR * featherR;
+      const featherSpan = fieldRadiusPx ? (fieldRadiusPx - featherR) : 0;
+
       for (let gy = 0; gy < gh; gy++) {
         const inVpY = gy >= vpGyMin && gy <= vpGyMax;
         for (let gx = 0; gx < gw; gx++) {
@@ -877,7 +1101,17 @@
           if (wSum < 0.001) {
             px[off] = 0; px[off+1] = 0; px[off+2] = 0; px[off+3] = 0;
           } else {
-            const fade = Math.min(1, wSum * 2);
+            let fade = Math.min(1, wSum * 2);
+            if (fieldRadiusPx) {
+              const dx = (gx + 0.5) * cellSize - cx;
+              const dy = (gy + 0.5) * cellSize - cy;
+              const dSq = dx * dx + dy * dy;
+              if (dSq >= outerRSq) {
+                fade = 0;
+              } else if (dSq > featherRSq) {
+                fade *= 1 - (Math.sqrt(dSq) - featherR) / featherSpan;
+              }
+            }
             const alpha = Math.round(FIELD_ALPHA * fade);
             const val = aqiCell[cell];
             if (inVpY && gx >= vpGxMin && gx < vpGxMax && val > fieldMaxAqi) {
@@ -948,10 +1182,10 @@
      *  cutoffSq: max range² for early-out (expanded by stretch² when wind active).
      *  isoCutoffSq: original isotropic range² — tight early-out for upwind/crosswind sensors.
      *  wind: { wx, wy, stretch, upwindShrink } or null for isotropic. */
-    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
+    _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx) {
       const gr = this._ensurePaGrid(gw, gh);
       this._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, gr.aqiCell, gr.wCell);
-      this._paintPaCells(gr.aqiCell, gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
+      this._paintPaCells(gr.aqiCell, gr.wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, fieldRadiusPx);
     }
 
     /** Max-mode field: render EACH pollutant's own kernel field independently
@@ -961,7 +1195,7 @@
      *  mixed per-sensor maxes instead averages dense low-PM2.5 PA sensors down
      *  and suppresses a region's high ozone/NO2/etc.
      *  perPollS5: array of stride-5 Float64Arrays, one per pollutant. */
-    _computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) {
+    _computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx) {
       const gr = this._ensurePaGrid(gw, gh);
       const n = gw * gh;
       if (!gr.bestAqi || gr.bestAqi.length !== n) {
@@ -985,7 +1219,7 @@
           }
         }
       }
-      this._paintPaCells(gr.bestAqi, gr.bestW, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH);
+      this._paintPaCells(gr.bestAqi, gr.bestW, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, fieldRadiusPx);
     }
 
     /** Upscale the coarse interpolation grid to viewport size with bilinear smoothing. */

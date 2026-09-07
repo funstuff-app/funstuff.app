@@ -254,6 +254,7 @@
       if (this._zoomDrawRAF) return;
       this._zoomDrawRAF = requestAnimationFrame(() => {
         this._zoomDrawRAF = null;
+        this._applyZoomAnchor3d();
         view.draw(view.lastState);
       });
     }
@@ -291,6 +292,7 @@
       if (this._panDrawRAF) return;
       this._panDrawRAF = requestAnimationFrame(() => {
         this._panDrawRAF = null;
+        this._applyZoomAnchor3d();
         this._redrawViewOnly();
         this._notifyViewChanged();
       });
@@ -304,9 +306,22 @@
       }
     }
 
+    /** overlayCanvas bounding rect, read at most once per animation frame.
+     *  Every pointer handler needs it, and at pointer rate (120+ events/s on
+     *  a trackpad or touch screen) a layout read per event forces a
+     *  synchronous layout flush each time the DOM is dirty. */
+    _overlayRect() {
+      const now = performance.now();
+      if (!this._rectCache || (now - this._rectCacheAt) > 12) {
+        this._rectCache = this.view.overlayCanvas.getBoundingClientRect();
+        this._rectCacheAt = now;
+      }
+      return this._rectCache;
+    }
+
     _eventToLocalXY(e) {
       const view = this.view;
-      const rect = view.overlayCanvas.getBoundingClientRect();
+      const rect = this._overlayRect();
       const cx = (typeof e.clientX === "number") ? e.clientX : (rect.left + rect.width / 2);
       const cy = (typeof e.clientY === "number") ? e.clientY : (rect.top + rect.height / 2);
       return { sx: cx - rect.left, sy: cy - rect.top };
@@ -386,7 +401,7 @@
       const touches = e.touches;
       if (touches.length === 0) return;
 
-      const rect = view.overlayCanvas.getBoundingClientRect();
+      const rect = this._overlayRect();
     
       // Compute touch midpoint in canvas-local coordinates
       let sumX = 0, sumY = 0;
@@ -456,7 +471,7 @@
       const touches = e.touches;
       if (touches.length === 0) return;
 
-      const rect = view.overlayCanvas.getBoundingClientRect();
+      const rect = this._overlayRect();
 
       // Compute current touch midpoint
       let sumX = 0, sumY = 0;
@@ -558,7 +573,7 @@
         this._touchState = null;
       } else if (remaining === 1 && this._touchState.startTouches >= 2) {
         // Went from 2+ fingers to 1 - reset pan origin to avoid jump
-        const rect = view.overlayCanvas.getBoundingClientRect();
+        const rect = this._overlayRect();
         const t = e.touches[0];
         const mx = t.clientX - rect.left;
         const my = t.clientY - rect.top;
@@ -685,8 +700,17 @@
         return;
       }
       if (!view._mouseDragging || !this._mouseDragStart || !this._mouseDragCenterStart) {
-        // Hover hit-test for mobile/fixed (non-PurpleAir) marker labels
-        this._updateHoverAtClientXY(e.clientX, e.clientY);
+        // Hover hit-test for mobile/fixed (non-PurpleAir) marker labels.
+        // mousemove fires at pointer rate (well above the frame rate on a
+        // 120 Hz display); coalesce to one hit-test per frame, and none while
+        // the camera is moving.
+        this._hoverClient = { x: e.clientX, y: e.clientY };
+        if (this._hoverRAF || this._isTransientAnimating()) return;
+        this._hoverRAF = requestAnimationFrame(() => {
+          this._hoverRAF = null;
+          const c = this._hoverClient;
+          if (c) this._updateHoverAtClientXY(c.x, c.y);
+        });
         return;
       }
       this._noteUserInteraction();
@@ -832,7 +856,7 @@
       const dx0 = Math.max(1e-6, Math.abs(xMax0 - xMin0));
       const dy0 = Math.max(1e-6, Math.abs(yMax0 - yMin0));
 
-      const rect = view.overlayCanvas.getBoundingClientRect();
+      const rect = this._overlayRect();
       const w = rect.width;
       const h = rect.height;
       const pad = view._getOverlayPaddingPx();
@@ -874,9 +898,12 @@
       const clamp = g.clamp;
       const latLonToWorld = g.latLonToWorld;
       const worldToLatLon = g.worldToLatLon;
-      const rect = view.tilesCanvas.getBoundingClientRect();
-      const w = rect.width;
-      const h = rect.height;
+      // Pitched 3D camera: the ground under a screen point is not a flat
+      // offset from center. Inverse of worldToScreen -> mapgl.projectWorld.
+      const gl = view.mapgl ? view.mapgl.unprojectScreen(sx, sy) : null;
+      if (gl) return gl;
+      const w = view._cssW || 1;
+      const h = view._cssH || 1;
       const c = latLonToWorld(view.center.lat, view.center.lon, view.zoom);
       const wx = c.x - w / 2 + sx;
       const wy = c.y - h / 2 + sy;
@@ -889,15 +916,26 @@
       const clamp = g.clamp;
       const latLonToWorld = g.latLonToWorld;
       const worldToLatLon = g.worldToLatLon;
-      const rect = view.tilesCanvas.getBoundingClientRect();
-      const w = rect.width;
-      const h = rect.height;
       const z2 = clamp(newZoom, view._zoomMin, view._zoomMax);
+      const gl = view.mapgl;
+      const is3d = !!(gl && gl.active && gl.ready);
 
-      // Lat/Lon under cursor at current zoom
-      const ll = this._screenPointToLatLon(sx, sy);
+      // This runs per wheel/gesturechange/touchmove EVENT (pointer rate, well
+      // above frame rate). Per event only the flat math below runs, in both
+      // modes. In 3D the true ground point under the cursor is captured ONCE
+      // per frame (one terrain unproject) and the flat result is corrected to
+      // it in the redraw rAF (_applyZoomAnchor3d), never per event: a terrain
+      // unproject needs the GL camera pushed first (jumpTo) and that per
+      // event is what locked Safari up.
+      if (is3d && !this._zoomAnchor3d) {
+        const a = gl.unprojectScreen(sx, sy);
+        if (a) this._zoomAnchor3d = { lat: a.lat, lon: a.lon };
+      }
 
-      // World point at new zoom
+      const w = view._cssW || 1;
+      const h = view._cssH || 1;
+      const c = latLonToWorld(view.center.lat, view.center.lon, view.zoom);
+      const ll = worldToLatLon(c.x - w / 2 + sx, clamp(c.y - h / 2 + sy, 0, c.ws - 1), view.zoom);
       const wpt2 = latLonToWorld(ll.lat, ll.lon, z2);
       const centerWorld2 = {
         x: wpt2.x - (sx - w / 2),
@@ -908,6 +946,35 @@
 
       view.zoom = z2;
       view.center = { lat: centerLL2.lat, lon: centerLL2.lon };
+
+      if (is3d) { this._zoomAnchorSX = sx; this._zoomAnchorSY = sy; }
+    }
+
+    /** Once per redraw frame in 3D: shift the center so the ground point
+     *  captured at the first zoom event of the frame is back under the cursor
+     *  (terrain relief makes the flat per-event result approximate). */
+    _applyZoomAnchor3d() {
+      const view = this.view;
+      const a = this._zoomAnchor3d;
+      this._zoomAnchor3d = null;
+      const gl = view.mapgl;
+      if (!a || !gl || !gl.active || !gl.ready) return;
+      const clamp = g.clamp;
+      const latLonToWorld = g.latLonToWorld;
+      const worldToLatLon = g.worldToLatLon;
+      const sx = this._zoomAnchorSX, sy = this._zoomAnchorSY;
+      const z = view.zoom;
+      for (let i = 0; i < 2; i++) {
+        const m = gl.unprojectScreen(sx, sy);
+        if (!m) break;
+        const A = latLonToWorld(a.lat, a.lon, z);
+        const Q = latLonToWorld(m.lat, m.lon, z);
+        const ex = A.x - Q.x, ey = A.y - Q.y;
+        if (!isFinite(ex) || !isFinite(ey) || Math.hypot(ex, ey) < 0.5) break;
+        const c = latLonToWorld(view.center.lat, view.center.lon, z);
+        const nc = worldToLatLon(c.x + ex, clamp(c.y + ey, 0, c.ws - 1), z);
+        view.center = { lat: nc.lat, lon: nc.lon };
+      }
     }
 
     centerOn(lat, lon, { animate = true } = {}) {
@@ -1098,7 +1165,7 @@
       const latLonToWorld = g.latLonToWorld;
       const st = view.lastState;
       const mobiles = st && Array.isArray(st.mobile) ? st.mobile : [];
-      const rect = view.overlayCanvas.getBoundingClientRect();
+      const rect = this._overlayRect();
       const sx = clientX - rect.left;
       const sy = clientY - rect.top;
 
@@ -1189,7 +1256,7 @@
         if (this._pinchZoomEndTimer) { window.clearTimeout(this._pinchZoomEndTimer); this._pinchZoomEndTimer = null; }
         view._pinchZooming = true;
 
-        const rect = view.overlayCanvas.getBoundingClientRect();
+        const rect = this._overlayRect();
         const sx = e.clientX - rect.left;
         const sy = e.clientY - rect.top;
         this._pinchAnchorSX = sx;
@@ -1275,6 +1342,19 @@
       if (!this._pinchInertiaRAF) this._requestPanRedraw();
     }
 
+    /** Cursor as a world point plus a hit tolerance in world px (radiusPx
+     *  screen px at the cursor). One unproject instead of one MapLibre
+     *  project() per candidate in 3D; identical arithmetic in 2D. */
+    _cursorWorldHit(sx, sy, radiusPx = 20) {
+      const latLonToWorld = g.latLonToWorld;
+      const cursorLL = this._screenPointToLatLon(sx, sy);
+      const cursorW = latLonToWorld(cursorLL.lat, cursorLL.lon, this.view.zoom);
+      const edgeLL = this._screenPointToLatLon(sx + radiusPx, sy);
+      const edgeW = latLonToWorld(edgeLL.lat, edgeLL.lon, this.view.zoom);
+      const tolSq = Math.max(radiusPx * radiusPx, (edgeW.x - cursorW.x) ** 2 + (edgeW.y - cursorW.y) ** 2);
+      return { cursorW, tolSq };
+    }
+
     _updateHoverAtClientXY(clientX, clientY) {
       const view = this.view;
       const latLonToWorld = g.latLonToWorld;
@@ -1282,7 +1362,7 @@
       const parseKey = g.parseKey;
       const st = view.lastState;
       if (!st) return;
-      const rect = view.overlayCanvas.getBoundingClientRect();
+      const rect = this._overlayRect();
       const sx = clientX - rect.left;
       const sy = clientY - rect.top;
       // Only test if cursor is within the canvas bounds
@@ -1305,6 +1385,12 @@
         ...[...otherMobileCands].reverse(),
         ...[...fixed.filter(f => !f.purpleair)].reverse().map(f => ({ type: "fixed", ...f })),
       ];
+      // Project the CURSOR into the world once and compare in world px,
+      // instead of projecting every candidate to the screen. In 2D that is
+      // the same arithmetic; in 3D worldToScreen was a terrain-aware
+      // MapLibre project() per candidate (hundreds of fixed sensors) per
+      // pointer event.
+      const { cursorW, tolSq } = this._cursorWorldHit(sx, sy);
       for (const m of candidates) {
         let lat = Number(m.lat), lon = Number(m.lon);
         if (m.type === "mobile") {
@@ -1319,10 +1405,9 @@
         }
         if (!isFinite(lat) || !isFinite(lon)) continue;
         const wpt = latLonToWorld(lat, lon, view.zoom);
-        const sp = view.worldToScreen(wpt.x, wpt.y);
-        const dx = sp.x - sx;
-        const dy = sp.y - sy;
-        if ((dx*dx + dy*dy) <= (20*20)) {
+        const dx = wpt.x - cursorW.x;
+        const dy = wpt.y - cursorW.y;
+        if ((dx*dx + dy*dy) <= tolSq) {
           hit = keyFor(m.type, m.id);
           break;
         }
@@ -1388,7 +1473,7 @@
       const st = view.lastState;
       const mobiles = st && Array.isArray(st.mobile) ? st.mobile : [];
       const fixed = st && Array.isArray(st.fixed) ? st.fixed : [];
-      const rect = view.overlayCanvas.getBoundingClientRect();
+      const rect = this._overlayRect();
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
 
@@ -1416,6 +1501,7 @@
       ];
       const _clickRefMs = view._historicalMode ? (view.getPlaybackTimeMs() || view._dataNowMs()) : Date.now();
       const _PA_FADE_MS = 45 * 60 * 1000;
+      const { cursorW: _hitW, tolSq: _hitTolSq } = this._cursorWorldHit(sx, sy, 20);
       for (const m of candidates) {
         // Skip fully-faded PurpleAir sensors
         if (m.purpleair) {
@@ -1435,10 +1521,9 @@
         }
         if (!isFinite(lat) || !isFinite(lon)) continue;
         const wpt = latLonToWorld(lat, lon, view.zoom);
-        const sp = view.worldToScreen(wpt.x, wpt.y);
-        const dx = sp.x - sx;
-        const dy = sp.y - sy;
-        if ((dx*dx + dy*dy) <= (20*20)) {
+        const dx = wpt.x - _hitW.x;
+        const dy = wpt.y - _hitW.y;
+        if ((dx*dx + dy*dy) <= _hitTolSq) {
           hit = keyFor(m.type, m.id);
           break;
         }
@@ -1478,6 +1563,7 @@
       ];
       const _tapRefMs = view._historicalMode ? (view.getPlaybackTimeMs() || view._dataNowMs()) : Date.now();
       const _TAP_PA_FADE_MS = 45 * 60 * 1000;
+      const { cursorW: _hitW, tolSq: _hitTolSq } = this._cursorWorldHit(sx, sy, 35);
       for (const m of candidates) {
         // Skip fully-faded PurpleAir sensors
         if (m.purpleair) {
@@ -1497,10 +1583,9 @@
         }
         if (!isFinite(lat) || !isFinite(lon)) continue;
         const wpt = latLonToWorld(lat, lon, view.zoom);
-        const sp = view.worldToScreen(wpt.x, wpt.y);
-        const dx = sp.x - sx;
-        const dy = sp.y - sy;
-        if ((dx*dx + dy*dy) <= (35*35)) { // Large hit area for iOS touch accuracy
+        const dx = wpt.x - _hitW.x;
+        const dy = wpt.y - _hitW.y;
+        if ((dx*dx + dy*dy) <= _hitTolSq) { // Large hit area for iOS touch accuracy
           hit = keyFor(m.type, m.id);
           break;
         }

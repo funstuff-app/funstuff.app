@@ -1096,11 +1096,11 @@ class MapView {
 
   _kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, outAqi, outW) { this.paField._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, outAqi, outW); }
 
-  _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH) { this.paField._paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH); }
+  _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, fieldRadiusPx) { this.paField._paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, fieldRadiusPx); }
 
-  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) { this.paField._computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH); }
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx) { this.paField._computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx); }
 
-  _computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) { this.paField._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH); }
+  _computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx) { this.paField._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx); }
 
   _upscalePaField(tc, cssW, cssH, dpr) { this.paField._upscalePaField(tc, cssW, cssH, dpr); }
 
@@ -1119,8 +1119,15 @@ class MapView {
 
   /** Delegates to OverlayRenderer (engine_overlay_renderer.js). */
   drawOverlay(state, opts = {}) {
+    const gl = this.mapgl;
+    if (gl && gl.active && gl.ready && !gl._drawingFromRender) {
+      // Camera moved and MapLibre hasn't painted it yet: push the camera and
+      // let the GL render callback draw the overlay in the painted frame.
+      gl.sync();
+      if (gl._cameraDirty) { gl.map.triggerRepaint(); return undefined; }
+    }
     const result = this.overlay.drawOverlay(state, opts);
-    if (this.mapgl && this.mapgl.active) this.mapgl.sync();
+    if (this.mapgl && this.mapgl.active) this.mapgl.sync(false, true);
     return result;
   }
 }

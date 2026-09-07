@@ -18,3 +18,8 @@ DUSTY_OWNER_TOKEN=""
 # DUSTY_DB_RETENTION_DAYS="30"       # Keep hot data for 30 days (default)
 # DUSTY_DB_MAX_SIZE_MB="1024"        # Emergency prune if DB exceeds 1 GB
 # DUSTY_BACKUP_TARGET="user@mac.local:/backups/dustytrails/"  # rsync destination
+
+# CARTO basemap key (raster tiles show an "API KEY REQUIRED" watermark without
+# it). The server also reads it from CARTO_API_KEY in the environment or from a
+# .env beside dashboard_server.py (NAME=value, or the bare key on one line).
+CARTO_API_KEY=""

@@ -102,6 +102,24 @@ patch_dashboard_for_subpath() {
         -e "s|src=\"camera_fit_logic.js\"|src=\"camera_fit_logic.js?${cache_bust}\"|g" \
         -e "s|src=\"/app.js\"|src=\"app.js?${cache_bust}\"|g" \
         -e "s|src=\"app.js\"|src=\"app.js?${cache_bust}\"|g"
+
+    # Every deploy re-minifies and re-obfuscates EVERY script with fresh
+    # random helper names, so every script must be refetched together:
+    # a browser that keeps a cached copy of one file (its hand-maintained
+    # ?v= in the source unchanged) and fetches a new copy of another runs a
+    # mix of two builds. Stamp all script/stylesheet URLs with this deploy's
+    # cache_bust, replacing whatever ?v= the source carried, including the
+    # worker URLs referenced from inside the scripts.
+    patch_file "$dashboard_dir/index.html" \
+        -e "s|\(src=\"[A-Za-z0-9_./-]*\.js\)?v=[A-Za-z0-9_.-]*\"|\1?${cache_bust}\"|g" \
+        -e "s|\(href=\"[A-Za-z0-9_./-]*\.css\)?v=[A-Za-z0-9_.-]*\"|\1?${cache_bust}\"|g"
+    for jsfile in "$dashboard_dir"/*.js; do
+        [[ -f "$jsfile" ]] || continue
+        if grep -q '_worker\.js?v=' "$jsfile"; then
+            patch_file "$jsfile" \
+                -e "s|\([A-Za-z0-9_]*_worker\.js\)?v=[A-Za-z0-9_.-]*|\1?${cache_bust}|g"
+        fi
+    done
     
     # NOTE: API paths kept absolute - tunnel serves at root, not subpath
     # patch_file "$dashboard_dir/app.js" \
@@ -168,11 +186,23 @@ obfuscate_javascript() {
             local basename
             basename=$(basename "$jsfile")
             local outfile="$tmpdir/$basename"
+            # Every file is obfuscated separately but they all share the page's
+            # global scope, and the obfuscator's per-file global helpers (the
+            # string-array decoder, `a0_0x????`) are drawn from a 16-bit hex
+            # name space. With ~34 files, two of them collide often enough: the
+            # later script overwrites the earlier one's decoder, and every
+            # string in the earlier file decodes to garbage (seen as
+            # `"...".startsWith is not a function` from colors.js after
+            # ui_snapshots_menus.js redefined its decoder). A per-file
+            # identifier prefix makes the global helper names disjoint.
+            local prefix
+            prefix="f_$(printf '%s' "${basename%.js}" | tr -c 'A-Za-z0-9_' '_')_"
             if javascript-obfuscator "$jsfile" \
                 --output "$outfile" \
                 --string-array true \
                 --string-array-encoding rc4 \
                 --identifier-names-generator hexadecimal \
+                --identifiers-prefix "$prefix" \
                 --rename-globals false \
                 --self-defending false 2>/dev/null; then
                 mv "$outfile" "$jsfile"
