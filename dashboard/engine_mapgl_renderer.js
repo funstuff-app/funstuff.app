@@ -476,8 +476,30 @@
   MapGLRenderer.prototype.projectWorld = function (worldX, worldY) {
     if (!this.map || !this.ready || this.map.getPitch() < 0.5) return null;
     const ll = window.worldToLatLon(worldX, worldY, this.view.zoom);
-    const point = this.map.project([ll.lon, ll.lat]);
-    return { x: point.x, y: point.y };
+    const map = this.map;
+    const t = map.transform;
+    const M = t && t._pixelMatrix3D;
+    const terrain = map.terrain;
+    if (!M || !terrain || typeof terrain.getElevationForLngLatZoom !== "function"
+        || typeof maplibregl.MercatorCoordinate !== "function") {
+      const point = map.project([ll.lon, ll.lat]);
+      return { x: point.x, y: point.y };
+    }
+    // Same arithmetic as map.project() with terrain, minus its per-point
+    // elevation lookup through the covering-tile search (that path costs
+    // ~0.1 ms per marker; hundreds of markers per overlay draw made every
+    // 3D pan frame a 40+ ms frame).
+    const lngLat = new maplibregl.LngLat(ll.lon, ll.lat);
+    const c = maplibregl.MercatorCoordinate.fromLngLat(lngLat);
+    const ws = t.worldSize;
+    const px = c.x * ws, py = c.y * ws;
+    const pz = terrain.getElevationForLngLatZoom(lngLat, t.tileZoom);
+    const w = M[3] * px + M[7] * py + M[11] * pz + M[15];
+    if (!(w > 0)) return null;
+    return {
+      x: (M[0] * px + M[4] * py + M[8] * pz + M[12]) / w,
+      y: (M[1] * px + M[5] * py + M[9] * pz + M[13]) / w,
+    };
   };
 
   MapGLRenderer.prototype._setButtonState = function (active) {
