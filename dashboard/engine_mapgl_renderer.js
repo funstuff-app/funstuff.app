@@ -239,8 +239,8 @@
   MapGLRenderer.prototype._fieldCoordinates = function () {
     const view = this.view;
     const computed = view.paField && view.paField._paFieldComputedView;
-    const lat = computed ? computed.centerLat : view.center.lat;
-    const lon = computed ? computed.centerLon : view.center.lon;
+    const lat = computed ? (computed.bufLat != null ? computed.bufLat : computed.centerLat) : view.center.lat;
+    const lon = computed ? (computed.bufLon != null ? computed.bufLon : computed.centerLon) : view.center.lon;
     const zoom = computed ? computed.zoom : view.zoom;
     const w = view._paFieldBufW || view._cssW || 1;
     const h = view._paFieldBufH || view._cssH || 1;

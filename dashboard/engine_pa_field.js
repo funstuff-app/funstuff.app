@@ -515,13 +515,17 @@
 
       const dpr = view._dpr || (window.devicePixelRatio || 1);
       const z = Number(view.zoom);
-      const clat = Number(view.center?.lat);
-      const clon = Number(view.center?.lon);
+      let clat = Number(view.center?.lat);
+      let clon = Number(view.center?.lon);
+      const viewClat = clat, viewClon = clon;
       const fixed = Array.isArray(state && state.fixed) ? state.fixed : [];
 
       // ── Viewport / reference-time setup (shared between the per-pollutant
       // max scan and the main single-pollutant field compute) ──
-      const centerW = latLonToWorld(clat, clon, z);
+      // centerW (buffer center in world px) is assigned after the buffer
+      // sizing below: in 3D the buffer is centered on the visible ground
+      // footprint, not the screen center.
+      let centerW = latLonToWorld(clat, clon, z);
       // Overfetch: collect sensors and compute the field on a buffer larger than
       // the viewport so gesture pans reveal pre-rendered content at the edges.
       //
@@ -548,11 +552,43 @@
         // rasterized at 1x device resolution (_paintPaCells), not by shrinking
         // the disc, which left the far part of the pitched view unfilled.
         view._paField3dFarCornerPx = farCornerPx;
-        const side = Math.min(Math.ceil(farCornerPx * _OVERFETCH * 2), Math.floor(maxDevPx / dpr));
+        // The pitched camera's ground footprint is not centered on the map
+        // center: it reaches a little way below the screen center and a long
+        // way above it (toward the horizon). A disc centered on the screen
+        // center wastes half its radius behind the camera and its edge shows
+        // in the upper viewport. Center the buffer on the footprint midpoint
+        // (unproject of the bottom and top screen edges, the far one capped
+        // at the geometric far-corner distance) and size it to reach both.
+        const gl = view.mapgl;
+        const viewC = latLonToWorld(clat, clon, z);
+        let nearV = { x: 0, y: cssH / 2 }, farV = { x: 0, y: -farCornerPx };
+        const nearLL = gl.unprojectScreen(cssW / 2, cssH);
+        const farLL = gl.unprojectScreen(cssW / 2, 0);
+        if (nearLL) { const w = latLonToWorld(nearLL.lat, nearLL.lon, z); nearV = { x: w.x - viewC.x, y: w.y - viewC.y }; }
+        if (farLL) {
+          const w = latLonToWorld(farLL.lat, farLL.lon, z);
+          let fx = w.x - viewC.x, fy = w.y - viewC.y;
+          const len = Math.hypot(fx, fy);
+          if (!isFinite(len) || len > farCornerPx) { const k = farCornerPx / (len || 1); fx *= k; fy *= k; }
+          farV = { x: fx, y: fy };
+        }
+        const midX = (nearV.x + farV.x) / 2, midY = (nearV.y + farV.y) / 2;
+        const halfSpan = Math.hypot(farV.x - nearV.x, farV.y - nearV.y) / 2;
+        // Radius: the far edge plus the same slack the 2D overfetch uses,
+        // within the device budget (the 3D texture is rasterized at 1x).
+        const side = Math.min(Math.ceil((halfSpan + cssW * 0.5) * _OVERFETCH * 2), Math.floor(maxDevPx));
         bufW = side;
         bufH = side;
         fieldRadiusPx = side / 2;
+        const bufLL = worldToLatLon(viewC.x + midX, viewC.y + midY, z);
+        clat = bufLL.lat;
+        clon = bufLL.lon;
+        centerW = latLonToWorld(clat, clon, z);
+        // Where the viewport sits inside the buffer (buffer px), for the
+        // viewport-restricted max-AQI scans.
+        view._paFieldVpOffset = { x: bufW / 2 - midX - cssW / 2, y: bufH / 2 - midY - cssH / 2 };
       } else {
+        view._paFieldVpOffset = null;
         bufW = Math.min(Math.ceil(cssW * _OVERFETCH), Math.floor(maxDevPx / dpr));
         bufH = Math.min(Math.ceil(cssH * _OVERFETCH), Math.floor(maxDevPx / dpr));
         fieldRadiusPx = null;
@@ -708,9 +744,9 @@
       // by viewport zoom, not by how far out the render-distance buffer
       // reaches — coarsening cells with the buffer made every sensor's smooth
       // blob render as a blocky/square patch instead of a circle.
-      const cellSize = Math.max(16, Math.ceil(Math.sqrt(cssW * cssH / 1400)));
-      const gw = Math.ceil(bufW / cellSize);
-      const gh = Math.ceil(bufH / cellSize);
+      let cellSize = Math.max(16, Math.ceil(Math.sqrt(cssW * cssH / 1400)));
+      let gw = Math.ceil(bufW / cellSize);
+      let gh = Math.ceil(bufH / cellSize);
 
       // ── Cutoff in screen pixels ──
       const _fd = window._fieldDebug;
@@ -743,6 +779,22 @@
       const sigmaDivisor = _fd.sigmaDivisor;
       const sigma = (cutoffPx / sigmaDivisor) * _spread.sigmaMult;
       const twoSigmaSq = 2 * sigma * sigma;
+      // 3D: the footprint buffer is up to 4096 css px on a side, ~40k cells
+      // at the viewport-pegged cell size, and the kernel is O(cells x
+      // sensors): measured 550 ms per recompute. The blob-shape constraint on
+      // cell size is really a constraint relative to the kernel's sigma (in
+      // px at this zoom), not to the viewport: keep >= 12 cells across the
+      // 2-sigma diameter and the Gaussian stays a smooth disc. At city-wide
+      // zooms sigma is small in px and this leaves the cell size alone; at
+      // close zooms sigma is hundreds of px and the grid shrinks 5-10x.
+      if (is3d) {
+        const c3 = Math.max(cellSize, Math.floor(sigma / 6));
+        if (c3 !== cellSize) {
+          cellSize = c3;
+          gw = Math.ceil(bufW / cellSize);
+          gh = Math.ceil(bufH / cellSize);
+        }
+      }
 
       // ── Build stride-5 sensor array(s): [sx, sy, aqi, twoSigSq, weightMultiplier, ...] ──
       // Blend in AQI space: the non-linear concentration→AQI transform gives high
@@ -823,7 +875,7 @@
         view._paFieldValidRange = null;
       }
       // Store view state for gesture-time translate offset
-      this._paFieldComputedView = { centerLat: clat, centerLon: clon, zoom: z };
+      this._paFieldComputedView = { centerLat: viewClat, centerLon: viewClon, zoom: z, bufLat: clat, bufLon: clon };
     }
 
     /**
@@ -887,8 +939,9 @@
       // matches no tab and every pollutant computes its own pass).
       const renderedTab = view._paFieldPollutant;
 
-      const vpMarginX = (bufW - cssW) / 2;
-      const vpMarginY = (bufH - cssH) / 2;
+      const _vpo = view._paFieldVpOffset;
+      const vpMarginX = _vpo ? _vpo.x : (bufW - cssW) / 2;
+      const vpMarginY = _vpo ? _vpo.y : (bufH - cssH) / 2;
       const vpGxMin = Math.max(0, Math.floor(vpMarginX / cellSize));
       const vpGyMin = Math.max(0, Math.floor(vpMarginY / cellSize));
       const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + cssW) / cellSize));
@@ -1090,8 +1143,9 @@
       let fieldMaxAqi = -Infinity;
       const vpW = vpCssW || cssW;
       const vpH = vpCssH || cssH;
-      const vpMarginX = (cssW - vpW) / 2;
-      const vpMarginY = (cssH - vpH) / 2;
+      const _vpo = view._paFieldVpOffset;
+      const vpMarginX = _vpo ? _vpo.x : (cssW - vpW) / 2;
+      const vpMarginY = _vpo ? _vpo.y : (cssH - vpH) / 2;
       const vpGxMin = Math.floor(vpMarginX / cellSize);
       const vpGyMin = Math.floor(vpMarginY / cellSize);
       const vpGxMax = Math.min(gw, Math.ceil((vpMarginX + vpW) / cellSize));
