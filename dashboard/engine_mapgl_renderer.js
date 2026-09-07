@@ -478,8 +478,13 @@
     const ll = window.worldToLatLon(worldX, worldY, this.view.zoom);
     const map = this.map;
     const t = map.transform;
-    const M = t._pixelMatrix3D;
+    const M = t && t._pixelMatrix3D;
     const terrain = map.terrain;
+    if (!M || !terrain || typeof terrain.getElevationForLngLatZoom !== "function"
+        || typeof maplibregl.MercatorCoordinate !== "function") {
+      const point = map.project([ll.lon, ll.lat]);
+      return { x: point.x, y: point.y };
+    }
     // Same arithmetic as map.project() with terrain, minus its per-point
     // elevation lookup through the covering-tile search (that path costs
     // ~0.1 ms per marker; hundreds of markers per overlay draw made every
