@@ -990,25 +990,30 @@
     // easing/fling continues advancing playbackTimeMs while physics would be
     // far behind, causing a lurch. We hold the fast path until the playback
     // velocity settles to normal speed (targetD stops racing ahead).
-    if (this.view._scrubbing) {
+    // Wheel coast counts as a scrub for the physics: the playhead is sweeping
+    // many seconds of sim time per frame, and the full pipeline below would
+    // snap + zero velocity + rescan curves on every tick (isScrub true each
+    // frame) for a marker that just needs to sit at the time position.
+    const _sweeping = !!(this.view._scrubbing || this.view._playheadSweeping);
+    if (_sweeping) {
       // Mark that we're in a scrub — cooldown will continue after release
       if (!this.view._scrubCooldownById) this.view._scrubCooldownById = new Map();
       this.view._scrubCooldownById.set(id, { lastTargetD: targetD, lastT: t });
     }
     const cooldown = this.view._scrubCooldownById?.get(id);
-    const inCooldown = !this.view._scrubbing && cooldown != null
+    const inCooldown = !_sweeping && cooldown != null
       && (t - cooldown.lastT) < 1500   // max 1.5s cooldown
       && (targetD - cooldown.lastTargetD) > 50;  // easing is still racing ahead (>50m jump)
     if (inCooldown) {
       // Update cooldown tracking
       cooldown.lastTargetD = targetD;
       cooldown.lastT = t;
-    } else if (!this.view._scrubbing && cooldown != null) {
+    } else if (!_sweeping && cooldown != null) {
       // Cooldown finished — clear it
       this.view._scrubCooldownById.delete(id);
     }
 
-    if (this.view._scrubbing || inCooldown) {
+    if (_sweeping || inCooldown) {
       const phys = this.view._getPhysicsState(id);
       phys.d = targetD;
       phys.lastPlaybackT = t;

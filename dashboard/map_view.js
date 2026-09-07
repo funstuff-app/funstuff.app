@@ -53,7 +53,9 @@ class MapView {
     // fractional zoom for smooth pinch / button zooming
     this.zoom = 12.58; // 50% more zoomed in than the original 12 (log2 scale: +log2(1.5))
     this._zoomMin = 3;
-    this._zoomMax = 18;
+    this._zoomMax2d = 18;
+    this._zoomMax3d = 16; // 3D: closer than this the pitched camera drops to street level
+    this._zoomMax = this._zoomMax2d;
     // Mouse drag pan (optional). Does not affect trackpad controls.
     // _mouseDragging is shared (read by PlaybackEngine/PaFieldRenderer); the
     // drag start/center/moved bookkeeping is owned by CameraGestures.
@@ -270,6 +272,7 @@ class MapView {
     // (read by TileRenderer/PlaybackEngine/PaFieldRenderer/app.js/jog_wheel).
     this._pinchZooming = false;
     this._scrubbing = false; // true during timeline scrub (slider/jog wheel drag)
+    this._playheadSweeping = false; // wheel coast far above playback speed (set by the playback loop)
 
     // Pointer/touch/wheel/gesture + camera animation/fit/orchestration controller
     // (engine_camera_gestures.js).

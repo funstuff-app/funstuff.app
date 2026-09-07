@@ -502,6 +502,9 @@
     this.active = true;
     this.pitch = PITCH_3D;
     this._lastViewKey = "";
+    // Zoom ceiling for 3D (every zoom gesture clamps to view._zoomMax).
+    this.view._zoomMax = this.view._zoomMax3d;
+    if (this.view.zoom > this.view._zoomMax) this.view.zoom = this.view._zoomMax;
     this.map.setTerrain({ source: "terrain", exaggeration: 1.15 });
     this.sync(true);
     this.map.jumpTo({ pitch: 0, bearing: 0 });
@@ -520,6 +523,7 @@
     if (this._transitionTimer) window.clearTimeout(this._transitionTimer);
     this.active = false;
     this.pitch = 0;
+    this.view._zoomMax = this.view._zoomMax2d;
     this.view.tiles.drawTiles();
 
     const root = this.container.parentElement;

@@ -543,19 +543,12 @@
       if (is3d) {
         const pitchDeg = (g.MapGLRenderer && g.MapGLRenderer.PITCH_3D) || 58;
         const farCornerPx = _field3dFarCornerDistPx(cssW, cssH, pitchDeg);
-        // 3D buffer cap: ~2048 device px rather than the 2D 4096, but never
-        // smaller than the viewport's long edge (+15%): the transient-animation
-        // fast path treats (buffer - viewport)/2 as its pan margin, and a
-        // buffer smaller than the viewport makes that margin negative, i.e.
-        // "exhausted" on every frame, i.e. a full field recompute per frame
-        // while panning. In 3D this canvas is a GL texture re-uploaded on
-        // every recompute and every cross-fade step; at 4096^2 that is a
-        // 64 MB upload each time, the periodic stall on Safari/iPad. The
-        // field is a blurred heatmap; the smaller texture is not
-        // distinguishable on terrain.
+        // Full render-distance coverage (up to the 4096 device-px budget in css
+        // px). The texture cost is controlled elsewhere: in 3D the field is
+        // rasterized at 1x device resolution (_paintPaCells), not by shrinking
+        // the disc, which left the far part of the pitched view unfilled.
         view._paField3dFarCornerPx = farCornerPx;
-        const capCss = Math.max(Math.max(cssW, cssH) * 1.15, 2048 / dpr);
-        const side = Math.min(Math.ceil(farCornerPx * _OVERFETCH * 2), Math.floor(Math.min(maxDevPx / dpr, capCss)));
+        const side = Math.min(Math.ceil(farCornerPx * _OVERFETCH * 2), Math.floor(maxDevPx / dpr));
         bufW = side;
         bufH = side;
         fieldRadiusPx = side / 2;
@@ -658,6 +651,20 @@
 
       // ── Cache key: view geometry + color fingerprint + pollutant ──
       const key = `pa:${viewKey}|p:${renderTab}|f:${fingerprint}`;
+      // Scrub rate limit: while the playhead is sweeping (wheel coast, slider
+      // drag), the virtual-sensor fingerprint changes on nearly every tick as
+      // the 45 min trail window slides, so this recomputed the full field
+      // (kernel passes + paint + upscale + GL upload) up to 30x/s. Only the
+      // TIME moved (same view, same pollutant): serve the last field for up
+      // to 200 ms, then recompute. Sweeps look like a 5 Hz field, playback
+      // at normal speed (fingerprint changes ~1/s) is unaffected.
+      if (view._paFieldCanvas && view._paFieldKey !== key
+          && this._paFieldLastComputeViewKey === `${viewKey}|${renderTab}`
+          && playbackTimeMs != null && this._paFieldLastComputeSimMs != null
+          && Math.abs(playbackTimeMs - this._paFieldLastComputeSimMs) > 60000
+          && (performance.now() - (this._paFieldLastComputePerf || 0)) < 200) {
+        return;
+      }
       if (view._paFieldCanvas && view._paFieldKey === key) {
         // Cache hit -- update validity window so future frames skip
         // _collectPaFieldSensors.  Skip when virtual sensors are present:
@@ -675,7 +682,14 @@
       // no stacking.
       const prevFingerprint = this._paFieldFingerprint || "";
       const fingerprintChanged = fingerprint !== prevFingerprint;
-      if (view._paFieldCanvas && fingerprintChanged) {
+      // No cross-fade when recomputes come in quick succession (a scrub
+      // sweep): each fade step is another full texture upload in 3D, and a
+      // 300 ms fade can't complete between 200 ms recomputes anyway.
+      const _sinceLastPerf = performance.now() - (this._paFieldLastComputePerf || 0);
+      this._paFieldLastComputePerf = performance.now();
+      this._paFieldLastComputeSimMs = (playbackTimeMs != null && isFinite(playbackTimeMs)) ? playbackTimeMs : null;
+      this._paFieldLastComputeViewKey = `${viewKey}|${renderTab}`;
+      if (view._paFieldCanvas && fingerprintChanged && _sinceLastPerf > 1000) {
         this._paFieldPrevCanvas = view._paFieldCanvas;
         view._paFieldCanvas = null;
         view._paFieldCtx = null;
@@ -1172,7 +1186,11 @@
       }
 
       tctx.putImageData(imgData, 0, 0);
-      this._upscalePaField(tc, cssW, cssH, dpr);
+      // 3D (fieldRadiusPx set): the result is a GL texture draped over terrain
+      // and re-uploaded on every recompute; a blurred field at 1x device
+      // resolution is not distinguishable from 2x on the pitched terrain, and
+      // the upload is a quarter of the bytes.
+      this._upscalePaField(tc, cssW, cssH, fieldRadiusPx ? 1 : dpr);
     }
 
     /** Synchronous Nadaraya-Watson kernel regression with Gaussian weights.
