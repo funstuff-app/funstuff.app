@@ -47,7 +47,15 @@
   // viewport so gesture panning reveals pre-rendered content instead of blank edges.
   const _OVERFETCH = 1.5;              // buffer = viewport × this factor
   const _OVERFETCH_MAX_DEVICE_PX = 4096; // hard cap to avoid GPU OOM
+  // 0.65 is a "hide latency in an invisible margin" policy: in flat 2D the
+  // margin is off-screen until you pan into it, so waiting until most of it
+  // is consumed before re-rendering is free — nobody can see the staleness.
+  // That premise is false in 3D: the pitched camera makes the ENTIRE buffer
+  // visible on screen at once, so a stale field is visible immediately, well
+  // before 65% of the (now much larger) margin is consumed. 3D gets its own,
+  // much tighter threshold instead of inheriting the 2D one.
   const _OVERFETCH_MARGIN_EXHAUST = 0.65; // re-render when pan consumes this fraction of margin
+  const _OVERFETCH_MARGIN_EXHAUST_3D = 0.12; // 3D: re-render much sooner — nothing is off-screen to hide staleness in
 
   /** Map legend tab id → array of reading keys to search for in fixed sensor data. */
   const _LEGEND_TAB_READING_KEYS = {
@@ -577,6 +585,7 @@
     _OVERFETCH,
     _OVERFETCH_MAX_DEVICE_PX,
     _OVERFETCH_MARGIN_EXHAUST,
+    _OVERFETCH_MARGIN_EXHAUST_3D,
     _LEGEND_TAB_READING_KEYS,
     _LEGEND_TAB_AQI_KEY,
     _LEGEND_TAB_FIELD_SPREAD,

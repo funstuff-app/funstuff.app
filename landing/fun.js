@@ -10,6 +10,16 @@
     }, { passive: true });
   }
 
+  /* ── Email links: hrefs assembled at runtime from reversed data attrs
+     so the address isn't sitting in page source for scrapers. ── */
+  var _mailLinks = document.querySelectorAll("[data-mail-u]");
+  for (var _mi = 0; _mi < _mailLinks.length; _mi++) {
+    var _mEl = _mailLinks[_mi];
+    var _mu = (_mEl.getAttribute("data-mail-u") || "").split("").reverse().join("");
+    var _mh = (_mEl.getAttribute("data-mail-h") || "").split("").reverse().join("");
+    if (_mu && _mh) _mEl.href = "mailto:" + _mu + "@" + _mh;
+  }
+
   /* ── Weekend snapshot logic for embedded map widget ── */
   var _widgetLoadTime = Date.now();
   var _widgetSnapshotParams = null;
@@ -93,10 +103,10 @@
       var iframe = document.getElementById("map-iframe");
       if (iframe) iframe.src = (iframe.getAttribute("data-src") || "https://dustytrails.funstuff.app/") + "?lite=1&fresh=1&demo=1";
       var overlayLabel = document.getElementById("demo-overlay-label");
-      if (overlayLabel) overlayLabel.textContent = "Live preview \u2014 click to open full app";
+      if (overlayLabel) overlayLabel.textContent = "Demo preview \u2014 click to open full app";
       var indicator = document.getElementById("snapshot-indicator");
       if (indicator) {
-        indicator.textContent = "\u25CF Live";
+        indicator.textContent = "\u25B6 Demo";
         indicator.style.display = "block";
       }
     }
@@ -156,6 +166,7 @@
     tuiOverlay.addEventListener("click", function () {
       tuiOverlay.style.display = "none";
       tuiIframe.classList.add("interactive");
+      tuiIframe.focus();
     });
   }
 
@@ -190,60 +201,16 @@
   }
 
   /* ── Window minimize / restore ── */
+  /* Thin wrappers so existing call sites keep working; the single
+     implementation now lives in _toggleDeskMin + the __main hooks. */
   function minimizeWindow() {
-    if (!appWindow) return;
-    appWindow.style.transition = "opacity 0.2s, transform 0.2s";
-    appWindow.style.opacity = "0";
-    appWindow.style.transform = "scaleY(0.97) translateY(-4px)";
-    setTimeout(function () {
-      appWindow.style.display = "none";
-      appWindow.style.transition = "";
-      appWindow.style.transform = "";
-      if (_pageEl) _pageEl.style.pointerEvents = "none";
-    }, 220);
-    /* Mark as minimized in the z-stack */
-    var mw = _deskWins["__main"];
-    if (mw) {
-      mw.minimized = true;
-      if (mw.tbBtn) mw.tbBtn.classList.remove("active");
-    }
-    /* Deactivate all section buttons */
-    Object.keys(_sectionBtns).forEach(function (key) {
-      var btn = _sectionBtns[key];
-      if (btn) btn.classList.remove("active");
-    });
-    if (_focusedWin === "__main") {
-      _focusedWin = null;
-      var bestId = null, bestZ = -1;
-      Object.keys(_deskWins).forEach(function (wid) {
-        var dw = _deskWins[wid];
-        if (wid !== "__main" && !dw.minimized) {
-          var z = parseInt(dw.el.style.zIndex, 10) || 0;
-          if (z > bestZ) { bestZ = z; bestId = wid; }
-        }
-      });
-      if (bestId) _bringToFront(bestId);
-    }
+    var w = _deskWins["__main"];
+    if (w && !w.minimized) _toggleDeskMin("__main");
   }
 
   function restoreWindow() {
-    if (!appWindow) return;
-    if (_pageEl) _pageEl.style.pointerEvents = "";
-    appWindow.style.display = "";
-    appWindow.style.opacity = "0";
-    appWindow.style.transform = "scaleY(0.97) translateY(-4px)";
-    appWindow.style.transition = "opacity 0.2s, transform 0.2s";
-    requestAnimationFrame(function () {
-      requestAnimationFrame(function () {
-        appWindow.style.opacity = "1";
-        appWindow.style.transform = "";
-      });
-    });
-    if (mainWindow) mainWindow.scrollTop = 0;
-    window.scrollTo({ top: 0, behavior: "smooth" });
-    var mw = _deskWins["__main"];
-    if (mw) mw.minimized = false;
-    _bringToFront("__main");
+    var w = _deskWins["__main"];
+    if (w && w.minimized) _toggleDeskMin("__main");
   }
 
   /* ── Maximize button ── */
@@ -262,12 +229,19 @@
   /* Taskbar main-window button: part of the same group */
   if (tbMainBtn) {
     tbMainBtn.addEventListener("click", function () {
-      if (appWindow && appWindow.style.display === "none") {
-        restoreWindow();
+      /* Same semantics as every other taskbar app button: minimized -> restore,
+         focused -> minimize, otherwise raise. It used to be restore-only, which
+         is why state tracking could never put main back to minimized. */
+      var w = _deskWins["__main"];
+      if (!w) return;
+      if (w.minimized || _focusedWin !== "__main") {
+        if (w.minimized) _toggleDeskMin("__main");
+        else _bringToFront("__main");
+        _setActiveSection(null);
+        if (mainWindow) mainWindow.scrollTo({ top: 0, behavior: "smooth" });
+      } else {
+        _toggleDeskMin("__main");
       }
-      _bringToFront("__main");
-      _setActiveSection(null);
-      if (mainWindow) mainWindow.scrollTo({ top: 0, behavior: "smooth" });
     });
   }
 
@@ -488,6 +462,72 @@
   var _lastWinY = null;
   var CASCADE_OFFSET = 28;
 
+  /* ── Window layout persistence ──────────────────────────────────────
+     Kept inside the manager on purpose. Saved geometry is applied while a
+     window is being built, and each window's initial state is decided
+     before it is shown, so nothing is ever opened and then corrected. An
+     external wrapper can only fix things up afterwards, which is visible
+     as a flash. */
+  var _LS = "funstuff.winstate.v1";
+  var _wsTimer = null;
+  var _wsReady = false;          /* suppress saves until the initial layout is applied */
+
+  function _wsRead() {
+    try { return JSON.parse(localStorage.getItem(_LS) || "{}") || {}; }
+    catch (e) { return {}; }
+  }
+
+  function _wsSave() {
+    if (!_wsReady) return;
+    var st = _wsRead();
+    Object.keys(_deskWins).forEach(function (id) {
+      var w = _deskWins[id];
+      if (!w || !w.el) return;
+      var prev = st[id] || {};
+      /* a hidden window reports unusable offsets, so keep its last box */
+      var box = w.minimized ? prev : {
+        x: parseInt(w.el.style.left, 10),
+        y: parseInt(w.el.style.top, 10),
+        w: parseInt(w.el.style.width, 10) || undefined
+      };
+      st[id] = {
+        x: isFinite(box.x) ? box.x : prev.x,
+        y: isFinite(box.y) ? box.y : prev.y,
+        w: box.w || prev.w,
+        min: !!w.minimized,
+        open: true,
+        z: parseInt(w.el.style.zIndex, 10) || 0
+      };
+    });
+    Object.keys(st).forEach(function (id) { if (!_deskWins[id]) st[id].open = false; });
+    try { localStorage.setItem(_LS, JSON.stringify(st)); } catch (e) {}
+  }
+
+  function _wsQueue() {
+    clearTimeout(_wsTimer);
+    _wsTimer = setTimeout(_wsSave, 300);
+  }
+
+  window.__winStateClear = function () {
+    try { localStorage.removeItem(_LS); } catch (e) {}
+    return "window layout forgotten";
+  };
+  window.__winStateDump = _wsRead;
+
+  /* Apps defined in later scripts register their opener here. If the saved
+     layout says they were open, they are opened immediately, so registration
+     order does the sequencing instead of a timer. */
+  var _wsOpeners = {};
+  window.__registerApp = function (id, open) {
+    _wsOpeners[id] = open;
+    if (!_wsReady) return;
+    var s = _wsRead()[id];
+    if (s && s.open && !s.min && !_deskWins[id]) {
+      open();
+      _wsRestoreZ();      /* it opened after the initial pass, so re-sort */
+    }
+  };
+
   /* Register the main app-window (.page) in the z-stack */
   var _pageEl = document.querySelector(".page");
   if (_pageEl && appWindow) {
@@ -496,6 +536,44 @@
       tbBtn: tbMainBtn,
       minimized: false,
       isMain: true,
+      __mainIsApp: true,
+      /* The manager already supports these hooks; using them lets "__main"
+         run through _toggleDeskMin like every other window instead of having
+         a parallel minimize/restore path that state tracking must special-case. */
+      onMinimize: function () {
+        if (!appWindow) return;
+        appWindow.style.transition = "opacity 0.2s, transform 0.2s";
+        appWindow.style.opacity = "0";
+        appWindow.style.transform = "scaleY(0.97) translateY(-4px)";
+        setTimeout(function () {
+          appWindow.style.display = "none";
+          appWindow.style.transition = "";
+          appWindow.style.transform = "";
+          if (_pageEl) _pageEl.style.pointerEvents = "none";
+        }, 220);
+        Object.keys(_sectionBtns).forEach(function (key) {
+          var btn = _sectionBtns[key];
+          if (btn) btn.classList.remove("active");
+        });
+      },
+      onRestore: function () {
+        if (!appWindow) return;
+        if (_pageEl) _pageEl.style.pointerEvents = "";
+        appWindow.style.display = "";
+        appWindow.style.opacity = "0";
+        appWindow.style.transform = "scaleY(0.97) translateY(-4px)";
+        appWindow.style.transition = "opacity 0.2s, transform 0.2s";
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () {
+            appWindow.style.opacity = "1";
+            appWindow.style.transform = "";
+          });
+        });
+        if (mainWindow) mainWindow.scrollTop = 0;
+      },
+      /* _toggleDeskMin hides w.el; for main that must be #app-window, not
+         .page (which wraps the whole desktop). */
+      minEl: appWindow,
     };
     /* Clicking anywhere in the main window brings it to front */
     appWindow.addEventListener("mousedown", function () { _bringToFront("__main"); });
@@ -586,13 +664,13 @@
     var w = _deskWins[id];
     if (!w) return;
     if (w.minimized) {
-      w.el.style.display = "";
+      if (!w.minEl) w.el.style.display = "";
       w.minimized = false;
       _bringToFront(id);
       if (w.onRestore) w.onRestore();
     } else {
       if (w.onMinimize) w.onMinimize();
-      w.el.style.display = "none";
+      if (!w.minEl) w.el.style.display = "none";   /* minEl owner hides itself */
       w.minimized = true;
       if (w.tbBtn) w.tbBtn.classList.remove("active");
       if (_focusedWin === id) {
@@ -722,6 +800,11 @@
    * you suspect the listener isn't bound. */
   window.__deskResize = _onDesktopBrowserResize;
   window.__deskWins = _deskWins;
+  window.__openDesktopWindow = openDesktopWindow;
+  window.__closeStartMenu = closeStartMenu;
+  window.__toggleDeskMin = _toggleDeskMin;
+  window.__minimizeWindow = minimizeWindow;
+  window.__restoreWindow = restoreWindow;
 
   function _closeDeskWin(id) {
     var w = _deskWins[id];
@@ -805,6 +888,14 @@
       x = baseX;
       y = baseY;
     }
+    /* Saved geometry wins over the cascade, applied here so the window is
+       built at its remembered position rather than moved after it appears. */
+    var _saved = _wsRead()[opts.id];
+    if (_saved && isFinite(_saved.x) && isFinite(_saved.y)) {
+      x = Math.max(0, Math.min(_saved.x, window.innerWidth - 60));
+      y = Math.max(0, Math.min(_saved.y, window.innerHeight - 60));
+      if (_saved.w) win.style.width = _saved.w + "px";
+    }
     x = Math.max(0, Math.min(x, window.innerWidth - opts.width - 10));
     y = Math.max(0, Math.min(y, window.innerHeight - 80));
     _lastWinX = x;
@@ -886,6 +977,15 @@
       onRestore: opts.onRestore,
       onMinimize: opts.onMinimize,
       onResize: opts.onResize,
+      _wsHooked: (function () {
+        /* drag and min/max both land on style or class */
+        try {
+          new MutationObserver(_wsQueue).observe(win, {
+            attributes: true, attributeFilter: ["style", "class"]
+          });
+        } catch (e) {}
+        return true;
+      }()),
     };
     _bringToFront(opts.id);
 
@@ -1316,7 +1416,7 @@
     var h = dim.h;
 
     var iframe = document.createElement("iframe");
-    iframe.src = "https://likes.funstuff.app/";
+    iframe.src = "https://likes.funstuff.app/?random=1";
     iframe.setAttribute("title", "Pictures");
     iframe.setAttribute("loading", "lazy");
     iframe.setAttribute("allow", "autoplay; encrypted-media; picture-in-picture; fullscreen");
@@ -1347,13 +1447,94 @@
     if (bodyEl) bodyEl.style.height = h + "px";
   }
 
+  /* Apply the saved layout. Runs once, here, after every window type is
+     defined: main's own state, then any app that was open, opened in ascending
+     saved z so the stacking comes back the way it was left. Nothing is opened
+     and then corrected, so there is no flash. */
+  (function _wsApply() {
+    var st = _wsRead();
+    var m = _deskWins["__main"];
+    if (st.__main && st.__main.min && !m.minimized) {
+      /* hide with no transition: this is initial state, not a user action */
+      appWindow.style.transition = "";
+      appWindow.style.display = "none";
+      _pageEl.style.pointerEvents = "none";
+      m.minimized = true;
+      m.tbBtn.classList.remove("active");
+      Object.keys(_sectionBtns).forEach(function (k) {
+        _sectionBtns[k].classList.remove("active");
+      });
+    }
+    var openers = {
+      pipes: openPipesWindow, flowerbox: openFlowerBoxWindow,
+      videos: openVideosWindow, music: openMusicWindow,
+      winamp: openWinampWindow, pictures: openPicturesWindow
+    };
+    Object.keys(openers).forEach(function (id) { _wsOpeners[id] = openers[id]; });
+
+    Object.keys(st)
+      .filter(function (id) {
+        return id !== "__main" && st[id].open && !st[id].min &&
+               _wsOpeners[id] && !_deskWins[id];
+      })
+      .sort(function (a, b) { return (st[a].z || 0) - (st[b].z || 0); })
+      .forEach(function (id) { _wsOpeners[id](); });
+    closeStartMenu();
+    _wsReady = true;
+
+    /* Rewrite z-index directly from the saved order, including "__main".
+       Opening in ascending z only orders the windows opened here; main and
+       anything registered later are not in that sequence. */
+    _wsRestoreZ();
+    /* No save here. Apps in deferred scripts have not registered yet, so
+       _wsSave's "not in _deskWins means closed" sweep would mark them closed
+       on every load and there would be nothing left to restore next time. */
+  }());
+
+  function _wsRestoreZ() {
+    var st = _wsRead();
+    var ids = Object.keys(_deskWins)
+      .filter(function (id) { return st[id] && isFinite(st[id].z); })
+      .sort(function (a, b) { return st[a].z - st[b].z; });
+    if (!ids.length) return;
+    ids.forEach(function (id, i) {
+      _deskWins[id].el.style.zIndex = 300 + i;
+    });
+    _topZ = 300 + ids.length;
+    var top = ids[ids.length - 1];
+    if (!_deskWins[top].minimized) _bringToFront(top);
+  }
+
+  window.addEventListener("beforeunload", _wsSave);
+  window.addEventListener("pagehide", _wsSave);
+  document.addEventListener("mouseup", _wsQueue, true);
+  window.addEventListener("resize", _wsQueue);
+
   /* ── Wire up Start Menu items ── */
+  /* Dusty Trails launches from the Start menu like every other app. It is
+     never removed from _deskWins, so "open" here means restore + raise. */
+  function openMainWindow() {
+    var w = _deskWins["__main"];
+    if (!w) return;
+    if (w.minimized) _toggleDeskMin("__main");
+    else _bringToFront("__main");
+    closeStartMenu();
+  }
+  window.__openMain = openMainWindow;
+
+  var smDusty = document.getElementById("sm-dustytrails");
+  if (smDusty) smDusty.addEventListener("click", openMainWindow);
+
+  var smEmail = document.getElementById("sm-email");
   var smPipes = document.getElementById("sm-pipes");
   var smFlowerbox = document.getElementById("sm-flowerbox");
   var smVideos = document.getElementById("sm-videos");
   var smWinamp = document.getElementById("sm-winamp");
   var smPictures = document.getElementById("sm-pictures");
 
+  if (smEmail) smEmail.addEventListener("click", function () {
+    closeStartMenu();
+  });
   if (smPipes) smPipes.addEventListener("click", function (e) {
     e.preventDefault();
     openPipesWindow();

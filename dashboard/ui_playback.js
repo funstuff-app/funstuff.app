@@ -1011,6 +1011,10 @@
       // ─────────────────────────────────────────────────────────────────────────
       // RENDER — capped to _pbDrawMinDt (see declaration above for why)
       // ─────────────────────────────────────────────────────────────────────────
+      // Tell the engine when the playhead is sweeping (wheel coast well above
+      // playback speed) so vehicles take the scrub fast path.
+      map._playheadSweeping = !!(pb._pbIsWheelCoasting
+        && Math.abs(pb._pbVelocity) > 2 * _pbPlaybackSpeed * (map.getPlaybackSpeed() || 1));
       if (didAdvanceTime && (now - pb._pbLastDrawPerf) >= _pbDrawMinDt) {
         map._compositePaFieldOnTiles(map.lastState);
         map.drawOverlay(map.lastState, { cacheUnderlay: true });

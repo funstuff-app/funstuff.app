@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
+import urllib.error
+import urllib.request
 from typing import Any
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -2596,6 +2598,38 @@ def _load_deploy_config() -> dict[str, str]:
 
 _deploy_cfg = _load_deploy_config()
 
+
+def _load_dotenv_value(name: str) -> str:
+    """Read one value from a .env beside this file.
+
+    Accepts `NAME=value` lines or a file holding a single bare token (the Pi's
+    .env is the bare CARTO key). Missing file or key -> "".
+    """
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.is_file():
+        return ""
+    try:
+        lines = [ln.strip() for ln in env_path.read_text().splitlines()]
+    except Exception:
+        return ""
+    lines = [ln for ln in lines if ln and not ln.startswith("#")]
+    for ln in lines:
+        if "=" in ln:
+            k, _, v = ln.partition("=")
+            if k.strip() == name:
+                return v.strip().strip('"').strip("'")
+    if len(lines) == 1 and "=" not in lines[0]:
+        return lines[0]
+    return ""
+
+
+# CARTO basemap key: raster tiles render an "API KEY REQUIRED" watermark
+# without it. Sent to the client via /api/config; appended as ?key= on every
+# cartocdn tile URL (canvas tiles and the MapLibre raster source).
+CARTO_API_KEY = (os.environ.get("CARTO_API_KEY", "").strip()
+                 or _deploy_cfg.get("CARTO_API_KEY", "")
+                 or _load_dotenv_value("CARTO_API_KEY"))
+
 PURPLEAIR_API_KEY = (os.environ.get("DUSTY_PURPLEAIR_API_KEY", "").strip()
                      or _deploy_cfg.get("DUSTY_PURPLEAIR_API_KEY", ""))
 
@@ -4708,7 +4742,8 @@ def wind_field_fetch_loop(
     _log("[Wind] wind_field_fetch_loop thread STOPPED")
 
 
-def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, server_config: dict | None = None):
+def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path,
+                 server_config: dict | None = None, api_upstream: str | None = None):
     """Create HTTP request handler with injected dependencies.
     
     Args:
@@ -4716,6 +4751,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
         static_dir: Path to static files (dashboard/)
         data_dir: Path to data directory (~/.mobileair)
         server_config: Server configuration for /api/config endpoint
+        api_upstream: Optional upstream API base URL proxied through local /api
     """
     # Default config for backwards compatibility
     if server_config is None:
@@ -4728,6 +4764,7 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
     
     # Casual bot deterrent — must match the value in dashboard/config.js.
     APP_TOKEN = "42c86460b903df7b764887b6278a17a7"
+    api_upstream = (api_upstream or "").rstrip("/")
 
     class Handler(BaseHTTPRequestHandler):
         # Disable keep-alive to avoid Safari/iOS hanging on connections
@@ -4802,6 +4839,85 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client disconnected while we were sending - ignore
                 pass
+
+        def _proxy_api_request(self):
+            """Forward a local /api request to the configured production API."""
+            suffix = self.path[len("/api"):]
+            upstream_url = api_upstream + suffix
+            request_body = None
+            if self.command in ("POST", "PUT", "PATCH"):
+                try:
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    return self._send(400, b'{"error":"invalid content length"}', "application/json")
+                if content_length < 0 or content_length > MAX_SNAPSHOT_SIZE_BYTES:
+                    return self._send(413, b'{"error":"request too large"}', "application/json")
+                request_body = self.rfile.read(content_length) if content_length else b""
+
+            headers = {
+                "X-App-Token": APP_TOKEN,
+                "Accept": self.headers.get("Accept", "*/*"),
+                "User-Agent": "DustyTrails-Local-Proxy/1.0",
+            }
+            for name in ("Content-Type", "If-None-Match", "If-Modified-Since", "Last-Event-ID"):
+                value = self.headers.get(name)
+                if value:
+                    headers[name] = value
+
+            request = urllib.request.Request(
+                upstream_url,
+                data=request_body,
+                headers=headers,
+                method=self.command,
+            )
+            try:
+                response = urllib.request.urlopen(request, timeout=60)
+            except urllib.error.HTTPError as error:
+                response = error
+            except (urllib.error.URLError, TimeoutError, OSError) as error:
+                body = json.dumps({"error": "upstream unavailable", "detail": str(error.reason if hasattr(error, "reason") else error)}).encode("utf-8")
+                return self._send(502, body, "application/json")
+
+            try:
+                status = getattr(response, "status", response.getcode())
+                content_type = response.headers.get("Content-Type", "application/octet-stream")
+                is_event_stream = content_type.lower().startswith("text/event-stream")
+
+                if is_event_stream:
+                    self.send_response(status)
+                    for name in ("Content-Type", "Cache-Control", "ETag", "Last-Modified", "Content-Encoding", "Set-Cookie"):
+                        value = response.headers.get(name)
+                        if value:
+                            self.send_header(name, value)
+                    self.send_header("Connection", "close")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        while True:
+                            line = response.readline()
+                            if not line:
+                                break
+                            self.wfile.write(line)
+                            self.wfile.flush()
+                    return
+
+                body = response.read(MAX_SNAPSHOT_SIZE_BYTES + 1)
+                if len(body) > MAX_SNAPSHOT_SIZE_BYTES:
+                    return self._send(502, b'{"error":"upstream response too large"}', "application/json")
+                self.send_response(status)
+                for name in ("Content-Type", "Cache-Control", "ETag", "Last-Modified", "Content-Encoding", "Set-Cookie"):
+                    value = response.headers.get(name)
+                    if value:
+                        self.send_header(name, value)
+                self.send_header("Connection", "close")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+            finally:
+                response.close()
 
         def _send_304(self, etag: str, cache_control: str):
             """Send 304 Not Modified (no body)."""
@@ -4908,8 +5024,10 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             path_no_query = self.path.split('?')[0]
 
             # Reject bare API requests missing the app token (bot deterrent).
-            if path_no_query.startswith("/api/") and not self._check_app_token():
+            if path_no_query.startswith("/api/") and not api_upstream and not self._check_app_token():
                 return
+            if path_no_query.startswith("/api/") and api_upstream:
+                return self._proxy_api_request()
 
             # Static HTML - short cache, may change frequently during development
             if path_no_query in ("/", "/index.html"):
@@ -5161,10 +5279,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             return self._send(404, b"not found", "text/plain")
 
         def do_POST(self):
-            if not self._check_app_token():
+            if not api_upstream and not self._check_app_token():
                 return
             if self.path.startswith("/api/auth"):
                 return self._handle_auth()
+            if api_upstream and self.path.startswith("/api/"):
+                return self._proxy_api_request()
             if self.path.startswith("/api/prefs/sync"):
                 return self._handle_prefs_sync()
             # if self.path.startswith("/api/view/sync"):
@@ -5176,10 +5296,12 @@ def make_handler(*, app_state: AppState, static_dir: Path, data_dir: Path, serve
             return self._send(404, b"not found", "text/plain")
 
         def do_DELETE(self):
-            if not self._check_app_token():
+            if not api_upstream and not self._check_app_token():
                 return
             if self.path.startswith("/api/auth"):
                 return self._handle_auth_delete()
+            if api_upstream and self.path.startswith("/api/"):
+                return self._proxy_api_request()
             return self._send(404, b"not found", "text/plain")
 
         def _handle_prefs_sync(self):
@@ -5882,6 +6004,11 @@ def main() -> int:
     parser.add_argument("--key", default="", help="Path to TLS private key")
     parser.add_argument("--interval", type=float, default=60.0, help="Data fetch interval in seconds")
     parser.add_argument(
+        "--api-upstream",
+        default="",
+        help="Upstream API base URL to proxy through local /api (for example, https://dustytrails.funstuff.app/api)",
+    )
+    parser.add_argument(
         "--data-mode",
         choices=["proxy", "direct"],
         default="proxy",
@@ -5917,6 +6044,10 @@ def main() -> int:
             "mobileair.mapSat.carto_dark": "118",
         },
     }
+    if CARTO_API_KEY:
+        server_config["cartoApiKey"] = CARTO_API_KEY
+    else:
+        _log("[Config] CARTO_API_KEY not set; basemap tiles will carry the watermark")
 
     data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -5928,6 +6059,31 @@ def main() -> int:
         persistent_mobile={},
     )
     app_state.demo_pa = getattr(args, "demo_pa", False)
+
+    # Production-backed local development serves local assets immediately. The
+    # local collectors and database are unused because every /api request is
+    # handled by the upstream proxy.
+    if args.api_upstream and not args.https:
+        httpd = ThreadingHTTPServer(
+            (args.host, args.port),
+            make_handler(
+                app_state=app_state,
+                static_dir=static_dir,
+                data_dir=data_dir,
+                server_config=server_config,
+                api_upstream=args.api_upstream,
+            ),
+        )
+        httpd.timeout = 30
+        scheme = "http"
+        print(f"Server optimized. Dashboard listening on {args.host}:{args.port} ({scheme})")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            httpd.server_close()
+        return 0
 
     # ── Initialize SQLite database ──
     db_path = data_dir / "dustytrails.db"
@@ -6080,7 +6236,16 @@ def main() -> int:
     # ).start()
     # _log("[HistoryPrefetch] Background trickle-download thread started")
 
-    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(app_state=app_state, static_dir=static_dir, data_dir=data_dir, server_config=server_config))
+    httpd = ThreadingHTTPServer(
+        (args.host, args.port),
+        make_handler(
+            app_state=app_state,
+            static_dir=static_dir,
+            data_dir=data_dir,
+            server_config=server_config,
+            api_upstream=args.api_upstream,
+        ),
+    )
     # Timeout for individual requests - helps with Safari/iOS connection issues
     httpd.timeout = 30
 

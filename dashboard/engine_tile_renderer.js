@@ -224,11 +224,11 @@
       };
       const subs = view.tileSubdomains || [""];
       const sub = subs[(x + y) % subs.length] || "";
-      img.src = view.tileTemplate
+      img.src = g.tileUrlWithKey(view.tileTemplate
         .replace("{s}", sub)
         .replace("{z}", z)
         .replace("{x}", x)
-        .replace("{y}", y);
+        .replace("{y}", y));
       if (epoch === view._tileEpoch) this._tileCacheSet(key, { img, ok: false });
     }
 

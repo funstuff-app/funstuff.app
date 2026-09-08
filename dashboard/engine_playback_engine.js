@@ -793,7 +793,15 @@
         const lat = Number(p?.lat);
         const lon = Number(p?.lon);
         if (!isFinite(lat) || !isFinite(lon)) continue;
-        const tMs = (p && typeof p.t === "string") ? g.parseUtcMs(p.t) : null;
+        // Timestamp parse cached on the (immutable) trail point, same as the
+        // field/overlay collectors do. This rebuild runs on every live data
+        // arrival over every point of every trail; re-parsing ~10k ISO
+        // strings each time was a main-thread hitch per SSE message.
+        let tMs = p._tMs;
+        if (tMs === undefined) {
+          tMs = (typeof p.t === "string") ? g.parseUtcMs(p.t) : null;
+          try { p._tMs = tMs; } catch {}
+        }
         if (tMs == null || !isFinite(tMs)) continue;
         pts.push({ lat, lon, tMs, m: p.m, readings: p.readings });
       }
@@ -951,7 +959,25 @@
     }
 
     // Get raw path geometry for physics (distance, curvature from original GPS points)
-    const { cumDist, totalDist, curvature } = this.view._getPathDistances(id, pts);
+    const pathInfo = this.view._getPathDistances(id, pts);
+    const { cumDist, totalDist, curvature } = pathInfo;
+    // Path prefix changed since this vehicle's physics last ran (live trail
+    // window slid, or the path was replaced by road matching). Carry the
+    // physics distance across a slide so motion continues; only a true
+    // replacement (no measurable shift) snaps.
+    let pathReplaced = false;
+    {
+      const physPre = this.view._getPhysicsState(id);
+      if (physPre.pathGen !== pathInfo.gen) {
+        if (physPre.pathGen != null && pathInfo.shift != null && physPre.d > 0) {
+          physPre.d = Math.max(0, physPre.d - pathInfo.shift);
+        } else if (physPre.pathGen != null) {
+          pathReplaced = true;
+        }
+        physPre.pathGen = pathInfo.gen;
+        physPre.totalDist = totalDist;
+      }
+    }
 
     // Target distance along raw path based on playback time
     const targetD = this.view._getTargetDistance(pts, cumDist, totalDist, t);
@@ -964,25 +990,30 @@
     // easing/fling continues advancing playbackTimeMs while physics would be
     // far behind, causing a lurch. We hold the fast path until the playback
     // velocity settles to normal speed (targetD stops racing ahead).
-    if (this.view._scrubbing) {
+    // Wheel coast counts as a scrub for the physics: the playhead is sweeping
+    // many seconds of sim time per frame, and the full pipeline below would
+    // snap + zero velocity + rescan curves on every tick (isScrub true each
+    // frame) for a marker that just needs to sit at the time position.
+    const _sweeping = !!(this.view._scrubbing || this.view._playheadSweeping);
+    if (_sweeping) {
       // Mark that we're in a scrub — cooldown will continue after release
       if (!this.view._scrubCooldownById) this.view._scrubCooldownById = new Map();
       this.view._scrubCooldownById.set(id, { lastTargetD: targetD, lastT: t });
     }
     const cooldown = this.view._scrubCooldownById?.get(id);
-    const inCooldown = !this.view._scrubbing && cooldown != null
+    const inCooldown = !_sweeping && cooldown != null
       && (t - cooldown.lastT) < 1500   // max 1.5s cooldown
       && (targetD - cooldown.lastTargetD) > 50;  // easing is still racing ahead (>50m jump)
     if (inCooldown) {
       // Update cooldown tracking
       cooldown.lastTargetD = targetD;
       cooldown.lastT = t;
-    } else if (!this.view._scrubbing && cooldown != null) {
+    } else if (!_sweeping && cooldown != null) {
       // Cooldown finished — clear it
       this.view._scrubCooldownById.delete(id);
     }
 
-    if (this.view._scrubbing || inCooldown) {
+    if (_sweeping || inCooldown) {
       const phys = this.view._getPhysicsState(id);
       phys.d = targetD;
       phys.lastPlaybackT = t;
@@ -1108,7 +1139,11 @@
 
     // Initialize or handle scrub: snap to target, reset velocity
     // Also snap if physics hasn't been initialized yet (d=0 but targetD is far ahead)
-    const needsSnap = phys.totalDist !== totalDist || isScrub ||
+    // NOT `phys.totalDist !== totalDist`: that is true on every trail append
+    // in live mode, which snapped the vehicle to target and zeroed its
+    // velocity on every data arrival (the periodic hitch). Growth is handled
+    // by the incremental path cache; only scrubs, init, and a replaced path snap.
+    const needsSnap = pathReplaced || isScrub ||
                       (phys.d === 0 && targetD > 100); // Snap if >100m behind on init
     if (needsSnap) {
       phys.totalDist = totalDist;
@@ -1233,28 +1268,34 @@
         const cpts = path.computedPts;
         const ccum = path.cumDist;
 
-        // Find where phys.d falls in raw GPS cumDist
+        // Find where phys.d falls in raw GPS cumDist. Binary search: this
+        // runs per vehicle per frame, and both arrays scale with the trail
+        // (the computed path is ~5x the GPS point count); the linear scans
+        // that were here walked from index 0 every frame.
         let rawIdx = 0;
         let rawFrac = 0;
-        for (let i = 0; i < cumDist.length - 1; i++) {
-          if (cumDist[i + 1] >= phys.d) {
-            rawIdx = i;
-            const segLen = cumDist[i + 1] - cumDist[i];
-            rawFrac = segLen > 0 ? (phys.d - cumDist[i]) / segLen : 0;
-            break;
+        {
+          let lo = 0, hi = cumDist.length - 2;
+          while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (cumDist[mid + 1] >= phys.d) hi = mid; else lo = mid + 1;
           }
-          rawIdx = i;
+          rawIdx = Math.max(0, lo);
+          const segLen = cumDist[rawIdx + 1] - cumDist[rawIdx];
+          rawFrac = (segLen > 0 && cumDist[rawIdx + 1] >= phys.d)
+            ? Math.max(0, Math.min(1, (phys.d - cumDist[rawIdx]) / segLen)) : 0;
         }
         const rawIdxFrac = rawIdx + rawFrac;
 
-        // Find corresponding position in computed path
+        // Find corresponding position in computed path (rawIdx is monotonic)
         let compIdx = 0;
-        for (let i = 0; i < cpts.length - 1; i++) {
-          if (cpts[i + 1].rawIdx >= rawIdxFrac) {
-            compIdx = i;
-            break;
+        {
+          let lo = 0, hi = cpts.length - 2;
+          while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (cpts[mid + 1].rawIdx >= rawIdxFrac) hi = mid; else lo = mid + 1;
           }
-          compIdx = i;
+          compIdx = Math.max(0, lo);
         }
 
         // Interpolate between computed points

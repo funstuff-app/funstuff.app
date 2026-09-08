@@ -31,15 +31,16 @@
   <meta name="apple-mobile-web-app-title" content="DustyTrails" />
   <link rel="apple-touch-icon" href="/icon-180.png" />
   <link rel="icon" href="/icon-192.png" type="image/png" />
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" />
 
   <!-- Design system: tokens → base/primitives → components → cross-cutting
-       states → responsive. No bundler in this project (see the 26 <script
-       defer> tags below) — multiple stylesheets is the idiomatic answer
+       states → responsive. No bundler in this project; multiple stylesheets
+       and ordered defer scripts are the idiomatic answer
        here, same pattern as the JS module chain. -->
   <link rel="stylesheet" href="/styles/00-tokens.css?v=20260707redesign3" />
   <link rel="stylesheet" href="/styles/01-base.css?v=20260707redesign3" />
   <link rel="stylesheet" href="/styles/02-shell.css?v=20260707redesign3" />
-  <link rel="stylesheet" href="/styles/03-map.css?v=20260707redesign3" />
+  <link rel="stylesheet" href="/styles/03-map.css?v=20260907a" />
   <link rel="stylesheet" href="/styles/04-legend.css?v=20260707redesign3" />
   <link rel="stylesheet" href="/styles/05-sidebar.css?v=20260707redesign3" />
   <link rel="stylesheet" href="/styles/06-playback.css?v=20260707redesign3" />
@@ -130,6 +131,7 @@
     <main id="layout">
       <section id="mapPane">
         <div id="mapRoot">
+          <div id="mapglMap" aria-label="3D air quality map"></div>
           <canvas id="tilesCanvas"></canvas>
           <canvas id="paFieldCanvas"></canvas>
           <canvas id="overlayCanvas"></canvas>
@@ -169,6 +171,7 @@
           <button id="camReplayBtn" type="button" title="Replay visitor camera history" aria-label="Replay visitor camera history"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></button>
           <div id="camClientPicker" class="camClientPicker hidden"></div>
           <button id="camCenterBtn" type="button" title="Camera center fit" aria-label="Camera center fit" style="display:none"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/></svg></button>
+          <button id="map3dToggle" type="button" title="Enter 3D terrain view" aria-label="Enter 3D terrain view" aria-pressed="false">3D</button>
 
           <!-- Sidebar panel (integrated, overlays map) -->
           <aside id="sidebar" class="sidebarPanel hidden">
@@ -318,44 +321,45 @@
 
     <footer id="appFooter">
       <div class="footerRow1"><span class="footerContent">©2026 Funstuff.wtf</span> <a href="mailto:matt@funstuff.app" class="contactLink">Contact Me</a> <span class="footerDisclaimer">Interactive art demo for entertainment only.</span></div>
-      <div class="footerRow2"><span class="footerDisclaimer"><span class="footerDisclaimer"><span class="footerSentence">Data courtesy of Utah DAQ &amp; <a href="https://www.airnow.gov" target="_blank" class="contactLink">EPA AirNow</a></span> <span class="footerSentence">Community sensors powered by <a href="https://www.purpleair.com" target="_blank" class="contactLink">PurpleAir</a></span> <span class="footerSentence">Not for medical, regulatory, or emergency use. Use at your own risk.</span></span></div>
+      <div class="footerRow2"><span class="footerDisclaimer"><span class="footerDisclaimer"><span class="footerSentence">Data courtesy of Utah DAQ &amp; <a href="https://www.airnow.gov" target="_blank" class="contactLink">EPA AirNow</a></span> <span class="footerSentence">Community sensors powered by <a href="https://www.purpleair.com" target="_blank" class="contactLink">PurpleAir</a></span> <span class="footerSentence">Basemap &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" class="contactLink">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank" class="contactLink">CARTO</a></span> <span class="footerSentence">Not for medical, regulatory, or emergency use. Use at your own risk.</span></span></div>
     </footer>
   </div>
 
-  <!-- Load order: nav engine → camera logic → config → projections → colors →
-       aqi → format → data → engine controllers → MapView class → sidebar UI →
-       ui_* controllers → main entry point. Unchanged from pre-redesign —
-       this is the tested, working rendering/data engine; this redesign only
-       touched the chrome around it. -->
+  <!-- Load order: MapLibre → nav engine → camera logic → config → projections →
+       colors → aqi → format → data → engine controllers → MapView class →
+       sidebar UI → ui_* controllers → main entry point. -->
+  <script defer src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
   <script defer src="map_nav_engine.js?v=20260224a"></script>
   <script defer src="camera_fit_logic.js?v=20260224a"></script>
-  <script defer src="config.js?v=20260702a"></script>
+  <script defer src="config.js?v=20260907a"></script>
   <script defer src="projections.js?v=20260224a"></script>
   <script defer src="colors.js?v=20260406a"></script>
   <script defer src="aqi.js?v=20260414a"></script>
   <script defer src="format_utils.js?v=20260224a"></script>
   <script defer src="data_utils.js?v=20260612c"></script>
   <script defer src="advection_solver.js?v=20260320a"></script>
-  <script defer src="engine_field_sensors.js?v=20260703a"></script>
-  <script defer src="engine_tile_renderer.js?v=20260701a"></script>
-  <script defer src="engine_road_matcher.js?v=20260701a"></script>
-  <script defer src="engine_vehicle_motion.js?v=20260701a"></script>
-  <script defer src="engine_playback_engine.js?v=20260709a"></script>
+  <script defer src="engine_field_sensors.js?v=20260823a"></script>
+  <script defer src="engine_mapgl_renderer.js?v=20260907t"></script>
+  <script defer src="engine_tile_renderer.js?v=20260907a"></script>
+  <script defer src="engine_road_matcher.js?v=20260907a"></script>
+  <script defer src="engine_vehicle_motion.js?v=20260907b"></script>
+  <script defer src="engine_playback_engine.js?v=20260907d"></script>
   <script defer src="engine_wind_advection.js?v=20260701a"></script>
-  <script defer src="engine_pa_field.js?v=20260703a"></script>
-  <script defer src="engine_overlay_renderer.js?v=20260709a"></script>
-  <script defer src="engine_camera_gestures.js?v=20260701a"></script>
-  <script defer src="map_view.js?v=20260709a"></script>
+  <script defer src="engine_pa_field.js?v=20260907l"></script>
+  <script defer src="engine_overlay_renderer.js?v=20260907d"></script>
+  <script defer src="engine_camera_gestures.js?v=20260907e"></script>
+  <script defer src="map_view.js?v=20260907i"></script>
   <script defer src="sidebar_ui.js?v=20260415a"></script>
   <script defer src="jog_wheel.js?v=20260327j"></script>
   <script defer src="ui_state_sync.js?v=20260701a"></script>
-  <script defer src="ui_legend.js?v=20260701a"></script>
+  <script defer src="ui_legend.js?v=20260907a"></script>
   <script defer src="ui_theme.js?v=20260701a"></script>
   <script defer src="playback_state.js?v=20260701a"></script>
-  <script defer src="ui_playback.js?v=20260702p"></script>
+  <script defer src="ui_playback.js?v=20260907a"></script>
   <script defer src="ui_snapshots_menus.js?v=20260709a"></script>
   <script defer src="ui_screensaver.js?v=20260701a"></script>
-  <script defer src="app.js?v=20260707b"></script>
+  <script defer src="app.js?v=20260907b"></script>
+  <script defer src="perf_probe.js?v=20260907a"></script>
 
   <!-- PA Field debug sliders — toggled via Menu > Debug or ?fieldDebug=1 -->
   <div id="fieldDebugPanel" class="fdHidden">

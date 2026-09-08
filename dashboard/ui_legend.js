@@ -764,7 +764,13 @@
     const map = this.cfg.map;
     const selectedId = this.cfg.getSelectedId();
     if (!this.legendEl) return;
-    const tabs = this.legendEl.querySelectorAll(".legendTab");
+    // Runs on every playback-loop iteration (rAF rate) while the legend is
+    // open. Query once; and below, only touch a tab's inline style when the
+    // resolved color/primary state actually changed: four style writes per
+    // tab per frame at 120 Hz is a style recalc every frame for nothing.
+    if (!this._legendTabEls) this._legendTabEls = Array.from(this.legendEl.querySelectorAll(".legendTab"));
+    const tabs = this._legendTabEls;
+    if (!this._legendTabApplied) this._legendTabApplied = new Map();
 
     const selectedSensor = (map && selectedId)
       ? (() => {
@@ -824,15 +830,18 @@
       } else {
         color = this._persistedTabColors[tabKey] || null;
       }
+      // Preserve the pre-color dim contrast: the active/auto-active tab
+      // reads full-strength, others read at reduced opacity so the
+      // selected pollutant pops without graying out the others.
+      const isPrimary = tab.classList.contains("active")
+        || tab.classList.contains("auto-active");
+      const sig = (color || "") + "|" + (isPrimary ? 1 : 0);
+      if (this._legendTabApplied.get(tab) === sig) continue;
+      this._legendTabApplied.set(tab, sig);
       if (color) {
         tab.style.color = color;
         tab.style.filter = "none";
         tab.style.textShadow = `0 0 6px ${g.hexToRgba(color, 0.4)}`;
-        // Preserve the pre-color dim contrast: the active/auto-active tab
-        // reads full-strength, others read at reduced opacity so the
-        // selected pollutant pops without graying out the others.
-        const isPrimary = tab.classList.contains("active")
-          || tab.classList.contains("auto-active");
         tab.style.opacity = isPrimary ? "" : "0.5";
       } else {
         tab.style.color = "";
@@ -844,6 +853,7 @@
   };
   LegendUI.prototype._clearLegendTabColors = function () {
     if (!this.legendEl) return;
+    if (this._legendTabApplied) this._legendTabApplied.clear();
     for (const tab of this.legendEl.querySelectorAll(".legendTab")) {
       tab.style.color = "";
       tab.style.filter = "";

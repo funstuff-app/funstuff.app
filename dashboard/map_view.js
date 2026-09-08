@@ -53,7 +53,15 @@ class MapView {
     // fractional zoom for smooth pinch / button zooming
     this.zoom = 12.58; // 50% more zoomed in than the original 12 (log2 scale: +log2(1.5))
     this._zoomMin = 3;
-    this._zoomMax = 18;
+    this._zoomMax2d = 18;
+    // 3D ceiling. MapLibre's pitched camera sits cos(58deg) * cameraToCenter
+    // px above the CENTER's ground; with the center elevation not yet known
+    // (DEM still loading on entry) that is above sea level: map zoom 14 =
+    // ~2.5 km, which clears the bench/foothills everywhere in the valley; map
+    // zoom 15 (~1.2 km) does not, and MapLibre then re-aims the camera from
+    // ground level.
+    this._zoomMax3d = 15;
+    this._zoomMax = this._zoomMax2d;
     // Mouse drag pan (optional). Does not affect trackpad controls.
     // _mouseDragging is shared (read by PlaybackEngine/PaFieldRenderer); the
     // drag start/center/moved bookkeeping is owned by CameraGestures.
@@ -270,11 +278,16 @@ class MapView {
     // (read by TileRenderer/PlaybackEngine/PaFieldRenderer/app.js/jog_wheel).
     this._pinchZooming = false;
     this._scrubbing = false; // true during timeline scrub (slider/jog wheel drag)
+    this._playheadSweeping = false; // wheel coast far above playback speed (set by the playback loop)
 
     // Pointer/touch/wheel/gesture + camera animation/fit/orchestration controller
     // (engine_camera_gestures.js).
     const CameraGesturesCtor = (typeof window !== "undefined" ? window : globalThis).CameraGestures;
     this.gestures = new CameraGesturesCtor(this);
+
+    const MapGLRendererCtor = (typeof window !== "undefined" ? window : globalThis).MapGLRenderer;
+    const mapglContainer = document.getElementById("mapglMap");
+    this.mapgl = MapGLRendererCtor ? new MapGLRendererCtor(this, mapglContainer) : null;
 
     // ResizeObserver fires after layout settles — catches window resize, devtools
     // show/hide, and fullscreen toggle more reliably than window "resize".
@@ -462,6 +475,7 @@ class MapView {
     // start new requests at the current epoch.
     this._lastTilesViewSig = null;
     this.draw(this.lastState);
+    if (this.mapgl) this.mapgl.setTheme();
   }
 
   /** Delegates to CameraGestures (engine_camera_gestures.js). */
@@ -768,6 +782,8 @@ class MapView {
   _handleTapSelection(...args) { return this.gestures._handleTapSelection(...args); }
 
   worldToScreen(wx, wy) {
+    const projected = this.mapgl ? this.mapgl.projectWorld(wx, wy) : null;
+    if (projected) return projected;
     const w = this._cssW || 1;
     const h = this._cssH || 1;
     const c = latLonToWorld(this.center.lat, this.center.lon, this.zoom);
@@ -883,7 +899,10 @@ class MapView {
   _updatePersistedTrails(state) { return this.overlay._updatePersistedTrails(state); }
 
   /** Delegates to TileRenderer (engine_tile_renderer.js). */
-  drawTiles() { this.tiles.drawTiles(); }
+  drawTiles() {
+    if (this.mapgl && this.mapgl.sync()) return;
+    this.tiles.drawTiles();
+  }
 
   /** Delegates to TileRenderer (engine_tile_renderer.js). */
   _captureTilesSnapshot() { this.tiles._captureTilesSnapshot(); }
@@ -1065,7 +1084,10 @@ class MapView {
 
   setPaFieldDim(target) { this.paField.setPaFieldDim(target); }
 
-  _compositePaFieldOnTiles(state, tilesJustRedrawn = false) { this.paField._compositePaFieldOnTiles(state, tilesJustRedrawn); }
+  _compositePaFieldOnTiles(state, tilesJustRedrawn = false) {
+    this.paField._compositePaFieldOnTiles(state, tilesJustRedrawn);
+    if (this.mapgl && this.mapgl.active) this.mapgl.sync();
+  }
 
   _ensurePaField(state, playbackTimeMs) { this.paField._ensurePaField(state, playbackTimeMs); }
 
@@ -1083,11 +1105,11 @@ class MapView {
 
   _kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, outAqi, outW) { this.paField._kernelGrid(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, wind, outAqi, outW); }
 
-  _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH) { this.paField._paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH); }
+  _paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, fieldRadiusPx) { this.paField._paintPaCells(aqiCell, wCell, gw, gh, cellSize, FIELD_ALPHA, dpr, vpCssW, vpCssH, cssW, cssH, fieldRadiusPx); }
 
-  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) { this.paField._computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH); }
+  _computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx) { this.paField._computePaFieldSync(sensors, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx); }
 
-  _computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH) { this.paField._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH); }
+  _computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx) { this.paField._computeMaxModeFieldSync(perPollS5, gw, gh, cellSize, cutoffSq, isoCutoffSq, FIELD_ALPHA, cssW, cssH, dpr, wind, vpCssW, vpCssH, fieldRadiusPx); }
 
   _upscalePaField(tc, cssW, cssH, dpr) { this.paField._upscalePaField(tc, cssW, cssH, dpr); }
 
@@ -1105,7 +1127,18 @@ class MapView {
   _ensureOverlayStatic(state) { return this.overlay._ensureOverlayStatic(state); }
 
   /** Delegates to OverlayRenderer (engine_overlay_renderer.js). */
-  drawOverlay(state, opts = {}) { return this.overlay.drawOverlay(state, opts); }
+  drawOverlay(state, opts = {}) {
+    const gl = this.mapgl;
+    if (gl && gl.active && gl.ready && !gl._drawingFromRender) {
+      // Camera moved and MapLibre hasn't painted it yet: push the camera and
+      // let the GL render callback draw the overlay in the painted frame.
+      gl.sync();
+      if (gl._cameraDirty) { gl.map.triggerRepaint(); return undefined; }
+    }
+    const result = this.overlay.drawOverlay(state, opts);
+    if (this.mapgl && this.mapgl.active) this.mapgl.sync(false, true);
+    return result;
+  }
 }
 // Expose on window for cross-script access (class declarations don't auto-create window properties)
 window.MapView = MapView;

@@ -1924,9 +1924,18 @@ function main() {
     const _scrubPointerSensitivity = 0.3;
 
     pbScrubEl.addEventListener("pointerdown", (e) => {
-      // Detect if pointer landed on the thumb vs the track (mouse/pen only)
+      // On touch devices, pointerdown fires BEFORE touchstart for the same
+      // interaction. Defer entirely to touchstart (which runs its own
+      // equivalent setup below) — otherwise this handler pauses playback and
+      // computes _pbResumeAfterScrub first, then touchstart re-derives "was
+      // it playing?" from the now-already-paused state and always gets false,
+      // so release never resumes (mobile-only pause-on-release bug; desktop
+      // only ever fires pointerdown, never touchstart).
+      if (e.pointerType === "touch") return;
+      // Detect if pointer landed on the thumb vs the track (mouse/pen only —
+      // touch already bailed above)
       _scrubPointerOnTrack = false;
-      if (e.pointerType !== "touch") {
+      {
         const rect = pbScrubEl.getBoundingClientRect();
         const range = Number(pbScrubEl.max) - Number(pbScrubEl.min);
         const curVal = Number(pbScrubEl.value);
@@ -2635,6 +2644,10 @@ function main() {
 
     // Re-apply theme in case config pushed new localStorage defaults
     applyTheme(_currentThemeKey, true);
+    // Tiles requested before /api/config answered went out without the CARTO
+    // key (watermarked). setTheme bumps the tile epoch, drops the cache and
+    // re-points the MapLibre raster source, so everything refetches keyed.
+    if (appConfig.cartoApiKey) map.setTheme(map.themeKey);
 
     // ── Embed / iframe URL parameter handling ────────────────────────────────
     // The landing page (fun.js) passes ?date=YYYY-MM-DD&start=10&speed=10 etc.

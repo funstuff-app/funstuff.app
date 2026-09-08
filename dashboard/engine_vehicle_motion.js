@@ -147,9 +147,13 @@
     if (!view._vehiclePathById) view._vehiclePathById = new Map();
 
     let path = view._vehiclePathById.get(id);
-    const ptsKey = view._playbackPtsKey;
-
-    // Reset if pts changed (different recording loaded)
+    // Reset only when the raw path's PREFIX changed (window slid, different
+    // recording, road-matched replacement): that is _getPathDistances' gen,
+    // computed for the same pts just before this is reached. Keying on
+    // _playbackPtsKey (any trail change) threw the spline away on every
+    // live data arrival and recomputed it from index 0 to the vehicle.
+    const pd = view._pathDistCache && view._pathDistCache.get(id);
+    const ptsKey = pd ? pd.gen : view._playbackPtsKey;
     if (path && path.ptsKey !== ptsKey) {
       path = null;
     }
@@ -309,14 +313,16 @@
     const cpts = path.computedPts;
     const ccum = path.cumDist;
 
-    // Find index in computed path corresponding to vehicleIdx
+    // Find index in computed path corresponding to vehicleIdx (rawIdx is
+    // monotonic; binary search, this is per vehicle per frame)
     let vehicleComputedIdx = 0;
-    for (let i = 0; i < cpts.length; i++) {
-      if (cpts[i].rawIdx >= vehicleIdx) {
-        vehicleComputedIdx = i;
-        break;
+    {
+      let lo = 0, hi = cpts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (cpts[mid].rawIdx >= vehicleIdx) hi = mid; else lo = mid + 1;
       }
-      vehicleComputedIdx = i;
+      vehicleComputedIdx = lo;
     }
 
     // Window bounds in computed path (5 samples per GPS segment)
@@ -480,31 +486,44 @@
 
   // Build cumulative distance array for a path (cached per vehicle)
   // Also computes per-point curvature for speed modulation
+  //
+  // Cache validity is by CONTENT, not length: the live trail is a sliding
+  // window (client merge caps it at MAX_TRAIL_LEN, the server trims at the
+  // day boundary), so once a vehicle hits the cap every new point drops one
+  // off the front and the length never changes. A length-only check kept
+  // serving cumDist computed for the old points: distances no longer lined
+  // up with pts[i].tMs, so time->distance lookups landed on the wrong
+  // segment and the marker jumped. When the prefix does change, `shift` is
+  // how much path was dropped in front, so the physics distance can be
+  // carried over instead of snapping; `gen` bumps on every rebuild.
   VehicleMotion.prototype._getPathDistances = function (id, pts) {
     const view = this.view;
     if (!view._pathDistCache) view._pathDistCache = new Map();
     let cached = view._pathDistCache.get(id);
-    if (cached && cached.ptsLen === pts.length) return cached;
-
     const n = pts.length;
-    const prevLen = cached ? cached.ptsLen : 0;
+    const firstT = pts[0].tMs;
+    const lastT = pts[n - 1].tMs;
+    if (cached && cached.ptsLen === n && cached.firstT === firstT && cached.lastT === lastT) return cached;
 
-    // Incremental: reuse existing arrays and only compute new appended points.
-    // GPS trails only grow by appending — never insert into the middle.
-    let cumDist, curvature;
-    if (cached && prevLen > 0 && n > prevLen) {
-      // Extend existing arrays
+    const prevLen = cached ? cached.ptsLen : 0;
+    // Same prefix (first point unchanged and the old last point still sits at
+    // its old index): pure append, extend in place.
+    const appendOnly = !!cached && prevLen > 0 && n > prevLen
+      && cached.firstT === firstT && pts[prevLen - 1].tMs === cached.lastT;
+
+    let cumDist, curvature, times;
+    if (appendOnly) {
       cumDist = cached.cumDist;
       curvature = cached.curvature;
-      // Grow arrays to new size
+      times = cached.times;
       cumDist.length = n;
       curvature.length = n;
-      // Compute distances for new points only
+      times.length = n;
       for (let i = prevLen; i < n; i++) {
         const segDist = g.haversineMeters(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
         cumDist[i] = cumDist[i-1] + segDist;
+        times[i] = pts[i].tMs;
       }
-      // Recompute curvature only at boundary + new points
       const curvStart = Math.max(1, prevLen - 1);
       for (let i = curvStart; i < n - 1; i++) {
         const dx1 = pts[i].lon - pts[i-1].lon;
@@ -519,33 +538,58 @@
         curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
       }
       if (n > 0) curvature[n - 1] = 0;
-    } else {
-      // Full rebuild (first call or data replaced)
-      cumDist = new Array(n);
-      cumDist[0] = 0;
-      for (let i = 1; i < n; i++) {
-        const segDist = g.haversineMeters(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
-        cumDist[i] = cumDist[i-1] + segDist;
+      cached.ptsLen = n;
+      cached.lastT = lastT;
+      cached.totalDist = cumDist[n - 1] || 1;
+      return cached;
+    }
+
+    // Full rebuild: first call, or the prefix changed (window slid, path replaced).
+    // Path dropped in front = old cumDist at the index where the new first
+    // point used to sit; null if it can't be located (path replaced).
+    let shift = null;
+    if (cached && cached.times && cached.times.length) {
+      const ot = cached.times;
+      let lo = 0, hi = ot.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (ot[mid] < firstT) lo = mid + 1; else hi = mid;
       }
-      curvature = new Array(n).fill(0);
-      if (n >= 3) {
-        for (let i = 1; i < n - 1; i++) {
-          const dx1 = pts[i].lon - pts[i-1].lon;
-          const dy1 = pts[i].lat - pts[i-1].lat;
-          const dx2 = pts[i+1].lon - pts[i].lon;
-          const dy2 = pts[i+1].lat - pts[i].lat;
-          const a1 = Math.atan2(dy1, dx1);
-          const a2 = Math.atan2(dy2, dx2);
-          let angleDiff = Math.abs(a2 - a1);
-          if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
-          const dist = (cumDist[i] - cumDist[i-1] + cumDist[i+1] - cumDist[i]) / 2;
-          curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
-        }
+      if (ot[lo] === firstT) shift = cached.cumDist[lo];
+    }
+
+    cumDist = new Array(n);
+    times = new Array(n);
+    cumDist[0] = 0;
+    times[0] = firstT;
+    for (let i = 1; i < n; i++) {
+      const segDist = g.haversineMeters(pts[i-1].lat, pts[i-1].lon, pts[i].lat, pts[i].lon);
+      cumDist[i] = cumDist[i-1] + segDist;
+      times[i] = pts[i].tMs;
+    }
+    curvature = new Array(n).fill(0);
+    if (n >= 3) {
+      for (let i = 1; i < n - 1; i++) {
+        const dx1 = pts[i].lon - pts[i-1].lon;
+        const dy1 = pts[i].lat - pts[i-1].lat;
+        const dx2 = pts[i+1].lon - pts[i].lon;
+        const dy2 = pts[i+1].lat - pts[i].lat;
+        const a1 = Math.atan2(dy1, dx1);
+        const a2 = Math.atan2(dy2, dx2);
+        let angleDiff = Math.abs(a2 - a1);
+        if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+        const dist = (cumDist[i] - cumDist[i-1] + cumDist[i+1] - cumDist[i]) / 2;
+        curvature[i] = dist > 0.1 ? angleDiff / dist : 0;
       }
     }
     const totalDist = cumDist[n - 1] || 1;
 
-    cached = { cumDist, totalDist, curvature, ptsLen: n };
+    cached = {
+      cumDist, totalDist, curvature, times,
+      ptsLen: n, firstT, lastT,
+      gen: (cached ? cached.gen : 0) + 1,
+      shift,
+    };
     view._pathDistCache.set(id, cached);
     return cached;
   };
